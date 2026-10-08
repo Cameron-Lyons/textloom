@@ -6,9 +6,9 @@ The default package has one dependency: `unicode-segmentation`. There is no unsa
 
 ```toml
 [dependencies]
-textloom = { path = "../textloom" }
+textloom = "0.1"
 # Enable only the integrations your application uses:
-# textloom = { path = "../textloom", features = ["egui"] }
+# textloom = { version = "0.1", features = ["egui"] }
 ```
 
 ```rust

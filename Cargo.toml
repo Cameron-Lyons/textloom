@@ -9,6 +9,10 @@ keywords = ["rich-text", "editor", "native", "egui", "unicode"]
 categories = ["gui", "text-editors"]
 readme = "README.md"
 repository = "https://github.com/Cameron-Lyons/textloom"
+documentation = "https://docs.rs/textloom"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
