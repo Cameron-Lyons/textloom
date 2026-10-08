@@ -42,8 +42,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --all-features --no-deps
+      - name: Release benchmark smoke tests
+        run: cargo bench --locked --all-features --bench editing --bench rendering
       - name: Headless examples
         run: |
+          cargo run --locked --example rich_text
           cargo run --locked --example egui_editor --features egui
           cargo run --locked --example winit_input --features winit
       - name: Cargo package verification

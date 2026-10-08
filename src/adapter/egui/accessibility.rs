@@ -235,12 +235,16 @@ impl Snapshot {
         editor: &Editor,
         layouts: &[ParagraphLayout],
         origin: Pos2,
+        read_only: bool,
     ) {
         let selection = editor.selection();
         if ui
             .ctx()
             .accesskit_node_builder(widget_id, |node| {
                 node.set_role(accesskit::Role::MultilineTextInput);
+                if read_only {
+                    node.set_read_only();
+                }
                 if let (Some(anchor), Some(focus)) = (
                     self.position(selection.anchor),
                     self.position(selection.focus),
@@ -249,8 +253,10 @@ impl Snapshot {
                 }
                 if ui.is_enabled() {
                     node.add_action(accesskit::Action::SetTextSelection);
-                    node.add_action(accesskit::Action::SetValue);
-                    node.add_action(accesskit::Action::ReplaceSelectedText);
+                    if !read_only {
+                        node.add_action(accesskit::Action::SetValue);
+                        node.add_action(accesskit::Action::ReplaceSelectedText);
+                    }
                 }
             })
             .is_none()

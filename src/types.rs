@@ -120,6 +120,7 @@ pub enum Movement {
 pub enum Error {
     InvalidPosition(Position),
     InvalidRange,
+    InvalidFragment,
     InvalidCompositionSelection,
     InvalidHeadingLevel(u8),
     CompositionActive,
@@ -132,6 +133,9 @@ impl fmt::Display for Error {
                 write!(f, "invalid grapheme position {}:{}", p.paragraph, p.byte)
             }
             Self::InvalidRange => f.write_str("range endpoints are reversed"),
+            Self::InvalidFragment => {
+                f.write_str("fragment has invalid text, formatting, or paragraph structure")
+            }
             Self::InvalidCompositionSelection => {
                 f.write_str("preedit selection must be valid UTF-8 byte offsets")
             }

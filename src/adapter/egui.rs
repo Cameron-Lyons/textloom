@@ -25,8 +25,11 @@ pub use accessibility::AccessibilityError;
 /// A reusable, multiline rich-text editor with pointer and keyboard selection.
 ///
 /// Place it in `ScrollArea::vertical()` for a scrolling document. The core owns
-/// document and history state; egui owns focus and cached layout jobs. Clipboard
+/// document and history state; egui owns focus and cached paragraph layouts. Clipboard
 /// interchange is plain text, so copying to another application remains portable.
+/// Full text in egui output metadata is generated when accessibility, a screen
+/// reader, or the debug widget inspector needs it. Other output events retain
+/// their widget type and selection without copying the whole document.
 pub struct RichTextEditor<'a> {
     editor: &'a mut Editor,
     id: Option<Id>,
@@ -36,6 +39,7 @@ pub struct RichTextEditor<'a> {
     font: Option<FontId>,
     bold_family: Option<FontFamily>,
     hint: String,
+    read_only: bool,
 }
 
 /// The response plus any rejected editor commands.
@@ -61,6 +65,7 @@ impl<'a> RichTextEditor<'a> {
             font: None,
             bold_family: None,
             hint: String::new(),
+            read_only: false,
         }
     }
 
@@ -99,6 +104,15 @@ impl<'a> RichTextEditor<'a> {
         self
     }
 
+    /// Permit focus, selection, navigation, and copying while preventing edits.
+    ///
+    /// A read-only editor remains enabled and available to assistive technology.
+    /// Existing composition is canceled when the widget becomes read-only.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> RichTextEditorOutput {
         let id = self.id.unwrap_or_else(|| {
             self.salt
@@ -128,10 +142,20 @@ impl<'a> RichTextEditor<'a> {
         let old_revision = self.editor.document().revision();
         let old_selection = self.editor.selection();
         let old_composition = self.editor.composition().cloned();
-        let old_text = cache.plain_text.clone();
+        let publish_text = ui
+            .ctx()
+            .accesskit_node_builder(id, |node| {
+                node.set_role(egui::accesskit::Role::MultilineTextInput)
+            })
+            .is_some()
+            || ui.memory(|memory| memory.options.screen_reader);
+        #[cfg(debug_assertions)]
+        let publish_text = publish_text || ui.style().debug.show_interactive_widgets;
         let mut errors = Vec::new();
         let mut accessibility_errors = Vec::new();
         let mut layouts = cache.layout(ui, self.editor, &appearance);
+        let old_text = publish_text.then(|| cache.plain_text(self.editor.document()));
+        let mut interrupted = self.read_only && self.editor.cancel_composition();
         let initial_preview = match cache.layout_preview(ui, self.editor, &appearance) {
             Ok(layouts) => layouts,
             Err(error) => {
@@ -150,12 +174,19 @@ impl<'a> RichTextEditor<'a> {
         ));
         let mut response = ui.interact(rect, id, Sense::click_and_drag());
         let origin = rect.min + Vec2::splat(PADDING);
-        let mut interrupted = false;
 
         if ui.is_enabled() {
             ui.input_mut(|input| {
                 input.consume_accesskit_action_requests(id, |request| {
                     use egui::accesskit::{Action, ActionData};
+                    if self.read_only
+                        && matches!(
+                            request.action,
+                            Action::SetValue | Action::ReplaceSelectedText
+                        )
+                    {
+                        return true;
+                    }
                     if matches!(
                         request.action,
                         Action::SetTextSelection | Action::SetValue | Action::ReplaceSelectedText
@@ -257,7 +288,7 @@ impl<'a> RichTextEditor<'a> {
                     memory.set_focus_lock_filter(
                         id,
                         egui::EventFilter {
-                            tab: false,
+                            tab: !self.read_only && cache.selection_contains_list(self.editor),
                             horizontal_arrows: true,
                             vertical_arrows: true,
                             escape: true,
@@ -276,6 +307,7 @@ impl<'a> RichTextEditor<'a> {
                         origin,
                         &mut errors,
                         &mut interrupted,
+                        self.read_only,
                     ) {
                         consumed.push(index);
                     }
@@ -351,7 +383,14 @@ impl<'a> RichTextEditor<'a> {
                     ui.visuals().selection.bg_fill,
                 );
             }
-            for paragraph in display_layouts {
+            let top = painter.clip_rect().top() - origin.y;
+            let bottom = painter.clip_rect().bottom() - origin.y;
+            let first_visible =
+                display_layouts.partition_point(|paragraph| paragraph.rect.bottom() < top);
+            let last_visible = display_layouts
+                .partition_point(|paragraph| paragraph.rect.top() <= bottom)
+                .max(first_visible);
+            for paragraph in &display_layouts[first_visible..last_visible] {
                 let text_origin = origin + paragraph.rect.min.to_vec2();
                 if !painter
                     .clip_rect()
@@ -368,7 +407,8 @@ impl<'a> RichTextEditor<'a> {
                 }
                 painter.galley(text_origin, paragraph.galley.clone(), appearance.color);
             }
-            if cache.plain_text.is_empty()
+            if self.editor.document().paragraphs().len() == 1
+                && self.editor.document().paragraphs()[0].text().is_empty()
                 && self.editor.composition().is_none()
                 && !self.hint.is_empty()
             {
@@ -405,14 +445,16 @@ impl<'a> RichTextEditor<'a> {
                     .ctx()
                     .layer_transform_to_global(ui.layer_id())
                     .unwrap_or_default();
-                ui.output_mut(|output| {
-                    output.ime = Some(egui::output::IMEOutput {
-                        purpose: egui::IMEPurpose::Normal,
-                        rect: transform * rect,
-                        cursor_rect: transform * caret,
-                        should_interrupt_composition: interrupted,
-                    })
-                });
+                if !self.read_only {
+                    ui.output_mut(|output| {
+                        output.ime = Some(egui::output::IMEOutput {
+                            purpose: egui::IMEPurpose::Normal,
+                            rect: transform * rect,
+                            cursor_rect: transform * caret,
+                            should_interrupt_composition: interrupted,
+                        })
+                    });
+                }
             }
         }
 
@@ -420,26 +462,28 @@ impl<'a> RichTextEditor<'a> {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
         }
         let range = self.editor.selection().range();
-        let char_range = CharIndex(document_char_offset(self.editor, range.start))
-            ..CharIndex(document_char_offset(self.editor, range.end));
+        let char_range = CharIndex(cache.char_offset(self.editor.document(), range.start))
+            ..CharIndex(cache.char_offset(self.editor.document(), range.end));
+        let text = publish_text.then(|| cache.plain_text(self.editor.document()));
         response.widget_info(|| {
-            let mut info = egui::WidgetInfo::text_edit(
-                ui.is_enabled(),
-                old_text.as_ref(),
-                cache.plain_text.as_ref(),
-                &self.hint,
-            );
+            let mut info = egui::WidgetInfo::new(egui::WidgetType::TextEdit);
+            info.enabled = ui.is_enabled();
+            info.hint_text = Some(self.hint.clone());
+            if let Some(text) = &text {
+                info.current_text_value = Some(text.to_string());
+                if old_text.as_ref() != Some(text) {
+                    info.prev_text_value = old_text.as_ref().map(ToString::to_string);
+                }
+            }
             info.text_selection = Some(char_range.clone());
             info
         });
         if old_selection != self.editor.selection() {
-            response.output_event(egui::output::OutputEvent::TextSelectionChanged(
-                egui::WidgetInfo::text_selection_changed(
-                    ui.is_enabled(),
-                    char_range,
-                    cache.plain_text.as_ref(),
-                ),
-            ));
+            let mut info = egui::WidgetInfo::new(egui::WidgetType::TextEdit);
+            info.enabled = ui.is_enabled();
+            info.text_selection = Some(char_range);
+            info.current_text_value = text.as_ref().map(ToString::to_string);
+            response.output_event(egui::output::OutputEvent::TextSelectionChanged(info));
         }
         if ui
             .ctx()
@@ -462,7 +506,7 @@ impl<'a> RichTextEditor<'a> {
                 }
             }
             if let Some(snapshot) = &cache.accessibility {
-                snapshot.publish(ui, id, self.editor, &layouts, origin);
+                snapshot.publish(ui, id, self.editor, &layouts, origin, self.read_only);
             }
         } else {
             cache.accessibility = None;
@@ -498,16 +542,25 @@ struct Appearance {
 #[derive(Clone)]
 struct ParagraphCache {
     paragraph: Arc<Paragraph>,
-    job: LayoutJob,
-    marker_job: Option<LayoutJob>,
+    galley: Arc<Galley>,
+    marker: Option<Arc<Galley>>,
+    chars: usize,
     indent: f32,
 }
 
 #[derive(Clone, Default)]
 struct Cache {
     appearance: Option<Appearance>,
+    /// A tiny egui-cached galley changes identity when egui resets its font
+    /// atlas/cache. Retaining it detects both font-definition/text-option
+    /// changes and atlas recreation without rehashing every paragraph job.
+    font_probe: Option<Arc<Galley>>,
+    document_identity: Option<Arc<()>>,
     paragraphs: Vec<ParagraphCache>,
-    plain_text: Arc<str>,
+    layouts: Arc<[ParagraphLayout]>,
+    char_offsets: Vec<usize>,
+    list_paragraphs: Vec<usize>,
+    plain_text: Option<Arc<str>>,
     preview: Option<Box<CompositionPreview>>,
     accessibility: Option<Arc<accessibility::Snapshot>>,
 }
@@ -522,6 +575,7 @@ struct CompositionPreview {
     selection: Option<Selection>,
 }
 
+#[derive(Clone)]
 struct ParagraphLayout {
     galley: Arc<Galley>,
     rect: Rect,
@@ -535,7 +589,7 @@ impl Cache {
         ui: &Ui,
         editor: &Editor,
         appearance: &Appearance,
-    ) -> Vec<ParagraphLayout> {
+    ) -> Arc<[ParagraphLayout]> {
         self.layout_document(ui, editor.document(), appearance)
     }
 
@@ -544,95 +598,162 @@ impl Cache {
         ui: &Ui,
         document: &Document,
         appearance: &Appearance,
-    ) -> Vec<ParagraphLayout> {
+    ) -> Arc<[ParagraphLayout]> {
         let appearance_changed = self.appearance.as_ref() != Some(appearance);
-        let document_changed = self.paragraphs.len() != document.paragraphs().len()
-            || self
-                .paragraphs
-                .iter()
-                .zip(document.paragraphs())
-                .any(|(cache, paragraph)| !Arc::ptr_eq(&cache.paragraph, paragraph));
-        if appearance_changed || document_changed {
-            let mut previous: HashMap<_, _> = std::mem::take(&mut self.paragraphs)
-                .into_iter()
-                .map(|cache| (Arc::as_ptr(&cache.paragraph), cache))
-                .collect();
-            self.paragraphs = document
-                .paragraphs()
-                .iter()
-                .map(|paragraph| {
-                    if !appearance_changed
-                        && let Some(cache) = previous.remove(&Arc::as_ptr(paragraph))
+        let document_identity = document.content_identity();
+        let document_changed = self
+            .document_identity
+            .as_ref()
+            .is_none_or(|cached| !Arc::ptr_eq(cached, &document_identity));
+        ui.fonts_mut(|fonts| {
+            let probe = fonts.layout_job(LayoutJob::simple_singleline(
+                " ".to_owned(),
+                appearance.font.clone(),
+                Color32::WHITE,
+            ));
+            let fonts_changed = self
+                .font_probe
+                .as_ref()
+                .is_none_or(|previous| !Arc::ptr_eq(previous, &probe));
+            self.font_probe = Some(probe);
+            if !appearance_changed && !document_changed && !fonts_changed {
+                return;
+            }
+            let mut create = |paragraph: &Arc<Paragraph>| {
+                let (indent, marker) = match paragraph.kind() {
+                    ParagraphKind::Bullet { indent } => {
+                        (24.0 + f32::from(indent) * 20.0, Some("•".to_owned()))
+                    }
+                    ParagraphKind::Ordered { indent, start } => {
+                        (32.0 + f32::from(indent) * 20.0, Some(format!("{start}.")))
+                    }
+                    _ => (0.0, None),
+                };
+                let marker = marker.map(|text| {
+                    fonts.layout_job(LayoutJob::simple_singleline(
+                        text,
+                        appearance.font.clone(),
+                        appearance.color,
+                    ))
+                });
+                let marker_width = marker.as_ref().map_or(0.0, |galley| galley.size().x);
+                let indent = if marker.is_some() {
+                    indent.max(marker_width + 8.0)
+                } else {
+                    indent
+                };
+                let indent = indent.min((appearance.width - appearance.font.size * 2.0).max(0.0));
+                let job =
+                    paragraph_job(paragraph, appearance, (appearance.width - indent).max(8.0));
+                ParagraphCache {
+                    paragraph: paragraph.clone(),
+                    galley: fonts.layout_job(job),
+                    marker,
+                    chars: paragraph.scalar_count(),
+                    indent,
+                }
+            };
+            if self.paragraphs.len() == document.paragraphs().len() {
+                // Typing, formatting, and undo usually preserve paragraph count.
+                // Update only changed entries without allocating a lookup table.
+                for (cache, paragraph) in self.paragraphs.iter_mut().zip(document.paragraphs()) {
+                    if appearance_changed
+                        || fonts_changed
+                        || !Arc::ptr_eq(&cache.paragraph, paragraph)
                     {
-                        return cache;
+                        *cache = create(paragraph);
                     }
-                    let (indent, marker) = match paragraph.kind() {
-                        ParagraphKind::Bullet { indent } => {
-                            (24.0 + f32::from(indent) * 20.0, Some("•".to_owned()))
+                }
+            } else {
+                let mut previous: HashMap<_, _> = std::mem::take(&mut self.paragraphs)
+                    .into_iter()
+                    .map(|cache| (Arc::as_ptr(&cache.paragraph), cache))
+                    .collect();
+                self.paragraphs = document
+                    .paragraphs()
+                    .iter()
+                    .map(|paragraph| {
+                        if !appearance_changed
+                            && !fonts_changed
+                            && let Some(cache) = previous.remove(&Arc::as_ptr(paragraph))
+                        {
+                            return cache;
                         }
-                        ParagraphKind::Ordered { indent, start } => {
-                            (32.0 + f32::from(indent) * 20.0, Some(format!("{start}.")))
-                        }
-                        _ => (0.0, None),
-                    };
-                    let marker_job = marker.map(|text| {
-                        LayoutJob::simple_singleline(
-                            text,
-                            appearance.font.clone(),
-                            appearance.color,
-                        )
-                    });
-                    let marker_width = marker_job.as_ref().map_or(0.0, |job| {
-                        ui.fonts_mut(|fonts| fonts.layout_job(job.clone())).size().x
-                    });
-                    let indent = if marker_job.is_some() {
-                        indent.max(marker_width + 8.0)
-                    } else {
-                        indent
-                    };
-                    let indent =
-                        indent.min((appearance.width - appearance.font.size * 2.0).max(0.0));
-                    let job =
-                        paragraph_job(paragraph, appearance, (appearance.width - indent).max(8.0));
-                    ParagraphCache {
-                        paragraph: paragraph.clone(),
-                        job,
-                        marker_job,
-                        indent,
-                    }
-                })
-                .collect();
+                        create(paragraph)
+                    })
+                    .collect();
+            }
             if document_changed {
-                self.plain_text = Arc::from(document.plain_text());
+                self.plain_text = None;
                 self.preview = None;
             }
             self.appearance = Some(appearance.clone());
-        }
-        let mut y = 0.0;
-        self.paragraphs
-            .iter()
-            .map(|cache| {
-                // egui invalidates its galley cache when DPI or the font atlas changes.
-                // Keep jobs, not stale galleys, across frames.
-                let galley = ui.fonts_mut(|fonts| fonts.layout_job(cache.job.clone()));
-                let marker = cache
-                    .marker_job
-                    .as_ref()
-                    .map(|job| ui.fonts_mut(|fonts| fonts.layout_job(job.clone())));
-                let rect = Rect::from_min_size(Pos2::new(cache.indent, y), galley.size());
-                let marker_position = Pos2::new(
-                    cache.indent - marker.as_ref().map_or(0.0, |marker| marker.size().x) - 8.0,
-                    y,
-                );
-                y += galley.size().y + PARAGRAPH_GAP;
-                ParagraphLayout {
-                    galley,
-                    rect,
-                    marker,
-                    marker_position,
-                }
-            })
-            .collect()
+            self.document_identity = Some(document_identity);
+            let mut y = 0.0;
+            let mut chars = 0;
+            self.char_offsets.clear();
+            self.list_paragraphs.clear();
+            self.layouts = self
+                .paragraphs
+                .iter()
+                .enumerate()
+                .map(|(index, cache)| {
+                    if matches!(
+                        cache.paragraph.kind(),
+                        ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. }
+                    ) {
+                        self.list_paragraphs.push(index);
+                    }
+                    self.char_offsets.push(chars);
+                    chars += cache.chars + 1;
+                    let rect = Rect::from_min_size(Pos2::new(cache.indent, y), cache.galley.size());
+                    let marker_position = Pos2::new(
+                        cache.indent
+                            - cache.marker.as_ref().map_or(0.0, |marker| marker.size().x)
+                            - 8.0,
+                        y,
+                    );
+                    y += cache.galley.size().y + PARAGRAPH_GAP;
+                    ParagraphLayout {
+                        galley: cache.galley.clone(),
+                        rect,
+                        marker: cache.marker.clone(),
+                        marker_position,
+                    }
+                })
+                .collect();
+        });
+        self.layouts.clone()
+    }
+
+    fn plain_text(&mut self, document: &Document) -> Arc<str> {
+        self.plain_text
+            .get_or_insert_with(|| Arc::from(document.plain_text()))
+            .clone()
+    }
+
+    fn char_offset(&self, document: &Document, position: Position) -> usize {
+        self.char_offsets
+            .get(position.paragraph)
+            .copied()
+            .unwrap_or(0)
+            + document
+                .paragraph(position.paragraph)
+                .map_or(0, |paragraph| {
+                    paragraph
+                        .scalar_index(position.byte)
+                        .unwrap_or(paragraph.scalar_count())
+                })
+    }
+
+    fn selection_contains_list(&self, editor: &Editor) -> bool {
+        let range = selected_paragraphs(editor);
+        let index = self
+            .list_paragraphs
+            .partition_point(|paragraph| *paragraph < range.start);
+        self.list_paragraphs
+            .get(index)
+            .is_some_and(|paragraph| *paragraph < range.end)
     }
 
     fn layout_preview(
@@ -640,7 +761,7 @@ impl Cache {
         ui: &Ui,
         editor: &Editor,
         appearance: &Appearance,
-    ) -> Result<Option<Vec<ParagraphLayout>>, Error> {
+    ) -> Result<Option<Arc<[ParagraphLayout]>>, Error> {
         let Some(composition) = editor.composition() else {
             self.preview = None;
             return Ok(None);
@@ -699,15 +820,10 @@ fn position_after_prefix(document: &Document, start: Position, prefix: &str) -> 
         normalized.rsplit('\n').next().map_or(0, str::len)
     };
     let paragraph = start.paragraph + paragraphs;
-    let Some(text) = document.paragraph(paragraph).map(Paragraph::text) else {
+    let Some(source) = document.paragraph(paragraph) else {
         return document.end();
     };
-    let byte = text
-        .grapheme_indices(true)
-        .map(|(byte, _)| byte)
-        .chain(std::iter::once(text.len()))
-        .find(|boundary| *boundary >= byte)
-        .unwrap_or(text.len());
+    let byte = source.boundary_at_or_after(byte);
     Position::new(paragraph, byte)
 }
 
@@ -793,21 +909,29 @@ fn record(result: Result<(), Error>, errors: &mut Vec<Error>) {
 
 fn hit_test(editor: &Editor, layouts: &[ParagraphLayout], point: Vec2) -> Position {
     let paragraph = layouts
-        .iter()
-        .position(|layout| point.y <= layout.rect.bottom() + PARAGRAPH_GAP / 2.0)
-        .unwrap_or_else(|| layouts.len().saturating_sub(1));
+        .partition_point(|layout| point.y > layout.rect.bottom() + PARAGRAPH_GAP / 2.0)
+        .min(layouts.len().saturating_sub(1));
     let Some(layout) = layouts.get(paragraph) else {
         return Position::default();
     };
-    let Some(text) = editor.document().paragraph(paragraph).map(Paragraph::text) else {
+    let Some(source) = editor.document().paragraph(paragraph) else {
         return Position::default();
     };
     let cursor = layout
         .galley
         .cursor_from_pos(point - layout.rect.min.to_vec2());
+    let byte = source
+        .byte_from_scalar(cursor.index.0)
+        .unwrap_or(source.text().len());
+    let before = source.boundary_at_or_before(byte);
+    let after = source.boundary_at_or_after(byte);
     Position::new(
         paragraph,
-        snap_grapheme(text, byte_from_char(text, cursor.index.0)),
+        if byte - before <= after - byte {
+            before
+        } else {
+            after
+        },
     )
 }
 
@@ -823,14 +947,16 @@ fn document_char_offset(editor: &Editor, position: Position) -> usize {
         .paragraphs()
         .iter()
         .take(position.paragraph)
-        .map(|p| p.text().chars().count() + 1)
+        .map(|p| p.scalar_count() + 1)
         .sum();
     preceding
         + editor
             .document()
             .paragraph(position.paragraph)
             .map_or(0, |paragraph| {
-                paragraph.text()[..position.byte].chars().count()
+                paragraph
+                    .scalar_index(position.byte)
+                    .unwrap_or(paragraph.scalar_count())
             })
 }
 
@@ -890,10 +1016,13 @@ fn document_caret_rect(
     let Some(layout) = layouts.get(position.paragraph) else {
         return Rect::from_min_size(origin, Vec2::new(0.0, 16.0));
     };
-    let text = document
+    let index = document
         .paragraph(position.paragraph)
-        .map_or("", Paragraph::text);
-    let index = text[..position.byte.min(text.len())].chars().count();
+        .map_or(0, |paragraph| {
+            paragraph
+                .scalar_index(position.byte)
+                .unwrap_or(paragraph.scalar_count())
+        });
     layout
         .galley
         .pos_from_cursor(CCursor {
@@ -915,11 +1044,25 @@ fn paint_document_selection(
     if selection.start == selection.end {
         return;
     }
-    for index in selection.start.paragraph..=selection.end.paragraph {
+    let top = painter.clip_rect().top() - origin.y - 5.0;
+    let bottom = painter.clip_rect().bottom() - origin.y + 5.0;
+    let first = layouts
+        .partition_point(|layout| layout.rect.bottom() < top)
+        .max(selection.start.paragraph);
+    let last = layouts
+        .partition_point(|layout| layout.rect.top() <= bottom)
+        .min(selection.end.paragraph.saturating_add(1));
+    for index in first..last {
         let Some(layout) = layouts.get(index) else {
             continue;
         };
-        let Some(text) = document.paragraph(index).map(Paragraph::text) else {
+        if !painter
+            .clip_rect()
+            .intersects(layout.rect.translate(origin.to_vec2()).expand(5.0))
+        {
+            continue;
+        }
+        let Some(source) = document.paragraph(index) else {
             continue;
         };
         let start = if index == selection.start.paragraph {
@@ -930,10 +1073,10 @@ fn paint_document_selection(
         let end = if index == selection.end.paragraph {
             selection.end.byte
         } else {
-            text.len()
+            source.text().len()
         };
-        let char_start = text[..start].chars().count();
-        let char_end = text[..end].chars().count();
+        let char_start = source.scalar_index(start).unwrap_or(0);
+        let char_end = source.scalar_index(end).unwrap_or(source.scalar_count());
         let mut row_start = 0;
         for row in &layout.galley.rows {
             let count = row.char_count_excluding_newline().0;
@@ -970,7 +1113,20 @@ fn handle_event(
     origin: Pos2,
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
+    read_only: bool,
 ) -> bool {
+    if read_only {
+        match event {
+            Event::Cut => {
+                if !editor.selection().is_caret() {
+                    ui.ctx().copy_text(editor.selected_text());
+                }
+                return true;
+            }
+            Event::Text(_) | Event::Paste(_) | Event::Ime(_) => return true,
+            _ => {}
+        }
+    }
     if editor
         .composition()
         .is_some_and(|composition| composition.text.is_empty())
@@ -1070,7 +1226,7 @@ fn handle_event(
             if editor.composition().is_some() {
                 return false;
             }
-            handle_key(editor, *key, *modifiers, layouts, origin, errors)
+            handle_key(editor, *key, *modifiers, layouts, origin, errors, read_only)
         }
         _ => false,
     }
@@ -1083,7 +1239,31 @@ fn handle_key(
     layouts: &[ParagraphLayout],
     origin: Pos2,
     errors: &mut Vec<Error>,
+    read_only: bool,
 ) -> bool {
+    if read_only
+        && (matches!(key, Key::Backspace | Key::Delete | Key::Enter)
+            || modifiers.command
+                && matches!(
+                    key,
+                    Key::Z
+                        | Key::Y
+                        | Key::B
+                        | Key::I
+                        | Key::U
+                        | Key::Num0
+                        | Key::Num1
+                        | Key::Num2
+                        | Key::Num3
+                        | Key::Num4
+                        | Key::Num5
+                        | Key::Num6
+                        | Key::Num7
+                        | Key::Num8
+                ))
+    {
+        return true;
+    }
     if modifiers.command {
         match key {
             Key::A => {
@@ -1221,19 +1401,71 @@ fn handle_key(
             true
         }
         Key::Backspace => {
-            record(editor.delete_backward(), errors);
+            record(
+                if by_word {
+                    editor.delete_word_backward()
+                } else {
+                    editor.delete_backward()
+                },
+                errors,
+            );
             true
         }
         Key::Delete => {
-            record(editor.delete_forward(), errors);
+            record(
+                if by_word {
+                    editor.delete_word_forward()
+                } else {
+                    editor.delete_forward()
+                },
+                errors,
+            );
             true
         }
         Key::Enter => {
             record(editor.insert_paragraph(), errors);
             true
         }
+        Key::Tab
+            if !read_only
+                && !modifiers.command
+                && !modifiers.ctrl
+                && !modifiers.alt
+                && selection_contains_list(editor) =>
+        {
+            record(
+                if modifiers.shift {
+                    editor.outdent_list()
+                } else {
+                    editor.indent_list()
+                },
+                errors,
+            );
+            true
+        }
         _ => false,
     }
+}
+
+fn selection_contains_list(editor: &Editor) -> bool {
+    editor.document().paragraphs()[selected_paragraphs(editor)]
+        .iter()
+        .any(|paragraph| {
+            matches!(
+                paragraph.kind(),
+                ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. }
+            )
+        })
+}
+
+fn selected_paragraphs(editor: &Editor) -> std::ops::Range<usize> {
+    let range = editor.selection().range();
+    let end = if range.end.paragraph > range.start.paragraph && range.end.byte == 0 {
+        range.end.paragraph
+    } else {
+        range.end.paragraph + 1
+    };
+    range.start.paragraph..end
 }
 
 fn delete_surrounding(editor: &mut Editor, before: usize, after: usize, errors: &mut Vec<Error>) {
@@ -1247,29 +1479,16 @@ fn delete_surrounding(editor: &mut Editor, before: usize, after: usize, errors: 
 }
 
 fn position_from_document_char(editor: &Editor, mut index: usize, round_up: bool) -> Position {
-    for (paragraph, text) in editor
-        .document()
-        .paragraphs()
-        .iter()
-        .map(|p| p.text())
-        .enumerate()
-    {
-        let chars = text.chars().count();
+    for (paragraph, source) in editor.document().paragraphs().iter().enumerate() {
+        let chars = source.scalar_count();
         if index <= chars {
-            let byte = byte_from_char(text, index);
-            let mut boundaries = text
-                .grapheme_indices(true)
-                .map(|(byte, _)| byte)
-                .chain(std::iter::once(text.len()));
+            let byte = source
+                .byte_from_scalar(index)
+                .unwrap_or(source.text().len());
             let boundary = if round_up {
-                boundaries
-                    .find(|boundary| *boundary >= byte)
-                    .unwrap_or(text.len())
+                source.boundary_at_or_after(byte)
             } else {
-                boundaries
-                    .take_while(|boundary| *boundary <= byte)
-                    .last()
-                    .unwrap_or(0)
+                source.boundary_at_or_before(byte)
             };
             return Position::new(paragraph, boundary);
         }
@@ -1288,6 +1507,16 @@ mod tests {
         events: Vec<Event>,
         focus: bool,
     ) -> egui::FullOutput {
+        frame_options(context, editor, events, focus, false)
+    }
+
+    fn frame_options(
+        context: &egui::Context,
+        editor: &mut Editor,
+        events: Vec<Event>,
+        focus: bool,
+        read_only: bool,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
             events,
@@ -1297,9 +1526,16 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| {
                 let id = ui.make_persistent_id("editor");
                 if focus {
-                    ui.memory_mut(|memory| memory.request_focus(id));
+                    ui.memory_mut(|memory| {
+                        if !memory.has_focus(id) {
+                            memory.request_focus(id);
+                        }
+                    });
                 }
-                let output = RichTextEditor::new(editor).id(id).show(ui);
+                let output = RichTextEditor::new(editor)
+                    .id(id)
+                    .read_only(read_only)
+                    .show(ui);
                 assert!(output.errors.is_empty(), "{:?}", output.errors);
                 assert!(
                     output.accessibility_errors.is_empty(),
@@ -1320,6 +1556,376 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    fn appearance() -> Appearance {
+        Appearance {
+            font: FontId::proportional(16.0),
+            bold_family: None,
+            color: Color32::WHITE,
+            strong_color: Color32::WHITE,
+            code_background: Color32::BLACK,
+            width: 400.0,
+        }
+    }
+
+    fn cached_layout_frame(
+        context: &egui::Context,
+        cache: &mut Cache,
+        editor: &Editor,
+        appearance: &Appearance,
+    ) -> Arc<[ParagraphLayout]> {
+        let mut layouts = Arc::from([]);
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                layouts = cache.layout(ui, editor, appearance);
+            })
+            .drop_without_applying_deltas();
+        layouts
+    }
+
+    #[test]
+    fn idle_layouts_and_unchanged_paragraph_galleys_are_reused() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text("first\nsecond\nthird");
+        let appearance = appearance();
+        let first = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        let idle = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert!(Arc::ptr_eq(&first, &idle));
+        editor
+            .set_selection(Selection::caret(Position::new(1, 0)))
+            .unwrap();
+        editor.insert_text("edited ").unwrap();
+        let edited = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert!(Arc::ptr_eq(&first[0].galley, &edited[0].galley));
+        assert!(!Arc::ptr_eq(&first[1].galley, &edited[1].galley));
+        assert!(Arc::ptr_eq(&first[2].galley, &edited[2].galley));
+        assert_eq!(edited[1].galley.job.text, "edited second");
+        assert!(cache.plain_text.is_none());
+        assert_eq!(
+            cache.char_offset(editor.document(), Position::new(2, 2)),
+            22
+        );
+    }
+
+    #[test]
+    fn layout_cache_refreshes_for_width_scale_fonts_and_colors() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let editor = Editor::from_text(&"words ".repeat(30));
+        let mut appearance = appearance();
+        let wide = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        appearance.width = 100.0;
+        let narrow = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert!(narrow[0].galley.size().y > wide[0].galley.size().y);
+        context.set_pixels_per_point(2.0);
+        let scaled = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert!(!Arc::ptr_eq(&narrow[0].galley, &scaled[0].galley));
+        let mut definitions = egui::FontDefinitions::default();
+        definitions.families.insert(
+            FontFamily::Proportional,
+            definitions.families[&FontFamily::Monospace].clone(),
+        );
+        context.set_fonts(definitions);
+        let replaced_fonts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert!(!Arc::ptr_eq(&scaled[0].galley, &replaced_fonts[0].galley));
+        appearance.color = Color32::RED;
+        let recolored = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert_eq!(
+            recolored[0].galley.job.sections[0].format.color,
+            Color32::RED
+        );
+        let idle = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert!(Arc::ptr_eq(&recolored, &idle));
+    }
+
+    #[test]
+    fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let editor = Editor::from_text("atlas glyphs café 👩‍💻\nunchanged paragraph");
+        let appearance = appearance();
+        let mut previous = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        for change_hinting in [true, false] {
+            let probe = cache.font_probe.clone().unwrap();
+            context.global_style_mut(|style| {
+                let options = &mut style.visuals.text_options;
+                if change_hinting {
+                    options.font_hinting = !options.font_hinting;
+                } else {
+                    options.subpixel_binning = !options.subpixel_binning;
+                }
+            });
+            let refreshed = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+            assert!(!Arc::ptr_eq(&probe, cache.font_probe.as_ref().unwrap()));
+            for (old, new) in previous.iter().zip(refreshed.iter()) {
+                assert!(!Arc::ptr_eq(&old.galley, &new.galley));
+                assert_eq!(old.galley.job.text, new.galley.job.text);
+            }
+            let idle = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+            assert!(Arc::ptr_eq(&refreshed, &idle));
+            previous = refreshed;
+        }
+    }
+
+    #[test]
+    fn inactive_accessibility_keeps_text_lazy_but_events_report_changes() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("hello");
+        frame(&context, &mut editor, vec![], true);
+        let output = frame(&context, &mut editor, vec![Event::Text("x".into())], true);
+        let id = context.memory(|memory| memory.focused()).unwrap();
+        assert!(
+            context
+                .data(|data| data.get_temp::<Cache>(id))
+                .unwrap()
+                .plain_text
+                .is_none()
+        );
+        assert!(
+            output
+                .platform_output
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::output::OutputEvent::ValueChanged(_)))
+        );
+        context.enable_accesskit();
+        let output = frame(&context, &mut editor, vec![Event::Text("y".into())], true);
+        assert!(output.platform_output.events.iter().any(|event| {
+            matches!(event, egui::output::OutputEvent::ValueChanged(info)
+                if info.current_text_value.as_deref() == Some("xyhello")
+                && info.prev_text_value.as_deref() == Some("xhello"))
+        }));
+    }
+
+    #[test]
+    fn read_only_consumes_mutations_and_preserves_copy_selection_and_history() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("hello");
+        editor.insert_text("x").unwrap();
+        editor.select_all();
+        let revision = editor.document().revision();
+        let output = frame_options(
+            &context,
+            &mut editor,
+            vec![
+                Event::Cut,
+                Event::Paste("pasted".into()),
+                Event::Text("typed".into()),
+                key(Key::Backspace, Modifiers::NONE),
+                key(Key::Delete, Modifiers::NONE),
+                key(Key::Enter, Modifiers::NONE),
+                key(Key::B, Modifiers::COMMAND),
+                key(Key::Z, Modifiers::COMMAND),
+                key(Key::Y, Modifiers::COMMAND),
+                key(Key::Num1, Modifiers::COMMAND),
+                Event::Ime(ImeEvent::Preedit {
+                    text: "に".into(),
+                    active_range_chars: Some(1..1),
+                }),
+                Event::Ime(ImeEvent::Commit("日本".into())),
+                Event::Ime(ImeEvent::DeleteSurrounding {
+                    before_chars: 1,
+                    after_chars: 1,
+                }),
+            ],
+            true,
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "xhello");
+        assert_eq!(editor.document().revision(), revision);
+        assert!(!editor.typing_style().bold);
+        assert!(editor.composition().is_none());
+        assert!(output.platform_output.ime.is_none());
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "xhello")
+        }));
+        assert!(context.memory(|memory| memory.focused()).is_some());
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowRight, Modifiers::NONE)],
+            true,
+            true,
+        );
+        assert!(editor.selection().is_caret());
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::A, Modifiers::COMMAND)],
+            true,
+            true,
+        );
+        assert_eq!(editor.selected_text(), "xhello");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "hello");
+    }
+
+    #[test]
+    fn read_only_cancels_existing_composition() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        editor.update_composition("candidate", None).unwrap();
+        frame_options(&context, &mut editor, vec![], true, true);
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn modifier_delete_shortcuts_remove_whole_words_and_restore_selection_on_undo() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("café 東京 next");
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let before = editor.selection();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Backspace, Modifiers::CTRL)],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "café 東京 ");
+        assert!(editor.undo());
+        assert_eq!(editor.selection(), before);
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Delete, Modifiers::ALT)],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), " 東京 next");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_indent_lists_while_body_tab_keeps_host_focus_navigation() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("first\nsecond");
+        editor.select_all();
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        frame(&context, &mut editor, vec![], true);
+        frame(&context, &mut editor, vec![], true);
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Tab, Modifiers::NONE)],
+            true,
+        );
+        assert!(
+            editor
+                .document()
+                .paragraphs()
+                .iter()
+                .all(|paragraph| paragraph.kind() == ParagraphKind::Bullet { indent: 1 })
+        );
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Tab, Modifiers::SHIFT)],
+            true,
+        );
+        assert!(
+            editor
+                .document()
+                .paragraphs()
+                .iter()
+                .all(|paragraph| paragraph.kind() == ParagraphKind::Bullet { indent: 0 })
+        );
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::Tab, Modifiers::NONE)],
+            true,
+            true,
+        );
+        assert!(
+            editor
+                .document()
+                .paragraphs()
+                .iter()
+                .all(|paragraph| paragraph.kind() == ParagraphKind::Bullet { indent: 0 })
+        );
+        editor.set_paragraph_kind(ParagraphKind::Body).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Tab, Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "first\nsecond");
+        assert!(!selection_contains_list(&editor));
+    }
+
+    #[test]
+    fn read_only_native_node_advertises_selection_and_rejects_mutation_actions() {
+        use egui::accesskit::{
+            Action, ActionData, ActionRequest, Role, TextPosition, TextSelection, TreeId,
+        };
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut editor = Editor::from_text("original");
+        let output = frame_options(&context, &mut editor, vec![], true, true);
+        let update = output.platform_output.accesskit_update.unwrap();
+        let (id, node) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::MultilineTextInput)
+            .unwrap();
+        assert!(node.is_read_only());
+        assert!(node.supports_action(Action::SetTextSelection));
+        assert!(!node.supports_action(Action::SetValue));
+        assert!(!node.supports_action(Action::ReplaceSelectedText));
+        let (run_id, _) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::TextRun)
+            .unwrap();
+        frame_options(
+            &context,
+            &mut editor,
+            vec![Event::AccessKitActionRequest(ActionRequest {
+                action: Action::SetTextSelection,
+                target_node: *id,
+                target_tree: TreeId::ROOT,
+                data: Some(ActionData::SetTextSelection(TextSelection {
+                    anchor: TextPosition {
+                        node: *run_id,
+                        character_index: 0,
+                    },
+                    focus: TextPosition {
+                        node: *run_id,
+                        character_index: 3,
+                    },
+                })),
+            })],
+            true,
+            true,
+        );
+        assert_eq!(editor.selected_text(), "ori");
+        for action in [Action::SetValue, Action::ReplaceSelectedText] {
+            frame_options(
+                &context,
+                &mut editor,
+                vec![Event::AccessKitActionRequest(ActionRequest {
+                    action,
+                    target_node: *id,
+                    target_tree: TreeId::ROOT,
+                    data: Some(ActionData::Value("replacement".into())),
+                })],
+                true,
+                true,
+            );
+        }
+        assert_eq!(editor.document().plain_text(), "original");
+        assert_eq!(editor.selected_text(), "ori");
+        assert!(!editor.can_undo());
     }
 
     #[test]
@@ -1601,6 +2207,7 @@ mod tests {
         assert!(!editor.can_undo());
         assert!(
             preview.render_cache.paragraphs[0]
+                .galley
                 .job
                 .sections
                 .iter()

@@ -6,7 +6,7 @@
 //! document and `Editor::composition()`, performs pointer hit testing, services
 //! clipboard requests, and calls [`WinitAdapter::sync_ime`] with the caret area.
 
-use crate::{Editor, Error, Movement, ParagraphKind, StylePatch};
+use crate::{Editor, Error, Fragment, Movement, ParagraphKind, StylePatch};
 use winit::{
     dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, Ime, WindowEvent},
@@ -18,8 +18,12 @@ use winit::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardEvent {
     Copy(String),
+    /// Enabled through [`WinitAdapter::rich_clipboard`]; encode native data or HTML in the host.
+    CopyRich(Fragment),
     /// The selection has already been removed from the document.
     Cut(String),
+    /// Rich content captured before the selection is removed.
+    CutRich(Fragment),
     /// Read the clipboard, then call [`WinitAdapter::paste`].
     PasteRequest,
 }
@@ -57,6 +61,7 @@ pub struct WinitAdapter {
     modifiers: ModifiersState,
     ime_enabled: bool,
     command_modifier: CommandModifier,
+    rich_clipboard: bool,
 }
 
 impl WinitAdapter {
@@ -66,6 +71,13 @@ impl WinitAdapter {
 
     pub fn command_modifier(mut self, modifier: CommandModifier) -> Self {
         self.command_modifier = modifier;
+        self
+    }
+
+    /// Request rich clipboard payloads for copy/cut instead of plain strings.
+    /// The host owns MIME types and clipboard transport.
+    pub fn rich_clipboard(mut self, enabled: bool) -> Self {
+        self.rich_clipboard = enabled;
         self
     }
 
@@ -196,14 +208,22 @@ impl WinitAdapter {
                 "a" => editor.select_all(),
                 "c" => {
                     if !editor.selection().is_caret() {
-                        outcome.clipboard = Some(ClipboardEvent::Copy(editor.selected_text()));
+                        outcome.clipboard = Some(if self.rich_clipboard {
+                            ClipboardEvent::CopyRich(editor.selected_fragment())
+                        } else {
+                            ClipboardEvent::Copy(editor.selected_text())
+                        });
                     }
                 }
                 "x" => {
                     if !editor.selection().is_caret() {
-                        let selected = editor.selected_text();
+                        let selected = if self.rich_clipboard {
+                            ClipboardEvent::CutRich(editor.selected_fragment())
+                        } else {
+                            ClipboardEvent::Cut(editor.selected_text())
+                        };
                         editor.insert_text("")?;
-                        outcome.clipboard = Some(ClipboardEvent::Cut(selected));
+                        outcome.clipboard = Some(selected);
                     }
                 }
                 "v" => outcome.clipboard = Some(ClipboardEvent::PasteRequest),
@@ -236,6 +256,8 @@ impl WinitAdapter {
                 "8" | "*" if shift => {
                     editor.set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })?
                 }
+                "]" => editor.indent_list()?,
+                "[" => editor.outdent_list()?,
                 _ => outcome.handled = false,
             }
             outcome.changed = before != EditorState::capture(editor);
@@ -267,8 +289,21 @@ impl WinitAdapter {
         } else {
             match key {
                 Key::Named(NamedKey::Enter) if !command => editor.insert_paragraph()?,
+                Key::Named(NamedKey::Backspace) if word => editor.delete_word_backward()?,
+                Key::Named(NamedKey::Delete) if word => editor.delete_word_forward()?,
                 Key::Named(NamedKey::Backspace) => editor.delete_backward()?,
                 Key::Named(NamedKey::Delete) => editor.delete_forward()?,
+                Key::Named(NamedKey::Tab)
+                    if !self.modifiers.intersects(
+                        ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SUPER,
+                    ) && selection_contains_list(editor) =>
+                {
+                    if shift {
+                        editor.outdent_list()?;
+                    } else {
+                        editor.indent_list()?;
+                    }
+                }
                 _ if !self.modifiers.super_key()
                     && (!self.modifiers.control_key() || self.modifiers.alt_key()) =>
                 {
@@ -353,6 +388,24 @@ impl WinitAdapter {
         })
     }
 
+    /// Deliver a rich host clipboard response as one undoable edit.
+    pub fn paste_fragment(
+        &mut self,
+        editor: &mut Editor,
+        fragment: &Fragment,
+    ) -> Result<InputOutcome, Error> {
+        if !self.is_focused() {
+            return Ok(InputOutcome::default());
+        }
+        let before = EditorState::capture(editor);
+        editor.insert_fragment(fragment)?;
+        Ok(InputOutcome {
+            handled: true,
+            changed: before != EditorState::capture(editor),
+            clipboard: None,
+        })
+    }
+
     fn command_pressed(&self) -> bool {
         match self.command_modifier {
             // Ctrl+Alt is commonly AltGr and must remain available for text.
@@ -368,6 +421,23 @@ impl WinitAdapter {
             }
         }
     }
+}
+
+fn selection_contains_list(editor: &Editor) -> bool {
+    let range = editor.selection().range();
+    let end = if range.end.paragraph > range.start.paragraph && range.end.byte == 0 {
+        range.end.paragraph
+    } else {
+        range.end.paragraph + 1
+    };
+    editor.document().paragraphs()[range.start.paragraph..end]
+        .iter()
+        .any(|paragraph| {
+            matches!(
+                paragraph.kind(),
+                ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. }
+            )
+        })
 }
 
 #[derive(PartialEq, Eq)]
@@ -444,6 +514,113 @@ mod tests {
             Some("\u{0}"),
         );
         assert_eq!(editor.document().plain_text(), "´e\n@");
+    }
+
+    #[test]
+    fn rich_clipboard_captures_styles_before_cut_and_pastes_atomically() {
+        let mut editor = Editor::from_text("café 👩‍💻");
+        editor.select_all();
+        editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let rich = editor.selected_fragment();
+        let mut adapter = focused(&mut editor).rich_clipboard(true);
+        adapter.set_modifiers(ModifiersState::CONTROL);
+        let copy = key(&mut adapter, &mut editor, Key::Character("c".into()), None);
+        assert_eq!(copy.clipboard, Some(ClipboardEvent::CopyRich(rich.clone())));
+        let cut = key(&mut adapter, &mut editor, Key::Character("x".into()), None);
+        assert_eq!(cut.clipboard, Some(ClipboardEvent::CutRich(rich.clone())));
+        assert_eq!(editor.document().plain_text(), "");
+        assert!(adapter.paste_fragment(&mut editor, &rich).unwrap().changed);
+        assert_eq!(editor.document().to_bytes(), rich.to_bytes());
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "");
+        assert!(editor.undo());
+        assert_eq!(editor.document().to_bytes(), rich.to_bytes());
+        adapter.set_focused(false, &mut editor);
+        assert!(!adapter.paste_fragment(&mut editor, &rich).unwrap().handled);
+    }
+
+    #[test]
+    fn word_deletion_and_list_tabs_route_to_core_and_leave_body_tab_to_host() {
+        let mut editor = Editor::from_text("one café");
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let mut adapter = focused(&mut editor);
+        adapter.set_modifiers(ModifiersState::CONTROL);
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::Backspace),
+            None,
+        );
+        assert_eq!(editor.document().plain_text(), "one ");
+        assert!(editor.undo());
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::Delete),
+            None,
+        );
+        assert_eq!(editor.document().plain_text(), " café");
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        adapter.set_modifiers(ModifiersState::empty());
+        assert!(key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None).handled);
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().kind(),
+            ParagraphKind::Bullet { indent: 1 }
+        );
+        adapter.set_modifiers(ModifiersState::SHIFT);
+        key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None);
+        key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None);
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().kind(),
+            ParagraphKind::Body
+        );
+        assert!(!key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None).handled);
+    }
+
+    #[test]
+    fn modified_tabs_remain_with_host_and_list_selection_excludes_body_endpoint() {
+        let mut editor = Editor::from_text("list\nbody");
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        let mut adapter = focused(&mut editor);
+        for modifier in [
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+            ModifiersState::SUPER,
+        ] {
+            adapter.set_modifiers(modifier);
+            assert!(!key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None).handled);
+            assert_eq!(
+                editor.document().paragraph(0).unwrap().kind(),
+                ParagraphKind::Bullet { indent: 0 }
+            );
+        }
+        adapter.set_modifiers(ModifiersState::empty());
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(1, 0)))
+            .unwrap();
+        assert!(key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None).handled);
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().kind(),
+            ParagraphKind::Bullet { indent: 1 }
+        );
+        assert_eq!(
+            editor.document().paragraph(1).unwrap().kind(),
+            ParagraphKind::Body
+        );
     }
 
     #[test]

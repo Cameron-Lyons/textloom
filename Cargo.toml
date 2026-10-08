@@ -34,6 +34,11 @@ required-features = ["winit"]
 name = "editing"
 harness = false
 
+[[bench]]
+name = "rendering"
+harness = false
+required-features = ["egui"]
+
 [lints.rust]
 unsafe_code = "forbid"
 

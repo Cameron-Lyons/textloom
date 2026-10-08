@@ -1,8 +1,12 @@
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{Error, InlineStyle, ParagraphKind, Position, StylePatch};
+use crate::{Error, Fragment, InlineStyle, ParagraphKind, Position, StylePatch};
 
 /// A run of equally formatted text, measured in UTF-8 bytes within a paragraph.
 ///
@@ -15,13 +19,32 @@ pub struct Span {
 }
 
 /// An immutable paragraph. Its text and formatting can be shared by history.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Paragraph {
     text: Arc<str>,
     spans: Arc<[Span]>,
     kind: ParagraphKind,
     ascii: bool,
+    indices: Option<Arc<TextIndices>>,
 }
+
+/// Immutable text indexes are built only when requested, and remain shared
+/// when formatting or paragraph metadata changes. ASCII has implicit byte
+/// boundaries and needs no index allocation.
+#[derive(Debug, Default)]
+struct TextIndices {
+    graphemes: OnceLock<Box<[usize]>>,
+    scalars: OnceLock<Box<[usize]>>,
+    words: OnceLock<Box<[Range<usize>]>>,
+}
+
+impl PartialEq for Paragraph {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.spans == other.spans && self.kind == other.kind
+    }
+}
+
+impl Eq for Paragraph {}
 
 impl Paragraph {
     pub fn text(&self) -> &str {
@@ -36,12 +59,218 @@ impl Paragraph {
         self.kind
     }
 
+    /// Number of extended grapheme clusters in this paragraph.
+    /// Unicode boundaries are indexed lazily and reused by later queries.
+    pub fn grapheme_count(&self) -> usize {
+        if self.ascii {
+            self.text.len()
+        } else {
+            self.grapheme_boundaries().len() - 1
+        }
+    }
+
+    /// Map a grapheme index to a UTF-8 byte offset. The index immediately
+    /// after the last grapheme maps to the end of the paragraph.
+    pub fn byte_from_grapheme(&self, index: usize) -> Option<usize> {
+        if self.ascii {
+            (index <= self.text.len()).then_some(index)
+        } else {
+            self.grapheme_boundaries().get(index).copied()
+        }
+    }
+
+    /// Map a UTF-8 byte offset to a grapheme index, rejecting offsets within
+    /// a cluster or outside the paragraph.
+    pub fn grapheme_index(&self, byte: usize) -> Option<usize> {
+        if byte == 0 {
+            Some(0)
+        } else if byte > self.text.len() || !self.text.is_char_boundary(byte) {
+            None
+        } else if self.ascii {
+            (byte <= self.text.len()).then_some(byte)
+        } else {
+            self.grapheme_boundaries().binary_search(&byte).ok()
+        }
+    }
+
+    /// Return the preceding grapheme boundary, clamped at paragraph start.
+    pub fn previous_grapheme(&self, byte: usize) -> usize {
+        if byte == 0 {
+            0
+        } else if self.ascii {
+            byte.saturating_sub(1).min(self.text.len())
+        } else {
+            let boundaries = self.grapheme_boundaries();
+            boundaries[boundaries
+                .partition_point(|offset| *offset < byte)
+                .saturating_sub(1)]
+        }
+    }
+
+    /// Return the following grapheme boundary, clamped at paragraph end.
+    pub fn next_grapheme(&self, byte: usize) -> usize {
+        if byte >= self.text.len() {
+            self.text.len()
+        } else if self.ascii {
+            byte.saturating_add(1).min(self.text.len())
+        } else {
+            let boundaries = self.grapheme_boundaries();
+            boundaries[boundaries
+                .partition_point(|offset| *offset <= byte)
+                .min(boundaries.len() - 1)]
+        }
+    }
+
+    /// Snap a byte offset backward to a grapheme boundary.
+    /// Offsets beyond the paragraph are clamped to its end.
+    pub fn boundary_at_or_before(&self, byte: usize) -> usize {
+        if byte == 0 || byte >= self.text.len() || self.ascii {
+            byte.min(self.text.len())
+        } else {
+            let boundaries = self.grapheme_boundaries();
+            boundaries[boundaries
+                .partition_point(|offset| *offset <= byte)
+                .saturating_sub(1)]
+        }
+    }
+
+    /// Snap a byte offset forward to a grapheme boundary.
+    /// Offsets beyond the paragraph are clamped to its end.
+    pub fn boundary_at_or_after(&self, byte: usize) -> usize {
+        if byte == 0 || byte >= self.text.len() || self.ascii {
+            byte.min(self.text.len())
+        } else {
+            let boundaries = self.grapheme_boundaries();
+            boundaries[boundaries
+                .partition_point(|offset| *offset < byte)
+                .min(boundaries.len() - 1)]
+        }
+    }
+
+    /// Number of Unicode scalar values, for GUI APIs that use character
+    /// rather than grapheme offsets.
+    pub fn scalar_count(&self) -> usize {
+        if self.ascii {
+            self.text.len()
+        } else {
+            self.scalar_boundaries().len() - 1
+        }
+    }
+
+    /// Map a Unicode scalar index to a byte offset, including paragraph end.
+    pub fn byte_from_scalar(&self, index: usize) -> Option<usize> {
+        if self.ascii {
+            (index <= self.text.len()).then_some(index)
+        } else {
+            self.scalar_boundaries().get(index).copied()
+        }
+    }
+
+    /// Map a byte offset to a Unicode scalar index. Grapheme-internal scalar
+    /// boundaries are accepted, while offsets inside UTF-8 encodings are not.
+    pub fn scalar_index(&self, byte: usize) -> Option<usize> {
+        if byte == 0 {
+            Some(0)
+        } else if byte > self.text.len() || !self.text.is_char_boundary(byte) {
+            None
+        } else if self.ascii {
+            (byte <= self.text.len()).then_some(byte)
+        } else {
+            self.scalar_boundaries().binary_search(&byte).ok()
+        }
+    }
+
+    /// Move backward to a Unicode word start, snapped to a grapheme boundary.
+    pub fn previous_word(&self, byte: usize) -> usize {
+        if byte == 0 {
+            return 0;
+        }
+        let byte = if self.ascii {
+            self.text
+                .unicode_word_indices()
+                .rev()
+                .find(|(start, _)| *start < byte)
+                .map_or(0, |(start, _)| start)
+        } else {
+            let words = self.word_ranges();
+            words
+                .get(
+                    words
+                        .partition_point(|word| word.start < byte)
+                        .wrapping_sub(1),
+                )
+                .map_or(0, |word| word.start)
+        };
+        self.boundary_at_or_before(byte)
+    }
+
+    /// Move forward to a Unicode word end, snapped to a grapheme boundary.
+    pub fn next_word(&self, byte: usize) -> usize {
+        if byte >= self.text.len() {
+            return self.text.len();
+        }
+        let byte = if self.ascii {
+            self.text
+                .unicode_word_indices()
+                .find(|(start, word)| start + word.len() > byte)
+                .map_or(self.text.len(), |(start, word)| start + word.len())
+        } else {
+            let words = self.word_ranges();
+            words
+                .get(words.partition_point(|word| word.end <= byte))
+                .map_or(self.text.len(), |word| word.end)
+        };
+        self.boundary_at_or_after(byte)
+    }
+
+    fn grapheme_boundaries(&self) -> &[usize] {
+        self.indices
+            .as_ref()
+            .expect("non-ASCII paragraph has an index cache")
+            .graphemes
+            .get_or_init(|| {
+                self.text
+                    .grapheme_indices(true)
+                    .map(|(byte, _)| byte)
+                    .chain([self.text.len()])
+                    .collect()
+            })
+    }
+
+    fn scalar_boundaries(&self) -> &[usize] {
+        self.indices
+            .as_ref()
+            .expect("non-ASCII paragraph has an index cache")
+            .scalars
+            .get_or_init(|| {
+                self.text
+                    .char_indices()
+                    .map(|(byte, _)| byte)
+                    .chain([self.text.len()])
+                    .collect()
+            })
+    }
+
+    fn word_ranges(&self) -> &[Range<usize>] {
+        self.indices
+            .as_ref()
+            .expect("non-ASCII paragraph has an index cache")
+            .words
+            .get_or_init(|| {
+                self.text
+                    .unicode_word_indices()
+                    .map(|(byte, word)| byte..byte + word.len())
+                    .collect()
+            })
+    }
+
     fn with_kind(&self, kind: ParagraphKind) -> Self {
         Self {
             text: Arc::clone(&self.text),
             spans: Arc::clone(&self.spans),
             kind,
             ascii: self.ascii,
+            indices: self.indices.clone(),
         }
     }
 
@@ -59,6 +288,7 @@ impl Paragraph {
             spans: spans.into(),
             kind: ParagraphKind::Body,
             ascii: text.is_ascii(),
+            indices: (!text.is_ascii()).then(|| Arc::new(TextIndices::default())),
         }
     }
 
@@ -70,7 +300,49 @@ impl Paragraph {
             spans: spans.into(),
             kind,
             ascii,
+            indices: (!ascii).then(|| Arc::new(TextIndices::default())),
         }
+    }
+
+    /// Construct validated rich-text data without accepting malformed run or
+    /// paragraph boundaries. Adjacent runs with equal styles are merged.
+    pub(crate) fn from_parts(
+        text: String,
+        spans: Vec<Span>,
+        kind: ParagraphKind,
+    ) -> Result<Self, Error> {
+        if text.contains(['\r', '\n'])
+            || matches!(kind, ParagraphKind::Heading { level } if !(1..=6).contains(&level))
+        {
+            return Err(Error::InvalidFragment);
+        }
+        let ascii = text.is_ascii();
+        let mut paragraph = Self {
+            text: text.into(),
+            spans: Arc::from([]),
+            kind,
+            ascii,
+            indices: (!ascii).then(|| Arc::new(TextIndices::default())),
+        };
+        let mut normalized = Vec::with_capacity(spans.len());
+        let mut end = 0;
+        for span in spans {
+            if span.range.start != end
+                || span.range.start >= span.range.end
+                || span.range.end > paragraph.text.len()
+                || (span.range.end < paragraph.text.len()
+                    && paragraph.grapheme_index(span.range.end).is_none())
+            {
+                return Err(Error::InvalidFragment);
+            }
+            end = span.range.end;
+            push_span(&mut normalized, span.range, span.style);
+        }
+        if end != paragraph.text.len() {
+            return Err(Error::InvalidFragment);
+        }
+        paragraph.spans = normalized.into();
+        Ok(paragraph)
     }
 
     fn style_for_byte(&self, byte: usize) -> InlineStyle {
@@ -89,6 +361,7 @@ impl Paragraph {
 pub struct Document {
     paragraphs: Vec<Arc<Paragraph>>,
     revision: u64,
+    identity: Arc<()>,
 }
 
 impl Default for Document {
@@ -111,7 +384,61 @@ impl Document {
                 .map(|text| Arc::new(Paragraph::plain(text)))
                 .collect(),
             revision: 0,
+            identity: Arc::new(()),
         }
+    }
+
+    /// Restore an immutable rich fragment, sharing its paragraph allocations.
+    pub fn from_fragment(fragment: &Fragment) -> Self {
+        Self {
+            paragraphs: fragment.paragraphs().to_vec(),
+            revision: 0,
+            identity: Arc::new(()),
+        }
+    }
+
+    /// Encode the complete document in Textloom's versioned native rich-text format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Fragment::encode_paragraphs(self.paragraphs())
+    }
+
+    /// Decode validated native rich text. See [`Fragment::from_bytes`] for resource limits.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::FragmentError> {
+        Fragment::from_bytes(bytes).map(|fragment| Self::from_fragment(&fragment))
+    }
+
+    /// Export semantic HTML with escaped text and preserved formatting.
+    pub fn to_html(&self) -> String {
+        crate::export::html(self.paragraphs())
+    }
+
+    /// Capture a forward range with clipped inline runs and original paragraph kinds.
+    /// Complete paragraphs share their original allocations.
+    pub fn fragment(&self, range: Range<Position>) -> Result<Fragment, Error> {
+        self.validate_range(&range)?;
+        let mut paragraphs = Vec::with_capacity(range.end.paragraph - range.start.paragraph + 1);
+        for index in range.start.paragraph..=range.end.paragraph {
+            let paragraph = &self.paragraphs[index];
+            let start = if index == range.start.paragraph {
+                range.start.byte
+            } else {
+                0
+            };
+            let end = if index == range.end.paragraph {
+                range.end.byte
+            } else {
+                paragraph.text.len()
+            };
+            if start == 0 && end == paragraph.text.len() {
+                paragraphs.push(Arc::clone(paragraph));
+            } else {
+                let mut text = String::with_capacity(end - start);
+                let mut spans = Vec::new();
+                append_slice(&mut text, &mut spans, paragraph, start..end);
+                paragraphs.push(Arc::new(Paragraph::styled(text, spans, paragraph.kind)));
+            }
+        }
+        Ok(Fragment::from_paragraphs(paragraphs))
     }
 
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
@@ -130,6 +457,14 @@ impl Document {
     /// Increases on every actual edit, undo, or redo; it is never restored by undo.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// A stable token for this content state, shared by document clones and
+    /// replaced only after actual changes. Renderers may compare its pointers
+    /// without retaining or comparing all paragraphs.
+    #[cfg(feature = "egui")]
+    pub(crate) fn content_identity(&self) -> Arc<()> {
+        Arc::clone(&self.identity)
     }
 
     /// Export text with LF between paragraphs. List markers are presentation.
@@ -178,12 +513,9 @@ impl Document {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return Err(Error::InvalidPosition(position));
         };
-        if position.byte == paragraph.text.len()
-            || (paragraph.ascii && position.byte < paragraph.text.len())
-            || paragraph
-                .text()
-                .grapheme_indices(true)
-                .any(|(byte, _)| byte == position.byte)
+        if position.byte == 0
+            || position.byte == paragraph.text.len()
+            || paragraph.grapheme_index(position.byte).is_some()
         {
             Ok(())
         } else {
@@ -306,6 +638,186 @@ impl Document {
         Ok((delta, caret))
     }
 
+    pub(crate) fn replace_fragment(
+        &mut self,
+        range: Range<Position>,
+        fragment: &Fragment,
+    ) -> Result<(Delta, Position), Error> {
+        self.validate_range(&range)?;
+        let first = &self.paragraphs[range.start.paragraph];
+        let last = &self.paragraphs[range.end.paragraph];
+        let mut after = Vec::with_capacity(fragment.paragraphs().len());
+        let mut insertion_end = 0;
+        for (index, source) in fragment.paragraphs().iter().enumerate() {
+            let is_first = index == 0;
+            let is_last = index + 1 == fragment.paragraphs().len();
+            let prefix_len = if is_first { range.start.byte } else { 0 };
+            let suffix_len = if is_last {
+                last.text.len() - range.end.byte
+            } else {
+                0
+            };
+            let kind = if is_first && prefix_len > 0 {
+                first.kind
+            } else {
+                source.kind
+            };
+            if prefix_len == 0 && suffix_len == 0 && kind == source.kind {
+                if is_last {
+                    insertion_end = source.text.len();
+                }
+                after.push(Arc::clone(source));
+                continue;
+            }
+            let mut text = String::with_capacity(prefix_len + source.text.len() + suffix_len);
+            let mut spans = Vec::new();
+            if is_first {
+                append_slice(&mut text, &mut spans, first, 0..range.start.byte);
+            }
+            append_slice(&mut text, &mut spans, source, 0..source.text.len());
+            if is_last {
+                insertion_end = text.len();
+                append_slice(&mut text, &mut spans, last, range.end.byte..last.text.len());
+            }
+            after.push(Arc::new(Paragraph::styled(text, spans, kind)));
+        }
+        let caret = Position::new(
+            range.start.paragraph + after.len() - 1,
+            after
+                .last()
+                .expect("fragment has a paragraph")
+                .boundary_at_or_after(insertion_end),
+        );
+        // Rich paste preserves explicit source numbering, including list restarts.
+        let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
+        Ok((delta, caret))
+    }
+
+    pub(crate) fn change_list_indent(&mut self, range: Range<usize>, increase: bool) -> Delta {
+        let after = self.paragraphs[range.clone()]
+            .iter()
+            .map(|paragraph| {
+                let kind = match paragraph.kind {
+                    ParagraphKind::Bullet { indent } => {
+                        if increase {
+                            ParagraphKind::Bullet {
+                                indent: indent.saturating_add(1),
+                            }
+                        } else if indent == 0 {
+                            ParagraphKind::Body
+                        } else {
+                            ParagraphKind::Bullet { indent: indent - 1 }
+                        }
+                    }
+                    ParagraphKind::Ordered { indent, start } => {
+                        if increase {
+                            ParagraphKind::Ordered {
+                                indent: indent.saturating_add(1),
+                                start,
+                            }
+                        } else if indent == 0 {
+                            ParagraphKind::Body
+                        } else {
+                            ParagraphKind::Ordered {
+                                indent: indent - 1,
+                                start,
+                            }
+                        }
+                    }
+                    kind => kind,
+                };
+                if kind == paragraph.kind {
+                    Arc::clone(paragraph)
+                } else {
+                    Arc::new(paragraph.with_kind(kind))
+                }
+            })
+            .collect();
+        self.change(range, after)
+    }
+
+    /// Build a batch replacement against the original text, normalizing joined
+    /// graphemes only after every match is applied. This avoids shifting ranges
+    /// and rebuilding the same paragraph once per match.
+    pub(crate) fn replace_matches(
+        &mut self,
+        matches: &[Range<Position>],
+        replacement: &str,
+    ) -> Result<(Delta, Position), Error> {
+        let first = matches.first().expect("nonempty matches");
+        let last = matches.last().expect("nonempty matches");
+        let mut cursor = Position::new(first.start.paragraph, 0);
+        for range in matches {
+            self.validate_range(range)?;
+            if range.start < cursor || range.is_empty() {
+                return Err(Error::InvalidRange);
+            }
+            cursor = range.end;
+        }
+        let replacement = normalize_newlines(replacement);
+        let mut builder = ReplacementBuilder::new(self.paragraphs[first.start.paragraph].kind);
+        cursor = Position::new(first.start.paragraph, 0);
+        let mut caret = Position::default();
+        for range in matches {
+            builder.append_document(self, cursor..range.start);
+            let source = &self.paragraphs[range.start.paragraph];
+            let style =
+                source.style_for_byte(range.start.byte.min(source.text.len().saturating_sub(1)));
+            if range.start.paragraph != range.end.paragraph
+                && range.start.byte == 0
+                && replacement.is_empty()
+                && builder.text.is_empty()
+            {
+                builder.kind = self.paragraphs[range.end.paragraph].kind;
+                if let (
+                    ParagraphKind::Ordered {
+                        indent: first_indent,
+                        start,
+                    },
+                    ParagraphKind::Ordered { indent, .. },
+                ) = (source.kind, builder.kind)
+                    && first_indent == indent
+                {
+                    builder.kind = ParagraphKind::Ordered { indent, start };
+                }
+            }
+            builder.append_text(&replacement, style);
+            if range.start.paragraph != range.end.paragraph && replacement.contains('\n') {
+                builder.kind = self.paragraphs[range.end.paragraph].kind;
+            }
+            caret = Position::new(
+                first.start.paragraph + builder.paragraphs.len(),
+                builder.text.len(),
+            );
+            cursor = range.end;
+        }
+        builder.append_document(
+            self,
+            cursor
+                ..Position::new(
+                    last.end.paragraph,
+                    self.paragraphs[last.end.paragraph].text.len(),
+                ),
+        );
+        builder.finish_paragraph();
+        let mut after = builder.paragraphs;
+        caret.byte =
+            after[caret.paragraph - first.start.paragraph].boundary_at_or_after(caret.byte);
+        let range = first.start.paragraph..last.end.paragraph + 1;
+        let structural = replacement.contains('\n')
+            || matches
+                .iter()
+                .any(|range| range.start.paragraph != range.end.paragraph);
+        let range = if structural {
+            let (range, numbered) = self.with_numbered_continuations(range, after);
+            after = numbered;
+            range
+        } else {
+            range
+        };
+        Ok((self.change(range, after), caret))
+    }
+
     pub(crate) fn apply_style(
         &mut self,
         range: Range<Position>,
@@ -349,6 +861,7 @@ impl Document {
                     spans: spans.into(),
                     kind: paragraph.kind,
                     ascii: paragraph.ascii,
+                    indices: paragraph.indices.clone(),
                 }));
             }
         }
@@ -405,6 +918,7 @@ impl Document {
             insert.iter().cloned(),
         );
         self.revision = self.revision.saturating_add(1);
+        self.identity = Arc::new(());
     }
 
     fn with_numbered_continuations(
@@ -470,8 +984,85 @@ impl Document {
             self.paragraphs
                 .splice(start..end, delta.after.iter().cloned());
             self.revision = self.revision.saturating_add(1);
+            self.identity = Arc::new(());
         }
         delta
+    }
+}
+
+struct ReplacementBuilder {
+    paragraphs: Vec<Arc<Paragraph>>,
+    text: String,
+    spans: Vec<Span>,
+    kind: ParagraphKind,
+    candidate: Option<Arc<Paragraph>>,
+}
+
+impl ReplacementBuilder {
+    fn new(kind: ParagraphKind) -> Self {
+        Self {
+            paragraphs: Vec::new(),
+            text: String::new(),
+            spans: Vec::new(),
+            kind,
+            candidate: None,
+        }
+    }
+
+    fn finish_paragraph(&mut self) {
+        let text = std::mem::take(&mut self.text);
+        let spans = std::mem::take(&mut self.spans);
+        if let Some(paragraph) = self.candidate.take()
+            && paragraph.kind == self.kind
+            && paragraph.text.as_ref() == text
+            && paragraph.spans.as_ref() == spans
+        {
+            self.paragraphs.push(paragraph);
+        } else {
+            self.paragraphs
+                .push(Arc::new(Paragraph::styled(text, spans, self.kind)));
+        }
+    }
+
+    fn append_document(&mut self, document: &Document, range: Range<Position>) {
+        for index in range.start.paragraph..=range.end.paragraph {
+            let paragraph = &document.paragraphs[index];
+            if index > range.start.paragraph {
+                self.finish_paragraph();
+                self.kind = paragraph.kind;
+            }
+            let start = if index == range.start.paragraph {
+                range.start.byte
+            } else {
+                0
+            };
+            let end = if index == range.end.paragraph {
+                range.end.byte
+            } else {
+                paragraph.text.len()
+            };
+            if self.text.is_empty() && start == 0 && end == paragraph.text.len() {
+                self.candidate = Some(Arc::clone(paragraph));
+            } else if start < end {
+                self.candidate = None;
+            }
+            append_slice(&mut self.text, &mut self.spans, paragraph, start..end);
+        }
+    }
+
+    fn append_text(&mut self, text: &str, style: InlineStyle) {
+        for (index, chunk) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.finish_paragraph();
+                self.kind = continuation_kind(self.kind, 1);
+            }
+            let start = self.text.len();
+            if !chunk.is_empty() {
+                self.candidate = None;
+            }
+            self.text.push_str(chunk);
+            push_span(&mut self.spans, start..self.text.len(), style);
+        }
     }
 }
 
@@ -583,7 +1174,7 @@ fn push_span(spans: &mut Vec<Span>, range: Range<usize>, style: InlineStyle) {
 fn normalize_spans(text: &str, raw: &[Span], ascii: bool) -> Vec<Span> {
     // Paragraphs contain no CR/LF, so every ASCII byte is a whole grapheme.
     // The common case can retain already normalized runs without segmentation.
-    if ascii {
+    if ascii || raw.len() <= 1 {
         return raw.to_vec();
     }
     let mut result = Vec::with_capacity(raw.len());
@@ -601,19 +1192,330 @@ fn normalize_spans(text: &str, raw: &[Span], ascii: bool) -> Vec<Span> {
 }
 
 fn boundary_at_or_after(paragraph: &Paragraph, byte: usize) -> usize {
-    let text = paragraph.text();
-    if paragraph.ascii {
-        return byte.min(text.len());
-    }
-    text.grapheme_indices(true)
-        .map(|(index, _)| index)
-        .find(|index| *index >= byte)
-        .unwrap_or(text.len())
+    paragraph.boundary_at_or_after(byte)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_unicode_offsets_match_extended_graphemes_and_scalars() {
+        for text in [
+            "",
+            "plain ASCII",
+            "café e\u{301}",
+            "👨‍👩‍👧‍👦🇺🇸🇨🇦🇯🇵",
+            "क्‍ष नमस्ते",
+            "a\u{301}\u{302}👩🏽‍💻z",
+        ] {
+            let paragraph = Paragraph::plain(text);
+            let graphemes: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            let scalars: Vec<_> = text
+                .char_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            assert_eq!(paragraph.grapheme_count(), graphemes.len() - 1);
+            assert_eq!(paragraph.scalar_count(), scalars.len() - 1);
+            for (index, byte) in graphemes.iter().enumerate() {
+                assert_eq!(paragraph.byte_from_grapheme(index), Some(*byte));
+                assert_eq!(paragraph.grapheme_index(*byte), Some(index));
+            }
+            for (index, byte) in scalars.iter().enumerate() {
+                assert_eq!(paragraph.byte_from_scalar(index), Some(*byte));
+                assert_eq!(paragraph.scalar_index(*byte), Some(index));
+            }
+            assert_eq!(paragraph.byte_from_grapheme(graphemes.len()), None);
+            assert_eq!(paragraph.byte_from_scalar(scalars.len()), None);
+            for byte in 0..=text.len() + 2 {
+                assert_eq!(
+                    paragraph.grapheme_index(byte),
+                    graphemes.iter().position(|offset| *offset == byte)
+                );
+                assert_eq!(
+                    paragraph.scalar_index(byte),
+                    scalars.iter().position(|offset| *offset == byte)
+                );
+                assert_eq!(
+                    paragraph.previous_grapheme(byte),
+                    graphemes
+                        .iter()
+                        .copied()
+                        .rev()
+                        .find(|offset| *offset < byte)
+                        .unwrap_or(0)
+                );
+                assert_eq!(
+                    paragraph.next_grapheme(byte),
+                    graphemes
+                        .iter()
+                        .copied()
+                        .find(|offset| *offset > byte)
+                        .unwrap_or(text.len())
+                );
+                assert_eq!(
+                    paragraph.boundary_at_or_before(byte),
+                    graphemes
+                        .iter()
+                        .copied()
+                        .rev()
+                        .find(|offset| *offset <= byte)
+                        .unwrap_or(0)
+                );
+                assert_eq!(
+                    paragraph.boundary_at_or_after(byte),
+                    graphemes
+                        .iter()
+                        .copied()
+                        .find(|offset| *offset >= byte)
+                        .unwrap_or(text.len())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn word_navigation_matches_unicode_segmentation() {
+        for text in [
+            "",
+            "one, two's!",
+            "café 👩‍💻 नमस्ते 🇺🇸",
+            "你好世界 e\u{301}",
+            "!!!",
+        ] {
+            let paragraph = Paragraph::plain(text);
+            for byte in 0..=text.len() + 1 {
+                let previous = text
+                    .unicode_word_indices()
+                    .rev()
+                    .find(|(start, _)| *start < byte)
+                    .map_or(0, |(start, _)| start);
+                let next = text
+                    .unicode_word_indices()
+                    .find(|(start, word)| start + word.len() > byte)
+                    .map_or(text.len(), |(start, word)| start + word.len());
+                assert_eq!(
+                    paragraph.previous_word(byte),
+                    paragraph.boundary_at_or_before(previous)
+                );
+                assert_eq!(
+                    paragraph.next_word(byte),
+                    paragraph.boundary_at_or_after(next)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_indexes_are_independently_lazy_and_shared_across_metadata_changes() {
+        let mut document = Document::from_text("café 👩‍💻");
+        let original = Arc::clone(&document.paragraphs()[0]);
+        let indices = original.indices.as_ref().unwrap();
+        assert!(indices.graphemes.get().is_none());
+        assert!(indices.scalars.get().is_none());
+        assert!(indices.words.get().is_none());
+        let equal = Paragraph::plain(original.text());
+        assert_eq!(*original, equal);
+        original.grapheme_count();
+        assert_eq!(*original, equal);
+        assert!(indices.graphemes.get().is_some());
+        assert!(indices.scalars.get().is_none());
+        assert!(indices.words.get().is_none());
+        document
+            .set_kind(0..1, ParagraphKind::Heading { level: 2 })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            indices,
+            document.paragraph(0).unwrap().indices.as_ref().unwrap()
+        ));
+        document
+            .apply_style(
+                Position::default()..document.end(),
+                StylePatch {
+                    bold: Some(true),
+                    ..StylePatch::default()
+                },
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            indices,
+            document.paragraph(0).unwrap().indices.as_ref().unwrap()
+        ));
+        document
+            .replace(document.end()..document.end(), "!", InlineStyle::default())
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            indices,
+            document.paragraph(0).unwrap().indices.as_ref().unwrap()
+        ));
+        assert!(Paragraph::plain("ASCII").indices.is_none());
+    }
+
+    #[test]
+    fn uniform_unicode_end_typing_does_not_build_text_indexes() {
+        let mut document = Document::from_text("café 👩‍💻");
+        for _ in 0..3 {
+            document
+                .replace(document.end()..document.end(), "é", InlineStyle::default())
+                .unwrap();
+            let paragraph = document.paragraph(0).unwrap();
+            assert_eq!(paragraph.spans().len(), 1);
+            let indices = paragraph.indices.as_ref().unwrap();
+            assert!(indices.graphemes.get().is_none());
+            assert!(indices.scalars.get().is_none());
+            assert!(indices.words.get().is_none());
+        }
+        assert_normalized(&document);
+    }
+
+    #[test]
+    fn rich_parts_validate_and_merge_runs() {
+        let paragraph = Paragraph::from_parts(
+            "aé".into(),
+            vec![
+                Span {
+                    range: 0..1,
+                    style: bold(),
+                },
+                Span {
+                    range: 1..3,
+                    style: bold(),
+                },
+            ],
+            ParagraphKind::Heading { level: 1 },
+        )
+        .unwrap();
+        assert_eq!(
+            paragraph.spans(),
+            &[Span {
+                range: 0..3,
+                style: bold()
+            }]
+        );
+        assert!(Paragraph::from_parts(String::new(), vec![], ParagraphKind::Body).is_ok());
+        for (text, spans, kind) in [
+            (
+                "a\nb",
+                vec![Span {
+                    range: 0..3,
+                    style: bold(),
+                }],
+                ParagraphKind::Body,
+            ),
+            (
+                "a\rb",
+                vec![Span {
+                    range: 0..3,
+                    style: bold(),
+                }],
+                ParagraphKind::Body,
+            ),
+            (
+                "a",
+                vec![Span {
+                    range: 0..1,
+                    style: bold(),
+                }],
+                ParagraphKind::Heading { level: 0 },
+            ),
+            ("a", vec![], ParagraphKind::Body),
+            (
+                "",
+                vec![Span {
+                    range: 0..0,
+                    style: bold(),
+                }],
+                ParagraphKind::Body,
+            ),
+            (
+                "ab",
+                vec![Span {
+                    range: 0..1,
+                    style: bold(),
+                }],
+                ParagraphKind::Body,
+            ),
+            (
+                "ab",
+                vec![Span {
+                    range: 1..2,
+                    style: bold(),
+                }],
+                ParagraphKind::Body,
+            ),
+            (
+                "ab",
+                vec![Span {
+                    range: 0..3,
+                    style: bold(),
+                }],
+                ParagraphKind::Body,
+            ),
+            (
+                "e\u{301}",
+                vec![
+                    Span {
+                        range: 0..1,
+                        style: bold(),
+                    },
+                    Span {
+                        range: 1..3,
+                        style: bold(),
+                    },
+                ],
+                ParagraphKind::Body,
+            ),
+            (
+                "é",
+                vec![
+                    Span {
+                        range: 0..1,
+                        style: bold(),
+                    },
+                    Span {
+                        range: 1..2,
+                        style: bold(),
+                    },
+                ],
+                ParagraphKind::Body,
+            ),
+        ] {
+            assert_eq!(
+                Paragraph::from_parts(text.into(), spans, kind),
+                Err(Error::InvalidFragment)
+            );
+        }
+    }
+
+    #[test]
+    fn document_content_identity_tracks_changes_and_preserves_noops() {
+        let mut document = Document::from_text("text");
+        let cloned = document.clone();
+        assert!(Arc::ptr_eq(&document.identity, &cloned.identity));
+        let (noop, _) = document
+            .replace(
+                Position::default()..document.end(),
+                "text",
+                InlineStyle::default(),
+            )
+            .unwrap();
+        assert!(noop.is_empty());
+        assert!(Arc::ptr_eq(&document.identity, &cloned.identity));
+        let (delta, _) = document
+            .replace(document.end()..document.end(), "!", InlineStyle::default())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&document.identity, &cloned.identity));
+        let changed = Arc::clone(&document.identity);
+        document.replay(&delta, false);
+        assert!(!Arc::ptr_eq(&document.identity, &changed));
+        assert!(!Arc::ptr_eq(&document.identity, &cloned.identity));
+        assert_eq!(document.paragraphs(), cloned.paragraphs());
+    }
 
     fn bold() -> InlineStyle {
         InlineStyle {

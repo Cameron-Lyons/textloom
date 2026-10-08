@@ -1,9 +1,9 @@
 use std::{collections::VecDeque, ops::Range};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::Delta;
 use crate::{
-    Document, Error, InlineStyle, Movement, ParagraphKind, Position, Selection, StylePatch,
+    Document, Error, Fragment, InlineStyle, Movement, ParagraphKind, Position, SearchOptions,
+    Selection, StylePatch,
 };
 
 /// Native IME preedit. It is rendered over `replacement` and never stored in the document.
@@ -108,7 +108,8 @@ impl Editor {
     pub fn history_limits(&self) -> HistoryLimits {
         self.limits
     }
-    /// Conservative estimate of paragraph content retained by undo and redo.
+    /// Conservative estimate of text and formatting retained by undo and redo.
+    /// Shared navigation indexes and allocator overhead are excluded.
     pub fn history_bytes(&self) -> usize {
         self.history_bytes
     }
@@ -157,6 +158,108 @@ impl Editor {
         self.document
             .text(self.selection.range())
             .expect("editor maintains a valid selection")
+    }
+
+    /// Capture selected text, inline styles, and paragraph metadata for a rich clipboard.
+    pub fn selected_fragment(&self) -> Fragment {
+        self.document
+            .fragment(self.selection.range())
+            .expect("editor maintains a valid selection")
+    }
+
+    /// Paste rich text as one undo step. Source paragraph kinds are preserved
+    /// at paragraph starts; insertion into existing text retains its first kind.
+    pub fn insert_fragment(&mut self, fragment: &Fragment) -> Result<(), Error> {
+        self.ensure_no_composition()?;
+        let before = self.state();
+        let (delta, caret) = self
+            .document
+            .replace_fragment(self.selection.range(), fragment)?;
+        self.selection = Selection::caret(caret);
+        self.typing_style = self.document.style_at(caret);
+        self.preferred_column = None;
+        self.break_history_group();
+        if !delta.is_empty() {
+            self.record(vec![delta], before, false);
+        }
+        Ok(())
+    }
+
+    /// Select the next match after the current selection, optionally wrapping.
+    /// Returns false without changing selection when no match is available.
+    pub fn find_next(
+        &mut self,
+        query: &str,
+        options: SearchOptions,
+        wrap: bool,
+    ) -> Result<bool, Error> {
+        self.find_match(query, options, wrap, false)
+    }
+
+    /// Select the preceding match, optionally wrapping to the last match.
+    pub fn find_previous(
+        &mut self,
+        query: &str,
+        options: SearchOptions,
+        wrap: bool,
+    ) -> Result<bool, Error> {
+        self.find_match(query, options, wrap, true)
+    }
+
+    fn find_match(
+        &mut self,
+        query: &str,
+        options: SearchOptions,
+        wrap: bool,
+        backward: bool,
+    ) -> Result<bool, Error> {
+        self.ensure_no_composition()?;
+        let matches = self.document.find(query, options);
+        let selection = self.selection.range();
+        let found = if backward {
+            matches
+                .iter()
+                .rev()
+                .find(|range| range.end <= selection.start)
+                .or_else(|| if wrap { matches.last() } else { None })
+        } else {
+            matches
+                .iter()
+                .find(|range| range.start >= selection.end)
+                .or_else(|| if wrap { matches.first() } else { None })
+        };
+        if let Some(range) = found {
+            self.set_selection(Selection::new(range.start, range.end))?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Replace every nonoverlapping match as one undo step, preserving each
+    /// match's initial style. Ranges refer to the original document, so joined
+    /// combining marks and inserted paragraph breaks cannot invalidate later matches.
+    pub fn replace_all(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        options: SearchOptions,
+    ) -> Result<usize, Error> {
+        self.ensure_no_composition()?;
+        let matches = self.document.find(query, options);
+        if matches.is_empty() {
+            return Ok(0);
+        }
+        let before = self.state();
+        let (delta, caret) = self.document.replace_matches(&matches, replacement)?;
+        self.selection = Selection::caret(caret);
+        self.typing_style = self.document.style_at(caret);
+        self.preferred_column = None;
+        self.break_history_group();
+        if !delta.is_empty() {
+            self.record(vec![delta], before, false);
+        }
+        Ok(matches.len())
     }
 
     pub fn insert_text(&mut self, text: &str) -> Result<(), Error> {
@@ -230,6 +333,35 @@ impl Editor {
         self.replace_selection("", false)
     }
 
+    /// Delete the selection or the preceding Unicode word, including intervening whitespace.
+    pub fn delete_word_backward(&mut self) -> Result<(), Error> {
+        self.delete_word(false)
+    }
+
+    /// Delete the selection or the following Unicode word, including intervening whitespace.
+    pub fn delete_word_forward(&mut self) -> Result<(), Error> {
+        self.delete_word(true)
+    }
+
+    fn delete_word(&mut self, forward: bool) -> Result<(), Error> {
+        self.ensure_no_composition()?;
+        if !self.selection.is_caret() {
+            return self.replace_selection("", false);
+        }
+        let focus = self.selection.focus;
+        let target = if forward {
+            self.next_word(focus)
+        } else {
+            self.previous_word(focus)
+        };
+        if target == focus {
+            return Ok(());
+        }
+        let before = self.state();
+        self.selection = Selection::new(focus, target);
+        self.replace_selection_with_before("", false, before)
+    }
+
     pub fn apply_style(&mut self, patch: StylePatch) -> Result<(), Error> {
         self.ensure_no_composition()?;
         self.break_history_group();
@@ -258,6 +390,35 @@ impl Editor {
         let delta = self.document.set_kind(range.start.paragraph..end, kind)?;
         self.break_history_group();
         if let Some(delta) = delta {
+            self.record(vec![delta], before, false);
+        }
+        Ok(())
+    }
+
+    /// Increase selected list item indentation, clamped at 255; body text is unchanged.
+    pub fn indent_list(&mut self) -> Result<(), Error> {
+        self.change_list_indent(true)
+    }
+
+    /// Decrease selected list item indentation. Level-zero items become body text.
+    pub fn outdent_list(&mut self) -> Result<(), Error> {
+        self.change_list_indent(false)
+    }
+
+    fn change_list_indent(&mut self, increase: bool) -> Result<(), Error> {
+        self.ensure_no_composition()?;
+        let range = self.selection.range();
+        let end = if range.end.paragraph > range.start.paragraph && range.end.byte == 0 {
+            range.end.paragraph
+        } else {
+            range.end.paragraph + 1
+        };
+        let before = self.state();
+        let delta = self
+            .document
+            .change_list_indent(range.start.paragraph..end, increase);
+        self.break_history_group();
+        if !delta.is_empty() {
             self.record(vec![delta], before, false);
         }
         Ok(())
@@ -304,9 +465,11 @@ impl Editor {
             Movement::DocumentEnd => self.document.end(),
             Movement::ParagraphUp | Movement::ParagraphDown => {
                 let column = self.preferred_column.unwrap_or_else(|| {
-                    self.paragraph_text(focus.paragraph)[..focus.byte]
-                        .graphemes(true)
-                        .count()
+                    self.document
+                        .paragraph(focus.paragraph)
+                        .expect("valid selection")
+                        .grapheme_index(focus.byte)
+                        .expect("valid caret")
                 });
                 self.preferred_column = Some(column);
                 let paragraph = if movement == Movement::ParagraphUp {
@@ -314,12 +477,10 @@ impl Editor {
                 } else {
                     (focus.paragraph + 1).min(self.document.paragraphs().len() - 1)
                 };
-                let text = self.paragraph_text(paragraph);
+                let text = self.document.paragraph(paragraph).expect("valid paragraph");
                 Position::new(
                     paragraph,
-                    text.grapheme_indices(true)
-                        .nth(column)
-                        .map_or(text.len(), |(byte, _)| byte),
+                    text.byte_from_grapheme(column).unwrap_or(text.text().len()),
                 )
             }
         };
@@ -546,10 +707,10 @@ impl Editor {
         }
         Position::new(
             position.paragraph,
-            self.paragraph_text(position.paragraph)[..position.byte]
-                .grapheme_indices(true)
-                .next_back()
-                .map_or(0, |(byte, _)| byte),
+            self.document
+                .paragraph(position.paragraph)
+                .expect("valid paragraph")
+                .previous_grapheme(position.byte),
         )
     }
 
@@ -561,25 +722,26 @@ impl Editor {
             }
             return Position::new(position.paragraph + 1, 0);
         }
-        let length = text[position.byte..]
-            .graphemes(true)
-            .next()
-            .expect("nonempty suffix")
-            .len();
-        Position::new(position.paragraph, position.byte + length)
+        Position::new(
+            position.paragraph,
+            self.document
+                .paragraph(position.paragraph)
+                .expect("valid paragraph")
+                .next_grapheme(position.byte),
+        )
     }
 
     fn previous_word(&self, position: Position) -> Position {
         if position.byte == 0 {
             return self.previous_grapheme(position);
         }
-        let text = self.paragraph_text(position.paragraph);
-        let byte = text
-            .unicode_word_indices()
-            .rev()
-            .find(|(start, _)| *start < position.byte)
-            .map_or(0, |(start, _)| start);
-        self.snap_boundary(Position::new(position.paragraph, byte), false)
+        Position::new(
+            position.paragraph,
+            self.document
+                .paragraph(position.paragraph)
+                .expect("valid paragraph")
+                .previous_word(position.byte),
+        )
     }
 
     fn next_word(&self, position: Position) -> Position {
@@ -587,36 +749,12 @@ impl Editor {
         if position.byte == text.len() {
             return self.next_grapheme(position);
         }
-        let byte = text
-            .unicode_word_indices()
-            .find(|(start, word)| start + word.len() > position.byte)
-            .map_or(text.len(), |(start, word)| start + word.len());
-        self.snap_boundary(Position::new(position.paragraph, byte), true)
-    }
-
-    fn snap_boundary(&self, position: Position, forward: bool) -> Position {
-        let text = self.paragraph_text(position.paragraph);
-        let mut previous = 0;
-        for (byte, _) in text.grapheme_indices(true) {
-            if byte >= position.byte {
-                return Position::new(
-                    position.paragraph,
-                    if forward || byte == position.byte {
-                        byte
-                    } else {
-                        previous
-                    },
-                );
-            }
-            previous = byte;
-        }
         Position::new(
             position.paragraph,
-            if forward || position.byte == text.len() {
-                text.len()
-            } else {
-                previous
-            },
+            self.document
+                .paragraph(position.paragraph)
+                .expect("valid paragraph")
+                .next_word(position.byte),
         )
     }
 }
