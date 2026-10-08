@@ -6,6 +6,8 @@
 //! document and `Editor::composition()`, performs pointer hit testing, services
 //! clipboard requests, and calls [`WinitAdapter::sync_ime`] with the caret area.
 
+use std::borrow::Cow;
+
 use crate::{Editor, Error, Fragment, Movement, ParagraphKind, StylePatch};
 use winit::{
     dpi::{LogicalPosition, LogicalSize},
@@ -17,6 +19,7 @@ use winit::{
 /// Clipboard operations are owned by the host, avoiding platform dependencies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardEvent {
+    /// Plain selected text for the host to write to its clipboard.
     Copy(String),
     /// Enabled through [`WinitAdapter::rich_clipboard`]; encode native data or HTML in the host.
     CopyRich(Fragment),
@@ -31,16 +34,20 @@ pub enum ClipboardEvent {
 /// A host should stop dispatching handled input and redraw after a change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InputOutcome {
+    /// Whether the host should stop dispatching this event to other widgets.
     pub handled: bool,
     /// Includes changes to the caret, typing style, and preedit text.
     pub changed: bool,
+    /// Clipboard work for the host to service after handling this event.
     pub clipboard: Option<ClipboardEvent>,
 }
 
 /// The command modifier can be overridden for a host's shortcut preferences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandModifier {
+    /// Control-based shortcuts, the default outside macOS.
     Control,
+    /// Super/Command-based shortcuts, the default on macOS.
     Super,
 }
 
@@ -54,6 +61,10 @@ impl Default for CommandModifier {
     }
 }
 
+/// Focus-aware native keyboard and IME routing for a host-rendered editor.
+///
+/// The host owns pointer selection, clipboard transport, rendering, and window
+/// IME configuration. Only route editing events here for editable widgets.
 #[derive(Debug, Default)]
 pub struct WinitAdapter {
     focused: bool,
@@ -65,10 +76,12 @@ pub struct WinitAdapter {
 }
 
 impl WinitAdapter {
+    /// Create an unfocused adapter using the platform's command modifier.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Override the platform shortcut modifier.
     pub fn command_modifier(mut self, modifier: CommandModifier) -> Self {
         self.command_modifier = modifier;
         self
@@ -81,14 +94,17 @@ impl WinitAdapter {
         self
     }
 
+    /// Whether both the editor widget and its window have focus.
     pub fn is_focused(&self) -> bool {
         self.focused && !self.window_unfocused
     }
 
+    /// Whether the native IME has announced that it is enabled.
     pub fn ime_enabled(&self) -> bool {
         self.ime_enabled
     }
 
+    /// Return the most recently received modifier state.
     pub fn modifiers(&self) -> ModifiersState {
         self.modifiers
     }
@@ -98,6 +114,7 @@ impl WinitAdapter {
         self.modifiers = modifiers;
     }
 
+    /// Set widget focus, canceling composition and clearing modifiers on blur.
     pub fn set_focused(&mut self, focused: bool, editor: &mut Editor) -> InputOutcome {
         let changed = self.focused != focused;
         self.focused = focused;
@@ -128,6 +145,9 @@ impl WinitAdapter {
         }
     }
 
+    /// Route window focus, modifier, nonsynthetic keyboard, and IME events.
+    ///
+    /// Other events remain unhandled for the host.
     pub fn handle_window_event(
         &mut self,
         event: &WindowEvent,
@@ -260,7 +280,7 @@ impl WinitAdapter {
                 "[" => editor.outdent_list()?,
                 _ => outcome.handled = false,
             }
-            outcome.changed = before != EditorState::capture(editor);
+            outcome.changed = before.changed(editor);
             return Ok(outcome);
         }
 
@@ -308,10 +328,7 @@ impl WinitAdapter {
                     && (!self.modifiers.control_key() || self.modifiers.alt_key()) =>
                 {
                     let produced = text.unwrap_or("");
-                    let clean: String = produced
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .collect();
+                    let clean = clean_text(produced, false);
                     if clean.is_empty() {
                         outcome.handled = false;
                     } else {
@@ -321,16 +338,21 @@ impl WinitAdapter {
                 _ => outcome.handled = false,
             }
         }
-        outcome.changed = before != EditorState::capture(editor);
+        outcome.changed = before.changed(editor);
         Ok(outcome)
     }
 
+    /// Route native preedit and commit events while the editor has focus.
+    ///
+    /// Invalid UTF-8 selection boundaries are rejected without changing preedit.
+    /// Empty reset events without an active composition preserve selected text.
     pub fn handle_ime(&mut self, event: &Ime, editor: &mut Editor) -> Result<InputOutcome, Error> {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
         }
         let before = EditorState::capture(editor);
         let was_enabled = self.ime_enabled;
+        let mut preedit_changed = false;
         match event {
             Ime::Enabled => self.ime_enabled = true,
             Ime::Disabled => {
@@ -348,42 +370,51 @@ impl WinitAdapter {
                 // An empty preedit preserves the captured replacement until
                 // Commit. Clearing/canceling here would lose that range.
                 if !text.is_empty() || editor.composition().is_some() {
-                    if editor.composition().is_none() {
-                        editor.begin_composition();
+                    let selection = selection.map(|(start, end)| start..end);
+                    preedit_changed = editor.composition().is_none_or(|composition| {
+                        composition.text != *text || composition.selection != selection
+                    });
+                    if preedit_changed {
+                        editor.update_composition(text, selection)?;
                     }
-                    editor.update_composition(text, selection.map(|(start, end)| start..end))?;
                 }
             }
             Ime::Commit(text) => {
-                if editor.composition().is_none() {
-                    editor.begin_composition();
+                // Platform IME setup can emit an empty reset without preedit.
+                // A real composition's empty commit still deletes its replacement.
+                if !text.is_empty() || editor.composition().is_some() {
+                    editor.commit_composition(text)?;
                 }
-                editor.commit_composition(text)?;
             }
         }
         Ok(InputOutcome {
             handled: true,
-            changed: before != EditorState::capture(editor) || was_enabled != self.ime_enabled,
+            changed: before.changed(editor) || preedit_changed || was_enabled != self.ime_enabled,
             clipboard: None,
         })
     }
 
     /// Deliver a host clipboard response. Paste is a single undoable edit.
+    /// Empty input or text consisting only of filtered controls leaves selection,
+    /// composition, and typing history unchanged.
     pub fn paste(&mut self, editor: &mut Editor, text: &str) -> Result<InputOutcome, Error> {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
         }
+        let clean = clean_text(text, true);
+        if clean.is_empty() {
+            return Ok(InputOutcome {
+                handled: true,
+                ..InputOutcome::default()
+            });
+        }
         let before = EditorState::capture(editor);
-        let clean: String = text
-            .chars()
-            .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
-            .collect();
         editor.break_history_group();
         editor.insert_text(&clean)?;
         editor.break_history_group();
         Ok(InputOutcome {
             handled: true,
-            changed: before != EditorState::capture(editor),
+            changed: before.changed(editor),
             clipboard: None,
         })
     }
@@ -401,7 +432,7 @@ impl WinitAdapter {
         editor.insert_fragment(fragment)?;
         Ok(InputOutcome {
             handled: true,
-            changed: before != EditorState::capture(editor),
+            changed: before.changed(editor),
             clipboard: None,
         })
     }
@@ -423,6 +454,21 @@ impl WinitAdapter {
     }
 }
 
+fn clean_text(text: &str, multiline: bool) -> Cow<'_, str> {
+    let allowed = |character: char| {
+        !character.is_control() || multiline && matches!(character, '\n' | '\r' | '\t')
+    };
+    if text.chars().all(allowed) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(
+            text.chars()
+                .filter(|character| allowed(*character))
+                .collect(),
+        )
+    }
+}
+
 fn selection_contains_list(editor: &Editor) -> bool {
     let range = editor.selection().range();
     let end = if range.end.paragraph > range.start.paragraph && range.end.byte == 0 {
@@ -440,12 +486,11 @@ fn selection_contains_list(editor: &Editor) -> bool {
         })
 }
 
-#[derive(PartialEq, Eq)]
 struct EditorState {
     revision: u64,
     selection: crate::Selection,
     style: crate::InlineStyle,
-    preedit: Option<(String, Option<std::ops::Range<usize>>)>,
+    composing: bool,
 }
 
 impl EditorState {
@@ -454,10 +499,15 @@ impl EditorState {
             revision: editor.document().revision(),
             selection: editor.selection(),
             style: editor.typing_style(),
-            preedit: editor
-                .composition()
-                .map(|composition| (composition.text.clone(), composition.selection.clone())),
+            composing: editor.composition().is_some(),
         }
+    }
+
+    fn changed(&self, editor: &Editor) -> bool {
+        self.revision != editor.document().revision()
+            || self.selection != editor.selection()
+            || self.style != editor.typing_style()
+            || self.composing != editor.composition().is_some()
     }
 }
 
@@ -624,6 +674,56 @@ mod tests {
     }
 
     #[test]
+    fn empty_or_filtered_paste_preserves_selection_and_history() {
+        let mut editor = Editor::from_text("original");
+        editor.insert_text("typed ").unwrap();
+        editor.select_all();
+        let selection = editor.selection();
+        let revision = editor.document().revision();
+        let mut adapter = focused(&mut editor);
+        for clipboard in ["", "\u{0}\u{1}\u{7}"] {
+            let outcome = adapter.paste(&mut editor, clipboard).unwrap();
+            assert!(outcome.handled);
+            assert!(!outcome.changed);
+            assert_eq!(editor.document().plain_text(), "typed original");
+            assert_eq!(editor.document().revision(), revision);
+            assert_eq!(editor.selection(), selection);
+        }
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("a".into()),
+            Some("a"),
+        );
+        adapter.paste(&mut editor, "").unwrap();
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("b".into()),
+            Some("b"),
+        );
+        assert_eq!(editor.document().plain_text(), "aboriginal");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+
+        for preedit in ["", "候"] {
+            editor.update_composition(preedit, None).unwrap();
+            let composition = editor.composition().cloned();
+            let outcome = adapter.paste(&mut editor, "\u{0}").unwrap();
+            assert!(outcome.handled);
+            assert!(!outcome.changed);
+            assert_eq!(editor.composition(), composition.as_ref());
+            assert_eq!(editor.document().plain_text(), "original");
+            assert!(!editor.can_undo());
+        }
+    }
+
+    #[test]
     fn clipboard_shortcuts_are_explicit_and_undoable() {
         let mut editor = Editor::from_text("hello");
         let mut adapter = focused(&mut editor);
@@ -726,5 +826,106 @@ mod tests {
         assert_eq!(editor.document().plain_text(), "cb");
         assert!(editor.composition().is_none());
         assert!(adapter.ime_enabled());
+    }
+
+    #[test]
+    fn idle_empty_ime_events_preserve_selection_and_history() {
+        let mut editor = Editor::from_text("selected");
+        editor.select_all();
+        let selection = editor.selection();
+        let mut adapter = focused(&mut editor);
+        for event in [
+            Ime::Preedit(String::new(), None),
+            Ime::Commit(String::new()),
+        ] {
+            let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
+            assert!(outcome.handled);
+            assert!(!outcome.changed);
+            assert_eq!(editor.document().plain_text(), "selected");
+            assert_eq!(editor.selection(), selection);
+            assert!(editor.composition().is_none());
+            assert!(!editor.can_undo());
+        }
+    }
+
+    #[test]
+    fn empty_commit_after_preedit_deletes_the_captured_replacement() {
+        let mut editor = Editor::from_text("selected");
+        editor.select_all();
+        let selection = editor.selection();
+        let mut adapter = focused(&mut editor);
+        adapter
+            .handle_ime(&Ime::Preedit("candidate".into(), None), &mut editor)
+            .unwrap();
+        adapter
+            .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+            .unwrap();
+        let outcome = adapter
+            .handle_ime(&Ime::Commit(String::new()), &mut editor)
+            .unwrap();
+        assert!(outcome.changed);
+        assert_eq!(editor.document().plain_text(), "");
+        assert!(editor.composition().is_none());
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "selected");
+        assert_eq!(editor.selection(), selection);
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn ime_outcomes_report_content_selection_and_enabled_changes() {
+        let mut editor = Editor::from_text("original");
+        let mut adapter = focused(&mut editor);
+        let text = "候".repeat(1024);
+        let preedit = Ime::Preedit(text.clone(), Some((text.len(), text.len())));
+        assert!(adapter.handle_ime(&preedit, &mut editor).unwrap().changed);
+        assert!(!adapter.handle_ime(&preedit, &mut editor).unwrap().changed);
+        assert!(
+            adapter
+                .handle_ime(&Ime::Enabled, &mut editor)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !adapter
+                .handle_ime(&Ime::Enabled, &mut editor)
+                .unwrap()
+                .changed
+        );
+
+        let selection_changed = Ime::Preedit(text, Some((0, 3)));
+        assert!(
+            adapter
+                .handle_ime(&selection_changed, &mut editor)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !adapter
+                .handle_ime(&selection_changed, &mut editor)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            adapter
+                .handle_ime(&Ime::Preedit("different".into(), None), &mut editor)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            adapter
+                .handle_ime(&Ime::Disabled, &mut editor)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !adapter
+                .handle_ime(&Ime::Disabled, &mut editor)
+                .unwrap()
+                .changed
+        );
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
     }
 }

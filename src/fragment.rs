@@ -2,8 +2,6 @@
 
 use std::{fmt, sync::Arc};
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
 
 const MAGIC: &[u8; 4] = b"TLFR";
@@ -48,6 +46,8 @@ impl Fragment {
         }
     }
 
+    /// Return the ordered, immutable paragraphs, including an empty paragraph
+    /// when the fragment contains no text.
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
     }
@@ -83,7 +83,9 @@ impl Fragment {
     ///
     /// The version and fixed integer widths make files independent of target
     /// architecture. [`Self::from_bytes`] checks the complete format and
-    /// applies explicit resource limits to untrusted data.
+    /// applies explicit resource limits to untrusted data. Encoding has no
+    /// size limit; fragments above those decoding limits cannot be imported
+    /// with [`Self::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         Self::encode_paragraphs(&self.paragraphs)
     }
@@ -202,24 +204,10 @@ impl Fragment {
             let mut spans = Vec::with_capacity(span_count);
             let mut start = 0;
             let mut previous_style = None;
-            let ascii = text.is_ascii();
-            let mut boundaries = text
-                .grapheme_indices(true)
-                .map(|(byte, _)| byte)
-                .chain(std::iter::once(text.len()))
-                .peekable();
             for _ in 0..span_count {
                 let end = input.length()?;
                 if end <= start || end > text.len() {
                     return Err(FragmentError::InvalidSpans);
-                }
-                if !ascii {
-                    while boundaries.peek().is_some_and(|&boundary| boundary < end) {
-                        boundaries.next();
-                    }
-                    if boundaries.peek() != Some(&end) {
-                        return Err(FragmentError::InvalidSpans);
-                    }
                 }
                 let style = read_style(&mut input)?;
                 if previous_style == Some(style) {
@@ -235,6 +223,8 @@ impl Fragment {
             if start != text.len() {
                 return Err(FragmentError::InvalidSpans);
             }
+            // The paragraph constructor validates grapheme boundaries in one
+            // forward scan; repeating segmentation here doubles import work.
             let paragraph = Paragraph::from_parts(text.to_owned(), spans, kind)
                 .map_err(|_| FragmentError::InvalidSpans)?;
             paragraphs.push(Arc::new(paragraph));
@@ -251,6 +241,7 @@ impl Fragment {
     /// numeric values. The wrapper preserves whitespace. Indentation increases
     /// nest lists beneath the preceding item; gaps in indentation do not create
     /// artificial empty list items. Explicit ordered numbering is preserved.
+    /// NUL characters become U+FFFD because HTML cannot represent them as text.
     pub fn to_html(&self) -> String {
         crate::export::html(self.paragraphs())
     }
@@ -258,17 +249,29 @@ impl Fragment {
 
 /// A malformed or unsupported native rich-text fragment.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FragmentError {
+    /// The input ends before a declared field or payload is complete.
     Truncated,
+    /// The input does not begin with the `TLFR` signature.
     InvalidMagic,
+    /// The version byte is not supported by this decoder.
     UnsupportedVersion(u8),
+    /// The input exceeds a size, paragraph count, span count, or platform limit.
     LimitExceeded,
+    /// The input declares no paragraphs.
     InvalidParagraphCount,
+    /// A paragraph kind tag or heading level is invalid.
     InvalidParagraphKind,
+    /// Paragraph text contains a CR or LF rather than a paragraph boundary.
     InvalidParagraphText,
+    /// Paragraph text is not valid UTF-8.
     InvalidUtf8,
+    /// Spans do not canonically cover the text at extended grapheme boundaries.
     InvalidSpans,
+    /// A style byte sets reserved bits.
     InvalidStyle,
+    /// Bytes remain after the last declared paragraph.
     TrailingData,
 }
 

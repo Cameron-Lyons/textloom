@@ -14,7 +14,9 @@ use crate::{Error, Fragment, InlineStyle, ParagraphKind, Position, StylePatch};
 /// grapheme boundaries. Empty paragraphs have no runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
+    /// Half-open UTF-8 byte range within its paragraph.
     pub range: Range<usize>,
+    /// Formatting applied to every grapheme in the range.
     pub style: InlineStyle,
 }
 
@@ -25,12 +27,12 @@ pub struct Paragraph {
     spans: Arc<[Span]>,
     kind: ParagraphKind,
     ascii: bool,
-    indices: Option<Arc<TextIndices>>,
+    indices: OnceLock<Arc<TextIndices>>,
 }
 
 /// Immutable text indexes are built only when requested, and remain shared
-/// when formatting or paragraph metadata changes. ASCII has implicit byte
-/// boundaries and needs no index allocation.
+/// when formatting or paragraph metadata changes. ASCII grapheme and scalar
+/// boundaries are implicit; only word navigation needs an allocated index.
 #[derive(Debug, Default)]
 struct TextIndices {
     graphemes: OnceLock<Box<[usize]>>,
@@ -47,14 +49,17 @@ impl PartialEq for Paragraph {
 impl Eq for Paragraph {}
 
 impl Paragraph {
+    /// Text without paragraph separators.
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// Complete, contiguous formatting runs, merged where adjacent styles agree.
     pub fn spans(&self) -> &[Span] {
         &self.spans
     }
 
+    /// Semantic paragraph formatting used by renderers and exporters.
     pub fn kind(&self) -> ParagraphKind {
         self.kind
     }
@@ -94,6 +99,7 @@ impl Paragraph {
     }
 
     /// Return the preceding grapheme boundary, clamped at paragraph start.
+    /// Arbitrary byte offsets are accepted; offsets beyond the end return the end.
     pub fn previous_grapheme(&self, byte: usize) -> usize {
         if byte == 0 {
             0
@@ -108,6 +114,7 @@ impl Paragraph {
     }
 
     /// Return the following grapheme boundary, clamped at paragraph end.
+    /// Arbitrary byte offsets are accepted, including offsets inside UTF-8 encodings.
     pub fn next_grapheme(&self, byte: usize) -> usize {
         if byte >= self.text.len() {
             self.text.len()
@@ -181,87 +188,67 @@ impl Paragraph {
     }
 
     /// Move backward to a Unicode word start, snapped to a grapheme boundary.
+    /// Arbitrary byte offsets are accepted; no preceding word returns zero.
     pub fn previous_word(&self, byte: usize) -> usize {
         if byte == 0 {
             return 0;
         }
-        let byte = if self.ascii {
-            self.text
-                .unicode_word_indices()
-                .rev()
-                .find(|(start, _)| *start < byte)
-                .map_or(0, |(start, _)| start)
-        } else {
-            let words = self.word_ranges();
-            words
-                .get(
-                    words
-                        .partition_point(|word| word.start < byte)
-                        .wrapping_sub(1),
-                )
-                .map_or(0, |word| word.start)
-        };
+        let words = self.word_ranges();
+        let byte = words
+            .get(
+                words
+                    .partition_point(|word| word.start < byte)
+                    .wrapping_sub(1),
+            )
+            .map_or(0, |word| word.start);
         self.boundary_at_or_before(byte)
     }
 
     /// Move forward to a Unicode word end, snapped to a grapheme boundary.
+    /// Arbitrary byte offsets are accepted; no following word returns the end.
     pub fn next_word(&self, byte: usize) -> usize {
         if byte >= self.text.len() {
             return self.text.len();
         }
-        let byte = if self.ascii {
-            self.text
-                .unicode_word_indices()
-                .find(|(start, word)| start + word.len() > byte)
-                .map_or(self.text.len(), |(start, word)| start + word.len())
-        } else {
-            let words = self.word_ranges();
-            words
-                .get(words.partition_point(|word| word.end <= byte))
-                .map_or(self.text.len(), |word| word.end)
-        };
+        let words = self.word_ranges();
+        let byte = words
+            .get(words.partition_point(|word| word.end <= byte))
+            .map_or(self.text.len(), |word| word.end);
         self.boundary_at_or_after(byte)
     }
 
-    fn grapheme_boundaries(&self) -> &[usize] {
+    fn text_indices(&self) -> &TextIndices {
         self.indices
-            .as_ref()
-            .expect("non-ASCII paragraph has an index cache")
-            .graphemes
-            .get_or_init(|| {
-                self.text
-                    .grapheme_indices(true)
-                    .map(|(byte, _)| byte)
-                    .chain([self.text.len()])
-                    .collect()
-            })
+            .get_or_init(|| Arc::new(TextIndices::default()))
+    }
+
+    fn grapheme_boundaries(&self) -> &[usize] {
+        self.text_indices().graphemes.get_or_init(|| {
+            self.text
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain([self.text.len()])
+                .collect()
+        })
     }
 
     fn scalar_boundaries(&self) -> &[usize] {
-        self.indices
-            .as_ref()
-            .expect("non-ASCII paragraph has an index cache")
-            .scalars
-            .get_or_init(|| {
-                self.text
-                    .char_indices()
-                    .map(|(byte, _)| byte)
-                    .chain([self.text.len()])
-                    .collect()
-            })
+        self.text_indices().scalars.get_or_init(|| {
+            self.text
+                .char_indices()
+                .map(|(byte, _)| byte)
+                .chain([self.text.len()])
+                .collect()
+        })
     }
 
     fn word_ranges(&self) -> &[Range<usize>] {
-        self.indices
-            .as_ref()
-            .expect("non-ASCII paragraph has an index cache")
-            .words
-            .get_or_init(|| {
-                self.text
-                    .unicode_word_indices()
-                    .map(|(byte, word)| byte..byte + word.len())
-                    .collect()
-            })
+        self.text_indices().words.get_or_init(|| {
+            self.text
+                .unicode_word_indices()
+                .map(|(byte, word)| byte..byte + word.len())
+                .collect()
+        })
     }
 
     fn with_kind(&self, kind: ParagraphKind) -> Self {
@@ -275,6 +262,7 @@ impl Paragraph {
     }
 
     fn plain(text: &str) -> Self {
+        let ascii = text.is_ascii();
         let spans = if text.is_empty() {
             Vec::new()
         } else {
@@ -287,8 +275,8 @@ impl Paragraph {
             text: Arc::from(text),
             spans: spans.into(),
             kind: ParagraphKind::Body,
-            ascii: text.is_ascii(),
-            indices: (!text.is_ascii()).then(|| Arc::new(TextIndices::default())),
+            ascii,
+            indices: new_text_indices(ascii),
         }
     }
 
@@ -300,7 +288,7 @@ impl Paragraph {
             spans: spans.into(),
             kind,
             ascii,
-            indices: (!ascii).then(|| Arc::new(TextIndices::default())),
+            indices: new_text_indices(ascii),
         }
     }
 
@@ -322,16 +310,21 @@ impl Paragraph {
             spans: Arc::from([]),
             kind,
             ascii,
-            indices: (!ascii).then(|| Arc::new(TextIndices::default())),
+            indices: new_text_indices(ascii),
         };
         let mut normalized = Vec::with_capacity(spans.len());
         let mut end = 0;
+        // Run endpoints are sorted, so validate them with one forward scan.
+        // Importing nonuniform Unicode text must not eagerly allocate a full
+        // grapheme index, which can be much larger than the serialized text.
+        let mut boundaries = paragraph.text.grapheme_indices(true).map(|(byte, _)| byte);
         for span in spans {
             if span.range.start != end
                 || span.range.start >= span.range.end
                 || span.range.end > paragraph.text.len()
-                || (span.range.end < paragraph.text.len()
-                    && paragraph.grapheme_index(span.range.end).is_none())
+                || (!ascii
+                    && span.range.end < paragraph.text.len()
+                    && boundaries.find(|byte| *byte >= span.range.end) != Some(span.range.end))
             {
                 return Err(Error::InvalidFragment);
             }
@@ -357,6 +350,8 @@ impl Paragraph {
 ///
 /// Paragraphs are shared with undo history. An edit rebuilds only its affected
 /// paragraphs; all other paragraph allocations remain intact.
+/// Equality compares rich content and the revision counter. To compare content
+/// independently of revision, compare [`Fragment::from_document`] values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     paragraphs: Vec<Arc<Paragraph>>,
@@ -371,6 +366,7 @@ impl Default for Document {
 }
 
 impl Document {
+    /// Create a document containing one empty body paragraph.
     pub fn new() -> Self {
         Self::default()
     }
@@ -398,6 +394,7 @@ impl Document {
     }
 
     /// Encode the complete document in Textloom's versioned native rich-text format.
+    /// See [`Fragment::to_bytes`] for compatibility and decoder resource limits.
     pub fn to_bytes(&self) -> Vec<u8> {
         Fragment::encode_paragraphs(self.paragraphs())
     }
@@ -408,12 +405,16 @@ impl Document {
     }
 
     /// Export semantic HTML with escaped text and preserved formatting.
+    /// NUL characters become U+FFFD because HTML cannot preserve literal NULs.
     pub fn to_html(&self) -> String {
         crate::export::html(self.paragraphs())
     }
 
     /// Capture a forward range with clipped inline runs and original paragraph kinds.
     /// Complete paragraphs share their original allocations.
+    ///
+    /// Returns [`Error::InvalidRange`] for reversed endpoints or
+    /// [`Error::InvalidPosition`] for endpoints outside grapheme boundaries.
     pub fn fragment(&self, range: Range<Position>) -> Result<Fragment, Error> {
         self.validate_range(&range)?;
         let mut paragraphs = Vec::with_capacity(range.end.paragraph - range.start.paragraph + 1);
@@ -441,20 +442,25 @@ impl Document {
         Ok(Fragment::from_paragraphs(paragraphs))
     }
 
+    /// Paragraphs in document order, always containing at least one element.
+    /// Shared allocations may be retained by fragments or undo history.
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
     }
 
+    /// Look up a paragraph by zero-based index; out-of-range indices return `None`.
     pub fn paragraph(&self, index: usize) -> Option<&Paragraph> {
         self.paragraphs.get(index).map(Arc::as_ref)
     }
 
+    /// The valid caret position immediately after the final paragraph's text.
     pub fn end(&self) -> Position {
         let paragraph = self.paragraphs.len() - 1;
         Position::new(paragraph, self.paragraphs[paragraph].text.len())
     }
 
     /// Increases on every actual edit, undo, or redo; it is never restored by undo.
+    /// Starts at zero on import and saturates at `u64::MAX`.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -462,7 +468,7 @@ impl Document {
     /// A stable token for this content state, shared by document clones and
     /// replaced only after actual changes. Renderers may compare its pointers
     /// without retaining or comparing all paragraphs.
-    #[cfg(feature = "egui")]
+    #[cfg(any(feature = "egui", feature = "accesskit"))]
     pub(crate) fn content_identity(&self) -> Arc<()> {
         Arc::clone(&self.identity)
     }
@@ -486,6 +492,9 @@ impl Document {
     }
 
     /// Read a forward range; paragraph breaks are returned as LF.
+    ///
+    /// Returns [`Error::InvalidRange`] for reversed endpoints or
+    /// [`Error::InvalidPosition`] for endpoints outside grapheme boundaries.
     pub fn text(&self, range: Range<Position>) -> Result<String, Error> {
         self.validate_range(&range)?;
         let mut result = String::new();
@@ -509,6 +518,9 @@ impl Document {
         Ok(result)
     }
 
+    /// Check that a position references an existing paragraph and a grapheme boundary.
+    /// Paragraph start and end are valid even for empty paragraphs.
+    /// Returns [`Error::InvalidPosition`] without changing the document on failure.
     pub fn validate_position(&self, position: Position) -> Result<(), Error> {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return Err(Error::InvalidPosition(position));
@@ -529,7 +541,10 @@ impl Document {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return InlineStyle::default();
         };
-        if position.byte > paragraph.text.len() {
+        if position.byte != 0
+            && position.byte != paragraph.text.len()
+            && paragraph.grapheme_index(position.byte).is_none()
+        {
             return InlineStyle::default();
         }
         paragraph.style_for_byte(position.byte.saturating_sub(1))
@@ -625,7 +640,7 @@ impl Document {
         let caret_source = after.last().expect("replacement has a paragraph");
         let caret = Position::new(
             caret_paragraph,
-            boundary_at_or_after(caret_source, insertion_end),
+            caret_source.boundary_at_or_after(insertion_end),
         );
         let paragraph_range = range.start.paragraph..range.end.paragraph + 1;
         let (paragraph_range, after) =
@@ -1191,8 +1206,12 @@ fn normalize_spans(text: &str, raw: &[Span], ascii: bool) -> Vec<Span> {
     result
 }
 
-fn boundary_at_or_after(paragraph: &Paragraph, byte: usize) -> usize {
-    paragraph.boundary_at_or_after(byte)
+fn new_text_indices(ascii: bool) -> OnceLock<Arc<TextIndices>> {
+    if ascii {
+        OnceLock::new()
+    } else {
+        OnceLock::from(Arc::new(TextIndices::default()))
+    }
 }
 
 #[cfg(test)]
@@ -1284,6 +1303,8 @@ mod tests {
         for text in [
             "",
             "one, two's!",
+            "can't 123,456 12.34 under_score a:b; c.d 'word'",
+            "\t  one\u{000b}two\u{000c}three \u{0000}four",
             "café 👩‍💻 नमस्ते 🇺🇸",
             "你好世界 e\u{301}",
             "!!!",
@@ -1315,7 +1336,7 @@ mod tests {
     fn unicode_indexes_are_independently_lazy_and_shared_across_metadata_changes() {
         let mut document = Document::from_text("café 👩‍💻");
         let original = Arc::clone(&document.paragraphs()[0]);
-        let indices = original.indices.as_ref().unwrap();
+        let indices = original.indices.get().unwrap();
         assert!(indices.graphemes.get().is_none());
         assert!(indices.scalars.get().is_none());
         assert!(indices.words.get().is_none());
@@ -1331,7 +1352,7 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(
             indices,
-            document.paragraph(0).unwrap().indices.as_ref().unwrap()
+            document.paragraph(0).unwrap().indices.get().unwrap()
         ));
         document
             .apply_style(
@@ -1344,16 +1365,68 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(
             indices,
-            document.paragraph(0).unwrap().indices.as_ref().unwrap()
+            document.paragraph(0).unwrap().indices.get().unwrap()
         ));
         document
             .replace(document.end()..document.end(), "!", InlineStyle::default())
             .unwrap();
         assert!(!Arc::ptr_eq(
             indices,
-            document.paragraph(0).unwrap().indices.as_ref().unwrap()
+            document.paragraph(0).unwrap().indices.get().unwrap()
         ));
-        assert!(Paragraph::plain("ASCII").indices.is_none());
+        assert!(Paragraph::plain("ASCII").indices.get().is_none());
+    }
+
+    #[test]
+    fn ascii_word_indexes_are_lazy_shared_and_invalidated_by_text_edits() {
+        let mut document = Document::from_text("one two's 12.34");
+        let original = Arc::clone(&document.paragraphs()[0]);
+        assert_eq!(original.grapheme_count(), original.text().len());
+        assert_eq!(original.scalar_count(), original.text().len());
+        assert_eq!(original.next_grapheme(3), 4);
+        assert_eq!(original.previous_grapheme(3), 2);
+        assert!(original.indices.get().is_none());
+
+        assert_eq!(original.next_word(3), 9);
+        assert_eq!(original.previous_word(14), 10);
+        let indices = original.indices.get().unwrap();
+        let words = indices.words.get().unwrap().as_ptr();
+        assert!(indices.graphemes.get().is_none());
+        assert!(indices.scalars.get().is_none());
+
+        document
+            .set_kind(0..1, ParagraphKind::Heading { level: 2 })
+            .unwrap();
+        document
+            .apply_style(
+                Position::default()..document.end(),
+                StylePatch {
+                    bold: Some(true),
+                    ..StylePatch::default()
+                },
+            )
+            .unwrap();
+        let formatted = document.paragraph(0).unwrap();
+        assert!(Arc::ptr_eq(indices, formatted.indices.get().unwrap()));
+        assert_eq!(formatted.next_word(3), 9);
+        assert_eq!(formatted.word_ranges().as_ptr(), words);
+
+        let (delta, _) = document
+            .replace(
+                document.end()..document.end(),
+                " six",
+                InlineStyle::default(),
+            )
+            .unwrap();
+        let edited = document.paragraph(0).unwrap();
+        assert!(edited.indices.get().is_none());
+        assert_eq!(edited.next_word(15), 19);
+        assert!(!Arc::ptr_eq(indices, edited.indices.get().unwrap()));
+        document.replay(&delta, false);
+        assert!(Arc::ptr_eq(
+            indices,
+            document.paragraph(0).unwrap().indices.get().unwrap()
+        ));
     }
 
     #[test]
@@ -1365,7 +1438,7 @@ mod tests {
                 .unwrap();
             let paragraph = document.paragraph(0).unwrap();
             assert_eq!(paragraph.spans().len(), 1);
-            let indices = paragraph.indices.as_ref().unwrap();
+            let indices = paragraph.indices.get().unwrap();
             assert!(indices.graphemes.get().is_none());
             assert!(indices.scalars.get().is_none());
             assert!(indices.words.get().is_none());
@@ -1493,6 +1566,35 @@ mod tests {
     }
 
     #[test]
+    fn rich_unicode_run_validation_keeps_navigation_indexes_lazy() {
+        let paragraph = Paragraph::from_parts(
+            "ééé🦀".into(),
+            vec![
+                Span {
+                    range: 0..2,
+                    style: bold(),
+                },
+                Span {
+                    range: 2..6,
+                    style: InlineStyle::default(),
+                },
+                Span {
+                    range: 6..10,
+                    style: bold(),
+                },
+            ],
+            ParagraphKind::Body,
+        )
+        .unwrap();
+        let indices = paragraph.indices.get().unwrap();
+        assert!(indices.graphemes.get().is_none());
+        assert!(indices.scalars.get().is_none());
+        assert!(indices.words.get().is_none());
+        assert_eq!(paragraph.spans().len(), 3);
+        assert_eq!(paragraph.grapheme_count(), 4);
+    }
+
+    #[test]
     fn document_content_identity_tracks_changes_and_preserves_noops() {
         let mut document = Document::from_text("text");
         let cloned = document.clone();
@@ -1515,6 +1617,38 @@ mod tests {
         assert!(!Arc::ptr_eq(&document.identity, &changed));
         assert!(!Arc::ptr_eq(&document.identity, &cloned.identity));
         assert_eq!(document.paragraphs(), cloned.paragraphs());
+        let undone = Arc::clone(&document.identity);
+        document.replay(&delta, true);
+        assert!(!Arc::ptr_eq(&document.identity, &undone));
+
+        let before_kind = Arc::clone(&document.identity);
+        let kind = ParagraphKind::Heading { level: 2 };
+        assert!(document.set_kind(0..1, kind).unwrap().is_some());
+        assert!(!Arc::ptr_eq(&document.identity, &before_kind));
+        let before_style = Arc::clone(&document.identity);
+        assert!(document.set_kind(0..1, kind).unwrap().is_none());
+        assert!(Arc::ptr_eq(&document.identity, &before_style));
+        let patch = StylePatch {
+            bold: Some(true),
+            ..StylePatch::default()
+        };
+        assert!(
+            document
+                .apply_style(Position::default()..document.end(), patch)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!Arc::ptr_eq(&document.identity, &before_style));
+        let styled = Arc::clone(&document.identity);
+        assert!(
+            document
+                .apply_style(Position::default()..document.end(), patch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&document.identity, &styled));
+        document.replay(&noop, true);
+        assert!(Arc::ptr_eq(&document.identity, &styled));
     }
 
     fn bold() -> InlineStyle {

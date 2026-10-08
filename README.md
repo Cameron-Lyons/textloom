@@ -6,9 +6,9 @@ The default package has one dependency: `unicode-segmentation`. There is no unsa
 
 ```toml
 [dependencies]
-textloom = "0.1"
+textloom = "1.0"
 # Enable only the integrations your application uses:
-# textloom = { version = "0.1", features = ["egui"] }
+# textloom = { version = "1.0", features = ["egui"] }
 ```
 
 ```rust
@@ -56,7 +56,7 @@ let restored = Document::from_bytes(&bytes).unwrap();
 let html = restored.to_html(); // Escaped text, semantic headings/styles, nested lists.
 ```
 
-`Document` and `Fragment` support lossless `to_bytes()`/`from_bytes()` with a versioned, architecture-independent native format. Decoding validates UTF-8, grapheme-safe canonical spans, paragraph kinds, lengths, and trailing data; inputs are limited to 64 MiB and one million paragraphs/spans. HTML export escapes text and preserves whitespace, colors, formatting, headings, and nested lists with explicit numbering. Run `cargo run --example rich_text` for a complete core-only example. Embedded objects and HTML/Markdown parsing remain outside the package's scope.
+`Document` and `Fragment` support lossless `to_bytes()`/`from_bytes()` with a versioned, architecture-independent native format. Decoding validates UTF-8, grapheme-safe canonical spans, paragraph kinds, lengths, and trailing data; inputs are limited to 64 MiB and one million paragraphs/spans. In-memory documents may exceed these limits, so an oversized encoded snapshot will be rejected on import. HTML export escapes text and preserves whitespace, colors, formatting, headings, and nested lists with explicit numbering; NUL becomes U+FFFD because HTML cannot represent NUL text. Run `cargo run --example rich_text` for a complete core-only example. Embedded objects and HTML/Markdown parsing remain outside the package's scope.
 
 ## egui
 
@@ -66,7 +66,7 @@ Enable `features = ["egui"]` and add the widget from a native egui host:
 ui.add(textloom::adapter::egui::RichTextEditor::new(&mut editor));
 ```
 
-The widget draws rich paragraphs, selections, list markers, headings, and preedit text. It routes pointer and keyboard input through the same core and publishes the IME caret area through egui's platform output. Each independently stored editor should use a stable widget ID. For a scrolling editor, place the widget inside an egui `ScrollArea`.
+The widget draws rich paragraphs, selections, list markers, headings, and preedit text. It routes pointer and keyboard input through the same core and publishes the IME caret area through egui's platform output. It checks layout character counts and retries inconsistent font shaping to keep rendered text and cursor positions aligned. Each independently stored editor should use a stable widget ID. For a scrolling editor, place the widget inside an egui `ScrollArea`.
 
 `.read_only(true)` retains selection, copy, and accessibility while suppressing edits and IME. Ctrl/Alt+Backspace/Delete deletes Unicode words; Tab/Shift+Tab indents/outdents selected lists. Body-text Tab stays available for host focus traversal.
 
@@ -90,9 +90,9 @@ The host owns accessibility activation, focus, and layout geometry. Both adapter
 
 Text and formatting are shared between immutable paragraphs. Editing rebuilds only the affected paragraphs; undo keeps localized before/after deltas instead of copying the full document. Formatting reuses paragraph text. Single-paragraph typing merges history entries without retaining every intermediate string.
 
-Unicode grapheme, scalar, and word indexes are built independently on first use and shared across formatting/history snapshots. Repeated navigation uses binary searches instead of rescanning long Unicode paragraphs; ASCII grapheme/scalar offsets need no indexes. `history_bytes()` estimates retained text and formatting, excluding shared navigation caches and allocator overhead.
+Grapheme, scalar, and word indexes are built independently on first use and shared across formatting/history snapshots. Repeated navigation uses binary searches instead of rescanning long paragraphs; ASCII grapheme/scalar offsets need no indexes, and ASCII word indexes are allocated only when used. `history_bytes()` estimates retained text and formatting, excluding shared navigation caches and allocator overhead.
 
-A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. Numbered-list edits may update the following continuation run. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers. Explicit search temporarily flattens the document; replace-all builds each affected paragraph once. The egui widget retains galleys and layout geometry, invalidates them on content/font/DPI/appearance changes, and paints visible paragraphs. Idle cache validation takes constant time; editing still updates paragraph geometry across the document.
+A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. Numbered-list edits may update the following continuation run. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers. Ordinary case-sensitive literal searches borrow paragraph text; multi-paragraph searches with line breaks, case-insensitive matching, or whole-word constraints temporarily flatten the document. Literal searchers are reused across matches within each searched text; replace-all builds each affected paragraph once. The egui widget retains galleys and layout geometry, invalidates them on content/font/DPI/appearance changes, and paints visible paragraphs. Idle cache validation takes constant time; editing still updates paragraph geometry across the document. Accessibility uses shared content tokens to validate text snapshots and an index to locate text runs, while reusing paragraph indexes and galley geometry. Direct AccessKit selection/label changes reuse paragraph nodes; unchanged trees return an empty update in constant time.
 
 ```sh
 cargo test --locked --no-default-features
@@ -104,16 +104,24 @@ cargo bench --features egui --bench rendering
 cargo package --locked --all-features
 ```
 
-The dependency-free benchmark harnesses measure local insertion/undo, long Unicode navigation, batched replacement, and headless egui idle/edit frames. See [BENCHMARKS.md](BENCHMARKS.md) for measured results and workload details. Tests cover Unicode editing, rich interchange and malformed files, search/replacement, selection direction, style preservation, history limits, list continuation/indentation, composition lifecycle, native event routing, read-only mode, and accessibility action conversion. Native candidate windows and screen-reader behavior still need integration testing in each host/platform.
+The dependency-free benchmark harnesses measure local insertion/undo, long Unicode and ASCII navigation, literal search, batched replacement, and headless egui idle/edit frames. See [BENCHMARKS.md](https://github.com/Cameron-Lyons/textloom/blob/main/BENCHMARKS.md) for measured results and workload details. Tests cover Unicode editing, rich interchange and malformed files, search/replacement, selection direction, style preservation, history limits, list continuation/indentation, composition lifecycle, native event routing, read-only mode, and accessibility action conversion. Native candidate windows and screen-reader behavior still need integration testing in each host/platform.
 
 ## CI
 
 [GitHub Actions](https://github.com/Cameron-Lyons/textloom/actions/workflows/ci.yml) runs on pushes to `main`, pull requests, and manual dispatch:
 
-- Ubuntu stable checks formatting, all-feature tests and doctests, Clippy for all targets, documentation with warnings denied, release benchmark smoke tests, the headless examples, and all-feature Cargo packaging.
-- Rust 1.95 tests the core and compiles each optional feature independently, then the combined package.
-- macOS and Windows compile all targets and run the library's native adapter tests.
+- Ubuntu stable runs `scripts/check-release.sh`: formatting, tests and doctests for all eight feature combinations, Clippy for all targets, complete API documentation with warnings denied, release benchmark smoke tests, the headless examples, and tests and all-target compilation from the extracted Cargo package.
+- Rust 1.95 tests every feature combination and compiles all targets.
+- macOS and Windows compile all targets and run all-feature tests and doctests.
 
 Dependencies are locked, actions are pinned to commit SHAs, jobs have a 15-minute limit, and superseded runs are canceled. The workflow only reads repository contents and saves dependency caches on `main`. CI runs release benchmarks as smoke tests and records their output; timing thresholds are kept out of shared runners.
 
-Rust 1.95 or newer. MIT licensed; see [LICENSE](LICENSE).
+## Stable release policy
+
+Textloom 1.x follows semantic versioning for its documented public API and feature names. Error enums are non-exhaustive; keep a fallback arm when matching them. Public adapter types use egui 0.36, winit 0.30, and AccessKit 0.24. Breaking upgrades to those exposed types require a Textloom major release. Exact error messages and benchmark timings may change.
+
+TLFR v1 bytes and their meanings remain stable independently of crate version. Unicode segmentation is pinned to version 1.13.3 (Unicode 17.0) because grapheme rules determine valid persisted style boundaries. Minimum Rust version increases, if needed, are announced in minor or major releases.
+
+Run `./scripts/check-release.sh --allow-dirty --tag v1.0.0` to check a pending release locally. A matching version tag runs the complete CI matrix and uploads the verified package plus a SHA-256 checksum. See [CHANGELOG.md](https://github.com/Cameron-Lyons/textloom/blob/main/CHANGELOG.md) for release notes and [RELEASING.md](https://github.com/Cameron-Lyons/textloom/blob/main/RELEASING.md) for compatibility rules, native-host checks, and publication steps.
+
+Rust 1.95 or newer. MIT licensed; see [LICENSE](https://github.com/Cameron-Lyons/textloom/blob/main/LICENSE).

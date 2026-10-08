@@ -72,8 +72,9 @@ vertical timing warms the starting paragraph first. First-use caches allocate
 and scan the required text, so a single cold validation can cost more than the
 old scan. Warm queries use indexed boundaries. Grapheme, scalar, and word
 indexes are independently lazy and shared through formatting/history snapshots.
-ASCII grapheme/scalar offsets use no indexes; ASCII word queries still use
-Unicode segmentation dynamically. Shared index memory is outside the retained
+ASCII grapheme/scalar offsets use no indexes. The source measured here still
+scanned ASCII words on each query; the October 8 changes below cache those queries
+too. Shared index memory is outside the retained
 text/formatting estimate returned by `history_bytes()`.
 
 ## Editing and replacement
@@ -88,4 +89,63 @@ The new batch workload replaces 10,000 occurrences of `match` with
 iterations averaged 446.91 µs per replace-all/undo pair. Batch replacement
 builds each affected paragraph once and produces one history delta, rather
 than repeatedly rebuilding a paragraph or shifting later match coordinates.
-Explicit search temporarily allocates a flattened text copy.
+This measurement used a flattened text copy for explicit search; single-paragraph
+searches now borrow text, as measured below.
+
+## October 8 cleanup measurements
+
+The expanded `benches/editing.rs` harness was run against a snapshot of the
+working tree before this cleanup and the updated source. Both used Rust 1.99.0,
+the same locked dependencies, default features, and separate target directories.
+The table reports the median of three sequential runs for each version; values
+are elapsed-time averages in microseconds per operation.
+
+| Operation | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| ASCII word backward + forward, cold | 654.12 | 791.77 |
+| ASCII word backward + forward, warm | 676.57 | 0.09 |
+| 1,000 long literal matches | 2,396.17 | 326.87 |
+| 10,000 replacements + undo | 394.10 | 327.41 |
+
+The ASCII workload repeats `A short paragraph with ASCII words. ` 10,000
+times (360,000 bytes), starts the caret 90% through the paragraph, and averages
+2,000 warm word-movement pairs. First use now builds a lazy word index; subsequent
+queries use binary searches. Cold navigation includes index construction and
+can cost more than one scan. ASCII grapheme/scalar navigation remains index free.
+
+The literal workload searches a 1,088-byte query repeated 1,000 times in a
+single paragraph and averages 50 searches. Borrowing the paragraph avoids a text
+copy, and reusing one literal searcher avoids rebuilding its query preprocessing
+for every accepted match. Rejected grapheme or word boundaries still retry
+overlapping candidates. These timings describe the stated workloads, not every
+search pattern or document size.
+
+## Accessibility navigation
+
+The AccessKit workload in `benches/editing.rs` is enabled with
+`cargo bench --locked --features accesskit --bench editing`. It builds a tree
+for 100 or 10,000 populated `aé👩‍💻` paragraphs and a trailing empty paragraph.
+After initial tree construction, it measures 2,000 position encode/decode
+roundtrips near the document end and 200 pairs of forward/backward caret moves
+and tree updates. Both sources used the same harness, locked dependencies, and
+release profile on October 8; values are medians of three sequential runs.
+
+| Populated paragraphs | Operation | Before (µs) | After (µs) |
+| ---: | --- | ---: | ---: |
+| 100 | Position roundtrip | 0.12 | 0.05 |
+| 10,000 | Position roundtrip | 34.74 | 0.04 |
+| 100 | Paired selection updates | 16.72 | 0.32 |
+| 10,000 | Paired selection updates | 2,110.16 | 6.83 |
+
+Content validation compares a shared identity token instead of scanning all
+paragraphs. Run-ID lookups use a cached index, rebuilt after content edits.
+Selection/label updates reuse paragraph nodes and their run index. The editor
+node's child list still needs to be cloned for selection updates, so that work
+continues to scale with paragraph count. Initial trees and content edits still
+visit every paragraph; this benchmark does not measure platform screen readers.
+
+The editing harness also checks ordinary literal queries on 100,000 short
+Unicode paragraphs, including matches, misses, and queries longer than every
+paragraph. Those searches now borrow paragraph text and skip paragraphs shorter
+than the query. Cross-paragraph, case-insensitive, and whole-word queries retain
+the flattened-text path.

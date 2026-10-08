@@ -1,10 +1,16 @@
+//! Standalone benchmarks for localized editing, Unicode navigation, and replacement.
+
 use std::{hint::black_box, time::Instant};
 use textloom::{Document, Editor, Movement, Position, SearchOptions, Selection};
 
 fn main() {
     short_paragraph_edits();
     unicode_navigation();
+    ascii_navigation();
+    literal_search();
     batch_replacement();
+    #[cfg(feature = "accesskit")]
+    accessibility_navigation();
 }
 
 fn short_paragraph_edits() {
@@ -83,6 +89,62 @@ fn paragraph_pair(editor: &mut Editor) {
     black_box(editor.selection());
 }
 
+fn ascii_navigation() {
+    let phrase = "A short paragraph with ASCII words. ";
+    let source = phrase.repeat(10_000);
+    let mut editor = Editor::from_text(&source);
+    editor
+        .set_selection(Selection::caret(Position::new(0, phrase.len() * 9_000)))
+        .unwrap();
+    let start = Instant::now();
+    word_pair(&mut editor);
+    println!(
+        "ASCII word backward + forward cold: {:.2} µs / first pair",
+        start.elapsed().as_secs_f64() * 1_000_000.0
+    );
+    measure("ASCII word backward + forward warm", 2_000, || {
+        word_pair(&mut editor);
+    });
+}
+
+fn literal_search() {
+    let needle = "A repeated literal search phrase. ".repeat(32);
+    let document = Document::from_text(&needle.repeat(1_000));
+    measure("1000 long literal matches", 50, || {
+        let matches = document.find(black_box(&needle), SearchOptions::default());
+        assert_eq!(matches.len(), 1_000);
+        black_box(matches);
+    });
+    measure("long paragraph literal miss", 50, || {
+        assert!(
+            document
+                .find(black_box("absent"), SearchOptions::default())
+                .is_empty()
+        );
+    });
+    let document =
+        Document::from_text(&"A short paragraph with Unicode café 👩‍💻.\n".repeat(100_000));
+    measure("100000 paragraph literal matches", 20, || {
+        let matches = document.find(black_box("Unicode"), SearchOptions::default());
+        assert_eq!(matches.len(), 100_000);
+        black_box(matches);
+    });
+    measure("100000 paragraph literal miss", 20, || {
+        assert!(
+            document
+                .find(black_box("absent"), SearchOptions::default())
+                .is_empty()
+        );
+    });
+    measure("100000 paragraphs shorter than query", 20, || {
+        assert!(
+            document
+                .find(black_box(&needle), SearchOptions::default())
+                .is_empty()
+        );
+    });
+}
+
 fn batch_replacement() {
     let mut editor = Editor::from_text(&"match ".repeat(10_000));
     assert_eq!(
@@ -117,4 +179,47 @@ fn measure(label: &str, iterations: usize, mut operation: impl FnMut()) {
         "{label}: {:.2} µs / operation ({iterations} iterations)",
         start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
     );
+}
+
+#[cfg(feature = "accesskit")]
+fn accessibility_navigation() {
+    use textloom::accessibility::AccessKitAdapter;
+
+    for paragraphs in [100, 10_000] {
+        let mut editor = Editor::from_text(&"aé👩‍💻\n".repeat(paragraphs));
+        let mut adapter = AccessKitAdapter::default();
+        adapter.update(&editor, "Notes", true).unwrap();
+        let position = Position::new(paragraphs - 1, 3);
+        let text_position = adapter.to_text_position(&editor, position).unwrap();
+        measure(
+            &format!("{paragraphs} paragraphs AccessKit position roundtrip"),
+            2_000,
+            || {
+                let encoded = adapter
+                    .to_text_position(&editor, black_box(position))
+                    .unwrap();
+                assert_eq!(encoded, text_position);
+                assert_eq!(
+                    adapter
+                        .from_text_position(&editor, black_box(encoded))
+                        .unwrap(),
+                    position
+                );
+            },
+        );
+        measure(
+            &format!("{paragraphs} paragraphs AccessKit selection update"),
+            200,
+            || {
+                editor
+                    .move_cursor(Movement::GraphemeForward, false)
+                    .unwrap();
+                black_box(adapter.update(&editor, "Notes", true).unwrap());
+                editor
+                    .move_cursor(Movement::GraphemeBackward, false)
+                    .unwrap();
+                black_box(adapter.update(&editor, "Notes", true).unwrap());
+            },
+        );
+    }
 }

@@ -4,14 +4,25 @@
 use super::ParagraphLayout;
 use crate::{Editor, InlineStyle, Paragraph, ParagraphKind, Position};
 use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, text::CCursor};
-use std::{fmt, ops::Range, sync::Arc};
+use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Failure to publish or apply the widget's native accessibility text model.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccessibilityError {
-    CharacterTooLong { position: Position, bytes: usize },
+    /// A grapheme exceeds AccessKit's maximum selectable UTF-8 character length.
+    CharacterTooLong {
+        /// Start of the unsupported grapheme in document coordinates.
+        position: Position,
+        /// UTF-8 byte length of the grapheme.
+        bytes: usize,
+    },
+    /// The rendered paragraphs do not match the committed document.
     InvalidLayout,
+    /// An action targets a text snapshot superseded by an edit.
     StaleDocument,
+    /// A requested caret stop is absent from the published text runs.
     InvalidTextPosition,
 }
 
@@ -52,11 +63,14 @@ struct ParagraphSnapshot {
     galley: Arc<Galley>,
     id: Id,
     runs: Vec<Run>,
+    geometries: Vec<Geometry>,
 }
 
 #[derive(Debug)]
 pub(super) struct Snapshot {
     paragraphs: Vec<ParagraphSnapshot>,
+    document_identity: Arc<()>,
+    run_locations: HashMap<accesskit::NodeId, (usize, usize)>,
 }
 
 fn paragraph_id(widget_id: Id, paragraph: usize) -> Id {
@@ -84,11 +98,6 @@ pub(super) fn build(
             return Err(AccessibilityError::InvalidLayout);
         }
         let id = paragraph_id(widget_id, index);
-        let scalar_boundaries: Vec<_> = text
-            .char_indices()
-            .map(|(byte, _)| byte)
-            .chain(std::iter::once(text.len()))
-            .collect();
         let mut row_ends = Vec::with_capacity(layout.galley.rows.len());
         let mut scalar_end = 0;
         for row in &layout.galley.rows {
@@ -97,6 +106,7 @@ pub(super) fn build(
         }
         let mut runs: Vec<Run> = Vec::new();
         let mut span_index = 0;
+        let mut scalar_start = 0;
         for (byte, grapheme) in text.grapheme_indices(true) {
             let length =
                 u8::try_from(grapheme.len()).map_err(|_| AccessibilityError::CharacterTooLong {
@@ -114,12 +124,7 @@ pub(super) fn build(
                 .spans()
                 .get(span_index)
                 .map_or(InlineStyle::default(), |span| span.style);
-            let scalar_start = scalar_boundaries
-                .binary_search(&byte)
-                .map_err(|_| AccessibilityError::InvalidLayout)?;
-            let scalar_end = scalar_boundaries
-                .binary_search(&(byte + grapheme.len()))
-                .map_err(|_| AccessibilityError::InvalidLayout)?;
+            let scalar_end = scalar_start + grapheme.chars().count();
             let row = row_ends
                 .partition_point(|end| *end <= scalar_start)
                 .min(row_ends.len() - 1);
@@ -145,6 +150,7 @@ pub(super) fn build(
             run.lengths.push(length);
             run.offsets.push(run.range.end);
             run.scalar_offsets.push(scalar_end);
+            scalar_start = scalar_end;
         }
         if runs.is_empty() {
             runs.push(Run {
@@ -165,24 +171,44 @@ pub(super) fn build(
             last.lengths.push(1);
             last.line_break = true;
         }
+        // Geometry only depends on the text runs and their cached galley.
+        // Keep it with the snapshot so caret changes do not redo layout work.
+        let geometries = runs
+            .iter()
+            .map(|run| run_geometry(run, &layout.galley))
+            .collect();
         paragraphs.push(ParagraphSnapshot {
             source: Arc::clone(source),
             galley: Arc::clone(&layout.galley),
             id,
             runs,
+            geometries,
         });
     }
-    Ok(Snapshot { paragraphs })
+    let run_locations = paragraphs
+        .iter()
+        .enumerate()
+        .flat_map(|(paragraph_index, paragraph)| {
+            paragraph
+                .runs
+                .iter()
+                .enumerate()
+                .map(move |(run_index, run)| (run.id.accesskit_id(), (paragraph_index, run_index)))
+        })
+        .collect();
+    Ok(Snapshot {
+        paragraphs,
+        document_identity: editor.document().content_identity(),
+        run_locations,
+    })
 }
 
 impl Snapshot {
     pub(super) fn matches_document(&self, editor: &Editor) -> bool {
-        self.paragraphs.len() == editor.document().paragraphs().len()
-            && self
-                .paragraphs
-                .iter()
-                .zip(editor.document().paragraphs())
-                .all(|(cached, current)| Arc::ptr_eq(&cached.source, current))
+        Arc::ptr_eq(
+            &self.document_identity,
+            &editor.document().content_identity(),
+        )
     }
 
     pub(super) fn is_current(&self, editor: &Editor, layouts: &[ParagraphLayout]) -> bool {
@@ -199,31 +225,29 @@ impl Snapshot {
         let paragraph = self.paragraphs.get(position.paragraph)?;
         // Prefer the next run at a shared boundary. In particular, paragraph
         // end must point before its synthetic newline, never after it.
-        for run in paragraph.runs.iter().rev() {
-            if let Ok(character_index) = run.offsets.binary_search(&position.byte) {
-                return Some(accesskit::TextPosition {
-                    node: run.id.accesskit_id(),
-                    character_index,
-                });
-            }
+        let index = paragraph
+            .runs
+            .partition_point(|run| run.range.start <= position.byte)
+            .checked_sub(1)?;
+        if let Some(run) = paragraph.runs.get(index)
+            && let Ok(character_index) = run.offsets.binary_search(&position.byte)
+        {
+            return Some(accesskit::TextPosition {
+                node: run.id.accesskit_id(),
+                character_index,
+            });
         }
         None
     }
 
     pub(super) fn decode(&self, position: accesskit::TextPosition) -> Option<Position> {
-        for (index, paragraph) in self.paragraphs.iter().enumerate() {
-            for run in &paragraph.runs {
-                if run.id.accesskit_id() != position.node {
-                    continue;
-                }
-                if let Some(byte) = run.offsets.get(position.character_index) {
-                    return Some(Position::new(index, *byte));
-                }
-                if run.line_break && position.character_index == run.offsets.len() {
-                    return Some(Position::new(index + 1, 0));
-                }
-                return None;
-            }
+        let &(index, run_index) = self.run_locations.get(&position.node)?;
+        let run = &self.paragraphs[index].runs[run_index];
+        if let Some(byte) = run.offsets.get(position.character_index) {
+            return Some(Position::new(index, *byte));
+        }
+        if run.line_break && position.character_index == run.offsets.len() {
+            return Some(Position::new(index + 1, 0));
         }
         None
     }
@@ -302,8 +326,9 @@ impl Snapshot {
             });
             let from_galley = to_global
                 * egui::emath::TSTransform::from_translation(paragraph_rect.min.to_vec2());
-            for (run_index, run) in paragraph.runs.iter().enumerate() {
-                let geometry = run_geometry(run, &paragraph.galley);
+            for (run_index, (run, geometry)) in
+                paragraph.runs.iter().zip(&paragraph.geometries).enumerate()
+            {
                 let local_rect = geometry.bounds.translate(paragraph_rect.min.to_vec2());
                 let _run_ui = Ui::new(
                     ui.ctx().clone(),
@@ -353,6 +378,7 @@ impl Snapshot {
     }
 }
 
+#[derive(Debug)]
 struct Geometry {
     bounds: Rect,
     positions: Option<Vec<f32>>,
@@ -553,8 +579,11 @@ mod tests {
         }
         let (_, wrapped) = make_snapshot("first second third fourth", 65.0);
         assert!(wrapped.paragraphs[0].runs.len() > 1);
-        for run in &wrapped.paragraphs[0].runs {
-            let geometry = run_geometry(run, &wrapped.paragraphs[0].galley);
+        for (run, geometry) in wrapped.paragraphs[0]
+            .runs
+            .iter()
+            .zip(&wrapped.paragraphs[0].geometries)
+        {
             assert_eq!(
                 geometry.positions.as_ref().unwrap().len(),
                 run.lengths.len()
@@ -574,5 +603,77 @@ mod tests {
         assert!(snapshot.matches_document(&editor));
         editor.insert_text("new").unwrap();
         assert!(!snapshot.matches_document(&editor));
+    }
+
+    #[test]
+    fn snapshots_validate_cloned_content_and_decode_wrapped_paragraphs() {
+        let (editor, snapshot) = make_snapshot("first\naé👩‍💻 second third\n", 65.0);
+        let cloned = Editor::new(editor.document().clone());
+        assert!(snapshot.matches_document(&cloned));
+        assert!(!snapshot.matches_document(&Editor::from_text("different\ntext\n")));
+
+        for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
+            for grapheme in 0..=paragraph.grapheme_count() {
+                let position =
+                    Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap());
+                assert_eq!(
+                    snapshot.decode(snapshot.position(position).unwrap()),
+                    Some(position)
+                );
+            }
+        }
+        assert_eq!(
+            snapshot.decode(accesskit::TextPosition {
+                node: accesskit::NodeId(u64::MAX),
+                character_index: 0,
+            }),
+            None
+        );
+        let run = snapshot.position(Position::new(1, 0)).unwrap();
+        assert_eq!(
+            snapshot.decode(accesskit::TextPosition {
+                character_index: usize::MAX,
+                ..run
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_geometry_follows_the_widget_origin_when_published() {
+        let (editor, snapshot) = make_snapshot("a👩🏽‍💻e\u{301}", 500.0);
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let paragraph = &snapshot.paragraphs[0];
+        let run_id = paragraph.runs[0].id.accesskit_id();
+        let layouts = vec![ParagraphLayout {
+            galley: Arc::clone(&paragraph.galley),
+            rect: Rect::from_min_size(Pos2::ZERO, paragraph.galley.size()),
+            marker: None,
+            marker_position: Pos2::ZERO,
+        }];
+        let publish_bounds = |origin| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                snapshot.publish(ui, Id::new("editor"), &editor, &layouts, origin, false);
+            });
+            output.textures_delta.clear();
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(id, _)| *id == run_id)
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap()
+        };
+        let first = publish_bounds(Pos2::new(10.0, 20.0));
+        let moved = publish_bounds(Pos2::new(110.0, 220.0));
+        assert_eq!(moved.x0 - first.x0, 100.0);
+        assert_eq!(moved.x1 - first.x1, 100.0);
+        assert_eq!(moved.y0 - first.y0, 200.0);
+        assert_eq!(moved.y1 - first.y1, 200.0);
     }
 }

@@ -142,6 +142,9 @@ fn escape(output: &mut String, text: &str) {
     let mut start = 0;
     for (index, byte) in text.bytes().enumerate() {
         let escaped = match byte {
+            // A literal NULL is a parse error and is discarded in HTML body
+            // text. Use its visible replacement, as for a NULL reference.
+            0 => "\u{fffd}",
             b'&' => "&amp;",
             b'<' => "&lt;",
             b'>' => "&gt;",

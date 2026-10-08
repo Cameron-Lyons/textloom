@@ -1,3 +1,5 @@
+//! Editor selection, Unicode navigation, formatting, IME, and history contracts.
+
 use std::sync::Arc;
 use textloom::{
     Document, Editor, Error, HistoryLimits, Movement, ParagraphKind, Position, Selection,
@@ -49,6 +51,46 @@ fn invalid_selection_is_atomic() {
             .is_err()
     );
     assert!(!editor.can_undo());
+}
+
+#[test]
+fn style_lookup_rejects_invalid_utf8_and_grapheme_positions() {
+    let mut editor = Editor::from_text("é e\u{301} 👩‍💻");
+    editor.select_all();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let document = editor.document();
+    for byte in 0..=document.end().byte + 1 {
+        let position = Position::new(0, byte);
+        if document.validate_position(position).is_ok() {
+            assert!(
+                document.style_at(position).bold,
+                "valid position {position:?}"
+            );
+        } else {
+            assert_eq!(
+                document.style_at(position),
+                Default::default(),
+                "{position:?}"
+            );
+        }
+    }
+    assert_eq!(
+        document.style_at(Position::new(usize::MAX, 0)),
+        Default::default()
+    );
+    assert_eq!(
+        document.style_at(Position::new(0, usize::MAX)),
+        Default::default()
+    );
+    assert_eq!(
+        Document::new().style_at(Position::default()),
+        Default::default()
+    );
 }
 
 #[test]
@@ -294,6 +336,37 @@ fn history_limits_apply_to_both_directions_and_new_edit_discards_redo() {
     assert_eq!(editor.history_bytes(), 0);
     editor.insert_text("Y").unwrap();
     assert!(!editor.can_undo());
+}
+
+#[test]
+fn history_limits_discard_farthest_redo_and_preserve_the_next_steps() {
+    let mut editor = Editor::default();
+    for text in ["a", "b", "c", "d"] {
+        editor.break_history_group();
+        editor.insert_text(text).unwrap();
+    }
+    while editor.undo() {}
+    assert_eq!(editor.redo_len(), 4);
+    editor.set_history_limits(HistoryLimits {
+        max_entries: 2,
+        max_bytes: usize::MAX,
+    });
+    assert_eq!(editor.redo_len(), 2);
+    assert!(editor.redo());
+    assert_eq!(editor.document().plain_text(), "a");
+    assert!(editor.redo());
+    assert_eq!(editor.document().plain_text(), "ab");
+    assert!(!editor.redo());
+    assert!(editor.undo());
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "");
+
+    editor.set_history_limits(HistoryLimits {
+        max_entries: 0,
+        max_bytes: 0,
+    });
+    assert_eq!(editor.redo_len(), 0);
+    assert_eq!(editor.history_bytes(), 0);
 }
 
 #[test]

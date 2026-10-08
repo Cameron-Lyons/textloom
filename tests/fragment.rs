@@ -1,3 +1,5 @@
+//! Rich clipboard, persisted-format compatibility, and HTML export regressions.
+
 use std::sync::Arc;
 
 use textloom::{
@@ -373,6 +375,78 @@ fn version_one_encoding_has_fixed_architecture_independent_layout() {
 }
 
 #[test]
+fn version_one_rich_fixture_remains_readable_and_byte_identical() {
+    // This fixture was assembled directly from the documented v1 layout,
+    // independently of Textloom's encoder. Keep its bytes stable for 1.x.
+    let bytes = include_bytes!("fixtures/native-v1.tlfr");
+    let mut editor = Editor::from_text("\nAé👩‍💻\ne\u{301}\nZ\n");
+    select_paragraph(&mut editor, 1);
+    editor
+        .set_paragraph_kind(ParagraphKind::Heading { level: 6 })
+        .unwrap();
+    editor
+        .set_selection(Selection::new(Position::new(1, 1), Position::new(1, 3)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            italic: Some(true),
+            underline: Some(true),
+            strikethrough: Some(true),
+            code: Some(true),
+            foreground: Some(Some(Color([1, 2, 3, 4]))),
+        })
+        .unwrap();
+    editor
+        .set_selection(Selection::new(Position::new(1, 3), Position::new(1, 14)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            code: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    select_paragraph(&mut editor, 2);
+    editor
+        .set_paragraph_kind(ParagraphKind::Bullet { indent: u8::MAX })
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    select_paragraph(&mut editor, 3);
+    editor
+        .set_paragraph_kind(ParagraphKind::Ordered {
+            indent: u8::MAX,
+            start: u32::MAX,
+        })
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            italic: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let expected = Fragment::from_document(editor.document());
+    let decoded = Fragment::from_bytes(bytes).unwrap();
+    assert_eq!(decoded, expected);
+    assert_eq!(decoded.to_bytes(), bytes);
+    assert_eq!(expected.to_bytes(), bytes);
+    assert_eq!(Document::from_bytes(bytes).unwrap().to_bytes(), bytes);
+}
+
+#[test]
+fn decoder_rejects_inputs_larger_than_its_byte_limit_before_parsing() {
+    let oversized = vec![0; 64 * 1024 * 1024 + 1];
+    assert_eq!(
+        Fragment::from_bytes(&oversized),
+        Err(FragmentError::LimitExceeded)
+    );
+}
+
+#[test]
 fn rejects_bad_signature_version_lengths_counts_and_unknown_kinds() {
     let mut invalid_magic = Fragment::default().to_bytes();
     invalid_magic[0] = b'X';
@@ -491,6 +565,35 @@ fn html_escapes_text_and_exports_all_inline_styles_and_heading_levels() {
     assert_eq!(
         Fragment::from_text("<script>alert('x')</script> & 🦀").to_html(),
         "<div style=\"white-space:pre-wrap\"><p>&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; 🦀</p></div>"
+    );
+}
+
+#[test]
+fn html_replaces_nulls_without_losing_surrounding_unicode_or_escaping() {
+    let document = Document::from_text("\0é\0<&🦀\0");
+    let expected = "<div style=\"white-space:pre-wrap\"><p>�é�&lt;&amp;🦀�</p></div>";
+    assert_eq!(document.to_html(), expected);
+    let fragment = Fragment::from_document(&document);
+    assert_eq!(fragment.to_html(), expected);
+    // The native interchange remains lossless for text HTML cannot represent.
+    assert_eq!(
+        Fragment::from_bytes(&fragment.to_bytes()).unwrap(),
+        fragment
+    );
+}
+
+#[test]
+fn html_exports_each_valid_heading_level_and_keeps_empty_headings_visible() {
+    let mut editor = Editor::from_text("one\ntwo\nthree\nfour\nfive\n");
+    for level in 1..=6 {
+        select_paragraph(&mut editor, usize::from(level - 1));
+        editor
+            .set_paragraph_kind(ParagraphKind::Heading { level })
+            .unwrap();
+    }
+    assert_eq!(
+        editor.document().to_html(),
+        "<div style=\"white-space:pre-wrap\"><h1>one</h1><h2>two</h2><h3>three</h3><h4>four</h4><h5>five</h5><h6><br></h6></div>"
     );
 }
 

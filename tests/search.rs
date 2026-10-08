@@ -1,3 +1,5 @@
+//! Literal and Unicode lowercase search coordinates and boundary contracts.
+
 use textloom::{Document, Position, SearchOptions};
 
 fn default_options() -> SearchOptions {
@@ -18,6 +20,34 @@ fn literal_matches_are_ordered_nonoverlapping_and_empty_queries_match_nothing() 
     assert!(document.find("", default_options()).is_empty());
     assert!(Document::new().find("a", default_options()).is_empty());
     assert!(document.find("BANANA", default_options()).is_empty());
+}
+
+#[test]
+fn paragraph_local_literals_preserve_empty_paragraphs_and_unicode_boundaries() {
+    let document = Document::from_text("\na\nba aa\n\ne\u{301} e\n🇨🇺🇺🇺\na\n");
+    assert_eq!(
+        document.find("a", default_options()),
+        vec![
+            Position::new(1, 0)..Position::new(1, 1),
+            Position::new(2, 1)..Position::new(2, 2),
+            Position::new(2, 3)..Position::new(2, 4),
+            Position::new(2, 4)..Position::new(2, 5),
+            Position::new(6, 0)..Position::new(6, 1),
+        ]
+    );
+    assert_eq!(
+        document.find("aa", default_options()),
+        vec![Position::new(2, 3)..Position::new(2, 5)]
+    );
+    assert_eq!(
+        document.find("e", default_options()),
+        vec![Position::new(4, 4)..Position::new(4, 5)]
+    );
+    assert_eq!(
+        document.find("🇺🇺", default_options()),
+        vec![Position::new(5, 8)..Position::new(5, 16)]
+    );
+    assert!(document.find("aa aa aa", default_options()).is_empty());
 }
 
 #[test]
@@ -159,4 +189,45 @@ fn lowercase_byte_width_changes_map_before_between_and_after_matches() {
         ]
     );
     assert!(document.find("i", options).is_empty());
+}
+
+#[test]
+fn overlapping_retries_preserve_earlier_and_later_matches() {
+    for source in ["🇺🇺 🇨🇺🇺🇺 🇺🇺", "🇺🇺\n🇨🇺🇺🇺\n🇺🇺"] {
+        let document = Document::from_text(source);
+        let matches = document.find("🇺🇺", SearchOptions::default());
+        assert_eq!(matches.len(), 3);
+        for range in &matches {
+            assert_eq!(document.text(range.clone()).unwrap(), "🇺🇺");
+        }
+        assert!(matches.windows(2).all(|pair| pair[0].end <= pair[1].start));
+    }
+
+    let document = Document::from_text("i İ i\ni İ i");
+    let matches = document.find(
+        "i",
+        SearchOptions {
+            case_sensitive: false,
+            whole_word: false,
+        },
+    );
+    assert_eq!(matches.len(), 4);
+    for range in matches {
+        assert_eq!(document.text(range).unwrap(), "i");
+    }
+
+    assert_eq!(
+        Document::from_text("a-a aa-a-a a-a").find(
+            "a-a",
+            SearchOptions {
+                whole_word: true,
+                ..Default::default()
+            }
+        ),
+        vec![
+            Position::new(0, 0)..Position::new(0, 3),
+            Position::new(0, 7)..Position::new(0, 10),
+            Position::new(0, 11)..Position::new(0, 14),
+        ]
+    );
 }

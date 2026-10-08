@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 use egui::{
     Color32, Event, FontFamily, FontId, Galley, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
     Sense, Stroke, TextFormat, TextStyle, Ui, Vec2, Widget,
-    text::{CCursor, CharIndex, LayoutJob},
+    text::{ByteIndex, CCursor, CharIndex, LayoutJob, LayoutSection},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -48,13 +48,16 @@ pub struct RichTextEditor<'a> {
 /// the application also wants to inspect errors. Invalid external IME ranges are
 /// reported here rather than panicking or altering the document.
 pub struct RichTextEditorOutput {
+    /// Focus, hover, interaction, and document-change state for the widget.
     pub response: Response,
+    /// Editor commands rejected by core validation.
     pub errors: Vec<Error>,
     /// Errors from publishing or applying native accessibility text actions.
     pub accessibility_errors: Vec<AccessibilityError>,
 }
 
 impl<'a> RichTextEditor<'a> {
+    /// Borrow an editor for one frame, using the body font and four minimum rows.
     pub fn new(editor: &'a mut Editor) -> Self {
         Self {
             editor,
@@ -69,36 +72,43 @@ impl<'a> RichTextEditor<'a> {
         }
     }
 
+    /// Set the persistent widget ID, overriding any ID salt.
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
         self
     }
 
+    /// Derive a persistent ID from the containing UI and this salt.
     pub fn id_salt(mut self, salt: impl egui::AsIdSalt) -> Self {
         self.salt = Some(egui::IdSalt::new(salt));
         self
     }
 
+    /// Set the desired width in points, clamped to the UI width and at least 32.
     pub fn desired_width(mut self, width: f32) -> Self {
         self.desired_width = Some(width.max(32.0));
         self
     }
 
+    /// Reserve at least this many body-font rows, with a minimum of one.
     pub fn min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
         self
     }
 
+    /// Set the base font; headings scale its size and code uses monospace.
     pub fn font(mut self, font: FontId) -> Self {
         self.font = Some(font);
         self
     }
 
+    /// Select a host-registered font family for bold spans.
     pub fn bold_font_family(mut self, family: FontFamily) -> Self {
         self.bold_family = Some(family);
         self
     }
 
+    /// Display placeholder text when the document and composition are empty.
     pub fn hint_text(mut self, hint: impl Into<String>) -> Self {
         self.hint = hint.into();
         self
@@ -113,6 +123,7 @@ impl<'a> RichTextEditor<'a> {
         self
     }
 
+    /// Process focused input, render the document, and return interaction errors.
     pub fn show(self, ui: &mut Ui) -> RichTextEditorOutput {
         let id = self.id.unwrap_or_else(|| {
             self.salt
@@ -154,8 +165,10 @@ impl<'a> RichTextEditor<'a> {
         let mut errors = Vec::new();
         let mut accessibility_errors = Vec::new();
         let mut layouts = cache.layout(ui, self.editor, &appearance);
+        cache.validate_navigation(self.editor.selection());
         let old_text = publish_text.then(|| cache.plain_text(self.editor.document()));
-        let mut interrupted = self.read_only && self.editor.cancel_composition();
+        let mut interrupted =
+            (self.read_only || !ui.is_enabled()) && self.editor.cancel_composition();
         let initial_preview = match cache.layout_preview(ui, self.editor, &appearance) {
             Ok(layouts) => layouts,
             Err(error) => {
@@ -246,6 +259,7 @@ impl<'a> RichTextEditor<'a> {
                 layouts = cache.layout(ui, self.editor, &appearance);
             }
             if response.clicked() || response.drag_started() {
+                cache.navigation = None;
                 response.request_focus();
                 if let Some(pointer) = response.interact_pointer_pos() {
                     interrupted |= self.editor.cancel_composition();
@@ -274,6 +288,7 @@ impl<'a> RichTextEditor<'a> {
             if response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
+                cache.navigation = None;
                 interrupted |= self.editor.cancel_composition();
                 let position = hit_test(self.editor, &layouts, pointer - origin);
                 record(
@@ -284,6 +299,7 @@ impl<'a> RichTextEditor<'a> {
             }
 
             if response.has_focus() {
+                cache.validate_navigation(self.editor.selection());
                 ui.memory_mut(|memory| {
                     memory.set_focus_lock_filter(
                         id,
@@ -298,13 +314,16 @@ impl<'a> RichTextEditor<'a> {
                 let events = ui.input(|input| input.events.clone());
                 let mut consumed = Vec::new();
                 for (index, event) in events.iter().enumerate() {
+                    if !ui.memory(|memory| memory.has_focus(id)) {
+                        break;
+                    }
                     let revision = self.editor.document().revision();
                     if handle_event(
                         self.editor,
                         ui,
                         event,
                         &layouts,
-                        origin,
+                        &mut cache.navigation,
                         &mut errors,
                         &mut interrupted,
                         self.read_only,
@@ -314,12 +333,17 @@ impl<'a> RichTextEditor<'a> {
                     if revision != self.editor.document().revision() {
                         layouts = cache.layout(ui, self.editor, &appearance);
                     }
+                    cache.validate_navigation(self.editor.selection());
                 }
                 // Leave pointer events and unrelated shortcuts available to the host.
                 ui.input_mut(|input| {
+                    let mut consumed = consumed.into_iter().peekable();
                     let mut index = 0;
                     input.events.retain(|_| {
-                        let retain = !consumed.contains(&index);
+                        let retain = consumed.peek() != Some(&index);
+                        if !retain {
+                            consumed.next();
+                        }
                         index += 1;
                         retain
                     });
@@ -424,8 +448,18 @@ impl<'a> RichTextEditor<'a> {
             if response.has_focus() {
                 let caret_position =
                     preview.map_or(self.editor.selection().focus, |preview| preview.caret);
-                let caret =
-                    document_caret_rect(display_document, display_layouts, origin, caret_position);
+                let prefer_next_row = preview.is_some()
+                    || cache
+                        .navigation
+                        .as_ref()
+                        .is_none_or(|navigation| navigation.prefer_next_row);
+                let caret = document_caret_rect(
+                    display_document,
+                    display_layouts,
+                    origin,
+                    caret_position,
+                    prefer_next_row,
+                );
                 let show_caret = self
                     .editor
                     .composition()
@@ -445,7 +479,7 @@ impl<'a> RichTextEditor<'a> {
                     .ctx()
                     .layer_transform_to_global(ui.layer_id())
                     .unwrap_or_default();
-                if !self.read_only {
+                if !self.read_only && ui.is_enabled() {
                     ui.output_mut(|output| {
                         output.ime = Some(egui::output::IMEOutput {
                             purpose: egui::IMEPurpose::Normal,
@@ -563,6 +597,14 @@ struct Cache {
     plain_text: Option<Arc<str>>,
     preview: Option<Box<CompositionPreview>>,
     accessibility: Option<Arc<accessibility::Snapshot>>,
+    navigation: Option<VerticalNavigation>,
+}
+
+#[derive(Clone)]
+struct VerticalNavigation {
+    selection: Selection,
+    preferred_x: f32,
+    prefer_next_row: bool,
 }
 
 #[derive(Clone)]
@@ -584,6 +626,16 @@ struct ParagraphLayout {
 }
 
 impl Cache {
+    fn validate_navigation(&mut self, selection: Selection) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.selection != selection)
+        {
+            self.navigation = None;
+        }
+    }
+
     fn layout(
         &mut self,
         ui: &Ui,
@@ -619,6 +671,7 @@ impl Cache {
             if !appearance_changed && !document_changed && !fonts_changed {
                 return;
             }
+            self.navigation = None;
             let mut create = |paragraph: &Arc<Paragraph>| {
                 let (indent, marker) = match paragraph.kind() {
                     ParagraphKind::Bullet { indent } => {
@@ -645,11 +698,19 @@ impl Cache {
                 let indent = indent.min((appearance.width - appearance.font.size * 2.0).max(0.0));
                 let job =
                     paragraph_job(paragraph, appearance, (appearance.width - indent).max(8.0));
+                let chars = paragraph.scalar_count();
+                let mut galley = fonts.layout_job(job);
+                if galley.end().index.0 != chars {
+                    // egui's shaper can duplicate scalar slots for descending
+                    // clusters. Retry independent scalars to retain valid text
+                    // coordinates and every original section's appearance.
+                    galley = fonts.layout_job(scalar_layout_job(&galley.job));
+                }
                 ParagraphCache {
                     paragraph: paragraph.clone(),
-                    galley: fonts.layout_job(job),
+                    galley,
                     marker,
-                    chars: paragraph.scalar_count(),
+                    chars,
                     indent,
                 }
             };
@@ -858,6 +919,28 @@ fn paragraph_job(paragraph: &Paragraph, appearance: &Appearance, width: f32) -> 
     job
 }
 
+fn scalar_layout_job(source: &LayoutJob) -> LayoutJob {
+    let mut job = source.clone();
+    job.sections.clear();
+    for section in &source.sections {
+        let start = section.byte_range.start.0;
+        let end = section.byte_range.end.0;
+        for (offset, scalar) in source.text[start..end].char_indices() {
+            job.sections.push(LayoutSection {
+                leading_space: if offset == 0 {
+                    section.leading_space
+                } else {
+                    0.0
+                },
+                byte_range: ByteIndex(start + offset)
+                    ..ByteIndex(start + offset + scalar.len_utf8()),
+                format: section.format.clone(),
+            });
+        }
+    }
+    job
+}
+
 fn text_format(style: InlineStyle, appearance: &Appearance, size_scale: f32) -> TextFormat {
     let mut font = appearance.font.clone();
     font.size *= size_scale;
@@ -941,25 +1024,6 @@ fn byte_from_char(text: &str, index: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
-fn document_char_offset(editor: &Editor, position: Position) -> usize {
-    let preceding: usize = editor
-        .document()
-        .paragraphs()
-        .iter()
-        .take(position.paragraph)
-        .map(|p| p.scalar_count() + 1)
-        .sum();
-    preceding
-        + editor
-            .document()
-            .paragraph(position.paragraph)
-            .map_or(0, |paragraph| {
-                paragraph
-                    .scalar_index(position.byte)
-                    .unwrap_or(paragraph.scalar_count())
-            })
-}
-
 fn snap_grapheme(text: &str, byte: usize) -> usize {
     let mut previous = 0;
     for (next, _) in text.grapheme_indices(true) {
@@ -987,8 +1051,17 @@ fn word_selection(editor: &Editor, position: Position) -> Selection {
     else {
         return Selection::caret(position);
     };
+    // Hit testing snaps the right half of the final grapheme to paragraph end.
+    // Double clicking there should still select the trailing word or symbol.
+    let byte = if position.byte == text.len() {
+        text.grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start)
+    } else {
+        position.byte
+    };
     for (start, word) in text.split_word_bound_indices() {
-        if start <= position.byte && position.byte < start + word.len() {
+        if start <= byte && byte < start + word.len() {
             return Selection::new(
                 Position::new(position.paragraph, snap_grapheme(text, start)),
                 Position::new(position.paragraph, snap_grapheme(text, start + word.len())),
@@ -998,20 +1071,12 @@ fn word_selection(editor: &Editor, position: Position) -> Selection {
     Selection::caret(position)
 }
 
-fn caret_rect(
-    editor: &Editor,
-    layouts: &[ParagraphLayout],
-    origin: Pos2,
-    position: Position,
-) -> Rect {
-    document_caret_rect(editor.document(), layouts, origin, position)
-}
-
 fn document_caret_rect(
     document: &Document,
     layouts: &[ParagraphLayout],
     origin: Pos2,
     position: Position,
+    prefer_next_row: bool,
 ) -> Rect {
     let Some(layout) = layouts.get(position.paragraph) else {
         return Rect::from_min_size(origin, Vec2::new(0.0, 16.0));
@@ -1027,9 +1092,126 @@ fn document_caret_rect(
         .galley
         .pos_from_cursor(CCursor {
             index: CharIndex(index),
-            prefer_next_row: true,
+            prefer_next_row,
         })
         .translate(origin.to_vec2() + layout.rect.min.to_vec2())
+}
+
+fn vertical_position(
+    editor: &Editor,
+    layouts: &[ParagraphLayout],
+    navigation: Option<&VerticalNavigation>,
+    down: bool,
+) -> Option<(Position, f32, bool)> {
+    let focus = editor.selection().focus;
+    let source = editor.document().paragraph(focus.paragraph)?;
+    let layout = layouts.get(focus.paragraph)?;
+    let cursor = CCursor {
+        index: CharIndex(source.scalar_index(focus.byte)?),
+        prefer_next_row: navigation.is_none_or(|navigation| navigation.prefer_next_row),
+    };
+    let row = layout.galley.layout_from_cursor(cursor).row;
+    let preferred_x = navigation.map_or_else(
+        || layout.rect.left() + layout.galley.pos_from_cursor(cursor).center().x,
+        |navigation| navigation.preferred_x,
+    );
+    let (paragraph, cursor) = if down && row + 1 < layout.galley.rows.len() {
+        (
+            focus.paragraph,
+            layout
+                .galley
+                .cursor_down_one_row(&cursor, Some(preferred_x - layout.rect.left()))
+                .0,
+        )
+    } else if !down && row > 0 {
+        (
+            focus.paragraph,
+            layout
+                .galley
+                .cursor_up_one_row(&cursor, Some(preferred_x - layout.rect.left()))
+                .0,
+        )
+    } else if down && focus.paragraph + 1 < layouts.len() {
+        let paragraph = focus.paragraph + 1;
+        let target = &layouts[paragraph];
+        let row = target.galley.rows.first()?;
+        (
+            paragraph,
+            target.galley.cursor_from_pos(Vec2::new(
+                preferred_x - target.rect.left(),
+                row.rect().center().y,
+            )),
+        )
+    } else if !down && focus.paragraph > 0 {
+        let paragraph = focus.paragraph - 1;
+        let target = &layouts[paragraph];
+        let row = target.galley.rows.last()?;
+        (
+            paragraph,
+            target.galley.cursor_from_pos(Vec2::new(
+                preferred_x - target.rect.left(),
+                row.rect().center().y,
+            )),
+        )
+    } else {
+        (
+            focus.paragraph,
+            if down {
+                layout.galley.end()
+            } else {
+                layout.galley.begin()
+            },
+        )
+    };
+    let source = editor.document().paragraph(paragraph)?;
+    let (byte, prefer_next_row) =
+        snap_vertical_cursor(source, &layouts[paragraph].galley, cursor, down)?;
+    Some((Position::new(paragraph, byte), preferred_x, prefer_next_row))
+}
+
+fn snap_vertical_cursor(
+    source: &Paragraph,
+    galley: &Galley,
+    cursor: CCursor,
+    down: bool,
+) -> Option<(usize, bool)> {
+    let byte = source.byte_from_scalar(cursor.index.0)?;
+    let before = source.boundary_at_or_before(byte);
+    let after = source.boundary_at_or_after(byte);
+    if before == after {
+        return Some((byte, cursor.prefer_next_row));
+    }
+    // A space followed by combining marks can wrap between its scalar glyphs.
+    // Prefer a real caret boundary on the target row rather than snapping back
+    // onto the row we just left. Recompute affinity for the snapped boundary.
+    let target_row = galley.layout_from_cursor(cursor).row;
+    let on_target_row = |byte| {
+        let index = CharIndex(source.scalar_index(byte)?);
+        [cursor.prefer_next_row, !cursor.prefer_next_row]
+            .into_iter()
+            .find(|&prefer_next_row| {
+                galley
+                    .layout_from_cursor(CCursor {
+                        index,
+                        prefer_next_row,
+                    })
+                    .row
+                    == target_row
+            })
+    };
+    match (on_target_row(before), on_target_row(after)) {
+        (Some(before_affinity), Some(after_affinity)) => Some(if byte - before <= after - byte {
+            (before, before_affinity)
+        } else {
+            (after, after_affinity)
+        }),
+        (Some(affinity), None) => Some((before, affinity)),
+        (None, Some(affinity)) => Some((after, affinity)),
+        // A grapheme spanning the entire target row has no legal caret there.
+        // Cross the cluster in the requested direction, using the closest row
+        // representation of that boundary when it falls on another wrap seam.
+        (None, None) => Some(if down { (after, false) } else { (before, true) }),
+    }
 }
 
 fn paint_document_selection(
@@ -1110,7 +1292,7 @@ fn handle_event(
     ui: &Ui,
     event: &Event,
     layouts: &[ParagraphLayout],
-    origin: Pos2,
+    navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
     read_only: bool,
@@ -1127,13 +1309,14 @@ fn handle_event(
             _ => {}
         }
     }
+    if matches!(event, Event::Paste(text) if text.is_empty()) {
+        return true;
+    }
     if editor
         .composition()
         .is_some_and(|composition| composition.text.is_empty())
-        && matches!(
-            event,
-            Event::Text(_) | Event::Paste(_) | Event::Cut | Event::Key { pressed: true, .. }
-        )
+        && (matches!(event, Event::Text(_) | Event::Paste(_) | Event::Cut)
+            || matches!(event, Event::Key { key, pressed: true, .. } if *key != Key::Escape))
     {
         // Empty preedit can be followed by either Commit or normal typing.
         // Keep the replacement for Commit, then cancel it when typing resumes.
@@ -1213,8 +1396,9 @@ fn handle_event(
             ..
         } => {
             if *key == Key::Escape {
-                *interrupted |= editor.cancel_composition();
-                if !*interrupted {
+                let canceled = editor.cancel_composition();
+                *interrupted |= canceled;
+                if !canceled {
                     ui.memory_mut(|memory| {
                         if let Some(id) = memory.focused() {
                             memory.surrender_focus(id);
@@ -1226,7 +1410,9 @@ fn handle_event(
             if editor.composition().is_some() {
                 return false;
             }
-            handle_key(editor, *key, *modifiers, layouts, origin, errors, read_only)
+            handle_key(
+                editor, *key, *modifiers, layouts, navigation, errors, read_only,
+            )
         }
         _ => false,
     }
@@ -1237,13 +1423,18 @@ fn handle_key(
     key: Key,
     modifiers: Modifiers,
     layouts: &[ParagraphLayout],
-    origin: Pos2,
+    navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
     read_only: bool,
 ) -> bool {
+    // Ctrl+Alt may be AltGr, and Command+Control is a host shortcut chord.
+    let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
+    if command || !matches!(key, Key::ArrowUp | Key::ArrowDown) {
+        *navigation = None;
+    }
     if read_only
         && (matches!(key, Key::Backspace | Key::Delete | Key::Enter)
-            || modifiers.command
+            || command
                 && matches!(
                     key,
                     Key::Z
@@ -1264,7 +1455,7 @@ fn handle_key(
     {
         return true;
     }
-    if modifiers.command {
+    if command {
         match key {
             Key::A => {
                 editor.select_all();
@@ -1353,6 +1544,10 @@ fn handle_key(
     }
     let by_word = modifiers.ctrl || modifiers.alt;
     let movement = match key {
+        Key::ArrowLeft if command && modifiers.mac_cmd => Some(Movement::ParagraphStart),
+        Key::ArrowRight if command && modifiers.mac_cmd => Some(Movement::ParagraphEnd),
+        Key::ArrowUp if command => Some(Movement::DocumentStart),
+        Key::ArrowDown if command => Some(Movement::DocumentEnd),
         Key::ArrowLeft => Some(if by_word {
             Movement::WordBackward
         } else {
@@ -1381,14 +1576,11 @@ fn handle_key(
     }
     match key {
         Key::ArrowUp | Key::ArrowDown => {
-            let caret = caret_rect(editor, layouts, origin, editor.selection().focus);
-            let direction = if key == Key::ArrowUp { -1.0 } else { 1.0 };
-            let position = hit_test(
-                editor,
-                layouts,
-                caret.center() - origin
-                    + Vec2::new(0.0, direction * (caret.height() + PARAGRAPH_GAP)),
-            );
+            let Some((position, preferred_x, prefer_next_row)) =
+                vertical_position(editor, layouts, navigation.as_ref(), key == Key::ArrowDown)
+            else {
+                return true;
+            };
             let anchor = if modifiers.shift {
                 editor.selection().anchor
             } else {
@@ -1398,6 +1590,11 @@ fn handle_key(
                 editor.set_selection(Selection::new(anchor, position)),
                 errors,
             );
+            *navigation = Some(VerticalNavigation {
+                selection: editor.selection(),
+                preferred_x,
+                prefer_next_row,
+            });
             true
         }
         Key::Backspace => {
@@ -1422,7 +1619,7 @@ fn handle_key(
             );
             true
         }
-        Key::Enter => {
+        Key::Enter if !modifiers.command => {
             record(editor.insert_paragraph(), errors);
             true
         }
@@ -1470,31 +1667,66 @@ fn selected_paragraphs(editor: &Editor) -> std::ops::Range<usize> {
 
 fn delete_surrounding(editor: &mut Editor, before: usize, after: usize, errors: &mut Vec<Error>) {
     let focus = editor.selection().focus;
-    let focus_char = document_char_offset(editor, focus);
-    let start = position_from_document_char(editor, focus_char.saturating_sub(before), false);
-    let end = position_from_document_char(editor, focus_char.saturating_add(after), true);
+    let start = surrounding_position(editor.document(), focus, before, false);
+    let end = surrounding_position(editor.document(), focus, after, true);
     if start < end {
         record(editor.replace_range(start..end, ""), errors);
     }
 }
 
-fn position_from_document_char(editor: &Editor, mut index: usize, round_up: bool) -> Position {
-    for (paragraph, source) in editor.document().paragraphs().iter().enumerate() {
+fn surrounding_position(
+    document: &Document,
+    focus: Position,
+    mut remaining: usize,
+    forward: bool,
+) -> Position {
+    let mut paragraph = focus.paragraph;
+    let mut index = document
+        .paragraph(paragraph)
+        .expect("editor maintains a valid selection")
+        .scalar_index(focus.byte)
+        .expect("editor maintains a valid selection");
+    loop {
+        let source = document.paragraph(paragraph).expect("valid paragraph");
         let chars = source.scalar_count();
-        if index <= chars {
+        let available = if forward { chars - index } else { index };
+        if remaining <= available {
+            let target = if forward {
+                index + remaining
+            } else {
+                index - remaining
+            };
             let byte = source
-                .byte_from_scalar(index)
+                .byte_from_scalar(target)
                 .unwrap_or(source.text().len());
-            let boundary = if round_up {
+            let boundary = if forward {
                 source.boundary_at_or_after(byte)
             } else {
                 source.boundary_at_or_before(byte)
             };
             return Position::new(paragraph, boundary);
         }
-        index -= chars + 1;
+        // Only visit paragraphs crossed by the requested native scalar count.
+        // Each paragraph separator contributes one scalar, including empty rows.
+        remaining -= available;
+        if forward {
+            if paragraph + 1 == document.paragraphs().len() {
+                return document.end();
+            }
+            paragraph += 1;
+            index = 0;
+        } else {
+            if paragraph == 0 {
+                return Position::default();
+            }
+            paragraph -= 1;
+            index = document
+                .paragraph(paragraph)
+                .expect("valid paragraph")
+                .scalar_count();
+        }
+        remaining -= 1;
     }
-    editor.document().end()
 }
 
 #[cfg(test)]
@@ -1641,6 +1873,106 @@ mod tests {
     }
 
     #[test]
+    fn malformed_shaping_retries_preserve_rendered_text_styles_and_widget_navigation() {
+        let context = egui::Context::default();
+        let cluster = format!("{}z", "\u{600}".repeat(16));
+        let text = format!("a {cluster} end");
+        let mut editor = Editor::from_text(&text);
+        editor
+            .set_selection(Selection::new(
+                Position::new(0, 2),
+                Position::new(0, 2 + cluster.len()),
+            ))
+            .unwrap();
+        editor
+            .apply_style(StylePatch {
+                italic: Some(true),
+                underline: Some(true),
+                foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
+                ..Default::default()
+            })
+            .unwrap();
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        let revision = editor.document().revision();
+        let draw = |editor: &mut Editor, events| {
+            context
+                .run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let id = ui.make_persistent_id("malformed-shaping");
+                            ui.memory_mut(|memory| memory.request_focus(id));
+                            let output = RichTextEditor::new(editor)
+                                .id(id)
+                                .font(FontId::proportional(14.0))
+                                .desired_width(48.0)
+                                .show(ui);
+                            assert!(output.errors.is_empty(), "{:?}", output.errors);
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
+        };
+        draw(&mut editor, vec![]);
+        let id = context.memory(|memory| memory.focused()).unwrap();
+        let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
+        let galley = &cache.layouts[0].galley;
+        assert_eq!(galley.job.text, text);
+        assert_eq!(galley.end().index.0, text.chars().count());
+        let rendered: String = galley
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+            .collect();
+        assert_eq!(rendered, text);
+        let source = editor.document().paragraph(0).unwrap();
+        for section in &galley.job.sections {
+            let style = source
+                .spans()
+                .iter()
+                .find(|span| span.range.contains(&section.byte_range.start.0))
+                .unwrap()
+                .style;
+            assert_eq!(section.format.italics, style.italic);
+            assert_eq!(section.format.underline != Stroke::NONE, style.underline);
+            if let Some(color) = style.foreground {
+                assert_eq!(
+                    section.format.color,
+                    Color32::from_rgba_unmultiplied(color.0[0], color.0[1], color.0[2], color.0[3])
+                );
+            }
+        }
+        draw(&mut editor, vec![]);
+        let idle = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
+        assert!(Arc::ptr_eq(&cache.layouts, &idle.layouts));
+        assert!(Arc::ptr_eq(galley, &idle.layouts[0].galley));
+        for _ in 0..galley.rows.len() {
+            draw(&mut editor, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+            editor
+                .document()
+                .validate_position(editor.selection().focus)
+                .unwrap();
+        }
+        assert_eq!(editor.selection().focus, editor.document().end());
+        for _ in 0..galley.rows.len() {
+            draw(&mut editor, vec![key(Key::ArrowUp, Modifiers::NONE)]);
+            editor
+                .document()
+                .validate_position(editor.selection().focus)
+                .unwrap();
+        }
+        assert_eq!(editor.selection().focus, Position::default());
+        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(editor.document().plain_text(), text);
+    }
+
+    #[test]
     fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
         let context = egui::Context::default();
         let mut cache = Cache::default();
@@ -1771,6 +2103,171 @@ mod tests {
         assert!(editor.composition().is_none());
         assert_eq!(editor.document().plain_text(), "original");
         assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn disabling_widget_cancels_composition_without_processing_input() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        frame(&context, &mut editor, vec![], true);
+        editor.update_composition("candidate", None).unwrap();
+        let output = context.run_ui(
+            egui::RawInput {
+                events: vec![Event::Text("typed".into())],
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.disable();
+                    let id = ui.make_persistent_id("editor");
+                    ui.add(RichTextEditor::new(&mut editor).id(id));
+                });
+            },
+        );
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(output.platform_output.ime.is_none());
+        assert!(!editor.can_undo());
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn escape_releases_focus_before_later_text_events() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        frame(&context, &mut editor, vec![], true);
+        frame(
+            &context,
+            &mut editor,
+            vec![
+                key(Key::Escape, Modifiers::NONE),
+                Event::Text("typed".into()),
+            ],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(context.memory(|memory| memory.focused()).is_none());
+        assert_eq!(
+            context.input(|input| input.events.clone()),
+            vec![Event::Text("typed".into())]
+        );
+    }
+
+    #[test]
+    fn second_escape_after_canceling_composition_releases_focus() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        frame(&context, &mut editor, vec![], true);
+        editor.update_composition("candidate", None).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![
+                key(Key::Escape, Modifiers::NONE),
+                key(Key::Escape, Modifiers::NONE),
+                Event::Text("typed".into()),
+            ],
+            true,
+        );
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(context.memory(|memory| memory.focused()).is_none());
+        assert_eq!(
+            context.input(|input| input.events.clone()),
+            vec![Event::Text("typed".into())]
+        );
+    }
+
+    #[test]
+    fn first_escape_cancels_empty_composition_and_second_releases_focus() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        frame(&context, &mut editor, vec![], true);
+        editor.update_composition("", None).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Escape, Modifiers::NONE)],
+            true,
+        );
+        assert!(editor.composition().is_none());
+        assert!(context.memory(|memory| memory.focused()).is_some());
+        frame(
+            &context,
+            &mut editor,
+            vec![
+                key(Key::Escape, Modifiers::NONE),
+                Event::Text("typed".into()),
+            ],
+            false,
+        );
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(context.memory(|memory| memory.focused()).is_none());
+    }
+
+    #[test]
+    fn escape_releases_focus_after_read_only_cancels_composition() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        frame(&context, &mut editor, vec![], true);
+        editor.update_composition("candidate", None).unwrap();
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::Escape, Modifiers::NONE)],
+            true,
+            true,
+        );
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(context.memory(|memory| memory.focused()).is_none());
+    }
+
+    #[test]
+    fn command_navigation_and_altgr_preserve_platform_shortcut_semantics() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("first\nsecond");
+        let mac_command = Modifiers::MAC_CMD | Modifiers::COMMAND;
+        editor
+            .set_selection(Selection::caret(Position::new(1, 3)))
+            .unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowLeft, mac_command)],
+            true,
+        );
+        assert_eq!(editor.selection().focus, Position::new(1, 0));
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowRight, mac_command)],
+            true,
+        );
+        assert_eq!(editor.selection().focus, Position::new(1, 6));
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowUp, mac_command)],
+            true,
+        );
+        assert_eq!(editor.selection().focus, Position::default());
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowDown, mac_command)],
+            true,
+        );
+        assert_eq!(editor.selection().focus, editor.document().end());
+        let altgr = Modifiers::ALT | Modifiers::CTRL | Modifiers::COMMAND;
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::B, altgr), Event::Text("β".into())],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "first\nsecondβ");
+        assert!(!editor.typing_style().bold);
     }
 
     #[test]
@@ -2083,6 +2580,110 @@ mod tests {
     }
 
     #[test]
+    fn empty_paste_preserves_selection_and_typing_history() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        editor.insert_text("typed ").unwrap();
+        editor.select_all();
+        let selection = editor.selection();
+        let revision = editor.document().revision();
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::Paste(String::new())],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "typed original");
+        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(editor.selection(), selection);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+
+        frame(
+            &context,
+            &mut editor,
+            vec![
+                Event::Text("a".into()),
+                Event::Paste(String::new()),
+                Event::Text("b".into()),
+            ],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "aboriginal");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+
+        for preedit in ["", "候"] {
+            editor.update_composition(preedit, None).unwrap();
+            let composition = editor.composition().cloned();
+            frame(
+                &context,
+                &mut editor,
+                vec![Event::Paste(String::new())],
+                true,
+            );
+            assert_eq!(editor.composition(), composition.as_ref());
+            assert_eq!(editor.document().plain_text(), "original");
+            assert!(!editor.can_undo());
+        }
+    }
+
+    #[test]
+    fn double_click_at_paragraph_end_selects_the_trailing_word() {
+        for (text, expected) in [
+            ("hello café", "café"),
+            ("hello 👩🏽‍💻", "👩🏽‍💻"),
+            ("e\u{301}", "e\u{301}"),
+            ("hello ", " "),
+        ] {
+            let editor = Editor::from_text(text);
+            let selection = word_selection(&editor, editor.document().end());
+            assert_eq!(
+                &text[selection.range().start.byte..selection.range().end.byte],
+                expected,
+                "{text:?}"
+            );
+            editor
+                .document()
+                .validate_position(selection.anchor)
+                .unwrap();
+            editor
+                .document()
+                .validate_position(selection.focus)
+                .unwrap();
+        }
+        let editor = Editor::from_text("");
+        assert!(word_selection(&editor, editor.document().end()).is_caret());
+    }
+
+    #[test]
+    fn input_batches_consume_editing_and_preserve_host_events_in_order() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("");
+        frame(&context, &mut editor, vec![], true);
+        let mut events = Vec::new();
+        let mut retained = Vec::new();
+        for index in 0..64 {
+            events.push(key(Key::ArrowLeft, Modifiers::NONE));
+            let mut shortcut = key(Key::F1, Modifiers::NONE);
+            if let Event::Key { repeat, .. } = &mut shortcut {
+                *repeat = index > 0;
+            }
+            events.push(shortcut.clone());
+            retained.push(shortcut);
+            let pointer = Event::PointerMoved(Pos2::new(index as f32, 0.0));
+            events.push(pointer.clone());
+            retained.push(pointer);
+            events.push(Event::Text("x".into()));
+        }
+        frame(&context, &mut editor, events, true);
+        assert_eq!(editor.document().plain_text(), "x".repeat(64));
+        assert_eq!(context.input(|input| input.events.clone()), retained);
+    }
+
+    #[test]
     fn paste_is_independent_from_adjacent_typing() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("");
@@ -2120,6 +2721,235 @@ mod tests {
         );
         assert_eq!(editor.document().plain_text(), "first\nsecond");
         assert_eq!(editor.selection().focus.paragraph, 0);
+    }
+
+    #[test]
+    fn vertical_navigation_keeps_the_column_across_short_paragraphs() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("aaaaaaaaa\nx\naaaaaaaaa");
+        editor
+            .set_selection(Selection::caret(Position::new(0, 8)))
+            .unwrap();
+        frame(&context, &mut editor, vec![], true);
+        for position in [Position::new(1, 1), Position::new(2, 8)] {
+            frame(
+                &context,
+                &mut editor,
+                vec![key(Key::ArrowDown, Modifiers::NONE)],
+                true,
+            );
+            assert_eq!(editor.selection().focus, position);
+        }
+    }
+
+    #[test]
+    fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("aaaaaaaaa x aaaaaaaaa");
+        editor
+            .set_selection(Selection::caret(Position::new(0, 8)))
+            .unwrap();
+        let mut cache = Cache::default();
+        let mut appearance = appearance();
+        appearance.font = FontId::monospace(16.0);
+        appearance.width = 100.0;
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert_eq!(layouts[0].galley.rows.len(), 3);
+        let mut navigation = None;
+        let mut errors = Vec::new();
+        for (key, expected_row, expected_byte) in [
+            (Key::ArrowDown, 1, 12),
+            (Key::ArrowDown, 2, 20),
+            (Key::ArrowUp, 1, 12),
+            (Key::ArrowUp, 0, 8),
+        ] {
+            assert!(handle_key(
+                &mut editor,
+                key,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                false,
+            ));
+            assert_eq!(editor.selection().focus.byte, expected_byte);
+            let navigation = navigation.as_ref().unwrap();
+            let cursor = CCursor {
+                index: CharIndex(expected_byte),
+                prefer_next_row: navigation.prefer_next_row,
+            };
+            assert_eq!(
+                layouts[0].galley.layout_from_cursor(cursor).row,
+                expected_row
+            );
+        }
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("previous\na \u{301}bbbbbbbbbbbbbbbbbbbbbbbb");
+        editor
+            .set_selection(Selection::caret(Position::new(1, 0)))
+            .unwrap();
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        let mut cache = Cache::default();
+        let mut appearance = appearance();
+        appearance.font = FontId::proportional(14.0);
+        appearance.width = 104.0;
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        let galley = &layouts[1].galley;
+        assert!(galley.rows.len() >= 3);
+        // egui can wrap between the space and its zero-width combining mark.
+        assert_eq!(galley.rows[0].char_count_excluding_newline().0, 2);
+        let mut navigation = None;
+        let mut errors = Vec::new();
+        for (key, paragraph, row, byte) in [
+            (Key::ArrowDown, 1, 0, Some(0)),
+            (Key::ArrowDown, 1, 1, Some("a \u{301}".len())),
+            (Key::ArrowDown, 1, 2, None),
+            (Key::ArrowUp, 1, 1, Some("a \u{301}".len())),
+            (Key::ArrowUp, 1, 0, Some(0)),
+            (Key::ArrowUp, 0, 0, Some(0)),
+        ] {
+            assert!(handle_key(
+                &mut editor,
+                key,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                false,
+            ));
+            let focus = editor.selection().focus;
+            editor.document().validate_position(focus).unwrap();
+            assert_eq!(focus.paragraph, paragraph);
+            if let Some(byte) = byte {
+                assert_eq!(focus.byte, byte);
+            }
+            let cursor = CCursor {
+                index: CharIndex(
+                    editor
+                        .document()
+                        .paragraph(paragraph)
+                        .unwrap()
+                        .scalar_index(focus.byte)
+                        .unwrap(),
+                ),
+                prefer_next_row: navigation.as_ref().unwrap().prefer_next_row,
+            };
+            assert_eq!(
+                layouts[paragraph].galley.layout_from_cursor(cursor).row,
+                row
+            );
+        }
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text(&format!("a {} end", "👨\u{200d}".repeat(8)));
+        let source = editor.document().paragraphs()[0].clone();
+        let mut cache = Cache::default();
+        let mut appearance = appearance();
+        appearance.font = FontId::proportional(14.0);
+        appearance.width = 32.0;
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        let galley = &layouts[0].galley;
+        assert_eq!(galley.rows.len(), 6);
+        let mut navigation = None;
+        let mut errors = Vec::new();
+        let mut previous_row = 0;
+        for (key, expected_row, scalar) in [
+            (Key::ArrowDown, 1, 2),
+            (Key::ArrowDown, 4, 18),
+            (Key::ArrowDown, 5, 19),
+            (Key::ArrowUp, 4, 18),
+            (Key::ArrowUp, 1, 2),
+            (Key::ArrowUp, 0, 0),
+        ] {
+            assert!(handle_key(
+                &mut editor,
+                key,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                false,
+            ));
+            let focus = editor.selection().focus;
+            editor.document().validate_position(focus).unwrap();
+            assert_eq!(
+                focus,
+                Position::new(0, source.byte_from_scalar(scalar).unwrap())
+            );
+            let cursor = CCursor {
+                index: CharIndex(scalar),
+                prefer_next_row: navigation.as_ref().unwrap().prefer_next_row,
+            };
+            let row = galley.layout_from_cursor(cursor).row;
+            assert_eq!(row, expected_row);
+            assert!(if key == Key::ArrowDown {
+                row > previous_row
+            } else {
+                row < previous_row
+            });
+            previous_row = row;
+        }
+        assert!(errors.is_empty());
+        assert_eq!(editor.selection(), Selection::caret(Position::default()));
+    }
+
+    #[test]
+    fn read_only_vertical_selection_extends_and_external_or_horizontal_movement_resets_column() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("aaaaaaaaa\nx\naaaaaaaaa");
+        let anchor = Position::new(0, 8);
+        editor.set_selection(Selection::caret(anchor)).unwrap();
+        for focus in [Position::new(1, 1), Position::new(2, 8)] {
+            frame_options(
+                &context,
+                &mut editor,
+                vec![key(Key::ArrowDown, Modifiers::SHIFT)],
+                true,
+                true,
+            );
+            assert_eq!(editor.selection(), Selection::new(anchor, focus));
+        }
+        editor
+            .set_selection(Selection::caret(Position::new(1, 0)))
+            .unwrap();
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowDown, Modifiers::NONE)],
+            true,
+            true,
+        );
+        assert_eq!(editor.selection().focus, Position::new(2, 0));
+
+        editor.set_selection(Selection::caret(anchor)).unwrap();
+        frame_options(
+            &context,
+            &mut editor,
+            vec![
+                key(Key::ArrowDown, Modifiers::NONE),
+                key(Key::ArrowLeft, Modifiers::NONE),
+                key(Key::ArrowDown, Modifiers::NONE),
+            ],
+            true,
+            true,
+        );
+        assert_eq!(editor.selection().focus, Position::new(2, 0));
+        assert_eq!(editor.document().plain_text(), "aaaaaaaaa\nx\naaaaaaaaa");
+        assert!(!editor.can_undo());
     }
 
     #[test]
@@ -2291,6 +3121,63 @@ mod tests {
             true,
         );
         assert_eq!(editor.document().plain_text(), "e\u{301}!next");
+    }
+
+    #[test]
+    fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
+        let editor = Editor::from_text("aé\n\ne\u{301}👩🏽‍💻!\nlast");
+        let document = editor.document();
+        let focus = Position::new(2, "e\u{301}👩🏽‍💻".len());
+        for (count, expected) in [
+            (0, focus),
+            (1, Position::new(2, "e\u{301}".len())),
+            (4, Position::new(2, "e\u{301}".len())),
+            (5, Position::new(2, 0)),
+            (6, Position::new(2, 0)),
+            (7, Position::new(1, 0)),
+            (8, Position::new(0, "aé".len())),
+            (9, Position::new(0, 1)),
+            (usize::MAX, Position::default()),
+        ] {
+            assert_eq!(
+                surrounding_position(document, focus, count, false),
+                expected
+            );
+        }
+        let focus = Position::new(0, 1);
+        for (count, expected) in [
+            (0, focus),
+            (1, Position::new(0, "aé".len())),
+            (2, Position::new(1, 0)),
+            (3, Position::new(2, 0)),
+            (4, Position::new(2, "e\u{301}".len())),
+            (5, Position::new(2, "e\u{301}".len())),
+            (6, Position::new(2, "e\u{301}👩🏽‍💻".len())),
+            (usize::MAX, document.end()),
+        ] {
+            assert_eq!(surrounding_position(document, focus, count, true), expected);
+        }
+    }
+
+    #[test]
+    fn surrounding_deletion_uses_selection_focus_and_restores_it_on_undo() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("prefix\n\né!\nsuffix");
+        let selection = Selection::new(Position::new(3, 3), Position::new(2, 0));
+        editor.set_selection(selection).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::Ime(ImeEvent::DeleteSurrounding {
+                before_chars: 2,
+                after_chars: 1,
+            })],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "prefix!\nsuffix");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "prefix\n\né!\nsuffix");
+        assert_eq!(editor.selection(), selection);
     }
 
     #[test]
