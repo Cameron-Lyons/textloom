@@ -4,7 +4,8 @@ Measured locally on 2026-10-07 with Rust 1.99.0, Cargo's default release profile
 Linux x86_64, and an Intel Core Ultra 5 325. These are elapsed-time averages from
 the standalone harnesses, not statistical confidence intervals. CPU frequency,
 background work, fonts, accessibility activation, and document contents affect
-results. CI runs these harnesses as smoke tests without timing thresholds.
+results. The rendering table reports the median of three runs; each run averages
+repeated operations. CI runs these harnesses as smoke tests without timing thresholds.
 
 ```sh
 cargo bench --locked --bench editing
@@ -14,27 +15,39 @@ cargo bench --locked --features egui --bench rendering
 ## egui frames
 
 The same `benches/rendering.rs` harness was run against baseline commit
-`2ac6269dacf515648fb8cc66f2d315b94d193115` and the updated implementation. For
+`2ac6269dacf515648fb8cc66f2d315b94d193115` and updated source commit
+`ff211806c4400ba26b090b1d7e50c343c739cd4d`. For
 the baseline, copy this new harness into that checkout and declare its
 `harness = false` / `required-features = ["egui"]` Cargo benchmark target.
 
-The workload uses unique short Unicode paragraphs, an 800×600 headless egui
-viewport inside a vertical `ScrollArea`, and three warmup frames. Accessibility
-is inactive. The 100-paragraph case averages 1,000 idle frames; the 10,000 case
+Both sources were compiled in separate Cargo target directories, then run
+sequentially with the same toolchain, release profile, lockfile dependencies,
+features, and harness. Use distinct target directories for each checkout to
+prevent Cargo from reusing identically named artifacts across revisions:
+
+```sh
+CARGO_TARGET_DIR=/tmp/textloom-bench-baseline cargo bench --manifest-path /path/to/baseline/Cargo.toml --locked --features egui --bench rendering
+CARGO_TARGET_DIR=/tmp/textloom-bench-current cargo bench --manifest-path /path/to/current/Cargo.toml --locked --features egui --bench rendering
+```
+
+The workload uses 100 or 10,000 unique populated Unicode paragraphs plus one
+trailing empty paragraph, an 800×600 headless egui viewport inside a vertical
+`ScrollArea`, and three warmup frames. Accessibility is inactive and the widget
+is unfocused. The 100-paragraph case averages 1,000 idle frames; the 10,000 case
 averages 100. Each edit iteration inserts one character in the middle paragraph,
 renders, undoes, and renders again; the reported value divides the whole
-iteration by two. Painting/renderer submission to a native GPU is not measured.
+iteration by two. Shape tessellation and submission to a native GPU are not measured.
 
-| Paragraphs | Operation | Before (µs) | After (µs) |
+| Populated paragraphs | Operation | Before (µs) | After (µs) |
 | ---: | --- | ---: | ---: |
-| 100 | Idle frame | 23.78 | 9.34 |
-| 100 | Local edit + frame | 41.02 | 25.38 |
-| 10,000 | Idle frame | 1,717.50 | 8.29 |
-| 10,000 | Local edit + frame | 2,584.83 | 228.26 |
+| 100 | Idle frame | 26.32 | 9.39 |
+| 100 | Local edit + frame | 45.81 | 26.96 |
+| 10,000 | Idle frame | 1,909.14 | 9.40 |
+| 10,000 | Local edit + frame | 2,882.31 | 244.33 |
 
-The 10,000-paragraph sample is about 207× faster while idle and 11× faster for
-local edits. Repeated runs during development ranged around 7–10 µs idle and
-160–241 µs per edit/frame. The widget retains paragraph galleys and geometry,
+The 10,000-paragraph sample is about 203× faster while idle and 12× faster for
+local edits. The three isolated runs ranged from 9.05–10.19 µs idle and
+239.71–247.31 µs per edit/frame. The widget retains paragraph galleys and geometry,
 checks an immutable content token, detects egui font-cache resets through a
 small cached galley, and paints only visible paragraphs. An edit still checks
 paragraph identities and rebuilds geometry across the document; initial layout
