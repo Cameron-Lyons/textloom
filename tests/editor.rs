@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 use textloom::{
-    Document, Editor, Error, HistoryLimits, Movement, ParagraphKind, Position, Selection,
-    StylePatch,
+    Color, Document, Editor, Error, Fragment, HistoryLimits, InlineStyle, Movement, ParagraphKind,
+    Position, Selection, SelectionStyle, StylePatch,
 };
 
 fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
@@ -167,6 +167,373 @@ fn formatting_undo_redo_restores_document_and_selection() {
     assert!(!editor.document().style_at(Position::new(0, 1)).bold);
     assert!(editor.redo());
     assert!(editor.document().style_at(Position::new(0, 1)).italic);
+}
+
+#[test]
+fn selection_style_reports_independent_mixed_attributes_inside_unicode_runs() {
+    let mut editor = Editor::from_text("a👩‍💻e\u{301}z");
+    let red = Color([255, 0, 0, 255]);
+    let blue = Color([0, 0, 255, 255]);
+    editor
+        .set_selection(Selection::new(Position::new(0, 1), Position::new(0, 15)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            underline: Some(true),
+            code: Some(true),
+            foreground: Some(Some(red)),
+            ..Default::default()
+        })
+        .unwrap();
+    editor
+        .set_selection(Selection::new(Position::new(0, 1), Position::new(0, 12)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            italic: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    editor
+        .set_selection(Selection::new(Position::new(0, 12), Position::new(0, 15)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            strikethrough: Some(true),
+            foreground: Some(Some(blue)),
+            ..Default::default()
+        })
+        .unwrap();
+    let selection = Selection::new(Position::new(0, 15), Position::new(0, 1));
+    editor.set_selection(selection).unwrap();
+    assert_eq!(editor.typing_style(), InlineStyle::default());
+    let expected = SelectionStyle {
+        bold: Some(true),
+        italic: None,
+        underline: Some(true),
+        strikethrough: None,
+        code: Some(true),
+        foreground: None,
+    };
+    let before = editor.document().clone();
+    let history = (editor.undo_len(), editor.redo_len(), editor.history_bytes());
+    assert_eq!(editor.selection_style(), expected);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.document(), &before);
+    assert_eq!(
+        (editor.undo_len(), editor.redo_len(), editor.history_bytes()),
+        history
+    );
+    editor
+        .set_selection(Selection::new(selection.focus, selection.anchor))
+        .unwrap();
+    assert_eq!(editor.selection_style(), expected);
+    assert!(editor.undo());
+    editor.set_selection(selection).unwrap();
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle {
+            strikethrough: Some(false),
+            foreground: Some(Some(red)),
+            ..expected
+        }
+    );
+    assert!(editor.redo());
+    editor.set_selection(selection).unwrap();
+    assert_eq!(editor.selection_style(), expected);
+    editor.clear_formatting().unwrap();
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(InlineStyle::default())
+    );
+}
+
+#[test]
+fn selection_style_ignores_empty_paragraphs_and_excluded_endpoint_text() {
+    let mut editor = Editor::from_text("one\n\nTWO\nexcluded");
+    let color = Color([42, 71, 149, 128]);
+    editor
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(2, 3)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            foreground: Some(Some(color)),
+            ..Default::default()
+        })
+        .unwrap();
+    editor
+        .set_selection(Selection::new(Position::new(3, 0), Position::new(0, 0)))
+        .unwrap();
+    let expected = SelectionStyle::from(InlineStyle {
+        bold: true,
+        foreground: Some(color),
+        ..Default::default()
+    });
+    assert_eq!(editor.selection_style(), expected);
+    editor
+        .set_selection(Selection::new(Position::new(0, 1), Position::new(2, 2)))
+        .unwrap();
+    assert_eq!(editor.selection_style(), expected);
+    editor
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(3, 1)))
+        .unwrap();
+    assert_eq!(editor.selection_style().bold, None);
+    assert_eq!(editor.selection_style().foreground, None);
+    assert_eq!(editor.selection_style().italic, Some(false));
+}
+
+#[test]
+fn selection_style_uses_pending_typing_for_carets_and_separator_only_selections() {
+    let mut editor = Editor::from_text("a\n\nb");
+    caret(&mut editor, 0, 1);
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            italic: Some(true),
+            foreground: Some(Some(Color([1, 2, 3, 4]))),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        editor.document().style_at(Position::new(0, 1)),
+        InlineStyle::default()
+    );
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(editor.typing_style())
+    );
+    assert_eq!(editor.selection_style().bold, Some(true));
+    editor.clear_formatting().unwrap();
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(InlineStyle::default())
+    );
+    editor
+        .set_selection(Selection::new(Position::new(0, 1), Position::new(2, 0)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            underline: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(editor.selection_style().underline, Some(true));
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(editor.typing_style())
+    );
+    assert_eq!(editor.undo_len(), 0);
+    editor.begin_composition();
+    editor.update_composition("仮", Some(0..3)).unwrap();
+    let composition = editor.composition().cloned();
+    assert_eq!(editor.selection_style().underline, Some(true));
+    assert_eq!(editor.composition(), composition.as_ref());
+}
+
+#[test]
+fn selection_style_all_mixed_attributes_remain_mixed_after_later_matching_runs() {
+    let mut editor = Editor::from_text("abc");
+    let emphasis = StylePatch {
+        bold: Some(true),
+        italic: Some(true),
+        underline: Some(true),
+        strikethrough: Some(true),
+        code: Some(true),
+        foreground: Some(Some(Color([10, 20, 30, 40]))),
+    };
+    editor
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
+        .unwrap();
+    editor.apply_style(emphasis).unwrap();
+    editor
+        .set_selection(Selection::new(Position::new(0, 2), Position::new(0, 3)))
+        .unwrap();
+    editor.apply_style(emphasis).unwrap();
+    editor.select_all();
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle {
+            bold: None,
+            italic: None,
+            underline: None,
+            strikethrough: None,
+            code: None,
+            foreground: None,
+        }
+    );
+}
+
+#[test]
+fn clear_formatting_resets_every_attribute_and_restores_rich_state_on_undo() {
+    let mut editor = Editor::from_text("left\ncafe\u{301}\nkeep");
+    editor.select_all();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            italic: Some(true),
+            underline: Some(true),
+            strikethrough: Some(true),
+            code: Some(true),
+            foreground: Some(Some(Color([23, 71, 149, 128]))),
+        })
+        .unwrap();
+    caret(&mut editor, 0, 0);
+    editor
+        .set_paragraph_kind(ParagraphKind::Heading { level: 2 })
+        .unwrap();
+    caret(&mut editor, 1, 0);
+    editor
+        .set_paragraph_kind(ParagraphKind::Bullet { indent: 3 })
+        .unwrap();
+    let selection = Selection::new(Position::new(1, 6), Position::new(0, 1));
+    editor.set_selection(selection).unwrap();
+    editor.clear_history();
+    let before = Fragment::from_document(editor.document());
+    let style = editor.typing_style();
+    editor.clear_formatting().unwrap();
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.typing_style(), InlineStyle::default());
+    assert_eq!(editor.undo_len(), 1);
+    let first = editor.document().paragraph(0).unwrap();
+    assert_eq!(first.kind(), ParagraphKind::Heading { level: 2 });
+    assert_eq!(first.spans().len(), 2);
+    assert_eq!(first.spans()[0].range, 0..1);
+    assert_eq!(first.spans()[0].style, style);
+    assert_eq!(first.spans()[1].style, InlineStyle::default());
+    let second = editor.document().paragraph(1).unwrap();
+    assert_eq!(second.kind(), ParagraphKind::Bullet { indent: 3 });
+    assert_eq!(second.spans()[0].style, InlineStyle::default());
+    assert!(Arc::ptr_eq(
+        &before.paragraphs()[2],
+        &editor.document().paragraphs()[2]
+    ));
+    let after = Fragment::from_document(editor.document());
+    assert!(editor.undo());
+    assert_eq!(Fragment::from_document(editor.document()), before);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.typing_style(), style);
+    assert!(editor.redo());
+    assert_eq!(Fragment::from_document(editor.document()), after);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.typing_style(), InlineStyle::default());
+}
+
+#[test]
+fn clear_formatting_at_a_caret_only_resets_typing_and_breaks_its_group() {
+    let mut editor = Editor::default();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            foreground: Some(Some(Color([1, 2, 3, 4]))),
+            ..Default::default()
+        })
+        .unwrap();
+    editor.insert_text("a").unwrap();
+    let before = editor.document().clone();
+    let selection = editor.selection();
+    editor.clear_formatting().unwrap();
+    assert_eq!(editor.document(), &before);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.typing_style(), InlineStyle::default());
+    assert_eq!(editor.undo_len(), 1);
+    editor.insert_text("b").unwrap();
+    assert_eq!(editor.undo_len(), 2);
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "a");
+    assert_eq!(editor.typing_style(), InlineStyle::default());
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "");
+    assert!(editor.typing_style().bold);
+}
+
+#[test]
+fn clear_formatting_noops_preserve_revision_history_and_active_ime() {
+    let mut editor = Editor::from_text("plain");
+    editor.select_all();
+    let before = editor.document().clone();
+    editor.clear_formatting().unwrap();
+    assert_eq!(editor.document(), &before);
+    assert_eq!(editor.undo_len(), 0);
+    editor.begin_composition();
+    editor.update_composition("仮", Some(0..3)).unwrap();
+    let selection = editor.selection();
+    let composition = editor.composition().cloned();
+    assert_eq!(editor.clear_formatting(), Err(Error::CompositionActive));
+    assert_eq!(editor.document(), &before);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.composition(), composition.as_ref());
+    assert_eq!(editor.undo_len(), 0);
+}
+
+#[test]
+fn unicode_typing_coalesces_joined_graphemes_into_one_reversible_delta() {
+    let mut editor = Editor::default();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let before_style = editor.typing_style();
+    for text in ["a", "\u{301}", "👩", "\u{200d}", "💻"] {
+        editor.insert_text(text).unwrap();
+        assert_eq!(editor.undo_len(), 1);
+        assert!(
+            editor
+                .document()
+                .validate_position(editor.selection().focus)
+                .is_ok()
+        );
+    }
+    let after = Fragment::from_document(editor.document());
+    let selection = editor.selection();
+    let bytes = editor.history_bytes();
+    assert_eq!(editor.document().plain_text(), "a\u{301}👩‍💻");
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "");
+    assert_eq!(editor.selection(), Selection::default());
+    assert_eq!(editor.typing_style(), before_style);
+    assert_eq!(editor.history_bytes(), bytes);
+    assert!(editor.redo());
+    assert_eq!(Fragment::from_document(editor.document()), after);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(editor.typing_style(), before_style);
+    assert_eq!(editor.history_bytes(), bytes);
+}
+
+#[test]
+fn either_zero_history_limit_disables_retention_and_reenabling_starts_a_fresh_chain() {
+    for limits in [
+        HistoryLimits {
+            max_entries: 0,
+            max_bytes: usize::MAX,
+        },
+        HistoryLimits {
+            max_entries: usize::MAX,
+            max_bytes: 0,
+        },
+    ] {
+        let mut editor = Editor::default();
+        editor.insert_text("old").unwrap();
+        assert!(editor.undo());
+        editor.set_history_limits(limits);
+        for text in ["a", "b", "c"] {
+            editor.insert_text(text).unwrap();
+            assert_eq!(editor.undo_len(), 0);
+            assert_eq!(editor.redo_len(), 0);
+            assert_eq!(editor.history_bytes(), 0);
+        }
+        editor.set_history_limits(HistoryLimits::default());
+        editor.insert_text("new").unwrap();
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "abc");
+        assert!(!editor.undo());
+        assert!(editor.redo());
+        assert_eq!(editor.document().plain_text(), "abcnew");
+    }
 }
 
 #[test]

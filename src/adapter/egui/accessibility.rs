@@ -24,6 +24,8 @@ pub enum AccessibilityError {
     StaleDocument,
     /// A requested caret stop is absent from the published text runs.
     InvalidTextPosition,
+    /// A recognized text action has missing or incompatible data.
+    InvalidActionData,
 }
 
 impl fmt::Display for AccessibilityError {
@@ -37,6 +39,9 @@ impl fmt::Display for AccessibilityError {
             Self::InvalidLayout => f.write_str("accessibility layout does not match the document"),
             Self::StaleDocument => f.write_str("accessibility action refers to an older document"),
             Self::InvalidTextPosition => f.write_str("invalid accessibility text position"),
+            Self::InvalidActionData => {
+                f.write_str("accessibility action has missing or incompatible data")
+            }
         }
     }
 }

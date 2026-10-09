@@ -1,7 +1,7 @@
 # Performance measurements
 
-Measured locally on 2026-10-07 with Rust 1.99.0, Cargo's default release profile,
-Linux x86_64, and an Intel Core Ultra 5 325. These are elapsed-time averages from
+Measured locally on October 7–9, 2026 with Rust 1.99.0, Cargo's default release
+profile, Linux x86_64, and an Intel Core Ultra 5 325. These are elapsed-time averages from
 the standalone harnesses, not statistical confidence intervals. CPU frequency,
 background work, fonts, accessibility activation, and document contents affect
 results. The rendering table reports the median of three runs; each run averages
@@ -147,5 +147,90 @@ visit every paragraph; this benchmark does not measure platform screen readers.
 The editing harness also checks ordinary literal queries on 100,000 short
 Unicode paragraphs, including matches, misses, and queries longer than every
 paragraph. Those searches now borrow paragraph text and skip paragraphs shorter
-than the query. Cross-paragraph, case-insensitive, and whole-word queries retain
-the flattened-text path.
+than the query. At that point, cross-paragraph, case-insensitive, and whole-word
+queries used the flattened-text path; the next section measures the updated
+paragraph-local search.
+
+## October 9 first-pass release-candidate search
+
+The expanded `benches/editing.rs` harness was copied into the October 8 baseline
+commit `1ee61fe` and run against that source and the updated 1.0 working tree.
+Both used Rust 1.99.0, the same lockfile, default features, Cargo's default release
+profile, and separate target directories on the same Linux machine. The table
+reports medians of three sequential runs of each version after the automated
+checks completed. Values are elapsed-time averages in microseconds per operation.
+These measurements precede the selection-near navigation update described below.
+
+| Operation | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| 100,000 paragraph literal matches | 9,772.00 | 9,758.32 |
+| 100,000 paragraph lowercase whole-word matches | 75,432.10 | 65,228.91 |
+| 100,000 short paragraphs, long lowercase whole-word query miss | 61,856.12 | 5,879.30 |
+| Find next from document start, 100,000 paragraphs | 45,248.51 | 0.38 |
+| Find previous near document start, 100,000 paragraphs | 45,130.72 | 0.61 |
+| 10,000 replacements + undo | 276.93 | 290.96 |
+
+The navigation workload repeats `MATCH match café\n` 100,000 times plus a
+trailing empty paragraph, with case-insensitive whole-word search for `match`.
+Each of 100 iterations resets the caret to document start for find-next or the
+start of paragraph 1 for find-previous. Navigation retains only its candidate
+ranges and stops when the answer is known. These results measure finding matches
+near the beginning. At this first-pass stage, navigation still visited matches
+from document start; backward wrapping, missing queries, and queries with
+paragraph breaks could scan the entire document.
+
+The full-search workloads repeat `A short paragraph with Unicode café 👩‍💻.\n`
+100,000 times. The literal query is `Unicode`, the lowercase whole-word query is
+`unicode`, and the long miss uses the 1,088-byte repeated query from the literal
+search benchmark. Full matches/misses average 20 operations, except lowercase
+whole-word matches, which average 10. Queries without paragraph breaks now
+prepare lowercase text and word boundaries independently for each paragraph,
+avoiding a full-document temporary copy. Needles longer than the lowercase
+paragraph are skipped before word indexing or literal-search preprocessing;
+length comparison follows lowercase expansion so `İ` still matches `i\u{307}`.
+
+Batched replacement averages 50 replace-all/undo operations after a warmup.
+Its full-harness median increased by 5.1% in that first-pass comparison. The
+improvements target find navigation and paragraph-local search; they do not
+imply faster timings for every operation. Initial Unicode indexes, query size,
+caret position, and background work still affect results.
+
+## October 9 continuation: search near the selection
+
+The expanded navigation workload was compared against the first-pass 1.0
+snapshot and the continuation source. Each source was built in an independent
+Cargo target directory; distinct binary hashes were verified before running.
+Both used Rust 1.99.0, locked dependencies, default features, and the default
+release profile on the same Linux machine. The `search_navigation()` workload
+was isolated from `benches/editing.rs`, with each timed loop capped at 20
+iterations for both sources. The table reports the median of three sequential
+runs per source, in microseconds per operation.
+
+| Operation, 100,000 paragraphs | First pass (µs) | Continuation (µs) |
+| --- | ---: | ---: |
+| Find next near middle | 15,292.91 | 0.55 |
+| Find previous near middle | 14,140.65 | 0.47 |
+| Find next near end | 29,222.06 | 0.50 |
+| Find previous near end | 28,284.63 | 0.45 |
+| Find next wrapped from document end | 28,329.03 | 0.44 |
+| Find previous wrapped from document start | 28,381.12 | 0.47 |
+
+The text and search options are the same `MATCH match café\n` workload used
+above. Middle queries start in paragraph 50,000; end queries start in paragraph
+99,999. Find-next starts just after `MATCH` and selects `match`; find-previous
+starts at `match` and selects `MATCH`. The wrap cases start at the document's
+final caret or initial caret and select the first or last accepted match.
+
+These repeated-paragraph queries improved from roughly 14–29 ms to about 1 µs.
+The small after-values are sensitive to timer resolution and background work;
+their last digits do not indicate a precision guarantee. Navigation now starts
+at the selection boundary paragraph and traverses paragraph indexes in the
+requested direction. Wrapping searches a bounded second interval, so wrapping
+backward from the beginning can find a match directly in the last populated
+paragraph. Within each visited paragraph, matching still proceeds forward from
+its beginning, preserving nonoverlapping matches and complete lowercase context.
+
+The results describe nearby matches in short paragraphs. Missing queries can
+still visit every paragraph, large visited paragraphs still require text scans,
+and queries containing paragraph breaks retain the flattened document-wide
+match stream. The optimization does not make every search constant time.

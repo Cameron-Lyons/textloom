@@ -169,6 +169,9 @@ pub enum AccessibleAction<'a> {
     SetSelection(Selection),
     /// Cancel preedit and replace the committed selection as one undo step.
     ReplaceSelectedText(&'a str),
+    /// Cancel preedit and replace the entire document as one undo step.
+    /// Undo restores the selection that existed before the replacement.
+    ReplaceAllText(&'a str),
 }
 
 /// Result of an accessibility action for the host to apply and redraw.
@@ -178,7 +181,7 @@ pub struct AccessibilityOutcome {
     pub handled: bool,
     /// The host should focus the editor widget and, if needed, its window.
     pub focus_requested: bool,
-    /// Whether document, selection, typing style, or composition changed.
+    /// Whether document, selection, typing style, composition, or adapter capabilities changed.
     pub changed: bool,
 }
 
@@ -206,6 +209,12 @@ pub fn apply_action(
             editor.cancel_composition();
             editor.break_history_group();
             editor.insert_text(text)?;
+            editor.break_history_group();
+        }
+        AccessibleAction::ReplaceAllText(text) => {
+            editor.cancel_composition();
+            editor.break_history_group();
+            editor.replace_range(Position::default()..editor.document().end(), text)?;
             editor.break_history_group();
         }
     }
@@ -334,6 +343,7 @@ mod accesskit_bridge {
         last_selection: Option<Selection>,
         document_identity: Option<Arc<()>>,
         initialized: bool,
+        read_only: bool,
     }
 
     impl Default for AccessKitAdapter {
@@ -364,6 +374,7 @@ mod accesskit_bridge {
                 last_selection: None,
                 document_identity: None,
                 initialized: false,
+                read_only: false,
             })
         }
 
@@ -382,6 +393,30 @@ mod accesskit_bridge {
         /// Return the reserved multiline editor ID.
         pub fn editor_node(&self) -> NodeId {
             self.editor_id
+        }
+
+        /// Whether accessibility text replacement is blocked.
+        pub fn is_read_only(&self) -> bool {
+            self.read_only
+        }
+
+        /// Expose a selectable read-only editor and cancel existing preedit.
+        ///
+        /// Call [`Self::update`] to publish the new capabilities. Focus and
+        /// selection actions remain available; replacement actions are consumed
+        /// without changing the document, selection, or undo history.
+        pub fn set_read_only(
+            &mut self,
+            read_only: bool,
+            editor: &mut Editor,
+        ) -> AccessibilityOutcome {
+            let changed = self.read_only != read_only;
+            self.read_only = read_only;
+            let canceled = read_only && editor.cancel_composition();
+            AccessibilityOutcome {
+                changed: changed || canceled,
+                ..AccessibilityOutcome::default()
+            }
         }
 
         /// Return a paragraph ID from the most recently published update.
@@ -420,11 +455,16 @@ mod accesskit_bridge {
                 let mut nodes = Vec::new();
                 if self.last_selection != Some(selection)
                     || self.last_editor.as_ref().and_then(Node::label) != Some(label)
+                    || self
+                        .last_editor
+                        .as_ref()
+                        .is_some_and(|node| node.is_read_only() != self.read_only)
                 {
                     // Selection and labels reuse all paragraph nodes and run
                     // locations. Only the editor node needs to be republished.
                     let mut node = self.last_editor.clone().expect("initialized editor node");
                     node.set_label(label);
+                    set_editable_actions(&mut node, self.read_only);
                     node.set_text_selection(TextSelection {
                         anchor: to_text_position(&self.paragraphs, selection.anchor)?,
                         focus: to_text_position(&self.paragraphs, selection.focus)?,
@@ -486,7 +526,7 @@ mod accesskit_bridge {
             editor_node.set_label(label);
             editor_node.add_action(Action::Focus);
             editor_node.add_action(Action::SetTextSelection);
-            editor_node.add_action(Action::ReplaceSelectedText);
+            set_editable_actions(&mut editor_node, self.read_only);
             editor_node.set_children(
                 paragraphs
                     .iter()
@@ -569,8 +609,8 @@ mod accesskit_bridge {
 
         /// Apply actions targeted at this editor; other targets remain unhandled.
         ///
-        /// The host owns focus changes and must suppress edits for read-only
-        /// editors. Text actions require the latest committed document update.
+        /// The host owns focus changes. Text actions require the latest committed
+        /// document update; read-only replacement actions are consumed unchanged.
         pub fn handle_action(
             &self,
             request: &ActionRequest,
@@ -581,6 +621,17 @@ mod accesskit_bridge {
             }
             if request.action == Action::Focus {
                 return Ok(apply_action(editor, AccessibleAction::Focus)?);
+            }
+            if self.read_only
+                && matches!(
+                    request.action,
+                    Action::SetValue | Action::ReplaceSelectedText
+                )
+            {
+                return Ok(AccessibilityOutcome {
+                    handled: true,
+                    ..AccessibilityOutcome::default()
+                });
             }
             match request.action {
                 Action::SetTextSelection => {
@@ -601,15 +652,17 @@ mod accesskit_bridge {
                         AccessibleAction::SetSelection(selection),
                     )?)
                 }
-                Action::ReplaceSelectedText => {
+                Action::SetValue | Action::ReplaceSelectedText => {
                     self.validate_document(editor)?;
                     let Some(ActionData::Value(value)) = &request.data else {
                         return Err(AccessKitError::InvalidActionData);
                     };
-                    Ok(apply_action(
-                        editor,
-                        AccessibleAction::ReplaceSelectedText(value),
-                    )?)
+                    let action = if request.action == Action::SetValue {
+                        AccessibleAction::ReplaceAllText(value)
+                    } else {
+                        AccessibleAction::ReplaceSelectedText(value)
+                    };
+                    Ok(apply_action(editor, action)?)
                 }
                 _ => Ok(AccessibilityOutcome::default()),
             }
@@ -624,6 +677,18 @@ mod accesskit_bridge {
                 return Err(AccessKitError::StaleDocument);
             }
             Ok(())
+        }
+    }
+
+    fn set_editable_actions(node: &mut Node, read_only: bool) {
+        if read_only {
+            node.set_read_only();
+            node.remove_action(Action::SetValue);
+            node.remove_action(Action::ReplaceSelectedText);
+        } else {
+            node.clear_read_only();
+            node.add_action(Action::SetValue);
+            node.add_action(Action::ReplaceSelectedText);
         }
     }
 
@@ -940,6 +1005,100 @@ mod accesskit_bridge {
         }
 
         #[test]
+        fn set_value_replaces_the_document_and_undo_restores_selection() {
+            let mut editor = Editor::from_text("aé\nhello");
+            let selection = Selection::new(Position::new(1, 2), Position::new(0, 1));
+            editor.set_selection(selection).unwrap();
+            let mut adapter = AccessKitAdapter::default();
+            let tree = adapter.update(&editor, "Notes", true).unwrap();
+            let node = &tree
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == adapter.editor_node())
+                .unwrap()
+                .1;
+            assert!(node.supports_action(Action::SetValue));
+            assert_eq!(
+                adapter.handle_action(&request(&adapter, Action::SetValue, None), &mut editor),
+                Err(AccessKitError::InvalidActionData)
+            );
+            let replace = request(
+                &adapter,
+                Action::SetValue,
+                Some(ActionData::Value("new\r\ntext".into())),
+            );
+            let outcome = adapter.handle_action(&replace, &mut editor).unwrap();
+            assert!(outcome.handled && outcome.changed);
+            assert_eq!(editor.document().plain_text(), "new\ntext");
+            assert_eq!(
+                editor.selection(),
+                Selection::caret(editor.document().end())
+            );
+            assert_eq!(
+                adapter.handle_action(&replace, &mut editor),
+                Err(AccessKitError::StaleDocument)
+            );
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "aé\nhello");
+            assert_eq!(editor.selection(), selection);
+            assert!(!editor.can_undo());
+        }
+
+        #[test]
+        fn read_only_updates_capabilities_without_republishing_paragraphs() {
+            let mut editor = Editor::from_text("original");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let paragraph_id = adapter.paragraph_node(0);
+            editor.update_composition("candidate", None).unwrap();
+            assert!(adapter.set_read_only(true, &mut editor).changed);
+            assert!(adapter.is_read_only());
+            assert!(editor.composition().is_none());
+            assert!(!adapter.set_read_only(true, &mut editor).changed);
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(update.nodes.len(), 1);
+            let (id, node) = &update.nodes[0];
+            assert_eq!(*id, adapter.editor_node());
+            assert!(node.is_read_only());
+            assert!(node.supports_action(Action::Focus));
+            assert!(node.supports_action(Action::SetTextSelection));
+            assert!(!node.supports_action(Action::SetValue));
+            assert!(!node.supports_action(Action::ReplaceSelectedText));
+            assert_eq!(adapter.paragraph_node(0), paragraph_id);
+
+            let selection = TextSelection {
+                anchor: adapter
+                    .to_text_position(&editor, Position::new(0, 8))
+                    .unwrap(),
+                focus: adapter
+                    .to_text_position(&editor, Position::new(0, 0))
+                    .unwrap(),
+            };
+            let select = request(
+                &adapter,
+                Action::SetTextSelection,
+                Some(ActionData::SetTextSelection(selection)),
+            );
+            assert!(adapter.handle_action(&select, &mut editor).unwrap().changed);
+            let selection = editor.selection();
+            for action in [Action::SetValue, Action::ReplaceSelectedText] {
+                let replace = request(&adapter, action, Some(ActionData::Value("new".into())));
+                let outcome = adapter.handle_action(&replace, &mut editor).unwrap();
+                assert!(outcome.handled && !outcome.changed);
+            }
+            assert_eq!(editor.document().plain_text(), "original");
+            assert_eq!(editor.selection(), selection);
+            assert!(!editor.can_undo());
+            assert!(adapter.set_read_only(false, &mut editor).changed);
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(update.nodes.len(), 1);
+            let node = &update.nodes[0].1;
+            assert!(!node.is_read_only());
+            assert!(node.supports_action(Action::SetValue));
+            assert!(node.supports_action(Action::ReplaceSelectedText));
+        }
+
+        #[test]
         fn styled_runs_roundtrip_and_keep_ids_for_unchanged_paragraphs() {
             let mut editor = Editor::from_text("abc\nxyz");
             editor
@@ -1215,5 +1374,26 @@ mod tests {
         assert_eq!(editor.document().plain_text(), "original");
         assert_eq!(editor.selection(), selection);
         assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn replacing_all_text_preserves_selection_and_typing_undo_boundaries() {
+        let mut editor = Editor::from_text("original");
+        editor.insert_text("typed ").unwrap();
+        let selection = Selection::new(Position::new(0, 7), Position::new(0, 2));
+        editor.set_selection(selection).unwrap();
+        editor.update_composition("candidate", None).unwrap();
+        let outcome = apply_action(&mut editor, AccessibleAction::ReplaceAllText("new")).unwrap();
+        assert!(outcome.handled && outcome.changed);
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "new");
+        editor.insert_text(" typing").unwrap();
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "new");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "typed original");
+        assert_eq!(editor.selection(), selection);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
     }
 }

@@ -17,6 +17,7 @@ use textloom::{Editor, ParagraphKind, Position, Selection, StylePatch};
 let mut editor = Editor::from_text("Hello, native Rust!");
 editor.set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5))).unwrap();
 editor.apply_style(StylePatch { bold: Some(true), ..Default::default() }).unwrap();
+assert_eq!(editor.selection_style().bold, Some(true));
 editor.set_paragraph_kind(ParagraphKind::Bullet { indent: 0 }).unwrap();
 assert!(editor.undo()); // Undo list formatting.
 assert!(editor.redo());
@@ -25,6 +26,8 @@ assert!(editor.redo());
 ## Editing
 
 - Bold, italic, underline, strikethrough, inline code, foreground colors, and six heading levels.
+- `clear_formatting()` resets selected inline styles and typing style in one undo step, preserving headings and lists. At a caret it resets only future typing.
+- `selection_style()` reports uniform or mixed attributes independently for formatting toolbars, including the pending typing style at a caret.
 - Bulleted and numbered paragraphs with indentation and explicit starting numbers. Enter continues a list; Enter on an empty item exits it. Applying `Ordered { start, .. }` restarts numbering at the first selected item and renumbers the following items at the same indent. Structural edits update that continuation run; inline typing preserves explicit restarts. A body paragraph or a different indent ends the run.
 - Directional selections, replacement, grapheme and Unicode word movement/deletion, paragraph/document navigation, and selection extension. `indent_list()` and `outdent_list()` format selected list items in one undo step; outdenting level zero returns to body text.
 - Literal find/replace across paragraph breaks, optional Unicode lowercase matching and whole words, next/previous search with wrapping, and `replace_all()` as one undo step. Matches always contain complete graphemes. Case-insensitive search uses lowercase mappings, without Unicode normalization or full case folding.
@@ -35,6 +38,8 @@ assert!(editor.redo());
 Positions are `(paragraph index, UTF-8 byte offset)`. Document selections must land at extended grapheme boundaries: combining marks, emoji sequences, and flags cannot be split. Invalid public input returns an error before mutation. IME preedit selections use native UTF-8 scalar boundaries because a composition can contain unfinished graphemes.
 
 `Document::paragraphs()` exposes immutable shared paragraphs and normalized style spans. `plain_text()` and clipboard selection export omit visual list markers. `Paragraph` also maps grapheme/scalar indexes to UTF-8 bytes for custom GUI integrations.
+
+`SelectionStyle` uses `Some(true)` for uniformly enabled emphasis, `Some(false)` for uniformly disabled emphasis, and `None` for mixed values. Its foreground field uses `None` for mixed colors, `Some(None)` for the renderer's default throughout, and `Some(Some(color))` for one explicit color throughout. The summary ignores paragraph separators and empty paragraphs; a selection containing only separators uses the pending typing style. Reading it does not allocate or change selection, history, or IME state.
 
 ## Rich clipboard and interchange
 
@@ -68,9 +73,19 @@ ui.add(textloom::adapter::egui::RichTextEditor::new(&mut editor));
 
 The widget draws rich paragraphs, selections, list markers, headings, and preedit text. It routes pointer and keyboard input through the same core and publishes the IME caret area through egui's platform output. It checks layout character counts and retries inconsistent font shaping to keep rendered text and cursor positions aligned. Each independently stored editor should use a stable widget ID. For a scrolling editor, place the widget inside an egui `ScrollArea`.
 
+Pointer clicks retain the chosen visual row at wrap boundaries, and selection highlighting extends a hard paragraph break only after the final wrapped row. Focused caret and preedit changes scroll into view even when the widget starts outside the viewport. Keyboard and accessibility actions follow their input batch order; accessibility actions based on content changed by an earlier event are rejected as stale.
+
 `.read_only(true)` retains selection, copy, and accessibility while suppressing edits and IME. Ctrl/Alt+Backspace/Delete deletes Unicode words; Tab/Shift+Tab indents/outdents selected lists. Body-text Tab stays available for host focus traversal.
 
 Run `cargo run --example egui_editor --features egui` for a display-independent integration example. A native window/renderer is supplied by your existing egui host; this crate does not select one for you. Register a bold font family for actual bold glyphs; egui's default fonts use strong color as a fallback.
+
+For a complete native window, run the repository's standalone eframe host:
+
+```sh
+cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+```
+
+The host demonstrates mixed selection state, formatting, lists, find/replace, snapshots, and read-only mode with a system plain-text clipboard and native IME caret area. It has its own Cargo workspace and lockfile and is maintained in the repository outside the published library archive. `--read-only` starts a selectable viewer; `--font PATH` and `--bold-font PATH` register application fonts; `--smoke-test` renders 20 native frames and exits. Pass these arguments after `--` in the command above. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md) for font examples and host checks.
 
 ## winit
 
@@ -80,19 +95,27 @@ Call `set_focused` when the editor widget gains or loses focus, pass window even
 
 Opt into `WinitAdapter::new().rich_clipboard(true)` for `CopyRich`/`CutRich` fragment payloads, then deliver native rich clipboard content through `paste_fragment()`. Plain clipboard events remain the default. Word deletion and list Tab/Shift+Tab shortcuts use the same core commands as egui.
 
+Call `set_read_only(true, &mut editor)` for a selectable viewer: navigation and copy remain available, cut copies, and keyboard edits, paste, and IME are suppressed. Enabling read-only mode cancels active preedit; call `sync_ime` to update the native window.
+
 ## Accessibility
 
 `accessibility::AccessibilitySnapshot` exposes borrowed paragraph semantics and directional selection without an extra dependency. The optional `accesskit` feature provides a text input tree with styled runs, grapheme boundaries, selection, and validated accessibility actions. Connect its tree updates and action requests to your host's platform AccessKit adapter.
 
 The host owns accessibility activation, focus, and layout geometry. Both adapters use AccessKit 0.24, matching egui's integration and avoiding a duplicate dependency version. Use a matching platform adapter for the direct tree. Text movement is logical; a renderer must provide visual movement across wrapped lines or bidirectional text. AccessKit integrations report an explicit error for graphemes larger than its upstream 255-byte character-length representation.
 
+The direct `AccessKitAdapter` supports selection replacement and full-value replacement as one undo step. Its `set_read_only(true, &mut editor)` advertises read-only capabilities and suppresses replacement actions while retaining focus and selection. Publish `update()` after changing the mode, and keep it aligned with your input adapter.
+
 ## Performance and validation
 
-Text and formatting are shared between immutable paragraphs. Editing rebuilds only the affected paragraphs; undo keeps localized before/after deltas instead of copying the full document. Formatting reuses paragraph text. Single-paragraph typing merges history entries without retaining every intermediate string.
+Text and formatting are shared between immutable paragraphs. Editing rebuilds only the affected paragraphs; undo keeps localized before/after deltas instead of copying the full document. Formatting reuses paragraph text. Single-paragraph typing merges history entries without retaining every intermediate string. Each history entry holds its delta directly, and disabled history skips retention work. CR/CRLF normalization copies unchanged text in one pass.
 
 Grapheme, scalar, and word indexes are built independently on first use and shared across formatting/history snapshots. Repeated navigation uses binary searches instead of rescanning long paragraphs; ASCII grapheme/scalar offsets need no indexes, and ASCII word indexes are allocated only when used. `history_bytes()` estimates retained text and formatting, excluding shared navigation caches and allocator overhead.
 
-A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. Numbered-list edits may update the following continuation run. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers. Ordinary case-sensitive literal searches borrow paragraph text; multi-paragraph searches with line breaks, case-insensitive matching, or whole-word constraints temporarily flatten the document. Literal searchers are reused across matches within each searched text; replace-all builds each affected paragraph once. The egui widget retains galleys and layout geometry, invalidates them on content/font/DPI/appearance changes, and paints visible paragraphs. Idle cache validation takes constant time; editing still updates paragraph geometry across the document. Accessibility uses shared content tokens to validate text snapshots and an index to locate text runs, while reusing paragraph indexes and galley geometry. Direct AccessKit selection/label changes reuse paragraph nodes; unchanged trees return an empty update in constant time.
+A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. Numbered-list edits may update the following continuation run. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers.
+
+Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. Each visited paragraph keeps ordinary forward nonoverlapping matching and complete lowercase context. A nearby match can be found without searching unrelated earlier paragraphs; missing queries may still visit the whole document. Cross-paragraph queries temporarily flatten the document and preserve its complete forward match stream. Literal searchers are reused across matches within each searched text; replace-all builds each affected paragraph once.
+
+The egui widget retains galleys and layout geometry, invalidates them on content/font/DPI/appearance changes, and paints visible paragraphs. Idle cache validation takes constant time; editing still updates paragraph geometry across the document. Accessibility uses shared content tokens to validate text snapshots and an index to locate text runs, while reusing paragraph indexes and galley geometry. Direct AccessKit selection/label changes reuse paragraph nodes; unchanged trees return an empty update in constant time.
 
 ```sh
 cargo test --locked --no-default-features
@@ -110,9 +133,11 @@ The dependency-free benchmark harnesses measure local insertion/undo, long Unico
 
 [GitHub Actions](https://github.com/Cameron-Lyons/textloom/actions/workflows/ci.yml) runs on pushes to `main`, pull requests, and manual dispatch:
 
-- Ubuntu stable runs `scripts/check-release.sh`: formatting, tests and doctests for all eight feature combinations, Clippy for all targets, complete API documentation with warnings denied, release benchmark smoke tests, the headless examples, and tests and all-target compilation from the extracted Cargo package.
-- Rust 1.95 tests every feature combination and compiles all targets.
-- macOS and Windows compile all targets and run all-feature tests and doctests.
+- Ubuntu stable runs `scripts/check-release.sh`: formatting, tests and doctests for all eight feature combinations, Clippy for all targets, complete API documentation with warnings denied, release benchmark smoke tests, the headless examples, explicit package inventory verification, and tests and all-target compilation from the extracted Cargo package.
+- Rust 1.95 tests every feature combination and compiles all targets plus the standalone native host.
+- macOS and Windows compile all targets and the native host, then run all-feature tests and doctests.
+
+The Ubuntu release checks also compile the native host, check its formatting and Clippy warnings, and verify its dependency on the packaged library. CI compilation opens no native window.
 
 Dependencies are locked, actions are pinned to commit SHAs, jobs have a 15-minute limit, and superseded runs are canceled. The workflow only reads repository contents and saves dependency caches on `main`. CI runs release benchmarks as smoke tests and records their output; timing thresholds are kept out of shared runners.
 

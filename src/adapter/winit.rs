@@ -64,7 +64,8 @@ impl Default for CommandModifier {
 /// Focus-aware native keyboard and IME routing for a host-rendered editor.
 ///
 /// The host owns pointer selection, clipboard transport, rendering, and window
-/// IME configuration. Only route editing events here for editable widgets.
+/// IME configuration. Read-only widgets retain navigation, selection, and copy
+/// support through [`WinitAdapter::set_read_only`].
 #[derive(Debug, Default)]
 pub struct WinitAdapter {
     focused: bool,
@@ -73,6 +74,7 @@ pub struct WinitAdapter {
     ime_enabled: bool,
     command_modifier: CommandModifier,
     rich_clipboard: bool,
+    read_only: bool,
 }
 
 impl WinitAdapter {
@@ -92,6 +94,29 @@ impl WinitAdapter {
     pub fn rich_clipboard(mut self, enabled: bool) -> Self {
         self.rich_clipboard = enabled;
         self
+    }
+
+    /// Whether document-changing keyboard, clipboard, and IME input is blocked.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Permit selection, navigation, and copying while preventing edits.
+    ///
+    /// Enabling read-only mode cancels active preedit and disables platform IME
+    /// on the next [`Self::sync_ime`] call. Cut copies without deleting; paste,
+    /// formatting, undo, and redo input is consumed without changing history.
+    pub fn set_read_only(&mut self, read_only: bool, editor: &mut Editor) -> InputOutcome {
+        let changed = self.read_only != read_only;
+        self.read_only = read_only;
+        let canceled = read_only && editor.cancel_composition();
+        if read_only {
+            self.ime_enabled = false;
+        }
+        InputOutcome {
+            changed: changed || canceled,
+            ..InputOutcome::default()
+        }
     }
 
     /// Whether both the editor widget and its window have focus.
@@ -139,8 +164,9 @@ impl WinitAdapter {
         position: LogicalPosition<f64>,
         size: LogicalSize<f64>,
     ) {
-        window.set_ime_allowed(self.is_focused());
-        if self.is_focused() && self.ime_enabled {
+        let editable = self.is_focused() && !self.read_only;
+        window.set_ime_allowed(editable);
+        if editable && self.ime_enabled {
             window.set_ime_cursor_area(position, size);
         }
     }
@@ -200,6 +226,10 @@ impl WinitAdapter {
         if !self.is_focused() || state != ElementState::Pressed {
             return Ok(InputOutcome::default());
         }
+        let before = EditorState::capture(editor);
+        if self.read_only {
+            editor.cancel_composition();
+        }
         if editor.composition().is_some_and(|composition| {
             !composition.text.is_empty() || matches!(key, Key::Named(NamedKey::Escape))
         }) {
@@ -210,7 +240,6 @@ impl WinitAdapter {
                 clipboard: None,
             });
         }
-        let before = EditorState::capture(editor);
         // Empty preedit can precede either Commit or IME cancellation. Keep
         // its replacement for Commit, but resume normal editing when a new
         // key arrives instead. Winit suppresses key events during composition.
@@ -224,7 +253,17 @@ impl WinitAdapter {
         let command = self.command_pressed();
         let shift = self.modifiers.shift_key();
         if command && let Key::Character(character) = key {
-            match character.to_ascii_lowercase().as_str() {
+            let shortcut = character.to_ascii_lowercase();
+            if self.read_only
+                && (matches!(
+                    shortcut.as_str(),
+                    "v" | "z" | "y" | "b" | "i" | "u" | "[" | "]"
+                ) || shift && matches!(shortcut.as_str(), "7" | "8" | "&" | "*"))
+            {
+                outcome.changed = before.changed(editor);
+                return Ok(outcome);
+            }
+            match shortcut.as_str() {
                 "a" => editor.select_all(),
                 "c" => {
                     if !editor.selection().is_caret() {
@@ -237,12 +276,18 @@ impl WinitAdapter {
                 }
                 "x" => {
                     if !editor.selection().is_caret() {
-                        let selected = if self.rich_clipboard {
+                        let selected = if self.read_only && self.rich_clipboard {
+                            ClipboardEvent::CopyRich(editor.selected_fragment())
+                        } else if self.read_only {
+                            ClipboardEvent::Copy(editor.selected_text())
+                        } else if self.rich_clipboard {
                             ClipboardEvent::CutRich(editor.selected_fragment())
                         } else {
                             ClipboardEvent::Cut(editor.selected_text())
                         };
-                        editor.insert_text("")?;
+                        if !self.read_only {
+                            editor.insert_text("")?;
+                        }
                         outcome.clipboard = Some(selected);
                     }
                 }
@@ -308,15 +353,19 @@ impl WinitAdapter {
             editor.move_cursor(movement, shift)?;
         } else {
             match key {
+                Key::Named(NamedKey::Enter | NamedKey::Backspace | NamedKey::Delete)
+                    if self.read_only => {}
                 Key::Named(NamedKey::Enter) if !command => editor.insert_paragraph()?,
                 Key::Named(NamedKey::Backspace) if word => editor.delete_word_backward()?,
                 Key::Named(NamedKey::Delete) if word => editor.delete_word_forward()?,
                 Key::Named(NamedKey::Backspace) => editor.delete_backward()?,
                 Key::Named(NamedKey::Delete) => editor.delete_forward()?,
                 Key::Named(NamedKey::Tab)
-                    if !self.modifiers.intersects(
-                        ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SUPER,
-                    ) && selection_contains_list(editor) =>
+                    if !self.read_only
+                        && !self.modifiers.intersects(
+                            ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SUPER,
+                        )
+                        && selection_contains_list(editor) =>
                 {
                     if shift {
                         editor.outdent_list()?;
@@ -331,7 +380,7 @@ impl WinitAdapter {
                     let clean = clean_text(produced, false);
                     if clean.is_empty() {
                         outcome.handled = false;
-                    } else {
+                    } else if !self.read_only {
                         editor.insert_text(&clean)?;
                     }
                 }
@@ -349,6 +398,15 @@ impl WinitAdapter {
     pub fn handle_ime(&mut self, event: &Ime, editor: &mut Editor) -> Result<InputOutcome, Error> {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
+        }
+        if self.read_only {
+            let changed = editor.cancel_composition() || self.ime_enabled;
+            self.ime_enabled = false;
+            return Ok(InputOutcome {
+                handled: true,
+                changed,
+                clipboard: None,
+            });
         }
         let before = EditorState::capture(editor);
         let was_enabled = self.ime_enabled;
@@ -401,6 +459,12 @@ impl WinitAdapter {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
         }
+        if self.read_only {
+            return Ok(InputOutcome {
+                handled: true,
+                ..InputOutcome::default()
+            });
+        }
         let clean = clean_text(text, true);
         if clean.is_empty() {
             return Ok(InputOutcome {
@@ -427,6 +491,12 @@ impl WinitAdapter {
     ) -> Result<InputOutcome, Error> {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
+        }
+        if self.read_only {
+            return Ok(InputOutcome {
+                handled: true,
+                ..InputOutcome::default()
+            });
         }
         let before = EditorState::capture(editor);
         editor.insert_fragment(fragment)?;
@@ -531,6 +601,132 @@ mod tests {
         adapter
             .handle_key(&key, ElementState::Pressed, text, editor)
             .unwrap()
+    }
+
+    #[test]
+    fn read_only_keeps_selection_and_copy_without_changing_history() {
+        let mut editor = Editor::from_text("original");
+        let mut adapter = focused(&mut editor);
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("a".into()),
+            Some("a"),
+        );
+        assert!(editor.can_undo());
+        assert!(adapter.set_read_only(true, &mut editor).changed);
+        assert!(adapter.is_read_only());
+        assert!(!adapter.set_read_only(true, &mut editor).changed);
+
+        adapter.set_modifiers(ModifiersState::CONTROL);
+        let select = key(&mut adapter, &mut editor, Key::Character("a".into()), None);
+        assert!(select.handled && select.changed);
+        let selection = editor.selection();
+        for shortcut in ["c", "x"] {
+            let outcome = key(
+                &mut adapter,
+                &mut editor,
+                Key::Character(shortcut.into()),
+                None,
+            );
+            assert!(outcome.handled && !outcome.changed);
+            assert_eq!(
+                outcome.clipboard,
+                Some(ClipboardEvent::Copy("aoriginal".to_owned()))
+            );
+        }
+        for shortcut in ["v", "z", "y", "b", "i", "u", "[", "]"] {
+            let outcome = key(
+                &mut adapter,
+                &mut editor,
+                Key::Character(shortcut.into()),
+                None,
+            );
+            assert!(outcome.handled && !outcome.changed);
+            assert_eq!(outcome.clipboard, None);
+        }
+        adapter.set_modifiers(ModifiersState::empty());
+        for named in [NamedKey::Enter, NamedKey::Backspace, NamedKey::Delete] {
+            let outcome = key(&mut adapter, &mut editor, Key::Named(named), None);
+            assert!(outcome.handled && !outcome.changed);
+        }
+        let text = key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("x".into()),
+            Some("x"),
+        );
+        assert!(text.handled && !text.changed);
+        assert_eq!(editor.selection(), selection);
+        assert!(adapter.paste(&mut editor, "replacement").unwrap().handled);
+        let fragment = Fragment::from_text("replacement");
+        assert!(
+            adapter
+                .paste_fragment(&mut editor, &fragment)
+                .unwrap()
+                .handled
+        );
+        assert_eq!(editor.document().plain_text(), "aoriginal");
+        assert_eq!(editor.selection(), selection);
+
+        let movement = key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::ArrowRight),
+            None,
+        );
+        assert!(movement.handled && movement.changed);
+        assert!(editor.selection().is_caret());
+        assert_eq!(editor.selection().focus, editor.document().end());
+        assert!(
+            !key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Tab),
+                Some("\t")
+            )
+            .handled
+        );
+        assert!(adapter.set_read_only(false, &mut editor).changed);
+        adapter.set_modifiers(ModifiersState::CONTROL);
+        key(&mut adapter, &mut editor, Key::Character("z".into()), None);
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn read_only_cancels_preedit_and_rejects_ime_mutations() {
+        let mut editor = Editor::from_text("original");
+        let mut adapter = focused(&mut editor).rich_clipboard(true);
+        editor.select_all();
+        let selection = editor.selection();
+        adapter.handle_ime(&Ime::Enabled, &mut editor).unwrap();
+        adapter
+            .handle_ime(&Ime::Preedit("candidate".to_owned(), None), &mut editor)
+            .unwrap();
+        assert!(adapter.set_read_only(true, &mut editor).changed);
+        assert!(editor.composition().is_none());
+        assert!(!adapter.ime_enabled());
+        for event in [
+            Ime::Enabled,
+            Ime::Preedit("candidate".to_owned(), Some((0, 9))),
+            Ime::Commit("replacement".to_owned()),
+            Ime::Disabled,
+        ] {
+            let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
+            assert!(outcome.handled && !outcome.changed);
+            assert!(!adapter.ime_enabled());
+            assert!(editor.composition().is_none());
+        }
+        adapter.set_modifiers(ModifiersState::CONTROL);
+        let outcome = key(&mut adapter, &mut editor, Key::Character("x".into()), None);
+        let Some(ClipboardEvent::CopyRich(fragment)) = outcome.clipboard else {
+            panic!("read-only cut should copy a rich fragment");
+        };
+        assert_eq!(fragment.plain_text(), "original");
+        assert_eq!(editor.document().plain_text(), "original");
+        assert_eq!(editor.selection(), selection);
+        assert!(!editor.can_undo());
     }
 
     #[test]

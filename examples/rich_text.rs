@@ -42,5 +42,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let html = pasted.document().to_html();
     assert!(html.contains("&amp; &lt;editors&gt;"));
     println!("\nNative snapshot: {} bytes\nHTML: {html}", bytes.len());
+
+    // Clear inline emphasis without changing the heading or list structure.
+    pasted.select_all();
+    pasted.clear_formatting()?;
+    assert!(pasted.document().paragraphs().iter().all(|paragraph| {
+        paragraph
+            .spans()
+            .iter()
+            .all(|span| span.style == Default::default())
+    }));
+    assert!(pasted.undo());
+    assert_eq!(Fragment::from_document(pasted.document()), clipboard);
     Ok(())
 }

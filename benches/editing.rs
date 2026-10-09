@@ -8,6 +8,7 @@ fn main() {
     unicode_navigation();
     ascii_navigation();
     literal_search();
+    search_navigation();
     batch_replacement();
     #[cfg(feature = "accesskit")]
     accessibility_navigation();
@@ -129,6 +130,17 @@ fn literal_search() {
         assert_eq!(matches.len(), 100_000);
         black_box(matches);
     });
+    measure("100000 paragraph lowercase whole-word matches", 10, || {
+        let matches = document.find(
+            black_box("unicode"),
+            SearchOptions {
+                case_sensitive: false,
+                whole_word: true,
+            },
+        );
+        assert_eq!(matches.len(), 100_000);
+        black_box(matches);
+    });
     measure("100000 paragraph literal miss", 20, || {
         assert!(
             document
@@ -140,6 +152,19 @@ fn literal_search() {
         assert!(
             document
                 .find(black_box(&needle), SearchOptions::default())
+                .is_empty()
+        );
+    });
+    measure("100000 paragraphs shorter than lowercase query", 20, || {
+        assert!(
+            document
+                .find(
+                    black_box(&needle),
+                    SearchOptions {
+                        case_sensitive: false,
+                        whole_word: true
+                    }
+                )
                 .is_empty()
         );
     });
@@ -168,6 +193,104 @@ fn batch_replacement() {
         assert!(editor.undo());
         black_box(editor.document().revision());
     });
+}
+
+fn search_navigation() {
+    let mut editor = Editor::from_text(&"MATCH match café\n".repeat(100_000));
+    let options = SearchOptions {
+        case_sensitive: false,
+        whole_word: true,
+    };
+    measure("100000 paragraphs find_next from start", 100, || {
+        editor.set_selection(Selection::default()).unwrap();
+        assert!(editor.find_next(black_box("match"), options, true).unwrap());
+        assert_eq!(
+            editor.selection(),
+            Selection::new(Position::new(0, 0), Position::new(0, 5))
+        );
+    });
+    measure("100000 paragraphs find_previous near start", 100, || {
+        editor
+            .set_selection(Selection::caret(Position::new(1, 0)))
+            .unwrap();
+        assert!(
+            editor
+                .find_previous(black_box("match"), options, true)
+                .unwrap()
+        );
+        assert_eq!(
+            editor.selection(),
+            Selection::new(Position::new(0, 6), Position::new(0, 11))
+        );
+    });
+    for (label, paragraph) in [("middle", 50_000), ("end", 99_999)] {
+        measure(
+            &format!("100000 paragraphs find_next near {label}"),
+            1_000,
+            || {
+                editor
+                    .set_selection(Selection::caret(Position::new(paragraph, 5)))
+                    .unwrap();
+                assert!(
+                    editor
+                        .find_next(black_box("match"), options, false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    editor.selection(),
+                    Selection::new(Position::new(paragraph, 6), Position::new(paragraph, 11))
+                );
+            },
+        );
+        measure(
+            &format!("100000 paragraphs find_previous near {label}"),
+            1_000,
+            || {
+                editor
+                    .set_selection(Selection::caret(Position::new(paragraph, 6)))
+                    .unwrap();
+                assert!(
+                    editor
+                        .find_previous(black_box("match"), options, false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    editor.selection(),
+                    Selection::new(Position::new(paragraph, 0), Position::new(paragraph, 5))
+                );
+            },
+        );
+    }
+    measure(
+        "100000 paragraphs find_next wrapped from end",
+        1_000,
+        || {
+            editor
+                .set_selection(Selection::caret(editor.document().end()))
+                .unwrap();
+            assert!(editor.find_next(black_box("match"), options, true).unwrap());
+            assert_eq!(
+                editor.selection(),
+                Selection::new(Position::new(0, 0), Position::new(0, 5))
+            );
+        },
+    );
+    measure(
+        "100000 paragraphs find_previous wrapped from start",
+        1_000,
+        || {
+            editor.set_selection(Selection::default()).unwrap();
+            assert!(
+                editor
+                    .find_previous(black_box("match"), options, true)
+                    .unwrap()
+            );
+            assert_eq!(
+                editor.selection(),
+                Selection::new(Position::new(99_999, 6), Position::new(99_999, 11))
+            );
+        },
+    );
 }
 
 fn measure(label: &str, iterations: usize, mut operation: impl FnMut()) {

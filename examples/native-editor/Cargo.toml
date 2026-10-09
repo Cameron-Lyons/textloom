@@ -1,0 +1,19 @@
+[package]
+name = "textloom-native-example"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# Keep the renderer and window integration out of Textloom's dependency graph.
+[workspace]
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+textloom = { path = "../..", version = "1.0", features = ["egui"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

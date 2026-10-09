@@ -189,81 +189,13 @@ impl<'a> RichTextEditor<'a> {
         let origin = rect.min + Vec2::splat(PADDING);
 
         if ui.is_enabled() {
-            ui.input_mut(|input| {
-                input.consume_accesskit_action_requests(id, |request| {
-                    use egui::accesskit::{Action, ActionData};
-                    if self.read_only
-                        && matches!(
-                            request.action,
-                            Action::SetValue | Action::ReplaceSelectedText
-                        )
-                    {
-                        return true;
-                    }
-                    if matches!(
-                        request.action,
-                        Action::SetTextSelection | Action::SetValue | Action::ReplaceSelectedText
-                    ) && !cache
-                        .accessibility
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.matches_document(self.editor))
-                    {
-                        accessibility_errors.push(AccessibilityError::StaleDocument);
-                        return true;
-                    }
-                    match (&request.action, &request.data) {
-                        (
-                            Action::SetTextSelection,
-                            Some(ActionData::SetTextSelection(selection)),
-                        ) => {
-                            if let (Some(anchor), Some(focus)) = (
-                                cache
-                                    .accessibility
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.decode(selection.anchor)),
-                                cache
-                                    .accessibility
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.decode(selection.focus)),
-                            ) {
-                                interrupted |= self.editor.cancel_composition();
-                                record(
-                                    self.editor.set_selection(Selection::new(anchor, focus)),
-                                    &mut errors,
-                                );
-                            } else {
-                                accessibility_errors.push(AccessibilityError::InvalidTextPosition);
-                            }
-                            true
-                        }
-                        (Action::SetValue, Some(ActionData::Value(value))) => {
-                            interrupted |= self.editor.cancel_composition();
-                            self.editor.select_all();
-                            self.editor.break_history_group();
-                            record(self.editor.insert_text(value), &mut errors);
-                            self.editor.break_history_group();
-                            true
-                        }
-                        (Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
-                            interrupted |= self.editor.cancel_composition();
-                            self.editor.break_history_group();
-                            record(self.editor.insert_text(value), &mut errors);
-                            self.editor.break_history_group();
-                            true
-                        }
-                        _ => false,
-                    }
-                })
-            });
-            if old_revision != self.editor.document().revision() {
-                layouts = cache.layout(ui, self.editor, &appearance);
-            }
             if response.clicked() || response.drag_started() {
                 cache.navigation = None;
                 response.request_focus();
                 if let Some(pointer) = response.interact_pointer_pos() {
                     interrupted |= self.editor.cancel_composition();
-                    let position = hit_test(self.editor, &layouts, pointer - origin);
+                    let (position, prefer_next_row) =
+                        hit_test(self.editor, &layouts, pointer - origin);
                     let shift = ui.input(|input| input.modifiers.shift);
                     let selection = if response.triple_clicked() {
                         let end = self
@@ -283,6 +215,8 @@ impl<'a> RichTextEditor<'a> {
                         Selection::caret(position)
                     };
                     record(self.editor.set_selection(selection), &mut errors);
+                    cache.navigation =
+                        pointer_navigation(self.editor, &layouts, position, prefer_next_row);
                 }
             }
             if response.dragged()
@@ -290,12 +224,14 @@ impl<'a> RichTextEditor<'a> {
             {
                 cache.navigation = None;
                 interrupted |= self.editor.cancel_composition();
-                let position = hit_test(self.editor, &layouts, pointer - origin);
+                let (position, prefer_next_row) = hit_test(self.editor, &layouts, pointer - origin);
                 record(
                     self.editor
                         .set_selection(Selection::new(self.editor.selection().anchor, position)),
                     &mut errors,
                 );
+                cache.navigation =
+                    pointer_navigation(self.editor, &layouts, position, prefer_next_row);
             }
 
             if response.has_focus() {
@@ -311,14 +247,38 @@ impl<'a> RichTextEditor<'a> {
                         },
                     )
                 });
-                let events = ui.input(|input| input.events.clone());
-                let mut consumed = Vec::new();
-                for (index, event) in events.iter().enumerate() {
-                    if !ui.memory(|memory| memory.has_focus(id)) {
-                        break;
-                    }
-                    let revision = self.editor.document().revision();
-                    if handle_event(
+            }
+            let process_events = response.has_focus()
+                || ui.input(|input| {
+                    input.events.iter().any(|event| {
+                        matches!(event, Event::AccessKitActionRequest(request)
+                            if request.target_node == id.accesskit_id()
+                                && request.target_tree == egui::accesskit::TreeId::ROOT)
+                    })
+                });
+            let events = if process_events {
+                ui.input(|input| input.events.clone())
+            } else {
+                Vec::new()
+            };
+            let mut consumed = Vec::new();
+            for (index, event) in events.iter().enumerate() {
+                let revision = self.editor.document().revision();
+                let handled = if let Event::AccessKitActionRequest(request) = event
+                    && request.target_node == id.accesskit_id()
+                    && request.target_tree == egui::accesskit::TreeId::ROOT
+                {
+                    handle_accessibility_action(
+                        self.editor,
+                        request,
+                        cache.accessibility.as_deref(),
+                        self.read_only,
+                        &mut interrupted,
+                        &mut errors,
+                        &mut accessibility_errors,
+                    )
+                } else if response.has_focus() {
+                    handle_event(
                         self.editor,
                         ui,
                         event,
@@ -327,15 +287,20 @@ impl<'a> RichTextEditor<'a> {
                         &mut errors,
                         &mut interrupted,
                         self.read_only,
-                    ) {
-                        consumed.push(index);
-                    }
-                    if revision != self.editor.document().revision() {
-                        layouts = cache.layout(ui, self.editor, &appearance);
-                    }
-                    cache.validate_navigation(self.editor.selection());
+                    )
+                } else {
+                    false
+                };
+                if handled {
+                    consumed.push(index);
                 }
-                // Leave pointer events and unrelated shortcuts available to the host.
+                if revision != self.editor.document().revision() {
+                    layouts = cache.layout(ui, self.editor, &appearance);
+                }
+                cache.validate_navigation(self.editor.selection());
+            }
+            // Keep unrelated events in their original order for the host.
+            if !consumed.is_empty() {
                 ui.input_mut(|input| {
                     let mut consumed = consumed.into_iter().peekable();
                     let mut index = 0;
@@ -348,7 +313,8 @@ impl<'a> RichTextEditor<'a> {
                         retain
                     });
                 });
-            } else {
+            }
+            if !response.has_focus() {
                 interrupted |= self.editor.cancel_composition();
             }
         }
@@ -396,7 +362,8 @@ impl<'a> RichTextEditor<'a> {
         let painter = ui
             .painter()
             .with_clip_rect(ui.clip_rect().intersect(rect.shrink(1.0)));
-        if ui.is_rect_visible(rect) {
+        let visible = ui.is_rect_visible(rect);
+        if visible {
             if let Some(selection) = display_selection {
                 paint_document_selection(
                     display_document,
@@ -444,52 +411,69 @@ impl<'a> RichTextEditor<'a> {
                     ui.visuals().weak_text_color(),
                 );
             }
-
-            if response.has_focus() {
-                let caret_position =
-                    preview.map_or(self.editor.selection().focus, |preview| preview.caret);
-                let prefer_next_row = preview.is_some()
-                    || cache
-                        .navigation
-                        .as_ref()
-                        .is_none_or(|navigation| navigation.prefer_next_row);
-                let caret = document_caret_rect(
-                    display_document,
-                    display_layouts,
-                    origin,
-                    caret_position,
-                    prefer_next_row,
+        }
+        if response.has_focus() {
+            let caret_position =
+                preview.map_or(self.editor.selection().focus, |preview| preview.caret);
+            let prefer_next_row = preview.is_some()
+                || cache
+                    .navigation
+                    .as_ref()
+                    .is_none_or(|navigation| navigation.prefer_next_row);
+            let local_caret = document_caret_rect(
+                display_document,
+                display_layouts,
+                Pos2::ZERO,
+                caret_position,
+                prefer_next_row,
+            );
+            let caret = local_caret.translate(origin.to_vec2());
+            let show_caret = self
+                .editor
+                .composition()
+                .map_or(self.editor.selection().is_caret(), |composition| {
+                    composition.selection.is_some()
+                });
+            if visible && show_caret {
+                painter.line_segment(
+                    [caret.left_top(), caret.left_bottom()],
+                    ui.visuals().text_cursor.stroke,
                 );
-                let show_caret = self
-                    .editor
-                    .composition()
-                    .map_or(self.editor.selection().is_caret(), |composition| {
-                        composition.selection.is_some()
-                    });
-                if show_caret {
-                    painter.line_segment(
-                        [caret.left_top(), caret.left_bottom()],
-                        ui.visuals().text_cursor.stroke,
-                    );
-                }
-                if old_selection != self.editor.selection() || response.changed() {
-                    ui.scroll_to_rect(caret.expand(4.0), None);
-                }
-                let transform = ui
-                    .ctx()
-                    .layer_transform_to_global(ui.layer_id())
-                    .unwrap_or_default();
-                if !self.read_only && ui.is_enabled() {
-                    ui.output_mut(|output| {
-                        output.ime = Some(egui::output::IMEOutput {
-                            purpose: egui::IMEPurpose::Normal,
-                            rect: transform * rect,
-                            cursor_rect: transform * caret,
-                            should_interrupt_composition: interrupted,
-                        })
-                    });
+            }
+            if cache.caret_rect != Some(local_caret)
+                || cache.scroll_to_caret
+                || old_selection != self.editor.selection()
+                || response.changed()
+                || old_composition.as_ref() != self.editor.composition()
+            {
+                // Scroll even if the whole widget is clipped. Input can grow
+                // the displayed document after its space was allocated; repeat
+                // the request next frame after the new content height is known.
+                ui.scroll_to_rect(caret.expand(4.0), None);
+                cache.scroll_to_caret = display_layouts
+                    .last()
+                    .is_some_and(|layout| layout.rect.bottom() > height);
+                if cache.scroll_to_caret {
+                    ui.ctx().request_repaint();
                 }
             }
+            cache.caret_rect = Some(local_caret);
+            let transform = ui
+                .ctx()
+                .layer_transform_to_global(ui.layer_id())
+                .unwrap_or_default();
+            if !self.read_only && ui.is_enabled() {
+                ui.output_mut(|output| {
+                    output.ime = Some(egui::output::IMEOutput {
+                        purpose: egui::IMEPurpose::Normal,
+                        rect: transform * rect,
+                        cursor_rect: transform * caret,
+                        should_interrupt_composition: interrupted,
+                    })
+                });
+            }
+        } else {
+            cache.scroll_to_caret = false;
         }
 
         if response.hovered() {
@@ -598,6 +582,8 @@ struct Cache {
     preview: Option<Box<CompositionPreview>>,
     accessibility: Option<Arc<accessibility::Snapshot>>,
     navigation: Option<VerticalNavigation>,
+    caret_rect: Option<Rect>,
+    scroll_to_caret: bool,
 }
 
 #[derive(Clone)]
@@ -990,15 +976,71 @@ fn record(result: Result<(), Error>, errors: &mut Vec<Error>) {
     }
 }
 
-fn hit_test(editor: &Editor, layouts: &[ParagraphLayout], point: Vec2) -> Position {
+fn handle_accessibility_action(
+    editor: &mut Editor,
+    request: &egui::accesskit::ActionRequest,
+    snapshot: Option<&accessibility::Snapshot>,
+    read_only: bool,
+    interrupted: &mut bool,
+    errors: &mut Vec<Error>,
+    accessibility_errors: &mut Vec<AccessibilityError>,
+) -> bool {
+    use egui::accesskit::{Action, ActionData};
+    if read_only
+        && matches!(
+            request.action,
+            Action::SetValue | Action::ReplaceSelectedText
+        )
+    {
+        return true;
+    }
+    if !matches!(
+        request.action,
+        Action::SetTextSelection | Action::SetValue | Action::ReplaceSelectedText
+    ) {
+        return false;
+    }
+    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.matches_document(editor)) else {
+        accessibility_errors.push(AccessibilityError::StaleDocument);
+        return true;
+    };
+    match (&request.action, &request.data) {
+        (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+            if let (Some(anchor), Some(focus)) = (
+                snapshot.decode(selection.anchor),
+                snapshot.decode(selection.focus),
+            ) {
+                *interrupted |= editor.cancel_composition();
+                record(editor.set_selection(Selection::new(anchor, focus)), errors);
+            } else {
+                accessibility_errors.push(AccessibilityError::InvalidTextPosition);
+            }
+        }
+        (Action::SetValue | Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
+            *interrupted |= editor.cancel_composition();
+            editor.break_history_group();
+            let result = if request.action == Action::SetValue {
+                editor.replace_range(Position::default()..editor.document().end(), value)
+            } else {
+                editor.insert_text(value)
+            };
+            record(result, errors);
+            editor.break_history_group();
+        }
+        _ => accessibility_errors.push(AccessibilityError::InvalidActionData),
+    }
+    true
+}
+
+fn hit_test(editor: &Editor, layouts: &[ParagraphLayout], point: Vec2) -> (Position, bool) {
     let paragraph = layouts
         .partition_point(|layout| point.y > layout.rect.bottom() + PARAGRAPH_GAP / 2.0)
         .min(layouts.len().saturating_sub(1));
     let Some(layout) = layouts.get(paragraph) else {
-        return Position::default();
+        return (Position::default(), true);
     };
     let Some(source) = editor.document().paragraph(paragraph) else {
-        return Position::default();
+        return (Position::default(), true);
     };
     let cursor = layout
         .galley
@@ -1008,14 +1050,53 @@ fn hit_test(editor: &Editor, layouts: &[ParagraphLayout], point: Vec2) -> Positi
         .unwrap_or(source.text().len());
     let before = source.boundary_at_or_before(byte);
     let after = source.boundary_at_or_after(byte);
-    Position::new(
-        paragraph,
-        if byte - before <= after - byte {
-            before
-        } else {
-            after
-        },
-    )
+    let byte = if byte - before <= after - byte {
+        before
+    } else {
+        after
+    };
+    let index = CharIndex(source.scalar_index(byte).expect("snapped scalar boundary"));
+    let clicked_row = layout.galley.layout_from_cursor(cursor).row;
+    // A wrap seam has two visual caret positions. Preserve the row that was
+    // clicked even when a scalar hit was snapped to a grapheme boundary.
+    let prefer_next_row = [cursor.prefer_next_row, !cursor.prefer_next_row]
+        .into_iter()
+        .find(|&prefer_next_row| {
+            layout
+                .galley
+                .layout_from_cursor(CCursor {
+                    index,
+                    prefer_next_row,
+                })
+                .row
+                == clicked_row
+        })
+        .unwrap_or(cursor.prefer_next_row);
+    (Position::new(paragraph, byte), prefer_next_row)
+}
+
+fn pointer_navigation(
+    editor: &Editor,
+    layouts: &[ParagraphLayout],
+    position: Position,
+    prefer_next_row: bool,
+) -> Option<VerticalNavigation> {
+    let selection = editor.selection();
+    if selection.focus != position {
+        return None;
+    }
+    let caret = document_caret_rect(
+        editor.document(),
+        layouts,
+        Pos2::ZERO,
+        position,
+        prefer_next_row,
+    );
+    Some(VerticalNavigation {
+        selection,
+        preferred_x: caret.center().x,
+        prefer_next_row,
+    })
 }
 
 fn byte_from_char(text: &str, index: usize) -> usize {
@@ -1260,11 +1341,12 @@ fn paint_document_selection(
         let char_start = source.scalar_index(start).unwrap_or(0);
         let char_end = source.scalar_index(end).unwrap_or(source.scalar_count());
         let mut row_start = 0;
-        for row in &layout.galley.rows {
+        for (row_index, row) in layout.galley.rows.iter().enumerate() {
             let count = row.char_count_excluding_newline().0;
             let local_start = char_start.saturating_sub(row_start).min(count);
             let local_end = char_end.saturating_sub(row_start).min(count);
-            let includes_break = index < selection.end.paragraph && char_end >= row_start + count;
+            let includes_break =
+                index < selection.end.paragraph && row_index + 1 == layout.galley.rows.len();
             if local_start < local_end || includes_break {
                 let left = row.pos.x + row.x_offset(CharIndex(local_start));
                 let mut right = row.pos.x + row.x_offset(CharIndex(local_end));
@@ -1788,6 +1870,52 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    fn scrolling_frame(
+        context: &egui::Context,
+        editor: &mut Editor,
+        events: Vec<Event>,
+        focus: bool,
+        preceding_space: f32,
+    ) -> (egui::FullOutput, Vec2, Rect, bool) {
+        let mut offset = Vec2::ZERO;
+        let mut viewport = Rect::NOTHING;
+        let mut visible = false;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let scroll = egui::ScrollArea::vertical()
+                        .id_salt("caret scroll")
+                        .animated(false)
+                        .max_height(100.0)
+                        .show(ui, |ui| {
+                            ui.add_space(preceding_space);
+                            let id = Id::new("scroll editor");
+                            if focus {
+                                ui.memory_mut(|memory| {
+                                    if !memory.has_focus(id) {
+                                        memory.request_focus(id);
+                                    }
+                                });
+                            }
+                            let output = RichTextEditor::new(editor).id(id).min_rows(1).show(ui);
+                            assert!(output.errors.is_empty());
+                            assert!(output.accessibility_errors.is_empty());
+                            visible = ui.is_rect_visible(output.response.rect);
+                        });
+                    offset = scroll.state.offset;
+                    viewport = scroll.inner_rect;
+                });
+            },
+        );
+        output.textures_delta.clear();
+        (output, offset, viewport, visible)
     }
 
     fn appearance() -> Appearance {
@@ -2550,6 +2678,234 @@ mod tests {
     }
 
     #[test]
+    fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
+        let context = egui::Context::default();
+        let editor = Editor::from_text("first second third fourth fifth\nnext");
+        let mut cache = Cache::default();
+        let mut appearance = appearance();
+        appearance.width = 70.0;
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        let rows = &layouts[0].galley.rows;
+        assert!(rows.len() >= 3);
+        let last_start = rows[..rows.len() - 1]
+            .iter()
+            .map(|row| row.char_count_including_newline().0)
+            .sum();
+        let byte = editor
+            .document()
+            .paragraph(0)
+            .unwrap()
+            .byte_from_scalar(last_start)
+            .unwrap();
+        let origin = Pos2::new(10.0, 10.0);
+        let color = Color32::from_rgb(4, 5, 6);
+        let rectangles = |selection| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                paint_document_selection(
+                    editor.document(),
+                    selection,
+                    &layouts,
+                    origin,
+                    ui.painter(),
+                    color,
+                );
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::epaint::Shape::Rect(rectangle) if rectangle.fill == color => {
+                        Some(rectangle.rect)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let selected = rectangles(Selection::new(Position::new(0, byte), Position::new(1, 0)));
+        assert_eq!(selected.len(), 1);
+        let final_row = rows.last().unwrap();
+        assert_eq!(selected[0].top(), origin.y + final_row.rect().top());
+        assert_eq!(
+            selected[0].right(),
+            origin.x + final_row.rect().right() + 5.0
+        );
+
+        let selected = rectangles(Selection::new(Position::default(), Position::new(1, 0)));
+        assert_eq!(selected.len(), rows.len());
+        for (index, (rect, row)) in selected.iter().zip(rows).enumerate() {
+            let extension = if index + 1 == rows.len() { 5.0 } else { 0.0 };
+            assert_eq!(rect.right(), origin.x + row.rect().right() + extension);
+        }
+    }
+
+    #[test]
+    fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
+        let context = egui::Context::default();
+        let id = Id::new("wrap seam");
+        let mut editor = Editor::from_text("first second third fourth fifth sixth seventh");
+        let mut run_frame = |events| {
+            let mut rect = Rect::NOTHING;
+            context
+                .run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let output = RichTextEditor::new(&mut editor)
+                            .id(id)
+                            .desired_width(120.0)
+                            .min_rows(1)
+                            .show(ui);
+                        assert!(output.errors.is_empty());
+                        rect = output.response.rect;
+                    },
+                )
+                .drop_without_applying_deltas();
+            rect
+        };
+        let rect = run_frame(vec![]);
+        let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
+        let layout = &cache.layouts[0];
+        assert!(layout.galley.rows.len() >= 3);
+        let row = &layout.galley.rows[0];
+        let pointer = rect.min
+            + Vec2::splat(PADDING)
+            + layout.rect.min.to_vec2()
+            + Vec2::new(row.rect().right() + 1.0, row.rect().center().y);
+        let click = |pressed| Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(vec![Event::PointerMoved(pointer), click(true)]);
+        run_frame(vec![click(false)]);
+        let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
+        let navigation = cache.navigation.as_ref().expect("pointer affinity");
+        assert!(!navigation.prefer_next_row);
+        assert_eq!(
+            navigation.selection.focus.byte,
+            row.char_count_including_newline().0
+        );
+        let source = cache.paragraphs[0].paragraph.as_ref();
+        assert_eq!(
+            cache.layouts[0]
+                .galley
+                .layout_from_cursor(CCursor {
+                    index: CharIndex(
+                        source
+                            .scalar_index(navigation.selection.focus.byte)
+                            .unwrap()
+                    ),
+                    prefer_next_row: navigation.prefer_next_row,
+                })
+                .row,
+            0
+        );
+
+        run_frame(vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
+        let navigation = cache.navigation.as_ref().unwrap();
+        let source = cache.paragraphs[0].paragraph.as_ref();
+        assert_eq!(
+            cache.layouts[0]
+                .galley
+                .layout_from_cursor(CCursor {
+                    index: CharIndex(
+                        source
+                            .scalar_index(navigation.selection.focus.byte)
+                            .unwrap()
+                    ),
+                    prefer_next_row: navigation.prefer_next_row,
+                })
+                .row,
+            1
+        );
+    }
+
+    #[test]
+    fn focused_clipped_editor_scrolls_to_input_and_keeps_ime_geometry() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        scrolling_frame(&context, &mut editor, vec![], false, 500.0);
+        let (output, offset, _, visible) = scrolling_frame(
+            &context,
+            &mut editor,
+            vec![Event::Text("typed ".into())],
+            true,
+            500.0,
+        );
+        assert!(!visible, "the editor starts entirely below the viewport");
+        assert_eq!(editor.document().plain_text(), "typed original");
+        assert!(
+            offset.y > 400.0,
+            "focused input must bring the caret into view: {offset:?}"
+        );
+        assert!(output.platform_output.ime.is_some());
+        let (output, _, viewport, visible) =
+            scrolling_frame(&context, &mut editor, vec![], true, 500.0);
+        assert!(visible);
+        assert!(viewport.contains_rect(output.platform_output.ime.unwrap().cursor_rect));
+    }
+
+    #[test]
+    fn external_selection_changes_scroll_the_focused_caret_into_view() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text(&format!("{}end", "line\n".repeat(20)));
+        let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+        assert_eq!(offset.y, 0.0);
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+        assert!(offset.y > 100.0);
+        let (output, _, viewport, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+        assert!(viewport.contains_rect(output.platform_output.ime.unwrap().cursor_rect));
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn growing_preedit_scrolls_after_its_new_height_is_allocated() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("");
+        scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+        let text = format!("{}end", "line\n".repeat(20));
+        let cursor = text.chars().count();
+        let (_, offset, _, _) = scrolling_frame(
+            &context,
+            &mut editor,
+            vec![Event::Ime(ImeEvent::Preedit {
+                text,
+                active_range_chars: Some(cursor..cursor),
+            })],
+            true,
+            0.0,
+        );
+        assert_eq!(editor.document().plain_text(), "");
+        assert_eq!(
+            offset.y, 0.0,
+            "the first allocation precedes the new preedit"
+        );
+        let cache = context
+            .data(|data| data.get_temp::<Cache>(Id::new("scroll editor")))
+            .unwrap();
+        assert!(cache.scroll_to_caret);
+        let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+        assert!(offset.y > 100.0);
+        let cache = context
+            .data(|data| data.get_temp::<Cache>(Id::new("scroll editor")))
+            .unwrap();
+        assert!(!cache.scroll_to_caret);
+        let (output, _, viewport, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+        assert!(viewport.contains_rect(output.platform_output.ime.unwrap().cursor_rect));
+        assert!(editor.composition().is_some());
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
     fn ordered_list_reserves_space_for_long_numbers() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("item");
@@ -3289,5 +3645,172 @@ mod tests {
         assert_eq!(editor.document().plain_text(), "axe\u{301}");
         assert!(editor.undo());
         assert_eq!(editor.selected_text(), "👩🏽‍💻");
+    }
+
+    #[test]
+    fn accessibility_set_value_undo_restores_the_previous_selection() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut editor = Editor::from_text("aé\nhello");
+        let selection = Selection::new(Position::new(1, 2), Position::new(0, 1));
+        editor.set_selection(selection).unwrap();
+        let output = frame(&context, &mut editor, vec![], true);
+        let update = output.platform_output.accesskit_update.unwrap();
+        let (root_id, _) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::MultilineTextInput)
+            .unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::AccessKitActionRequest(ActionRequest {
+                action: Action::SetValue,
+                target_node: *root_id,
+                target_tree: TreeId::ROOT,
+                data: Some(ActionData::Value("replacement".into())),
+            })],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "replacement");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "aé\nhello");
+        assert_eq!(editor.selection(), selection);
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn malformed_and_stale_accessibility_actions_are_consumed_without_edits() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut editor = Editor::from_text("original");
+        editor.select_all();
+        let output = frame(&context, &mut editor, vec![], false);
+        let update = output.platform_output.accesskit_update.unwrap();
+        let (root_id, _) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::MultilineTextInput)
+            .unwrap();
+        let run_action = |editor: &mut Editor, action, data, expected: AccessibilityError| {
+            let input = egui::RawInput {
+                events: vec![Event::AccessKitActionRequest(ActionRequest {
+                    action,
+                    target_node: *root_id,
+                    target_tree: TreeId::ROOT,
+                    data,
+                })],
+                ..Default::default()
+            };
+            context
+                .run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let id = ui.make_persistent_id("editor");
+                        let output = RichTextEditor::new(editor).id(id).show(ui);
+                        assert!(output.errors.is_empty());
+                        assert_eq!(output.accessibility_errors, vec![expected.clone()]);
+                        assert!(ui.input(|input| input.events.is_empty()));
+                    });
+                })
+                .drop_without_applying_deltas();
+        };
+        for (action, data) in [
+            (Action::SetValue, None),
+            (Action::ReplaceSelectedText, None),
+            (
+                Action::SetTextSelection,
+                Some(ActionData::Value("wrong".into())),
+            ),
+        ] {
+            run_action(
+                &mut editor,
+                action,
+                data,
+                AccessibilityError::InvalidActionData,
+            );
+            assert_eq!(editor.document().plain_text(), "original");
+            assert_eq!(editor.selected_text(), "original");
+            assert!(!editor.can_undo());
+        }
+        editor.insert_text("external").unwrap();
+        let revision = editor.document().revision();
+        let selection = editor.selection();
+        run_action(
+            &mut editor,
+            Action::SetValue,
+            Some(ActionData::Value("replacement".into())),
+            AccessibilityError::StaleDocument,
+        );
+        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(editor.document().plain_text(), "external");
+        assert_eq!(editor.selection(), selection);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn accessibility_and_keyboard_input_follow_their_batch_order() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, TextSelection, TreeId};
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut editor = Editor::from_text("original");
+        frame(&context, &mut editor, vec![], true);
+        let id = context.memory(|memory| memory.focused()).unwrap();
+        let snapshot = context
+            .data(|data| data.get_temp::<Cache>(id))
+            .unwrap()
+            .accessibility
+            .unwrap();
+        let end = snapshot.position(editor.document().end()).unwrap();
+        let move_to_end = Event::AccessKitActionRequest(ActionRequest {
+            action: Action::SetTextSelection,
+            target_node: id.accesskit_id(),
+            target_tree: TreeId::ROOT,
+            data: Some(ActionData::SetTextSelection(TextSelection {
+                anchor: end,
+                focus: end,
+            })),
+        });
+        let unrelated = key(Key::F1, Modifiers::NONE);
+        let output = context.run_ui(
+            egui::RawInput {
+                events: vec![
+                    Event::Text("typed ".into()),
+                    move_to_end.clone(),
+                    unrelated.clone(),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let id = ui.make_persistent_id("editor");
+                    let output = RichTextEditor::new(&mut editor).id(id).show(ui);
+                    assert!(output.errors.is_empty());
+                    assert_eq!(
+                        output.accessibility_errors,
+                        vec![AccessibilityError::StaleDocument]
+                    );
+                });
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(editor.document().plain_text(), "typed original");
+        assert_eq!(editor.selection().focus, Position::new(0, 6));
+        assert_eq!(context.input(|input| input.events.clone()), vec![unrelated]);
+        assert!(editor.undo());
+        frame(&context, &mut editor, vec![], true);
+
+        frame(
+            &context,
+            &mut editor,
+            vec![move_to_end, Event::Text(" typed".into())],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "original typed");
+        assert_eq!(editor.selection().focus, editor.document().end());
+        assert!(context.input(|input| input.events.is_empty()));
     }
 }

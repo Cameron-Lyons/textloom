@@ -1,7 +1,11 @@
-use std::{borrow::Cow, ops::Range};
+use std::{
+    borrow::Cow,
+    ops::{ControlFlow, Range},
+};
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::document::normalize_newlines;
 use crate::{Document, Position};
 
 /// Options for explicit document searches.
@@ -32,37 +36,193 @@ impl Document {
     /// paragraph and UTF-8 byte coordinates. Only complete graphemes match.
     ///
     /// Query CRLF and CR are normalized to paragraph breaks. Empty queries
-    /// return no matches. Case-sensitive queries without paragraph breaks or
-    /// whole-word constraints search each paragraph without copying its text.
-    /// Other multi-paragraph searches temporarily flatten the document.
+    /// return no matches. Queries without paragraph breaks search paragraphs
+    /// independently; only cross-paragraph queries flatten the document.
     pub fn find(&self, query: &str, options: SearchOptions) -> Vec<Range<Position>> {
+        let mut matches = Vec::new();
+        let _ = self.visit_matches(query, options, |range| {
+            matches.push(range);
+            ControlFlow::Continue(())
+        });
+        matches
+    }
+
+    /// Visit matches without retaining every range; a consumer can stop early.
+    pub(crate) fn visit_matches(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         if query.is_empty() {
-            return Vec::new();
+            return ControlFlow::Continue(());
         }
-        let normalized_query = if query.contains('\r') {
-            Cow::Owned(query.replace("\r\n", "\n").replace('\r', "\n"))
-        } else {
-            Cow::Borrowed(query)
-        };
-        if options.case_sensitive && !options.whole_word && !normalized_query.contains('\n') {
-            let mut matches = Vec::new();
-            for (index, paragraph) in self.paragraphs().iter().enumerate() {
-                if normalized_query.len() > paragraph.text().len() {
-                    continue;
-                }
-                visit_matches(paragraph.text(), &normalized_query, |bytes| {
-                    let range = Position::new(index, bytes.start)..Position::new(index, bytes.end);
-                    if self.validate_position(range.start).is_ok()
-                        && self.validate_position(range.end).is_ok()
-                    {
-                        matches.push(range);
-                        true
+        let needle = search_needle(query, options);
+        self.visit_normalized_matches(&needle, options, accept)
+    }
+
+    /// Local queries start near the selection instead of walking every earlier
+    /// paragraph. Each paragraph still uses forward nonoverlapping matches.
+    pub(crate) fn find_relative(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        selection: Range<Position>,
+        wrap: bool,
+        backward: bool,
+    ) -> Option<Range<Position>> {
+        if query.is_empty() {
+            return None;
+        }
+        let needle = search_needle(query, options);
+        if needle.contains('\n') {
+            // Matching across paragraph breaks must retain the original
+            // document-wide stream and its nonoverlapping candidate order.
+            let mut found = None;
+            let mut wrapped = None;
+            let _ = self.visit_normalized_matches(&needle, options, |range| {
+                if backward {
+                    if range.end <= selection.start {
+                        found = Some(range);
+                    } else if found.is_some() || !wrap {
+                        return ControlFlow::Break(());
                     } else {
-                        false
+                        wrapped = Some(range);
                     }
-                });
+                } else {
+                    if range.start >= selection.end {
+                        found = Some(range);
+                        return ControlFlow::Break(());
+                    }
+                    if wrap && wrapped.is_none() {
+                        wrapped = Some(range);
+                    }
+                }
+                ControlFlow::Continue(())
+            });
+            return found.or(wrapped);
+        }
+
+        let boundary = if backward {
+            selection.start
+        } else {
+            selection.end
+        };
+        if backward {
+            for index in (0..=boundary.paragraph).rev() {
+                if let Some(found) = self.find_paragraph_match(
+                    index,
+                    &needle,
+                    options,
+                    (index == boundary.paragraph).then_some(boundary),
+                    true,
+                ) {
+                    return Some(found);
+                }
             }
-            return matches;
+            if wrap {
+                for index in (boundary.paragraph..self.paragraphs().len()).rev() {
+                    if let Some(found) =
+                        self.find_paragraph_match(index, &needle, options, None, true)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        } else {
+            for index in boundary.paragraph..self.paragraphs().len() {
+                if let Some(found) = self.find_paragraph_match(
+                    index,
+                    &needle,
+                    options,
+                    (index == boundary.paragraph).then_some(boundary),
+                    false,
+                ) {
+                    return Some(found);
+                }
+            }
+            if wrap {
+                for index in 0..=boundary.paragraph {
+                    if let Some(found) =
+                        self.find_paragraph_match(index, &needle, options, None, false)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_paragraph_match(
+        &self,
+        index: usize,
+        needle: &str,
+        options: SearchOptions,
+        boundary: Option<Position>,
+        backward: bool,
+    ) -> Option<Range<Position>> {
+        if boundary.is_some_and(|position| {
+            if backward {
+                position.byte == 0
+            } else {
+                position.byte == self.paragraphs()[index].text().len()
+            }
+        }) {
+            return None;
+        }
+        let mut found = None;
+        let _ = self.visit_paragraph_matches(index, needle, options, |range| {
+            if backward {
+                if boundary.is_some_and(|position| range.end > position) {
+                    return ControlFlow::Break(());
+                }
+                found = Some(range);
+            } else if boundary.is_none_or(|position| range.start >= position) {
+                found = Some(range);
+                return ControlFlow::Break(());
+            }
+            // Ineligible earlier matches remain accepted by the literal
+            // scanner, preserving the document's nonoverlapping match set.
+            ControlFlow::Continue(())
+        });
+        found
+    }
+
+    fn visit_paragraph_matches(
+        &self,
+        index: usize,
+        needle: &str,
+        options: SearchOptions,
+        mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let paragraph = &self.paragraphs()[index];
+        if options.case_sensitive && needle.len() > paragraph.text().len() {
+            return ControlFlow::Continue(());
+        }
+        visit_text_matches(paragraph.text(), needle, options, |bytes| {
+            let range = Position::new(index, bytes.start)..Position::new(index, bytes.end);
+            if self.validate_position(range.start).is_ok()
+                && self.validate_position(range.end).is_ok()
+            {
+                accept(range).map_continue(|()| true)
+            } else {
+                ControlFlow::Continue(false)
+            }
+        })
+    }
+
+    fn visit_normalized_matches(
+        &self,
+        needle: &str,
+        options: SearchOptions,
+        mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        if !needle.contains('\n') {
+            for index in 0..self.paragraphs().len() {
+                self.visit_paragraph_matches(index, needle, options, &mut accept)?;
+            }
+            return ControlFlow::Continue(());
         }
         let source = if let [paragraph] = self.paragraphs() {
             Cow::Borrowed(paragraph.text())
@@ -79,99 +239,131 @@ impl Document {
             let paragraph = paragraph_starts.partition_point(|start| *start <= byte) - 1;
             Position::new(paragraph, byte - paragraph_starts[paragraph])
         };
-        let word_boundaries: Vec<_> = if options.whole_word {
-            source
-                .split_word_bound_indices()
-                .map(|(byte, _)| byte)
-                .chain([source.len()])
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let (searched, needle, lowercase_changes) = if options.case_sensitive {
-            (Cow::Borrowed(source.as_ref()), normalized_query, Vec::new())
-        } else {
-            let lowered = source.to_lowercase();
-            let mut changes = Vec::new();
-            let mut lower_byte = 0;
-            for (byte, character) in source.char_indices() {
-                // String lowercase additionally handles contextual final
-                // sigma, whose UTF-8 length equals its scalar lowercase.
-                let lowered_len = if character.is_ascii() {
-                    1
-                } else {
-                    character.to_lowercase().map(char::len_utf8).sum::<usize>()
-                };
-                if lowered_len != character.len_utf8() {
-                    changes.push((
-                        lower_byte..lower_byte + lowered_len,
-                        byte..byte + character.len_utf8(),
-                    ));
-                }
-                lower_byte += lowered_len;
-            }
-            debug_assert_eq!(lower_byte, lowered.len());
-            (
-                Cow::Owned(lowered),
-                Cow::Owned(normalized_query.to_lowercase()),
-                changes,
-            )
-        };
-
-        let original_byte = |byte: usize| -> Option<usize> {
-            let index = lowercase_changes.partition_point(|(lowered, _)| lowered.end <= byte);
-            if let Some((lowered, original)) = lowercase_changes.get(index)
-                && byte >= lowered.start
+        visit_text_matches(&source, needle, options, |bytes| {
+            let range = position(bytes.start)..position(bytes.end);
+            if self.validate_position(range.start).is_ok()
+                && self.validate_position(range.end).is_ok()
             {
-                // A width-changing scalar may expand into several lowercase
-                // scalars. Only its original outer boundaries are valid.
-                return (byte == lowered.start).then_some(original.start);
-            }
-            let original = index.checked_sub(1).map_or(byte, |index| {
-                let (lowered, original) = &lowercase_changes[index];
-                byte - lowered.end + original.end
-            });
-            // This also rejects partial expansions whose total UTF-8 width
-            // equals the original scalar width, without storing all offsets.
-            source.is_char_boundary(original).then_some(original)
-        };
-        let mut matches = Vec::new();
-        visit_matches(&searched, &needle, |bytes| {
-            let range = original_byte(bytes.start)
-                .zip(original_byte(bytes.end))
-                .and_then(|(start, end)| {
-                    if options.whole_word
-                        && (word_boundaries.binary_search(&start).is_err()
-                            || word_boundaries.binary_search(&end).is_err())
-                    {
-                        return None;
-                    }
-                    let range = position(start)..position(end);
-                    (self.validate_position(range.start).is_ok()
-                        && self.validate_position(range.end).is_ok())
-                    .then_some(range)
-                });
-            if let Some(range) = range {
-                matches.push(range);
-                true
+                accept(range).map_continue(|()| true)
             } else {
-                false
+                ControlFlow::Continue(false)
             }
-        });
-        matches
+        })
     }
+}
+
+fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
+    let query = normalize_newlines(query);
+    if options.case_sensitive {
+        query
+    } else {
+        Cow::Owned(query.to_lowercase())
+    }
+}
+
+/// Lowercasing and word indexes stay bounded by one paragraph for local queries.
+/// `needle` has already been normalized and lowercased as requested.
+fn visit_text_matches(
+    source: &str,
+    needle: &str,
+    options: SearchOptions,
+    mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
+) -> ControlFlow<()> {
+    if options.case_sensitive && !options.whole_word {
+        return visit_literals(source, needle, accept);
+    }
+    let searched = if options.case_sensitive {
+        Cow::Borrowed(source)
+    } else {
+        Cow::Owned(source.to_lowercase())
+    };
+    // Compare after lowercase expansion: a short source such as İ may become
+    // a longer match. Avoid preprocessing impossible needles per paragraph.
+    if needle.len() > searched.len() {
+        return ControlFlow::Continue(());
+    }
+    let word_boundaries: Vec<_> = if options.whole_word {
+        source
+            .split_word_bound_indices()
+            .map(|(byte, _)| byte)
+            .chain([source.len()])
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut lowercase_changes = Vec::new();
+    if !options.case_sensitive && !source.is_ascii() {
+        let mut lower_byte = 0;
+        for (byte, character) in source.char_indices() {
+            // String lowercase additionally handles contextual final
+            // sigma, whose UTF-8 length equals its scalar lowercase.
+            let lowered_len = if character.is_ascii() {
+                1
+            } else {
+                character.to_lowercase().map(char::len_utf8).sum::<usize>()
+            };
+            if lowered_len != character.len_utf8() {
+                lowercase_changes.push((
+                    lower_byte..lower_byte + lowered_len,
+                    byte..byte + character.len_utf8(),
+                ));
+            }
+            lower_byte += lowered_len;
+        }
+        debug_assert_eq!(lower_byte, searched.len());
+    }
+
+    let original_byte = |byte: usize| -> Option<usize> {
+        let index = lowercase_changes.partition_point(|(lowered, _)| lowered.end <= byte);
+        if let Some((lowered, original)) = lowercase_changes.get(index)
+            && byte >= lowered.start
+        {
+            // A width-changing scalar may expand into several lowercase
+            // scalars. Only its original outer boundaries are valid.
+            return (byte == lowered.start).then_some(original.start);
+        }
+        let original = index.checked_sub(1).map_or(byte, |index| {
+            let (lowered, original) = &lowercase_changes[index];
+            byte - lowered.end + original.end
+        });
+        // This also rejects partial expansions whose total UTF-8 width
+        // equals the original scalar width, without storing all offsets.
+        source.is_char_boundary(original).then_some(original)
+    };
+    visit_literals(&searched, needle, |bytes| {
+        let range = original_byte(bytes.start)
+            .zip(original_byte(bytes.end))
+            .and_then(|(start, end)| {
+                if options.whole_word
+                    && (word_boundaries.binary_search(&start).is_err()
+                        || word_boundaries.binary_search(&end).is_err())
+                {
+                    return None;
+                }
+                Some(start..end)
+            });
+        if let Some(range) = range {
+            accept(range)
+        } else {
+            ControlFlow::Continue(false)
+        }
+    })
 }
 
 /// A rejected candidate may overlap a valid later match, so only accepted
 /// matches advance past the full needle. Retain the literal searcher's needle
 /// preprocessing between accepted candidates.
-fn visit_matches(source: &str, needle: &str, mut accept: impl FnMut(Range<usize>) -> bool) {
+fn visit_literals(
+    source: &str,
+    needle: &str,
+    mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
+) -> ControlFlow<()> {
     let mut offset = 0;
     'search: loop {
         for (relative_start, _) in source[offset..].match_indices(needle) {
             let start = offset + relative_start;
-            if !accept(start..start + needle.len()) {
+            if !accept(start..start + needle.len())? {
                 offset = start
                     + source[start..]
                         .chars()
@@ -183,4 +375,5 @@ fn visit_matches(source: &str, needle: &str, mut accept: impl FnMut(Range<usize>
         }
         break;
     }
+    ControlFlow::Continue(())
 }

@@ -1108,11 +1108,20 @@ impl Delta {
     }
 }
 
-fn normalize_newlines(text: &str) -> Cow<'_, str> {
-    if !text.contains('\r') {
+pub(crate) fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    let mut breaks = text.match_indices('\r').map(|(index, _)| index);
+    let Some(first) = breaks.next() else {
         return Cow::Borrowed(text);
+    };
+    let mut normalized = String::with_capacity(text.len());
+    let mut start = 0;
+    for index in std::iter::once(first).chain(breaks) {
+        normalized.push_str(&text[start..index]);
+        normalized.push('\n');
+        start = index + 1 + usize::from(text.as_bytes().get(index + 1) == Some(&b'\n'));
     }
-    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    normalized.push_str(&text[start..]);
+    Cow::Owned(normalized)
 }
 
 fn continuation_kind(kind: ParagraphKind, offset: usize) -> ParagraphKind {
@@ -1217,6 +1226,24 @@ fn new_text_indices(ascii: bool) -> OnceLock<Arc<TextIndices>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newline_normalization_handles_all_adjacent_breaks_and_keeps_lf_borrowed() {
+        let tokens = ["a", "é", "\r", "\n"];
+        for length in 0..=5 {
+            for mut case in 0..4usize.pow(length) {
+                let mut text = String::new();
+                for _ in 0..length {
+                    text.push_str(tokens[case % tokens.len()]);
+                    case /= tokens.len();
+                }
+                let expected = text.replace("\r\n", "\n").replace('\r', "\n");
+                let normalized = normalize_newlines(&text);
+                assert_eq!(normalized, expected, "input {text:?}");
+                assert_eq!(matches!(normalized, Cow::Borrowed(_)), !text.contains('\r'));
+            }
+        }
+    }
 
     #[test]
     fn indexed_unicode_offsets_match_extended_graphemes_and_scalars() {

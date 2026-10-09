@@ -71,6 +71,84 @@ pub struct InlineStyle {
     pub foreground: Option<Color>,
 }
 
+/// Inline formatting shared by selected text, with `None` for mixed attributes.
+///
+/// [`crate::Editor::selection_style`] reports each attribute independently, so
+/// a selection can be uniformly bold while having mixed italic or color values.
+/// At a caret, every field describes the pending typing style.
+///
+/// Foreground uses two optional layers: `None` is mixed, `Some(None)` is the
+/// renderer's default color throughout, and `Some(Some(color))` is one explicit
+/// color throughout.
+///
+/// ```
+/// use textloom::{Color, Editor, StylePatch};
+///
+/// let mut editor = Editor::from_text("ab");
+/// assert_eq!(editor.selection_style().foreground, Some(None));
+/// let color = Color([40, 80, 120, 255]);
+/// editor.apply_style(StylePatch {
+///     foreground: Some(Some(color)),
+///     ..Default::default()
+/// }).unwrap();
+/// assert_eq!(editor.selection_style().foreground, Some(Some(color)));
+/// editor.insert_text("x").unwrap();
+/// editor.select_all();
+/// assert_eq!(editor.selection_style().foreground, None);
+/// assert_eq!(editor.selection_style().bold, Some(false));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionStyle {
+    /// Shared bold value, or `None` when selected runs disagree.
+    pub bold: Option<bool>,
+    /// Shared italic value, or `None` when selected runs disagree.
+    pub italic: Option<bool>,
+    /// Shared underline value, or `None` when selected runs disagree.
+    pub underline: Option<bool>,
+    /// Shared strikethrough value, or `None` when selected runs disagree.
+    pub strikethrough: Option<bool>,
+    /// Shared inline-code value, or `None` when selected runs disagree.
+    pub code: Option<bool>,
+    /// Shared color: `None` is mixed, `Some(None)` is uniformly default,
+    /// and `Some(Some(color))` is uniformly explicit.
+    pub foreground: Option<Option<Color>>,
+}
+
+impl From<InlineStyle> for SelectionStyle {
+    fn from(style: InlineStyle) -> Self {
+        Self {
+            bold: Some(style.bold),
+            italic: Some(style.italic),
+            underline: Some(style.underline),
+            strikethrough: Some(style.strikethrough),
+            code: Some(style.code),
+            foreground: Some(style.foreground),
+        }
+    }
+}
+
+impl SelectionStyle {
+    pub(crate) fn include(&mut self, style: InlineStyle) {
+        self.bold = self.bold.filter(|value| *value == style.bold);
+        self.italic = self.italic.filter(|value| *value == style.italic);
+        self.underline = self.underline.filter(|value| *value == style.underline);
+        self.strikethrough = self
+            .strikethrough
+            .filter(|value| *value == style.strikethrough);
+        self.code = self.code.filter(|value| *value == style.code);
+        self.foreground = self.foreground.filter(|value| *value == style.foreground);
+    }
+
+    pub(crate) fn is_fully_mixed(self) -> bool {
+        self.bold.is_none()
+            && self.italic.is_none()
+            && self.underline.is_none()
+            && self.strikethrough.is_none()
+            && self.code.is_none()
+            && self.foreground.is_none()
+    }
+}
+
 /// Only supplied attributes change. `Some(None)` clears a foreground color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StylePatch {

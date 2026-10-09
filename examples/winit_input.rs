@@ -38,5 +38,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(editor.document().plain_text(), "日本語");
     assert!(editor.undo());
     println!("Undo restored: {}", editor.document().plain_text());
+
+    // A read-only viewer still offers selection and clipboard access.
+    input.set_read_only(true, &mut editor);
+    input.set_modifiers(ModifiersState::CONTROL);
+    let copy = input.handle_key(
+        &Key::Character("x".into()),
+        ElementState::Pressed,
+        None,
+        &mut editor,
+    )?;
+    assert_eq!(
+        copy.clipboard,
+        Some(ClipboardEvent::Copy("Select and edit me".into()))
+    );
+    assert!(!input.paste(&mut editor, "ignored")?.changed);
+    assert_eq!(editor.document().plain_text(), "Select and edit me");
     Ok(())
 }

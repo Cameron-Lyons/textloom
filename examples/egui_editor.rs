@@ -7,9 +7,10 @@ use textloom::{Editor, ParagraphKind, StylePatch, adapter::egui::RichTextEditor}
 fn editor_ui(ui: &mut egui::Ui, editor: &mut Editor) {
     let mut errors = Vec::new();
     ui.horizontal(|ui| {
+        let style = editor.selection_style();
         if ui.button("Bold").clicked()
             && let Err(error) = editor.apply_style(StylePatch {
-                bold: Some(!editor.typing_style().bold),
+                bold: Some(style.bold != Some(true)),
                 ..Default::default()
             })
         {
@@ -17,9 +18,14 @@ fn editor_ui(ui: &mut egui::Ui, editor: &mut Editor) {
         }
         if ui.button("Italic").clicked()
             && let Err(error) = editor.apply_style(StylePatch {
-                italic: Some(!editor.typing_style().italic),
+                italic: Some(style.italic != Some(true)),
                 ..Default::default()
             })
+        {
+            errors.push(error);
+        }
+        if ui.button("Clear formatting").clicked()
+            && let Err(error) = editor.clear_formatting()
         {
             errors.push(error);
         }

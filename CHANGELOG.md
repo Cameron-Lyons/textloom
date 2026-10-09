@@ -2,10 +2,41 @@
 
 ## 1.0.0
 
-Unreleased. Native host validation is still pending; see `RELEASING.md`.
+Unreleased. Native host checks and publication steps are tracked in `RELEASING.md`.
 
 First stable release of the native Rust rich-text editing library.
 
+- Inline clear-formatting preserves paragraph kinds and selection direction,
+  supports caret typing-style reset, and restores rich state through undo/redo.
+- `SelectionStyle` reports uniform and mixed inline attributes independently for
+  formatting toolbars. `Editor::selection_style()` respects partial Unicode and
+  directional selections, ignores separators, and reports pending caret styles
+  without allocating or changing editor state.
+- Selectable read-only winit input suppresses keyboard edits, paste, and IME
+  while retaining navigation and copy. Direct AccessKit read-only mode cancels
+  existing preedit and blocks accessibility text replacements while retaining
+  selection. Both support runtime mode changes; AccessKit full-value replacement
+  uses one undo step.
+- Egui accessibility full-value replacement restores the previous directional
+  selection on undo. Malformed and stale accessibility actions are rejected
+  without editing content.
+- Egui keyboard and accessibility events follow their input batch order, so
+  edits invalidate later stale accessibility coordinates instead of reordering
+  the actions. Unrelated host events retain their original order.
+- Egui pointer carets retain the clicked row at wrap boundaries, and hard-break
+  selection highlighting extends only the final wrapped row of a paragraph.
+  Focused caret and preedit changes scroll into view from clipped content,
+  including external selection changes and newly allocated preedit height.
+- Find navigation starts near the selection for paragraph-local queries and
+  wraps through bounded paragraph intervals in either direction. Each paragraph
+  retains forward nonoverlapping matches and full Unicode lowercase context.
+  Queries with paragraph breaks retain document-wide matching. Paragraph-local
+  lowercase and whole-word searches avoid flattening the document.
+- History entries store their delta directly to avoid a per-edit allocation;
+  disabled history skips retention work. Newline normalization uses one copied
+  buffer and is shared by import, insertion, and search queries.
+- Release verification checks the complete package inventory before testing
+  the extracted crate, catching omitted test, example, and benchmark directories.
 - Renderer-independent documents, inline styles, headings, lists, directional
   selections, Unicode grapheme/word editing, and transient IME composition.
 - Bounded undo/redo with grouped typing, rich clipboard fragments, literal
@@ -17,6 +48,10 @@ First stable release of the native Rust rich-text editing library.
   compatibility policy, and a reproducible release verification script.
 - Full feature-combination checks, Rust 1.95 validation, cross-platform CI,
   and tag-gated package artifacts.
+- A repository-only native eframe host demonstrates mixed-state formatting,
+  headings/lists, search/replacement, snapshots, read-only mode, clipboard and
+  IME integration. It has a separate lockfile and font/smoke-test options; native
+  host compilation joins Ubuntu, Rust 1.95, macOS and Windows validation.
 - Corrected invalid-position style lookup, composition cancellation and focus
   handling, macOS navigation and AltGr shortcuts, and accessibility updates.
 - Rich Unicode import keeps navigation indexes lazy. HTML export replaces NUL

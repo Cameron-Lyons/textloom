@@ -58,6 +58,8 @@ jobs:
       - name: All targets compile
         run: |
           cargo check --locked --all-features --all-targets
+      - name: Native host example compiles
+        run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
 
   native:
     name: Native (${{ matrix.os }})
@@ -79,5 +81,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: All targets compile
         run: cargo check --locked --all-features --all-targets
+      - name: Native host example compiles
+        run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
       - name: Tests and doctests
         run: cargo test --locked --all-features

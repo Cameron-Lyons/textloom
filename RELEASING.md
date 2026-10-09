@@ -2,22 +2,71 @@
 
 ## 1.0 validation status
 
-Local Linux validation on 2026-10-08 passed the complete release script with Rust
-1.99.0, including all eight feature combinations, strict Clippy, documentation,
-benchmarks, examples, and tests/all-target compilation from the extracted crate.
-The all-feature suite and three doctests pass; one host widget
-snippet is intentionally ignored. Rust 1.95.0 also passed all eight test/doctest
-combinations and all-feature compilation of every target.
+Local Linux validation on 2026-10-09 passed all eight test/doctest feature
+combinations with Rust 1.99.0 stable and Rust 1.95.0. The all-feature suite passes 201 unit and
+integration tests and four doctests, including the compile-fail accessibility
+API check: 205 passing tests in total. One egui host widget snippet is
+intentionally ignored. All library targets and the standalone native host also
+compile with Rust 1.95.0.
 
-The 1.0.0 working tree is an unreleased candidate. As of 2026-10-08, no native
-host testing has been performed. Do not treat passing automated checks as native
-host signoff: candidate placement, clipboard transport, rendering, and platform
-accessibility depend on services supplied by the host.
+The complete stable-toolchain release script passed on the candidate working
+tree: formatting, strict Clippy, warning-free API documentation, benchmark smoke
+tests, headless examples, package inventory verification, and tests and all-target
+compilation from the extracted crate. Native host formatting, strict Clippy,
+and compilation against both the source and extracted library also passed.
+
+The 1.0.0 working tree is an unreleased candidate. Linux Wayland rendering has
+passed at 200% display scale with optional Noto CJK and Liberation Bold fonts.
+Native ASCII typing and plain-text copy passed with exact clipboard content
+verified. Unicode paste, native formatting/undo/redo, read-only behavior, IME
+candidate placement, screen-reader behavior, and macOS and Windows native host
+checks still require manual signoff.
 
 Before publication, record the final commit, native host and version, operating
 system and display backend, IMEs and screen readers used, and the outcome of each
 native check below. Linux, macOS, and Windows host results and the CI matrix on
 the final clean commit remain required. Publish only after these checks pass.
+
+## Native host validation record
+
+The standalone host in `examples/native-editor` uses eframe/egui 0.36.2 and
+winit 0.30.13. It is available from a repository checkout and is intentionally
+excluded from the published library archive. Its renderer, window, clipboard,
+and platform accessibility dependencies remain outside the library's dependency
+graph. The example transports plain text through the system clipboard; rich MIME
+transport requires a host integration using Textloom's fragment API.
+
+Reproduce the Linux host used for rendering checks from the repository root:
+
+```sh
+cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target -- \
+  --font /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc \
+  --bold-font /usr/share/fonts/liberation/LiberationSans-Bold.ttf
+```
+
+These optional font paths require the corresponding local font files; the host
+does not install or change system fonts. Add `--smoke-test` to render 20 native
+frames and exit, or `--read-only` for selection/copy checks with editing disabled.
+The smoke mode fails if the widget reports an editing or accessibility error;
+native IME, clipboard, and screen-reader behavior need separate interaction tests.
+
+Partial QA record for 2026-10-09: uncommitted 1.0.0 candidate; Omarchy
+4.0.0.r6815.g50d687a (Arch-based Linux), kernel 7.2.8-5-omarchy-bore,
+Hyprland/Wayland, 200% display scale. Final commit and complete platform signoff
+remain pending.
+
+| Check | Result |
+| --- | --- |
+| Native window rendering at 200% scale with Noto CJK and Liberation Bold | Passed |
+| Native ASCII typing and plain-text copy | Passed; exact clipboard content verified |
+| Unicode clipboard paste | Validation pending |
+| Native formatting shortcuts and undo/redo | Validation pending |
+| Native read-only input and copy | Validation pending |
+| Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Manual validation pending |
+| Dead keys and AltGr | Manual validation pending |
+| Screen-reader selection and replacement | Manual validation pending |
+| Rich clipboard MIME transport | Host integration and validation pending |
+| macOS and Windows native host checks | Manual validation pending |
 
 ## Compatibility contract
 
@@ -56,14 +105,23 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
 2. Run `./scripts/check-release.sh --allow-dirty --tag v1.0.0` while reviewing
    pending changes. This requires a matching changelog entry and checks formatting,
    every feature combination, doctests, Clippy, documentation, benchmarks, and
-   examples. It then runs all-feature tests and compiles every target from the
-   extracted Cargo package, so missing fixtures or examples fail the release gate.
-3. Review `cargo package --locked --list --allow-dirty`. Source, examples, tests,
-   fixtures, benchmark documentation, changelog, and license must be included;
-   repository workflows and local build output must be absent.
+   headless examples. It also checks formatting and strict Clippy for the native
+   host without opening a window. It then runs all-feature tests and compiles
+   every target from the extracted Cargo package. An explicit inventory check
+   requires every packaged source, test, fixture, headless example, benchmark,
+   and release document before those checks, so accidentally omitting an entire
+   target directory cannot silently pass. A temporary copy of the repository's
+   native host is also compiled against the extracted library with its unchanged
+   lockfile; this leaves the verified crate untouched.
+3. Review `cargo package --locked --list --allow-dirty`. Source, headless examples,
+   tests, fixtures, benchmark documentation, changelog, and license must be
+   included. The repository-only native host, workflows, and local build output
+   must be absent.
 4. Commit the release changes, then run `./scripts/check-release.sh --tag v1.0.0`
    on the clean checkout. Run `cargo +1.95.0 test --locked --all-features` and
-   confirm the MSRV feature checks and macOS/Windows jobs pass on that commit.
+   `cargo +1.95.0 check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target`.
+   Confirm the MSRV feature checks and macOS/Windows jobs pass on that commit;
+   they compile the standalone native host as well as the library targets.
 5. Exercise a native host on Linux, macOS, and Windows. Check focus loss during
    composition, Japanese/Chinese IME replacement and candidate placement,
    dead keys and AltGr, platform shortcuts, plain/rich clipboard transport,

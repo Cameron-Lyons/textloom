@@ -3,7 +3,7 @@ use std::{collections::VecDeque, ops::Range};
 use crate::document::Delta;
 use crate::{
     Document, Error, Fragment, InlineStyle, Movement, ParagraphKind, Position, SearchOptions,
-    Selection, StylePatch,
+    Selection, SelectionStyle, StylePatch,
 };
 
 /// Native IME preedit. It is rendered over `replacement` and never stored in the document.
@@ -43,7 +43,7 @@ struct EditState {
 }
 
 struct HistoryEntry {
-    deltas: Vec<Delta>,
+    delta: Delta,
     before: EditState,
     after: EditState,
     typing: bool,
@@ -111,6 +111,52 @@ impl Editor {
     /// Formatting applied to plain text insertions at the current selection.
     pub fn typing_style(&self) -> InlineStyle {
         self.typing_style
+    }
+    /// Report uniform or mixed inline attributes across the selected text.
+    /// Paragraph separators and empty paragraphs have no inline attributes and
+    /// are ignored. At a caret, or when only separators are selected, reports
+    /// the pending typing style. Transient IME preedit is not included.
+    ///
+    /// Reads intersecting formatting runs without allocating or building text
+    /// indexes. Selection direction does not affect the result.
+    pub fn selection_style(&self) -> SelectionStyle {
+        if self.selection.is_caret() {
+            return self.typing_style.into();
+        }
+        let range = self.selection.range();
+        let mut result: Option<SelectionStyle> = None;
+        for index in range.start.paragraph..=range.end.paragraph {
+            let paragraph = &self.document.paragraphs()[index];
+            let start = if index == range.start.paragraph {
+                range.start.byte
+            } else {
+                0
+            };
+            let end = if index == range.end.paragraph {
+                range.end.byte
+            } else {
+                paragraph.text().len()
+            };
+            if start == end {
+                continue;
+            }
+            let spans = paragraph.spans();
+            let first = spans.partition_point(|span| span.range.end <= start);
+            for span in &spans[first..] {
+                if span.range.start >= end {
+                    break;
+                }
+                if let Some(style) = &mut result {
+                    style.include(span.style);
+                    if style.is_fully_mixed() {
+                        return *style;
+                    }
+                } else {
+                    result = Some(span.style.into());
+                }
+            }
+        }
+        result.unwrap_or_else(|| self.typing_style.into())
     }
     /// Current transient IME preedit, or `None` when no composition is active.
     pub fn composition(&self) -> Option<&Composition> {
@@ -212,7 +258,7 @@ impl Editor {
         self.preferred_column = None;
         self.break_history_group();
         if !delta.is_empty() {
-            self.record(vec![delta], before, false);
+            self.record(delta, before, false);
         }
         Ok(())
     }
@@ -249,20 +295,9 @@ impl Editor {
         backward: bool,
     ) -> Result<bool, Error> {
         self.ensure_no_composition()?;
-        let matches = self.document.find(query, options);
-        let selection = self.selection.range();
-        let found = if backward {
-            matches
-                .iter()
-                .rev()
-                .find(|range| range.end <= selection.start)
-                .or_else(|| if wrap { matches.last() } else { None })
-        } else {
-            matches
-                .iter()
-                .find(|range| range.start >= selection.end)
-                .or_else(|| if wrap { matches.first() } else { None })
-        };
+        let found =
+            self.document
+                .find_relative(query, options, self.selection.range(), wrap, backward);
         if let Some(range) = found {
             self.set_selection(Selection::new(range.start, range.end))?;
             Ok(true)
@@ -295,7 +330,7 @@ impl Editor {
         self.preferred_column = None;
         self.break_history_group();
         if !delta.is_empty() {
-            self.record(vec![delta], before, false);
+            self.record(delta, before, false);
         }
         Ok(matches.len())
     }
@@ -428,9 +463,25 @@ impl Editor {
         let delta = self.document.apply_style(self.selection.range(), patch)?;
         patch.apply(&mut self.typing_style);
         if let Some(delta) = delta {
-            self.record(vec![delta], before, false);
+            self.record(delta, before, false);
         }
         Ok(())
+    }
+
+    /// Remove every inline attribute from selected text and reset the typing style.
+    /// Paragraph kinds, selection direction, and unselected text are preserved.
+    /// At a caret, resets only the typing style without adding an undo step.
+    /// A selection with formatting changes is reset as a single undo step.
+    /// Returns [`Error::CompositionActive`] during IME preedit.
+    pub fn clear_formatting(&mut self) -> Result<(), Error> {
+        self.apply_style(StylePatch {
+            bold: Some(false),
+            italic: Some(false),
+            underline: Some(false),
+            strikethrough: Some(false),
+            code: Some(false),
+            foreground: Some(None),
+        })
     }
 
     /// Applies paragraph formatting to every selected paragraph. An endpoint at
@@ -447,7 +498,7 @@ impl Editor {
             .set_kind(self.selected_paragraph_range(), kind)?;
         self.break_history_group();
         if let Some(delta) = delta {
-            self.record(vec![delta], before, false);
+            self.record(delta, before, false);
         }
         Ok(())
     }
@@ -474,7 +525,7 @@ impl Editor {
             .change_list_indent(self.selected_paragraph_range(), increase);
         self.break_history_group();
         if !delta.is_empty() {
-            self.record(vec![delta], before, false);
+            self.record(delta, before, false);
         }
         Ok(())
     }
@@ -628,9 +679,7 @@ impl Editor {
         let Some(entry) = self.undo.pop_back() else {
             return false;
         };
-        for delta in entry.deltas.iter().rev() {
-            self.document.replay(delta, false);
-        }
+        self.document.replay(&entry.delta, false);
         self.restore(entry.before);
         self.redo.push_back(entry);
         true
@@ -645,9 +694,7 @@ impl Editor {
         let Some(entry) = self.redo.pop_back() else {
             return false;
         };
-        for delta in &entry.deltas {
-            self.document.replay(delta, true);
-        }
+        self.document.replay(&entry.delta, true);
         self.restore(entry.after);
         self.undo.push_back(entry);
         true
@@ -696,19 +743,23 @@ impl Editor {
         self.selection = Selection::caret(caret);
         self.preferred_column = None;
         if !delta.is_empty() {
-            self.record(vec![delta], before, typing);
+            self.record(delta, before, typing);
         }
         Ok(())
     }
 
-    fn record(&mut self, deltas: Vec<Delta>, before: EditState, typing: bool) {
+    fn record(&mut self, delta: Delta, before: EditState, typing: bool) {
         for entry in self.redo.drain(..) {
             self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
         }
+        if self.limits.max_entries == 0 || self.limits.max_bytes == 0 {
+            self.coalesce_typing = false;
+            return;
+        }
         let after = self.state();
-        let mut entry = HistoryEntry {
-            bytes: deltas.iter().map(Delta::retained_bytes).sum(),
-            deltas,
+        let entry = HistoryEntry {
+            bytes: delta.retained_bytes(),
+            delta,
             before,
             after,
             typing,
@@ -719,20 +770,18 @@ impl Editor {
                 previous.typing
                     && previous.after.selection == before.selection
                     && previous.after.style == before.style
-                    && previous.deltas.len() == 1
-                    && entry.deltas.len() == 1
-                    && previous.deltas[0].start == entry.deltas[0].start
-                    && previous.deltas[0].before.len() == 1
-                    && previous.deltas[0].after.len() == 1
-                    && entry.deltas[0].before.len() == 1
-                    && entry.deltas[0].after.len() == 1
+                    && previous.delta.start == entry.delta.start
+                    && previous.delta.before.len() == 1
+                    && previous.delta.after.len() == 1
+                    && entry.delta.before.len() == 1
+                    && entry.delta.after.len() == 1
             });
         if merge {
             let previous = self.undo.back_mut().expect("checked entry");
             self.history_bytes = self.history_bytes.saturating_sub(previous.bytes);
-            previous.deltas[0].after = std::mem::take(&mut entry.deltas[0].after);
+            previous.delta.after = entry.delta.after;
             previous.after = after;
-            previous.bytes = previous.deltas[0].retained_bytes();
+            previous.bytes = previous.delta.retained_bytes();
             self.history_bytes = self.history_bytes.saturating_add(previous.bytes);
         } else {
             self.history_bytes = self.history_bytes.saturating_add(entry.bytes);

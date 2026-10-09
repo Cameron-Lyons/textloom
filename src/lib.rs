@@ -16,5 +16,6 @@ pub use editor::{Composition, Editor, HistoryLimits};
 pub use fragment::{Fragment, FragmentError};
 pub use search::SearchOptions;
 pub use types::{
-    Color, Error, InlineStyle, Movement, ParagraphKind, Position, Selection, StylePatch,
+    Color, Error, InlineStyle, Movement, ParagraphKind, Position, Selection, SelectionStyle,
+    StylePatch,
 };
