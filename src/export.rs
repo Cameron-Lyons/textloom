@@ -2,6 +2,22 @@ use std::{fmt::Write, sync::Arc};
 
 use crate::{Color, Paragraph, ParagraphKind};
 
+pub(crate) fn plain_text(paragraphs: &[Arc<Paragraph>]) -> String {
+    let capacity = paragraphs
+        .iter()
+        .map(|paragraph| paragraph.text().len())
+        .sum::<usize>()
+        .saturating_add(paragraphs.len().saturating_sub(1));
+    let mut output = String::with_capacity(capacity);
+    for (index, paragraph) in paragraphs.iter().enumerate() {
+        if index != 0 {
+            output.push('\n');
+        }
+        output.push_str(paragraph.text());
+    }
+    output
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ListKind {
     Bullet,

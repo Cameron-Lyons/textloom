@@ -63,6 +63,14 @@ fn main() {
             frame(&context, &mut editor);
         }
         let edit = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64 / 2.0;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            editor.insert_paragraph().unwrap();
+            frame(&context, &mut editor);
+            assert!(editor.undo());
+            frame(&context, &mut editor);
+        }
+        let split = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64 / 2.0;
         context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
         editor.begin_composition();
         editor.update_composition("preedit", Some(0..7)).unwrap();
@@ -101,11 +109,12 @@ fn main() {
         editor.cancel_composition();
         assert_eq!(editor.document().plain_text(), source);
         println!(
-            "{paragraphs:>6} paragraphs: {idle:.2} µs / idle frame; {edit:.2} µs / local edit + frame; {preedit:.2} µs / preedit update + frame; {cursor:.2} µs / preedit cursor + frame"
+            "{paragraphs:>6} paragraphs: {idle:.2} µs / idle frame; {edit:.2} µs / local edit + frame; {split:.2} µs / paragraph split or undo + frame; {preedit:.2} µs / preedit update + frame; {cursor:.2} µs / preedit cursor + frame"
         );
     }
     accessibility_frames();
     native_preedit_frames();
+    long_preedit_frames();
 }
 
 fn document_text(paragraphs: usize) -> String {
@@ -167,4 +176,52 @@ fn native_preedit_frames() {
         assert_eq!(editor.document().plain_text(), "");
         println!("long Unicode preedit: {elapsed:.2} µs / native cursor at {label} + frame");
     }
+}
+
+fn long_preedit_frames() {
+    let text = "café 👩‍💻 ".repeat(10_000);
+    let changed_text = format!("{text}x");
+    let context = egui::Context::default();
+    let mut editor = Editor::default();
+    frame(&context, &mut editor);
+    context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
+    editor.update_composition(&text, Some(0..0)).unwrap();
+    for _ in 0..3 {
+        frame(&context, &mut editor);
+    }
+    for mode in ["idle", "identical update", "cursor update", "text update"] {
+        let iterations = if mode == "text update" { 20 } else { 200 };
+        let start = Instant::now();
+        for index in 0..iterations {
+            match mode {
+                "idle" => {}
+                "identical update" => editor
+                    .update_composition(black_box(&text), Some(0..0))
+                    .unwrap(),
+                "cursor update" => {
+                    let end = if index % 2 == 0 { 0 } else { text.len() };
+                    editor
+                        .update_composition(black_box(&text), Some(end..end))
+                        .unwrap();
+                }
+                "text update" => {
+                    let text = if index % 2 == 0 { &changed_text } else { &text };
+                    editor
+                        .update_composition(black_box(text), Some(0..0))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            frame(&context, &mut editor);
+            assert_eq!(
+                editor.composition().unwrap().text.len(),
+                text.len() + usize::from(mode == "text update" && index % 2 == 0)
+            );
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        assert_eq!(editor.composition().unwrap().text, text);
+        println!("long Unicode preedit: {elapsed:.2} µs / {mode} + frame");
+    }
+    editor.cancel_composition();
+    assert_eq!(editor.document().plain_text(), "");
 }

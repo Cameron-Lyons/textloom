@@ -60,20 +60,7 @@ impl Fragment {
 
     /// Export text with LF between paragraphs, omitting visual list markers.
     pub fn plain_text(&self) -> String {
-        let capacity = self
-            .paragraphs
-            .iter()
-            .map(|paragraph| paragraph.text().len())
-            .sum::<usize>()
-            .saturating_add(self.paragraphs.len() - 1);
-        let mut output = String::with_capacity(capacity);
-        for (index, paragraph) in self.paragraphs.iter().enumerate() {
-            if index != 0 {
-                output.push('\n');
-            }
-            output.push_str(paragraph.text());
-        }
-        output
+        crate::export::plain_text(self.paragraphs())
     }
 
     /// Encode text, paragraph kinds and inline formatting without losing data.

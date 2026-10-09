@@ -101,31 +101,13 @@ impl Paragraph {
     /// Return the preceding grapheme boundary, clamped at paragraph start.
     /// Arbitrary byte offsets are accepted; offsets beyond the end return the end.
     pub fn previous_grapheme(&self, byte: usize) -> usize {
-        if byte == 0 {
-            0
-        } else if self.ascii {
-            byte.saturating_sub(1).min(self.text.len())
-        } else {
-            let boundaries = self.grapheme_boundaries();
-            boundaries[boundaries
-                .partition_point(|offset| *offset < byte)
-                .saturating_sub(1)]
-        }
+        self.boundary_at_or_before(byte.saturating_sub(1))
     }
 
     /// Return the following grapheme boundary, clamped at paragraph end.
     /// Arbitrary byte offsets are accepted, including offsets inside UTF-8 encodings.
     pub fn next_grapheme(&self, byte: usize) -> usize {
-        if byte >= self.text.len() {
-            self.text.len()
-        } else if self.ascii {
-            byte.saturating_add(1).min(self.text.len())
-        } else {
-            let boundaries = self.grapheme_boundaries();
-            boundaries[boundaries
-                .partition_point(|offset| *offset <= byte)
-                .min(boundaries.len() - 1)]
-        }
+        self.boundary_at_or_after(byte.saturating_add(1))
     }
 
     /// Snap a byte offset backward to a grapheme boundary.
@@ -332,6 +314,47 @@ impl Paragraph {
             ascii: self.ascii,
             indices: self.indices.clone(),
         }
+    }
+
+    fn with_style(&self, range: Range<usize>, patch: StylePatch) -> Option<Self> {
+        if range.is_empty() {
+            return None;
+        }
+        let first = self
+            .spans
+            .partition_point(|span| span.range.end <= range.start);
+        let last = self
+            .spans
+            .partition_point(|span| span.range.start < range.end);
+        // Already formatted text keeps its runs and paragraph allocation.
+        let first = first
+            + self.spans[first..last].iter().position(|span| {
+                let mut style = span.style;
+                patch.apply(&mut style);
+                style != span.style
+            })?;
+        let mut spans = Vec::with_capacity(self.spans.len() + 2);
+        spans.extend_from_slice(&self.spans[..first]);
+        for span in &self.spans[first..last] {
+            let overlap = span.range.start.max(range.start)..span.range.end.min(range.end);
+            push_span(&mut spans, span.range.start..overlap.start, span.style);
+            let mut style = span.style;
+            patch.apply(&mut style);
+            push_span(&mut spans, overlap.clone(), style);
+            push_span(&mut spans, overlap.end..span.range.end, span.style);
+        }
+        // Only the first untouched suffix run can merge with the changed edge.
+        if let Some(span) = self.spans.get(last) {
+            push_span(&mut spans, span.range.clone(), span.style);
+            spans.extend_from_slice(&self.spans[last + 1..]);
+        }
+        Some(Self {
+            text: Arc::clone(&self.text),
+            spans: spans.into(),
+            kind: self.kind,
+            ascii: self.ascii,
+            indices: self.indices.clone(),
+        })
     }
 
     fn plain(text: &str) -> Self {
@@ -561,20 +584,7 @@ impl Document {
 
     /// Export text with LF between paragraphs. List markers are presentation.
     pub fn plain_text(&self) -> String {
-        let capacity = self
-            .paragraphs
-            .iter()
-            .map(|paragraph| paragraph.text.len())
-            .sum::<usize>()
-            .saturating_add(self.paragraphs.len() - 1);
-        let mut result = String::with_capacity(capacity);
-        for (index, paragraph) in self.paragraphs.iter().enumerate() {
-            if index != 0 {
-                result.push('\n');
-            }
-            result.push_str(paragraph.text());
-        }
-        result
+        crate::export::plain_text(self.paragraphs())
     }
 
     /// Read a forward range; paragraph breaks are returned as LF.
@@ -926,7 +936,7 @@ impl Document {
         patch: StylePatch,
     ) -> Result<Option<Delta>, Error> {
         self.validate_range(&range)?;
-        if range.is_empty() {
+        if range.is_empty() || patch == StylePatch::default() {
             return Ok(None);
         }
         let mut after = Vec::with_capacity(range.end.paragraph - range.start.paragraph + 1);
@@ -942,30 +952,11 @@ impl Document {
             } else {
                 paragraph.text.len()
             };
-            let mut spans = Vec::new();
-            for span in paragraph.spans.iter() {
-                let overlap = span.range.start.max(start)..span.range.end.min(end);
-                if overlap.start >= overlap.end {
-                    push_span(&mut spans, span.range.clone(), span.style);
-                    continue;
-                }
-                push_span(&mut spans, span.range.start..overlap.start, span.style);
-                let mut style = span.style;
-                patch.apply(&mut style);
-                push_span(&mut spans, overlap.clone(), style);
-                push_span(&mut spans, overlap.end..span.range.end, span.style);
-            }
-            if spans.as_slice() == paragraph.spans() {
-                after.push(Arc::clone(paragraph));
-            } else {
-                after.push(Arc::new(Paragraph {
-                    text: Arc::clone(&paragraph.text),
-                    spans: spans.into(),
-                    kind: paragraph.kind,
-                    ascii: paragraph.ascii,
-                    indices: paragraph.indices.clone(),
-                }));
-            }
+            after.push(
+                paragraph
+                    .with_style(start..end, patch)
+                    .map_or_else(|| Arc::clone(paragraph), Arc::new),
+            );
         }
         let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
         Ok((!delta.is_empty()).then_some(delta))
@@ -1487,6 +1478,25 @@ mod tests {
                         .unwrap_or(text.len()),
                     "forward snap at {byte} in {text:?}"
                 );
+                assert_eq!(
+                    paragraph.previous_grapheme(byte),
+                    boundaries
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|offset| *offset < byte)
+                        .unwrap_or(0),
+                    "previous grapheme at {byte} in {text:?}"
+                );
+                assert_eq!(
+                    paragraph.next_grapheme(byte),
+                    boundaries
+                        .iter()
+                        .copied()
+                        .find(|offset| *offset > byte)
+                        .unwrap_or(text.len()),
+                    "next grapheme at {byte} in {text:?}"
+                );
             };
             for byte in (0..=text.len() + 2).chain([usize::MAX]) {
                 check(&Paragraph::plain(&text), byte);
@@ -1500,6 +1510,43 @@ mod tests {
             assert_eq!(
                 paragraph.cached_grapheme_boundaries().map(<[_]>::as_ptr),
                 cached
+            );
+        }
+    }
+
+    #[test]
+    fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
+        use crate::{Editor, Movement, Selection};
+
+        let phrase = "café e\u{301} 👩🏽‍💻 🇺🇸 नमस्ते ";
+        let text = phrase.repeat(256);
+        let original = Selection::caret(Position::new(0, phrase.len() * 128));
+        let mut editor = Editor::from_text(&text);
+        editor.set_selection(original).unwrap();
+        for _ in 0..3 {
+            editor
+                .move_cursor(Movement::GraphemeBackward, false)
+                .unwrap();
+            editor
+                .move_cursor(Movement::GraphemeForward, false)
+                .unwrap();
+            assert_eq!(editor.selection(), original);
+            editor.insert_text("é").unwrap();
+            editor.delete_backward().unwrap();
+            assert_eq!(editor.document().plain_text(), text);
+            assert!(editor.undo());
+            editor.delete_forward().unwrap();
+            assert!(editor.undo());
+            assert!(editor.undo());
+            assert_eq!(editor.selection(), original);
+            assert_eq!(editor.document().plain_text(), text);
+            assert!(
+                editor
+                    .document()
+                    .paragraph(0)
+                    .unwrap()
+                    .cached_grapheme_boundaries()
+                    .is_none()
             );
         }
     }
@@ -2153,6 +2200,169 @@ mod tests {
     }
 
     #[test]
+    fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
+        let red = crate::Color([255, 0, 0, 255]);
+        let blue = crate::Color([0, 0, 255, 255]);
+        let styles = [
+            InlineStyle::default(),
+            bold(),
+            InlineStyle {
+                italic: true,
+                underline: true,
+                strikethrough: true,
+                code: true,
+                foreground: Some(red),
+                ..InlineStyle::default()
+            },
+            InlineStyle {
+                foreground: Some(blue),
+                ..bold()
+            },
+        ];
+        let texts = ["ab e\u{301}👩‍💻cd 🇺🇸ef", "", "क्‍ष xyz"];
+        let source = Document::from_paragraphs(
+            texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let spans = text
+                        .grapheme_indices(true)
+                        .enumerate()
+                        .map(|(grapheme, (byte, text))| Span {
+                            range: byte..byte + text.len(),
+                            style: styles[(grapheme / 2 + index) % styles.len()],
+                        })
+                        .collect();
+                    Arc::new(
+                        Paragraph::from_parts(
+                            text,
+                            spans,
+                            if index == 0 {
+                                ParagraphKind::Heading { level: 2 }
+                            } else {
+                                ParagraphKind::Bullet { indent: 1 }
+                            },
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let positions: Vec<_> = source
+            .paragraphs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, paragraph)| {
+                paragraph.grapheme_count();
+                paragraph.scalar_count();
+                paragraph.previous_word(paragraph.text().len());
+                paragraph
+                    .text()
+                    .grapheme_indices(true)
+                    .map(move |(byte, _)| Position::new(index, byte))
+                    .chain([Position::new(index, paragraph.text().len())])
+            })
+            .collect();
+        let mut patches = vec![
+            StylePatch::default(),
+            StylePatch {
+                foreground: Some(None),
+                ..StylePatch::default()
+            },
+            StylePatch {
+                foreground: Some(Some(blue)),
+                ..StylePatch::default()
+            },
+        ];
+        for value in [false, true] {
+            patches.extend([
+                StylePatch {
+                    bold: Some(value),
+                    ..StylePatch::default()
+                },
+                StylePatch {
+                    italic: Some(value),
+                    underline: Some(value),
+                    ..StylePatch::default()
+                },
+                StylePatch {
+                    strikethrough: Some(value),
+                    code: Some(value),
+                    ..StylePatch::default()
+                },
+                StylePatch {
+                    bold: Some(value),
+                    italic: Some(value),
+                    underline: Some(value),
+                    strikethrough: Some(value),
+                    code: Some(value),
+                    foreground: Some(value.then_some(red)),
+                },
+            ]);
+        }
+        for (first, start) in positions.iter().copied().enumerate() {
+            for end in positions[first..].iter().copied() {
+                for patch in patches.iter().copied() {
+                    let expected: Vec<_> = source
+                        .paragraphs()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, paragraph)| {
+                            let spans = paragraph
+                                .text()
+                                .grapheme_indices(true)
+                                .map(|(byte, text)| {
+                                    let mut style = paragraph
+                                        .spans()
+                                        .iter()
+                                        .find(|span| span.range.contains(&byte))
+                                        .unwrap()
+                                        .style;
+                                    if (start..end).contains(&Position::new(index, byte)) {
+                                        patch.apply(&mut style);
+                                    }
+                                    Span {
+                                        range: byte..byte + text.len(),
+                                        style,
+                                    }
+                                })
+                                .collect();
+                            Arc::new(
+                                Paragraph::from_parts(paragraph.text(), spans, paragraph.kind())
+                                    .unwrap(),
+                            )
+                        })
+                        .collect();
+                    let mut document = source.clone();
+                    let delta = document.apply_style(start..end, patch).unwrap();
+                    let changed = source.paragraphs() != expected;
+                    assert_eq!(delta.is_some(), changed, "{start:?}..{end:?}, {patch:?}");
+                    assert_eq!(document.paragraphs(), expected);
+                    assert_eq!(document.revision(), u64::from(changed));
+                    assert_eq!(Arc::ptr_eq(&document.identity, &source.identity), !changed);
+                    for (before, after) in source.paragraphs().iter().zip(document.paragraphs()) {
+                        assert!(Arc::ptr_eq(&before.text, &after.text));
+                        match (before.indices.get(), after.indices.get()) {
+                            (Some(before), Some(after)) => assert!(Arc::ptr_eq(before, after)),
+                            (None, None) => {}
+                            _ => panic!("formatting changed the navigation cache"),
+                        }
+                        if before == after {
+                            assert!(Arc::ptr_eq(before, after));
+                        }
+                    }
+                    if let Some(delta) = delta {
+                        document.replay(&delta, false);
+                        assert_eq!(document.paragraphs(), source.paragraphs());
+                        document.replay(&delta, true);
+                        assert_eq!(document.paragraphs(), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn inserted_combining_marks_cannot_split_formatting_runs() {
         let mut document = Document::from_text("ex");
         document
@@ -2359,6 +2569,14 @@ mod tests {
             document.text(document.end()..Position::default()),
             Err(Error::InvalidRange)
         );
+        assert!(matches!(
+            document.apply_style(Position::new(0, 1)..document.end(), StylePatch::default()),
+            Err(Error::InvalidPosition(_))
+        ));
+        assert!(matches!(
+            document.apply_style(document.end()..Position::default(), StylePatch::default()),
+            Err(Error::InvalidRange)
+        ));
         assert_eq!(document, original);
     }
 

@@ -94,8 +94,21 @@ First stable release of the native Rust rich-text editing library.
   the shared full index, preserving long regional-indicator, emoji, and Indic
   sequences. Release checks now run search/replacement oracles with debug
   assertions disabled.
+- Adjacent grapheme movement and deletion reuse the same bounded boundary
+  queries, avoiding full Unicode indexes after ordinary text edits. Structural
+  egui layout updates retain unchanged cache entries around the changed range
+  and rebuild appearance-invalidated entries without a lookup table.
+- The editor and egui preview share immutable IME snapshots, avoiding full
+  preedit copies and comparisons during idle frames. Identical updates retain
+  their snapshot, changed state preserves earlier snapshots, and exclusive text
+  updates reuse their buffer. Document and fragment plain-text export share one
+  implementation.
 - Inline clear-formatting preserves paragraph kinds and selection direction,
   supports caret typing-style reset, and restores rich state through undo/redo.
+- Inline formatting locates selected runs with binary search and retains
+  unchanged paragraphs without rebuilding their runs. Changed formatting copies
+  untouched edges directly, merges affected boundaries, and shares paragraph
+  text and Unicode indexes.
 - `SelectionStyle` reports uniform and mixed inline attributes independently for
   formatting toolbars. `Editor::selection_style()` respects partial Unicode and
   directional selections, ignores separators, and reports pending caret styles

@@ -560,3 +560,169 @@ results establish gains for the workloads above, with no general frame-time
 improvement claimed. Full release checks passed, including all eight feature
 combinations, optimized search/replacement oracles, native-host tests, Clippy,
 docs, and tests/compilation from the extracted Cargo package.
+
+## October 9 continuation: adjacent grapheme movement and structural layouts
+
+The preceding source was compared with shared boundary queries for adjacent
+grapheme movement and a smaller structural layout lookup. Both versions used
+the same expanded harnesses, Rust 1.99.0, locked dependencies, the
+`egui,accesskit` features, and Cargo's default release profile on the Intel
+Core Ultra 5 325 Linux machine. Saved baseline and current executables came
+from separate build directories, with distinct SHA-256 hashes verified before
+measurement. Three complete runs of each harness alternated baseline/current,
+reversing the order for the second run. The table reports medians in microseconds.
+
+| Workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Long Unicode paragraph, first grapheme backward/forward pair | 3,259.41 | 1.13 |
+| Long Unicode paragraph, repeated grapheme backward/forward pair | 0.09 | 0.05 |
+| Long Unicode paragraph, insert + backspace + two undos | 3,286.53 | 31.90 |
+| Long Unicode paragraph, insert + delete + two undos | 3,278.41 | 32.11 |
+| 100 paragraphs, split or undo + frame | 26.73 | 22.51 |
+| 10,000 paragraphs, split or undo + frame | 511.84 | 193.54 |
+| 10,000 paragraphs, idle frame | 8.32 | 8.45 |
+| 10,000 paragraphs, local edit + frame | 203.58 | 192.49 |
+| Long regional-indicator run, middle insert + undo | 263.44 | 260.84 |
+
+Navigation uses the existing 460,000-byte paragraph, with the caret 90% through
+it. The first backward/forward pair is measured once per run after selection
+validation; subsequent pairs average 2,000 operations. The baseline builds the
+complete grapheme index on its first move. Adjacent movement now snaps from
+one byte before or after the requested offset, reusing the existing bounded
+boundary checks. Ordinary local movement does not allocate the full index.
+Tiny warm timings and single-query cold timings remain sensitive to timer
+resolution. Grapheme counting and index conversions still build full indexes;
+long contextual sequences still fall back to the shared index.
+
+The deletion cases start at the paragraph's midpoint. Each averages 200 cycles:
+insert `x`, delete the preceding or following grapheme, then undo both edits.
+Deleting immediately after insertion previously indexed every newly rebuilt
+Unicode paragraph. Both samples now use about 100× less time. Paragraph text
+copying and nonuniform span normalization retain their existing costs.
+
+The structural frame cases use the existing unique Unicode paragraphs and
+headless scrolling widget. Each sample averages 1,000 split/undo pairs at 100
+paragraphs or 100 pairs at 10,000 paragraphs, with one frame after each action.
+Unchanged cache entries before and after the affected range remain in the
+paragraph vector; only its changed middle needs a lookup table. Font or
+appearance invalidation recreates entries directly. The larger sample uses
+about 62% less time. Geometry rebuilding still visits the complete document,
+and native rendering is outside this measurement.
+
+Import/export, search/replacement, idle rendering, word navigation, and the
+regional-indicator controls stayed in similar ranges. Unicode tests compare
+cold and indexed navigation at every byte with complete segmentation, including
+overflow offsets and long contextual clusters. Structural layout tests compare
+cached geometry, text, markers, and offsets with a fresh cache after splits,
+undo, rich paste, appearance changes, and full replacement. All automated
+release checks passed offline, including the eight feature combinations,
+optimized Unicode and search/replacement checks, native-host tests, Clippy,
+docs, and extracted-package validation.
+
+## October 9 continuation: shared IME snapshots and export cleanup
+
+The preceding source was compared with internally shared composition snapshots
+and consolidated document/fragment plain-text export. Both used identical
+expanded harnesses, Rust 1.99.0, locked dependencies, `egui,accesskit`, and the
+default release profile on the same Intel Core Ultra 5 325 Linux machine.
+Baseline and current sources used separate build directories; saved executable
+SHA-256 hashes were distinct. Three complete runs alternated baseline/current,
+reversing the order for the second run. The table reports medians in microseconds.
+
+| Workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Long preedit, idle frame | 21.32 | 6.63 |
+| Long preedit, identical update + frame | 23.06 | 10.69 |
+| Long preedit, cursor update + frame | 72.38 | 70.51 |
+| Long preedit, native cursor at start + frame | 34.27 | 19.26 |
+| Long preedit, native cursor at end + frame | 85.39 | 71.29 |
+| Long preedit, changed text + frame | 40,818.64 | 40,082.71 |
+| 10,000 paragraphs, idle frame | 7.76 | 7.72 |
+| 10,000 paragraphs, local edit + frame | 195.83 | 192.30 |
+| 10,000 paragraphs, split or undo + frame | 196.18 | 191.58 |
+
+The long-preedit fixture repeats `café 👩‍💻 ` 10,000 times: 180,000 UTF-8
+bytes and 90,000 scalars. After three warm frames, idle, identical-update, and
+cursor-update samples average 200 frames each. Cursor updates alternate between
+the beginning and end. Text updates average 20 frames, alternating the fixture
+and an appended `x`, with the cursor at the start. Each iteration checks the
+preedit byte length; full text equality is checked after timing. Existing native
+event workloads retain their 100-frame samples, including event text cloning.
+
+The widget now retains an immutable composition snapshot instead of cloning its
+string every frame. Its preview shares that snapshot and uses pointer equality
+before comparing changed text. Identical updates retain the same snapshot.
+Shared updates copy incoming text directly, preserving earlier values; exclusive
+updates reuse their text buffer. The public `Composition` type and borrowed
+editor accessor retain their existing interfaces. Idle and identical-update
+frames use about 69% and 54% less time. Native cursor-at-start/end samples use
+about 44% and 17% less time.
+
+Cursor-only updates still compute preview positions through the requested
+prefix, and changed text still rebuilds the preview and shapes the changed
+paragraph. Those controls stayed close to the baseline. Ordinary edit/split
+frames, import/export, and search/replacement also remained in similar ranges;
+the export consolidation establishes shared implementation, without an export
+speedup claimed. These are headless measurements, excluding native rendering.
+
+Regression checks retain snapshots across valid and invalid updates, cursor
+changes, commit, cancel, and undo. They also verify exclusive buffer reuse,
+preview snapshot sharing, and unchanged preview document/layout reuse. Automated
+release checks cover all feature combinations and the extracted Cargo package.
+
+## October 9 continuation: localized inline formatting
+
+The preceding source was compared with paragraph-local style patching. Both
+used the same expanded harnesses, Rust 1.99.0, locked dependencies,
+`egui,accesskit`, and the default release profile on the Intel Core Ultra 5 325
+Linux machine. The checkout was built before and after the change; saved
+executables had distinct SHA-256 hashes. Three complete runs alternated
+baseline/current, reversing the order for the second run. Medians are in
+microseconds.
+
+| Workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| 10,000 style runs, local unchanged formatting | 56.70 | 0.09 |
+| 10,000 style runs, local formatting + undo | 44.72 | 12.91 |
+| 10,000 style runs, full unchanged formatting | 69.18 | 9.70 |
+| 10,000 style runs, full formatting + undo | 56.73 | 53.78 |
+| 10,000 style runs, clear formatting + undo | 42.85 | 42.42 |
+| One style run, local formatting + undo | 0.24 | 0.24 |
+| One style run, clear formatting + undo | 0.22 | 0.25 |
+| 10,000 paragraphs, idle frame | 8.33 | 8.40 |
+| 10,000 paragraphs, local edit + frame | 199.46 | 198.67 |
+
+The larger formatting fixture repeats `match café 👩‍💻 ` 10,000 times,
+with alternating bold/italic runs covering 240,000 UTF-8 bytes. Local selection
+covers four ASCII graphemes inside its middle run. Unchanged commands request
+underline removal, averaging 5,000 local or 500 full-selection operations.
+Changed commands add underline and undo, averaging 1,000 local or 100 full
+operations. Clear-formatting/undo averages 100 operations. Snapshot equality is
+checked outside timing; local undo also verifies selection restoration.
+
+Formatting now locates the selected runs with binary search and checks whether
+any style changes before allocating replacement runs. Actual changes patch
+the affected runs and copy canonical prefix/suffix runs directly, merging their
+boundaries. Paragraph text and navigation indexes remain shared. Small
+unchanged selections avoid rebuilding unrelated runs, while local changed
+formatting uses about 71% less time in this fixture. Full unchanged formatting
+uses about 86% less time; it still visits all selected styles. Changed formatting
+still copies the complete run array, and clearing a full paragraph still
+processes every run.
+
+Full changed formatting and clear-formatting controls stayed close. The
+one-run clear-formatting median rose by 0.03 µs. Most editing, import/export,
+search, and large-document frame controls remained close, but the 100-paragraph
+idle/local-edit frame medians rose from 7.36/21.03 to 8.21/25.33 µs, and the
+long literal-miss median rose from 213.74 to 258.83 µs. These samples establish
+the formatting gains above; they do not establish a general search or rendering
+speedup. Single-query cold and submicrosecond timings remain sensitive to timer
+resolution.
+
+Regression checks compare every valid range in mixed Unicode paragraphs and
+empty paragraphs with per-grapheme styles, including color changes and clearing
+attributes. They verify canonical run merging, shared text/indexes, unchanged
+allocations/content identity, and undo/redo. Editor checks preserve directional
+selections and redo through unchanged commands, and update typing style when
+only paragraph breaks are selected. Automated release checks cover all feature
+combinations and the extracted Cargo package.

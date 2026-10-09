@@ -215,7 +215,7 @@ impl<'a> RichTextEditor<'a> {
         };
         let old_revision = self.editor.document().revision();
         let old_selection = self.editor.selection();
-        let old_composition = self.editor.composition().cloned();
+        let old_composition = self.editor.composition_snapshot();
         let publish_text = ui
             .ctx()
             .accesskit_node_builder(id, |node| {
@@ -397,7 +397,12 @@ impl<'a> RichTextEditor<'a> {
         if old_selection != self.editor.selection() {
             ui.ctx().request_repaint();
         }
-        if old_composition.as_ref() != self.editor.composition() {
+        let composition_changed = match (old_composition.as_deref(), self.editor.composition()) {
+            (Some(before), Some(after)) => !std::ptr::eq(before, after) && before != after,
+            (None, None) => false,
+            _ => true,
+        };
+        if composition_changed {
             ui.ctx().request_repaint();
         }
         let preview_layouts = match cache.layout_preview(ui, self.editor, &appearance) {
@@ -511,7 +516,7 @@ impl<'a> RichTextEditor<'a> {
                 || cache.scroll_to_caret
                 || old_selection != self.editor.selection()
                 || response.changed()
-                || old_composition.as_ref() != self.editor.composition()
+                || composition_changed
             {
                 // Scroll even if the whole widget is clipped. Input can grow
                 // the displayed document after its space was allocated; repeat
@@ -668,7 +673,7 @@ struct VerticalNavigation {
 
 #[derive(Clone)]
 struct CompositionPreview {
-    composition: Composition,
+    composition: Arc<Composition>,
     style: InlineStyle,
     document: Document,
     render_cache: Cache,
@@ -780,35 +785,48 @@ impl Cache {
                     indent,
                 }
             };
-            if self.paragraphs.len() == document.paragraphs().len() {
+            if appearance_changed || fonts_changed {
+                self.paragraphs.clear();
+                self.paragraphs
+                    .extend(document.paragraphs().iter().map(create));
+            } else if self.paragraphs.len() == document.paragraphs().len() {
                 // Typing, formatting, and undo usually preserve paragraph count.
                 // Update only changed entries without allocating a lookup table.
                 for (cache, paragraph) in self.paragraphs.iter_mut().zip(document.paragraphs()) {
-                    if appearance_changed
-                        || fonts_changed
-                        || !Arc::ptr_eq(&cache.paragraph, paragraph)
-                    {
+                    if !Arc::ptr_eq(&cache.paragraph, paragraph) {
                         *cache = create(paragraph);
                     }
                 }
             } else {
-                let mut previous: HashMap<_, _> = std::mem::take(&mut self.paragraphs)
-                    .into_iter()
+                // A split, join, or paste usually changes a small contiguous
+                // range. Retain both unchanged edges in place, including the
+                // suffix whose paragraph indexes shifted.
+                let source = document.paragraphs();
+                let prefix = self
+                    .paragraphs
+                    .iter()
+                    .zip(source)
+                    .take_while(|(cache, paragraph)| Arc::ptr_eq(&cache.paragraph, paragraph))
+                    .count();
+                let suffix = self.paragraphs[prefix..]
+                    .iter()
+                    .rev()
+                    .zip(source[prefix..].iter().rev())
+                    .take_while(|(cache, paragraph)| Arc::ptr_eq(&cache.paragraph, paragraph))
+                    .count();
+                let mut previous: HashMap<_, _> = self
+                    .paragraphs
+                    .drain(prefix..self.paragraphs.len() - suffix)
                     .map(|cache| (Arc::as_ptr(&cache.paragraph), cache))
                     .collect();
-                self.paragraphs = document
-                    .paragraphs()
+                let replacement = source[prefix..source.len() - suffix]
                     .iter()
                     .map(|paragraph| {
-                        if !appearance_changed
-                            && !fonts_changed
-                            && let Some(cache) = previous.remove(&Arc::as_ptr(paragraph))
-                        {
-                            return cache;
-                        }
-                        create(paragraph)
-                    })
-                    .collect();
+                        previous
+                            .remove(&Arc::as_ptr(paragraph))
+                            .unwrap_or_else(|| create(paragraph))
+                    });
+                self.paragraphs.splice(prefix..prefix, replacement);
             }
             if document_changed {
                 self.plain_text = None;
@@ -893,7 +911,7 @@ impl Cache {
         // Keep its captured replacement, but show the source until Commit
         // rather than hiding the selection behind an empty preview.
         let Some(composition) = editor
-            .composition()
+            .composition_snapshot()
             .filter(|composition| !composition.text.is_empty())
         else {
             self.preview = None;
@@ -901,16 +919,17 @@ impl Cache {
         };
         let style = editor.typing_style();
         if !self.preview.as_ref().is_some_and(|preview| {
-            preview.composition.text == composition.text
-                && preview.composition.replacement == composition.replacement
-                && preview.style == style
+            preview.style == style
+                && (Arc::ptr_eq(&preview.composition, &composition)
+                    || preview.composition.text == composition.text
+                        && preview.composition.replacement == composition.replacement)
         }) {
             let mut document = editor.document().clone();
             let range = composition.replacement.range();
             let mut preedit_style = style;
             preedit_style.underline = true;
             document.replace(range, &composition.text, preedit_style)?;
-            let (caret, selection) = preedit_selection(&document, composition);
+            let (caret, selection) = preedit_selection(&document, &composition);
             // Successive preedits share the untouched source paragraphs. Keep
             // their layouts; normal content, appearance, and font invalidation
             // still applies when the new preview is laid out below.
@@ -919,7 +938,7 @@ impl Cache {
                 .take()
                 .map_or_else(Cache::default, |preview| preview.render_cache);
             self.preview = Some(Box::new(CompositionPreview {
-                composition: composition.clone(),
+                composition: Arc::clone(&composition),
                 style,
                 document,
                 render_cache,
@@ -931,12 +950,9 @@ impl Cache {
         if preview.composition.selection != composition.selection {
             // Native IMEs can move the cursor without changing preedit text.
             // Update its coordinates without rebuilding the preview document.
-            (preview.caret, preview.selection) = preedit_selection(&preview.document, composition);
-            preview
-                .composition
-                .selection
-                .clone_from(&composition.selection);
+            (preview.caret, preview.selection) = preedit_selection(&preview.document, &composition);
         }
+        preview.composition = composition;
         Ok(Some(preview.render_cache.layout_document(
             ui,
             &preview.document,
@@ -2758,6 +2774,18 @@ mod tests {
         let first = cached_preview_frame(&context, &mut cache, &editor, &appearance);
         let identity = cache.preview.as_ref().unwrap().document.content_identity();
         assert_eq!(cache.preview.as_ref().unwrap().caret, Position::new(1, 3));
+        let snapshot = editor.composition_snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &cache.preview.as_ref().unwrap().composition
+        ));
+        editor.update_composition(text, Some(0..3)).unwrap();
+        let identical = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert!(Arc::ptr_eq(&first, &identical));
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &editor.composition_snapshot().unwrap()
+        ));
 
         // The native caret may stop within an unfinished grapheme. Display it
         // at the complete cluster boundary in the normalized preview document.
@@ -2772,6 +2800,12 @@ mod tests {
             Some(Selection::new(Position::new(2, 0), Position::new(2, 11)))
         );
         assert_eq!(preview.composition.selection, Some(5..9));
+        assert!(Arc::ptr_eq(
+            &preview.composition,
+            &editor.composition_snapshot().unwrap()
+        ));
+        assert_eq!(snapshot.selection, Some(0..3));
+        assert_eq!(snapshot.text, text);
 
         editor.update_composition(text, None).unwrap();
         let hidden = cached_preview_frame(&context, &mut cache, &editor, &appearance);
@@ -2853,6 +2887,73 @@ mod tests {
             cache.char_offset(editor.document(), Position::new(2, 2)),
             22
         );
+    }
+
+    #[test]
+    fn structural_layout_updates_retain_edges_and_match_a_fresh_cache() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text("first\nsecond\nthird\nfourth");
+        let mut appearance = appearance();
+        editor
+            .set_selection(Selection::caret(Position::new(2, 0)))
+            .unwrap();
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 1 })
+            .unwrap();
+        editor
+            .set_selection(Selection::caret(Position::new(1, 3)))
+            .unwrap();
+        let original = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        cache.paragraphs.reserve(16);
+        let storage = cache.paragraphs.as_ptr();
+        editor.insert_paragraph().unwrap();
+        let split = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        assert_eq!(storage, cache.paragraphs.as_ptr());
+        for (before, after) in [(0, 0), (2, 3), (3, 4)] {
+            assert!(Arc::ptr_eq(&original[before].galley, &split[after].galley));
+        }
+        assert_eq!(original[1].galley.job.text, "second");
+        assert_eq!(split[1].galley.job.text, "sec");
+        assert_eq!(split[2].galley.job.text, "ond");
+
+        for step in 0..5 {
+            match step {
+                0 => {}
+                1 => assert!(editor.undo()),
+                2 => {
+                    // Rich paste can repeat shared paragraphs inside the
+                    // changed range as well as shift the retained suffix.
+                    let fragment = Fragment::from_document(editor.document());
+                    editor.insert_fragment(&fragment).unwrap();
+                }
+                3 => {
+                    editor.select_all();
+                    editor.insert_text("new\ncontent").unwrap();
+                    appearance.color = Color32::RED;
+                }
+                4 => {
+                    editor.select_all();
+                    editor.insert_text("").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let updated = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+            let mut fresh = Cache::default();
+            let expected = cached_layout_frame(&context, &mut fresh, &editor, &appearance);
+            assert_eq!(updated.len(), expected.len());
+            assert_eq!(cache.char_offsets, fresh.char_offsets);
+            assert_eq!(cache.list_paragraphs, fresh.list_paragraphs);
+            for (actual, expected) in updated.iter().zip(expected.iter()) {
+                assert_eq!(actual.rect, expected.rect);
+                assert_eq!(actual.marker_position, expected.marker_position);
+                assert_eq!(actual.galley.job, expected.galley.job);
+                assert_eq!(
+                    actual.marker.as_ref().map(|marker| &marker.job),
+                    expected.marker.as_ref().map(|marker| &marker.job)
+                );
+            }
+        }
     }
 
     #[test]

@@ -170,6 +170,66 @@ fn formatting_undo_redo_restores_document_and_selection() {
 }
 
 #[test]
+fn unchanged_formatting_preserves_redo_and_directional_selection() {
+    let mut editor = Editor::from_text("abc");
+    let selection = Selection::new(Position::new(0, 3), Position::default());
+    editor.set_selection(selection).unwrap();
+    let bold = StylePatch {
+        bold: Some(true),
+        ..StylePatch::default()
+    };
+    editor.apply_style(bold).unwrap();
+    editor
+        .apply_style(StylePatch {
+            underline: Some(true),
+            ..StylePatch::default()
+        })
+        .unwrap();
+    assert!(editor.undo());
+    let paragraph = Arc::clone(&editor.document().paragraphs()[0]);
+    let revision = editor.document().revision();
+    let history = (editor.undo_len(), editor.redo_len(), editor.history_bytes());
+    editor.apply_style(bold).unwrap();
+    assert!(Arc::ptr_eq(&paragraph, &editor.document().paragraphs()[0]));
+    assert_eq!(editor.document().revision(), revision);
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(
+        (editor.undo_len(), editor.redo_len(), editor.history_bytes()),
+        history
+    );
+    assert!(editor.typing_style().bold);
+    assert!(!editor.typing_style().underline);
+    assert!(editor.redo());
+    assert!(editor.document().style_at(Position::new(0, 1)).underline);
+    assert_eq!(editor.selection(), selection);
+}
+
+#[test]
+fn formatting_only_paragraph_breaks_updates_typing_style_without_history() {
+    let mut editor = Editor::from_text("a\n\nb");
+    let original = editor.document().clone();
+    let selection = Selection::new(Position::new(2, 0), Position::new(0, 1));
+    editor.set_selection(selection).unwrap();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            ..StylePatch::default()
+        })
+        .unwrap();
+    assert_eq!(editor.document(), &original);
+    for (before, after) in original
+        .paragraphs()
+        .iter()
+        .zip(editor.document().paragraphs())
+    {
+        assert!(Arc::ptr_eq(before, after));
+    }
+    assert_eq!(editor.selection(), selection);
+    assert!(editor.typing_style().bold);
+    assert!(!editor.can_undo());
+}
+
+#[test]
 fn selection_style_reports_independent_mixed_attributes_inside_unicode_runs() {
     let mut editor = Editor::from_text("a👩‍💻e\u{301}z");
     let red = Color([255, 0, 0, 255]);

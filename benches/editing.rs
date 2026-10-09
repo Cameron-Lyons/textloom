@@ -3,12 +3,14 @@
 use std::{hint::black_box, time::Instant};
 use textloom::{
     Document, Editor, Fragment, HistoryLimits, Movement, Position, SearchOptions, Selection,
+    StylePatch,
 };
 
 fn main() {
     short_paragraph_edits();
     paragraph_import();
     serialization();
+    formatting();
     unicode_navigation();
     long_unicode_edits();
     contextual_unicode_search();
@@ -96,6 +98,67 @@ fn styled_repetitions(phrase: &str, repetitions: usize) -> Document {
     Document::from_bytes(&bytes).unwrap()
 }
 
+fn formatting() {
+    let phrase = "match café 👩‍💻 ";
+    for repetitions in [1, 10_000] {
+        let document = styled_repetitions(phrase, repetitions);
+        let original = document.to_bytes();
+        let mut editor = Editor::new(document);
+        let start = repetitions / 2 * phrase.len() + 1;
+        let local = Selection::new(Position::new(0, start), Position::new(0, start + 4));
+        let unchanged = StylePatch {
+            underline: Some(false),
+            ..StylePatch::default()
+        };
+        let changed = StylePatch {
+            underline: Some(true),
+            ..StylePatch::default()
+        };
+        editor.set_selection(local).unwrap();
+        measure(
+            &format!("{repetitions} styled spans local unchanged formatting"),
+            5_000,
+            || editor.apply_style(black_box(unchanged)).unwrap(),
+        );
+        assert_eq!(editor.undo_len(), 0);
+        assert_eq!(editor.document().to_bytes(), original);
+        measure(
+            &format!("{repetitions} styled spans local formatting + undo"),
+            1_000,
+            || {
+                editor.apply_style(black_box(changed)).unwrap();
+                assert!(editor.undo());
+                assert_eq!(editor.selection(), local);
+            },
+        );
+        assert_eq!(editor.document().to_bytes(), original);
+
+        editor.select_all();
+        measure(
+            &format!("{repetitions} styled spans full unchanged formatting"),
+            500,
+            || editor.apply_style(black_box(unchanged)).unwrap(),
+        );
+        measure(
+            &format!("{repetitions} styled spans full formatting + undo"),
+            100,
+            || {
+                editor.apply_style(black_box(changed)).unwrap();
+                assert!(editor.undo());
+            },
+        );
+        measure(
+            &format!("{repetitions} styled spans clear formatting + undo"),
+            100,
+            || {
+                editor.clear_formatting().unwrap();
+                assert!(editor.undo());
+            },
+        );
+        assert_eq!(editor.document().to_bytes(), original);
+    }
+}
+
 fn sparse_whole_word_search() {
     let source = format!("match {}", "other café 👩‍💻. ".repeat(50_000));
     let document = Document::from_text(&source);
@@ -178,6 +241,18 @@ fn unicode_navigation() {
     // Explicit selection warms position validation separately from words.
     editor.set_selection(Selection::caret(position)).unwrap();
     let start = Instant::now();
+    grapheme_pair(&mut editor);
+    println!(
+        "grapheme backward + forward cold: {:.2} µs / first pair",
+        start.elapsed().as_secs_f64() * 1_000_000.0
+    );
+    measure("grapheme backward + forward warm", 2_000, || {
+        grapheme_pair(&mut editor);
+    });
+
+    let mut editor = Editor::from_text(&source);
+    editor.set_selection(Selection::caret(position)).unwrap();
+    let start = Instant::now();
     word_pair(&mut editor);
     println!(
         "word backward + forward cold: {:.2} µs / first pair",
@@ -200,6 +275,17 @@ fn unicode_navigation() {
     });
 }
 
+fn grapheme_pair(editor: &mut Editor) {
+    let original = editor.selection();
+    editor
+        .move_cursor(Movement::GraphemeBackward, false)
+        .unwrap();
+    editor
+        .move_cursor(Movement::GraphemeForward, false)
+        .unwrap();
+    assert_eq!(editor.selection(), original);
+}
+
 fn word_pair(editor: &mut Editor) {
     editor.move_cursor(Movement::WordBackward, false).unwrap();
     editor.move_cursor(Movement::WordForward, false).unwrap();
@@ -219,6 +305,31 @@ fn long_unicode_edits() {
         assert_eq!(editor.selection(), original);
     });
     assert_eq!(editor.document().plain_text(), source);
+
+    for backward in [true, false] {
+        let mut editor = Editor::from_text(&source);
+        editor.set_selection(original).unwrap();
+        measure(
+            if backward {
+                "long Unicode paragraph insert + backspace + undo"
+            } else {
+                "long Unicode paragraph insert + delete + undo"
+            },
+            200,
+            || {
+                editor.insert_text(black_box("x")).unwrap();
+                if backward {
+                    editor.delete_backward().unwrap();
+                } else {
+                    editor.delete_forward().unwrap();
+                }
+                assert!(editor.undo());
+                assert!(editor.undo());
+                assert_eq!(editor.selection(), original);
+            },
+        );
+        assert_eq!(editor.document().plain_text(), source);
+    }
 
     // Force a contextual boundary that exceeds a local cursor's context. The
     // fallback must preserve regional-indicator pairing without rescanning it
