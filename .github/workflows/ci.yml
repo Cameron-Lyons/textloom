@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      windows_native_probe:
+        description: Probe native OpenGL rendering on the Windows hosted runner
+        type: boolean
+        default: false
   workflow_call:
 
 permissions:
@@ -16,6 +21,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  TEXTLOOM_QA_REVISION: ${{ github.sha }}
 
 jobs:
   quality:
@@ -35,6 +41,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Complete release checks
         run: ./scripts/check-release.sh
+      - name: Native report validator regression tests
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
   msrv:
     name: MSRV and feature combinations
@@ -60,6 +68,8 @@ jobs:
           cargo check --locked --all-features --all-targets
       - name: Native host example compiles
         run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native host CLI and report tests
+        run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
 
   native:
     name: Native (${{ matrix.os }})
@@ -83,5 +93,148 @@ jobs:
         run: cargo check --locked --all-features --all-targets
       - name: Native host example compiles
         run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native host CLI and report tests
+        run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
       - name: Tests and doctests
         run: cargo test --locked --all-features
+      - name: Build native renderer
+        if: runner.os == 'macOS'
+        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      # Upstream egui also runs its GPU tests on macos-latest:
+      # https://github.com/emilk/egui/blob/main/.github/workflows/rust.yml
+      # These checks cover native initialization and rendering. IME, clipboard,
+      # and screen-reader interaction still require the RELEASING.md signoffs.
+      - name: Native rendering smoke (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mkdir -p native-observations
+          for mode in editable read-only disabled; do
+            args=(--smoke-test --qa-report "native-smoke-$mode.json")
+            case "$mode" in
+              read-only) args+=(--read-only) ;;
+              disabled) args+=(--disabled) ;;
+            esac
+            ./target/debug/textloom-native-example "${args[@]}" 2>&1 | tee "native-smoke-$mode.log"
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.log"
+            python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode"
+            cp "native-smoke-$mode.json" "native-observations/$mode.json"
+          done
+      - name: Native rendering observations (macOS)
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-rendering-macos
+          path: |
+            native-observations/*.json
+            native-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux-renderer:
+    name: Native rendering (Linux X11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install virtual display and software renderer
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 xauth xvfb
+      - name: Build native renderer
+        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native rendering smoke
+        timeout-minutes: 2
+        shell: bash
+        env:
+          # Mesa supports this flag without requiring a GPU on the runner.
+          # https://docs.mesa3d.org/envvars.html#envvar-LIBGL_ALWAYS_SOFTWARE
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: |
+          mkdir -p native-observations
+          for mode in editable read-only disabled; do
+            args=(--smoke-test --qa-report "native-smoke-$mode.json")
+            case "$mode" in
+              read-only) args+=(--read-only) ;;
+              disabled) args+=(--disabled) ;;
+            esac
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' ./target/debug/textloom-native-example "${args[@]}" 2>&1 | tee "native-smoke-$mode.log"
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.log"
+            python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os linux --mode "$mode"
+            cp "native-smoke-$mode.json" "native-observations/$mode.json"
+          done
+      - name: Native rendering observations (Linux X11)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-rendering-linux-x11
+          path: |
+            native-observations/*.json
+            native-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # OpenGL availability is not guaranteed on Windows hosted runners. Keep this
+  # explicit experiment separate from the required platform gates until a run
+  # establishes a supported renderer configuration.
+  windows-renderer-probe:
+    name: Native OpenGL probe (Windows)
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_native_probe
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build native renderer
+        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native OpenGL renderer probe
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path native-observations | Out-Null
+          foreach ($mode in @('editable', 'read-only', 'disabled')) {
+            $smokeArguments = @('--smoke-test', '--qa-report', "native-smoke-$mode.json")
+            if ($mode -eq 'read-only') {
+              $smokeArguments += '--read-only'
+            } elseif ($mode -eq 'disabled') {
+              $smokeArguments += '--disabled'
+            }
+            & ./target/debug/textloom-native-example.exe @smokeArguments 2>&1 | Tee-Object -FilePath "native-smoke-$mode.log"
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+            if (-not (Select-String -Path "native-smoke-$mode.log" -Pattern '^Rendered 20 native frames at [0-9.]+ pixels per point$' -Quiet)) {
+              throw "The $mode native renderer did not complete 20 frames"
+            }
+            python scripts/check_native_report.py "native-smoke-$mode.json" --revision "$env:TEXTLOOM_QA_REVISION" --os windows --mode "$mode"
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+            Copy-Item -LiteralPath "native-smoke-$mode.json" -Destination "native-observations/$mode.json"
+          }
+      - name: Native rendering observations (Windows probe)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-rendering-windows-probe
+          path: |
+            native-observations/*.json
+            native-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14

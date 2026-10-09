@@ -6,6 +6,23 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- `RichTextEditor::rich_clipboard()` accepts a host-owned `RichClipboard`
+  transport. Hosts receive selected fragments before cut, can publish TLFR/HTML
+  with plain alternatives, and can supply rich paste as one undo step. Successful
+  host copies suppress egui's plain clipboard overwrite and retire older queued
+  text/image copies; unavailable rich formats
+  retain plain fallback. Focus, read-only/disabled, IME, accessibility, and input
+  ordering rules remain enforced without adding native clipboard dependencies.
+- The standalone native host adds independently toggleable disabled/read-only
+  modes, associated document/search accessibility labels, and opt-in content-free
+  JSON QA reports on graceful exit. Reports capture native input/state/error
+  observations and snapshot checks, protect existing paths, and explicitly leave
+  manual signoff unrecorded. Six CLI/report tests join local and cross-platform
+  host checks. Rich MIME transport remains a host integration requirement.
+- The candidate CI workflow adds required Linux X11/Mesa and macOS native
+  rendering smoke checks for editable, read-only, and disabled hosts, plus a
+  separate optional Windows OpenGL probe. Runtime results remain pending;
+  renderer checks do not replace manual platform interaction signoffs.
 - Bold, italic, and underline shortcuts in both input adapters apply emphasis
   uniformly to mixed selections, matching toolbar behavior, and disable it only
   when the whole selection already has that emphasis.

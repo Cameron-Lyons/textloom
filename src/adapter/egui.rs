@@ -15,18 +15,68 @@ use egui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    Composition, Document, Editor, Error, InlineStyle, Movement, Paragraph, ParagraphKind,
-    Position, Selection, StylePatch,
+    Composition, Document, Editor, Error, Fragment, InlineStyle, Movement, Paragraph,
+    ParagraphKind, Position, Selection, StylePatch,
 };
 
 mod accessibility;
 pub use accessibility::AccessibilityError;
 
+/// Optional host transport for rich clipboard representations.
+///
+/// The host owns native clipboard access and any transport errors. These methods
+/// run synchronously when a focused, enabled widget handles a clipboard event,
+/// preserving its order relative to typing, selection, and IME input. Defaults
+/// retain egui's plain-text clipboard behavior, so a host can implement either
+/// direction independently.
+pub trait RichClipboard {
+    /// Publish a selected fragment for copy or cut, before cut removes text.
+    ///
+    /// Use [`Fragment::to_bytes`], [`Fragment::to_html`], and
+    /// [`Fragment::plain_text`] to provide native, HTML, and plain representations.
+    /// Return `true` only when the host has published the clipboard, including a
+    /// plain-text alternative. This suppresses egui's `CopyText` command, which
+    /// would otherwise overwrite the host's rich representations. Return `false`
+    /// to let egui copy the selected plain text instead.
+    /// Successful publication also discards earlier queued egui text/image copy
+    /// commands, so deferred writes cannot replace the newer rich clipboard item.
+    /// Unrelated commands and clipboard writes queued afterward remain intact.
+    ///
+    /// Caret selections do not call this method. Read-only cut calls it without
+    /// removing text. Copy during composition captures the committed document
+    /// selection, excluding preedit text.
+    fn copy(&mut self, _fragment: &Fragment) -> bool {
+        false
+    }
+
+    /// Read a rich representation for a nonempty egui paste event.
+    ///
+    /// `plain_text` is that event's plain-text alternative. Return a decoded
+    /// fragment to replace the selection in one undo step, or `None` to insert
+    /// the event's plain text. Decode untrusted native data with
+    /// [`Fragment::from_bytes`]; an unavailable or rejected format should fall
+    /// back to plain text. The fragment must represent this paste event's
+    /// clipboard item. Hosts can capture rich and plain data together when
+    /// producing the event; a later clipboard read may retrieve a different item.
+    /// Comparing plain text can reject mismatches but cannot distinguish equal-text
+    /// items with different formatting. Do not infer clipboard identity from a
+    /// previously copied string.
+    ///
+    /// Empty paste events and read-only widgets do not call this method. Active
+    /// nonempty IME preedit blocks paste; an empty preedit is canceled first.
+    /// Egui integrations may emit no paste event when native plain text is absent
+    /// or empty, so rich clipboard writers must also publish plain text.
+    fn paste(&mut self, _plain_text: &str) -> Option<Fragment> {
+        None
+    }
+}
+
 /// A reusable, multiline rich-text editor with pointer and keyboard selection.
 ///
 /// Place it in `ScrollArea::vertical()` for a scrolling document. The core owns
-/// document and history state; egui owns focus and cached paragraph layouts. Clipboard
-/// interchange is plain text, so copying to another application remains portable.
+/// document and history state; egui owns focus and cached paragraph layouts.
+/// Clipboard interchange uses plain text by default; [`Self::rich_clipboard`]
+/// lets the host provide rich formats while retaining a plain-text alternative.
 /// Full text in egui output metadata is generated when accessibility, a screen
 /// reader, or the debug widget inspector needs it. Other output events retain
 /// their widget type and selection without copying the whole document.
@@ -40,6 +90,7 @@ pub struct RichTextEditor<'a> {
     bold_family: Option<FontFamily>,
     hint: String,
     read_only: bool,
+    rich_clipboard: Option<&'a mut dyn RichClipboard>,
 }
 
 /// The response plus any rejected editor commands.
@@ -69,6 +120,7 @@ impl<'a> RichTextEditor<'a> {
             bold_family: None,
             hint: String::new(),
             read_only: false,
+            rich_clipboard: None,
         }
     }
 
@@ -123,8 +175,19 @@ impl<'a> RichTextEditor<'a> {
         self
     }
 
+    /// Use the host's rich clipboard transport for this frame.
+    ///
+    /// The widget applies normal focus, read-only, IME, and undo rules before
+    /// calling the transport. Without this hook, clipboard events remain plain
+    /// text and do not capture rich fragments. Native MIME transport and its
+    /// lifetime remain the host's responsibility.
+    pub fn rich_clipboard(mut self, clipboard: &'a mut dyn RichClipboard) -> Self {
+        self.rich_clipboard = Some(clipboard);
+        self
+    }
+
     /// Process focused input, render the document, and return interaction errors.
-    pub fn show(self, ui: &mut Ui) -> RichTextEditorOutput {
+    pub fn show(mut self, ui: &mut Ui) -> RichTextEditorOutput {
         let id = self.id.unwrap_or_else(|| {
             self.salt
                 .map_or_else(|| ui.next_auto_id(), |salt| ui.make_persistent_id(salt))
@@ -289,6 +352,7 @@ impl<'a> RichTextEditor<'a> {
                         &mut errors,
                         &mut interrupted,
                         self.read_only,
+                        &mut self.rich_clipboard,
                     )
                 } else {
                     false
@@ -1379,6 +1443,29 @@ fn paint_document_selection(
     }
 }
 
+fn copy_selection(editor: &Editor, ui: &Ui, clipboard: &mut Option<&mut dyn RichClipboard>) {
+    if editor.selection().is_caret() {
+        return;
+    }
+    let copied = clipboard
+        .as_deref_mut()
+        .is_some_and(|clipboard| clipboard.copy(&editor.selected_fragment()));
+    if copied {
+        // The transport publishes synchronously; earlier deferred clipboard writes
+        // would otherwise run afterward and replace this newer clipboard item.
+        ui.ctx().output_mut(|output| {
+            output.commands.retain(|command| {
+                !matches!(
+                    command,
+                    egui::OutputCommand::CopyText(_) | egui::OutputCommand::CopyImage(_)
+                )
+            });
+        });
+    } else {
+        ui.ctx().copy_text(editor.selected_text());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_event(
     editor: &mut Editor,
@@ -1389,13 +1476,12 @@ fn handle_event(
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
     read_only: bool,
+    clipboard: &mut Option<&mut dyn RichClipboard>,
 ) -> bool {
     if read_only {
         match event {
             Event::Cut => {
-                if !editor.selection().is_caret() {
-                    ui.ctx().copy_text(editor.selected_text());
-                }
+                copy_selection(editor, ui, clipboard);
                 return true;
             }
             Event::Text(_) | Event::Paste(_) | Event::Ime(_) => return true,
@@ -1417,14 +1503,12 @@ fn handle_event(
     }
     match event {
         Event::Copy => {
-            if !editor.selection().is_caret() {
-                ui.ctx().copy_text(editor.selected_text());
-            }
+            copy_selection(editor, ui, clipboard);
             true
         }
         Event::Cut if editor.composition().is_none() => {
             if !editor.selection().is_caret() {
-                ui.ctx().copy_text(editor.selected_text());
+                copy_selection(editor, ui, clipboard);
                 editor.break_history_group();
                 record(editor.insert_text(""), errors);
                 editor.break_history_group();
@@ -1432,8 +1516,17 @@ fn handle_event(
             true
         }
         Event::Paste(text) if editor.composition().is_none() => {
+            let fragment = clipboard
+                .as_deref_mut()
+                .and_then(|clipboard| clipboard.paste(text));
             editor.break_history_group();
-            record(editor.insert_text(text), errors);
+            record(
+                match fragment {
+                    Some(fragment) => editor.insert_fragment(&fragment),
+                    None => editor.insert_text(text),
+                },
+                errors,
+            );
             editor.break_history_group();
             true
         }
@@ -1844,6 +1937,18 @@ mod tests {
         focus: bool,
         read_only: bool,
     ) -> egui::FullOutput {
+        clipboard_frame(context, editor, events, focus, read_only, true, None)
+    }
+
+    fn clipboard_frame(
+        context: &egui::Context,
+        editor: &mut Editor,
+        events: Vec<Event>,
+        focus: bool,
+        read_only: bool,
+        enabled: bool,
+        mut clipboard: Option<&mut dyn RichClipboard>,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
             events,
@@ -1859,20 +1964,534 @@ mod tests {
                         }
                     });
                 }
-                let output = RichTextEditor::new(editor)
-                    .id(id)
-                    .read_only(read_only)
-                    .show(ui);
-                assert!(output.errors.is_empty(), "{:?}", output.errors);
-                assert!(
-                    output.accessibility_errors.is_empty(),
-                    "{:?}",
-                    output.accessibility_errors
-                );
+                ui.add_enabled_ui(enabled, |ui| {
+                    let mut widget = RichTextEditor::new(editor).id(id).read_only(read_only);
+                    if let Some(clipboard) = clipboard.as_deref_mut() {
+                        widget = widget.rich_clipboard(clipboard);
+                    }
+                    let output = widget.show(ui);
+                    assert!(output.errors.is_empty(), "{:?}", output.errors);
+                    assert!(
+                        output.accessibility_errors.is_empty(),
+                        "{:?}",
+                        output.accessibility_errors
+                    );
+                });
             });
         });
         output.textures_delta.clear();
         output
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ClipboardCall {
+        Copy(Fragment),
+        Paste(String),
+    }
+
+    #[derive(Default)]
+    struct TestClipboard {
+        calls: Vec<ClipboardCall>,
+        accept_copy: bool,
+        fragment: Option<Fragment>,
+    }
+
+    impl RichClipboard for TestClipboard {
+        fn copy(&mut self, fragment: &Fragment) -> bool {
+            self.calls.push(ClipboardCall::Copy(fragment.clone()));
+            self.accept_copy
+        }
+
+        fn paste(&mut self, plain_text: &str) -> Option<Fragment> {
+            self.calls.push(ClipboardCall::Paste(plain_text.into()));
+            self.fragment.clone()
+        }
+    }
+
+    fn styled_clipboard_editor() -> Editor {
+        let mut editor = Editor::from_text("café 日本語👩🏽‍💻\nsecond");
+        editor.select_all();
+        editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                italic: Some(true),
+                foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
+                ..Default::default()
+            })
+            .unwrap();
+        editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 1,
+                start: 4,
+            })
+            .unwrap();
+        editor
+            .set_selection(Selection::new(editor.document().end(), Position::default()))
+            .unwrap();
+        editor.clear_history();
+        editor
+    }
+
+    #[test]
+    fn rich_copy_and_cut_capture_styles_before_deletion_and_preserve_undo() {
+        for accept_copy in [true, false] {
+            let context = egui::Context::default();
+            let mut editor = styled_clipboard_editor();
+            let fragment = editor.selected_fragment();
+            let selection = editor.selection();
+            let mut clipboard = TestClipboard {
+                accept_copy,
+                ..Default::default()
+            };
+            let output = clipboard_frame(
+                &context,
+                &mut editor,
+                vec![Event::Copy, Event::Cut],
+                true,
+                false,
+                true,
+                Some(&mut clipboard),
+            );
+            assert_eq!(
+                clipboard.calls,
+                vec![
+                    ClipboardCall::Copy(fragment.clone()),
+                    ClipboardCall::Copy(fragment.clone()),
+                ]
+            );
+            let copied: Vec<_> = output
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if accept_copy {
+                assert!(copied.is_empty());
+            } else {
+                let text = fragment.plain_text();
+                assert_eq!(copied, vec![text.as_str(), text.as_str()]);
+            }
+            assert_eq!(editor.document().plain_text(), "");
+            assert_eq!(editor.undo_len(), 1);
+            assert!(editor.undo());
+            assert_eq!(Fragment::from_document(editor.document()), fragment);
+            assert_eq!(editor.selection(), selection);
+            assert!(!editor.can_undo());
+
+            editor
+                .set_selection(Selection::caret(Position::default()))
+                .unwrap();
+            clipboard.calls.clear();
+            let output = clipboard_frame(
+                &context,
+                &mut editor,
+                vec![Event::Copy, Event::Cut],
+                true,
+                false,
+                true,
+                Some(&mut clipboard),
+            );
+            assert!(clipboard.calls.is_empty());
+            assert!(output.platform_output.commands.is_empty());
+            assert!(!editor.can_undo());
+        }
+    }
+
+    #[test]
+    fn rich_copy_supersedes_earlier_plain_and_image_commands_with_later_plain_fallback() {
+        struct AlternatingClipboard {
+            outcomes: Vec<bool>,
+            copied: Vec<String>,
+        }
+        impl RichClipboard for AlternatingClipboard {
+            fn copy(&mut self, fragment: &Fragment) -> bool {
+                self.copied.push(fragment.plain_text());
+                self.outcomes[self.copied.len() - 1]
+            }
+        }
+
+        for later_plain_fallback in [false, true] {
+            let context = egui::Context::default();
+            let mut editor = Editor::from_text("first");
+            editor.select_all();
+            let mut clipboard = AlternatingClipboard {
+                outcomes: if later_plain_fallback {
+                    vec![false, true, false]
+                } else {
+                    vec![false, true]
+                },
+                copied: Vec::new(),
+            };
+            let mut events = vec![
+                Event::Copy,
+                Event::Text("second".into()),
+                key(Key::A, Modifiers::COMMAND),
+                Event::Copy,
+            ];
+            if later_plain_fallback {
+                events.extend([
+                    Event::Text("third".into()),
+                    key(Key::A, Modifiers::COMMAND),
+                    Event::Copy,
+                ]);
+            }
+            let open_url = egui::OpenUrl::new_tab("https://example.invalid/clipboard-regression");
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    // Another host control may have queued an image before document copy.
+                    ui.ctx()
+                        .copy_image(egui::ColorImage::filled([1, 1], Color32::WHITE));
+                    ui.ctx().open_url(open_url.clone());
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let id = ui.make_persistent_id("editor");
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                        let response = RichTextEditor::new(&mut editor)
+                            .id(id)
+                            .rich_clipboard(&mut clipboard)
+                            .show(ui);
+                        assert!(response.errors.is_empty());
+                        assert!(response.accessibility_errors.is_empty());
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            let mut expected_commands = vec![egui::OutputCommand::OpenUrl(open_url)];
+            let mut expected_copies = vec!["first", "second"];
+            if later_plain_fallback {
+                expected_commands.push(egui::OutputCommand::CopyText("third".into()));
+                expected_copies.push("third");
+            }
+            assert_eq!(clipboard.copied, expected_copies);
+            assert_eq!(output.platform_output.commands, expected_commands);
+        }
+    }
+
+    #[test]
+    fn rich_paste_replaces_selection_in_one_undo_step_with_plain_fallback() {
+        let fragment = styled_clipboard_editor().selected_fragment();
+        for payload in [Some(fragment.clone()), None] {
+            let context = egui::Context::default();
+            let mut editor = Editor::from_text("original");
+            editor.select_all();
+            let selection = editor.selection();
+            let mut clipboard = TestClipboard {
+                fragment: payload.clone(),
+                ..Default::default()
+            };
+            clipboard_frame(
+                &context,
+                &mut editor,
+                vec![Event::Paste(fragment.plain_text())],
+                true,
+                false,
+                true,
+                Some(&mut clipboard),
+            );
+            assert_eq!(
+                clipboard.calls,
+                vec![ClipboardCall::Paste(fragment.plain_text())]
+            );
+            assert_eq!(editor.document().plain_text(), fragment.plain_text());
+            let expected = payload.unwrap_or_else(|| Fragment::from_text(&fragment.plain_text()));
+            assert_eq!(Fragment::from_document(editor.document()), expected);
+            assert_eq!(
+                editor.selection(),
+                Selection::caret(editor.document().end())
+            );
+            assert_eq!(editor.undo_len(), 1);
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "original");
+            assert_eq!(editor.selection(), selection);
+            assert!(!editor.can_undo());
+            assert!(editor.redo());
+            assert_eq!(Fragment::from_document(editor.document()), expected);
+        }
+    }
+
+    #[test]
+    fn rich_clipboard_callbacks_follow_input_order_and_separate_typing_history() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        editor.select_all();
+        let fragment = styled_clipboard_editor().selected_fragment();
+        let initial = editor.selected_fragment();
+        let mut clipboard = TestClipboard {
+            accept_copy: true,
+            fragment: Some(fragment.clone()),
+            ..Default::default()
+        };
+        let unrelated = key(Key::F1, Modifiers::NONE);
+        clipboard_frame(
+            &context,
+            &mut editor,
+            vec![
+                Event::Copy,
+                Event::Text("before".into()),
+                Event::Paste(fragment.plain_text()),
+                unrelated.clone(),
+                Event::Text("after".into()),
+                key(Key::A, Modifiers::COMMAND),
+                Event::Copy,
+            ],
+            true,
+            false,
+            true,
+            Some(&mut clipboard),
+        );
+        assert_eq!(
+            editor.document().plain_text(),
+            format!("before{}after", fragment.plain_text())
+        );
+        let final_fragment = editor.selected_fragment();
+        assert_eq!(
+            clipboard.calls,
+            vec![
+                ClipboardCall::Copy(initial),
+                ClipboardCall::Paste(fragment.plain_text()),
+                ClipboardCall::Copy(final_fragment),
+            ]
+        );
+        assert_eq!(context.input(|input| input.events.clone()), vec![unrelated]);
+        assert_eq!(editor.undo_len(), 3);
+        assert!(editor.undo());
+        assert_eq!(
+            editor.document().plain_text(),
+            format!("before{}", fragment.plain_text())
+        );
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "before");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+    }
+
+    #[test]
+    fn rich_clipboard_read_only_copies_without_paste_or_cut_mutation() {
+        let context = egui::Context::default();
+        let mut editor = styled_clipboard_editor();
+        let fragment = editor.selected_fragment();
+        let selection = editor.selection();
+        let revision = editor.document().revision();
+        let mut clipboard = TestClipboard {
+            accept_copy: true,
+            fragment: Some(Fragment::from_text("replacement")),
+            ..Default::default()
+        };
+        let output = clipboard_frame(
+            &context,
+            &mut editor,
+            vec![Event::Cut, Event::Paste("replacement".into()), Event::Copy],
+            true,
+            true,
+            true,
+            Some(&mut clipboard),
+        );
+        assert_eq!(
+            clipboard.calls,
+            vec![
+                ClipboardCall::Copy(fragment.clone()),
+                ClipboardCall::Copy(fragment.clone()),
+            ]
+        );
+        assert!(output.platform_output.commands.is_empty());
+        assert_eq!(Fragment::from_document(editor.document()), fragment);
+        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(editor.selection(), selection);
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn rich_clipboard_ignores_empty_paste_and_active_preedit() {
+        for preedit in ["", "候"] {
+            let context = egui::Context::default();
+            let mut editor = styled_clipboard_editor();
+            let fragment = editor.selected_fragment();
+            editor.update_composition(preedit, None).unwrap();
+            let composition = editor.composition().cloned();
+            let mut clipboard = TestClipboard {
+                accept_copy: true,
+                fragment: Some(Fragment::from_text("replacement")),
+                ..Default::default()
+            };
+            clipboard_frame(
+                &context,
+                &mut editor,
+                vec![Event::Paste(String::new()), Event::Copy],
+                true,
+                false,
+                true,
+                Some(&mut clipboard),
+            );
+            assert_eq!(clipboard.calls, vec![ClipboardCall::Copy(fragment.clone())]);
+            assert_eq!(editor.composition(), composition.as_ref());
+            assert_eq!(Fragment::from_document(editor.document()), fragment);
+            assert!(!editor.can_undo());
+
+            clipboard.calls.clear();
+            clipboard_frame(
+                &context,
+                &mut editor,
+                vec![Event::Paste("replacement".into())],
+                true,
+                false,
+                true,
+                Some(&mut clipboard),
+            );
+            if preedit.is_empty() {
+                assert_eq!(
+                    clipboard.calls,
+                    vec![ClipboardCall::Paste("replacement".into())]
+                );
+                assert!(editor.composition().is_none());
+                assert_eq!(editor.document().plain_text(), "replacement");
+                assert_eq!(editor.undo_len(), 1);
+                assert!(editor.undo());
+                assert_eq!(Fragment::from_document(editor.document()), fragment);
+            } else {
+                assert!(clipboard.calls.is_empty());
+                assert_eq!(editor.composition(), composition.as_ref());
+                assert_eq!(Fragment::from_document(editor.document()), fragment);
+                assert!(!editor.can_undo());
+                clipboard_frame(
+                    &context,
+                    &mut editor,
+                    vec![Event::Cut],
+                    true,
+                    false,
+                    true,
+                    Some(&mut clipboard),
+                );
+                assert!(clipboard.calls.is_empty());
+                assert_eq!(editor.composition(), composition.as_ref());
+                assert!(!editor.can_undo());
+            }
+        }
+    }
+
+    #[test]
+    fn rich_clipboard_does_not_access_host_when_disabled_or_unfocused() {
+        for (enabled, focused) in [(false, true), (true, false)] {
+            let context = egui::Context::default();
+            let mut editor = styled_clipboard_editor();
+            let fragment = editor.selected_fragment();
+            let mut clipboard = TestClipboard {
+                accept_copy: true,
+                fragment: Some(Fragment::from_text("replacement")),
+                ..Default::default()
+            };
+            let events = vec![Event::Copy, Event::Cut, Event::Paste("replacement".into())];
+            let output = clipboard_frame(
+                &context,
+                &mut editor,
+                events.clone(),
+                focused,
+                false,
+                enabled,
+                Some(&mut clipboard),
+            );
+            assert!(clipboard.calls.is_empty());
+            assert!(output.platform_output.commands.is_empty());
+            assert_eq!(context.input(|input| input.events.clone()), events);
+            assert_eq!(Fragment::from_document(editor.document()), fragment);
+            assert!(!editor.can_undo());
+        }
+    }
+
+    #[test]
+    fn default_rich_clipboard_methods_keep_plain_text_interchange() {
+        struct DefaultClipboard;
+        impl RichClipboard for DefaultClipboard {}
+        let context = egui::Context::default();
+        let mut editor = styled_clipboard_editor();
+        let text = editor.selected_text();
+        let output = clipboard_frame(
+            &context,
+            &mut editor,
+            vec![Event::Copy, Event::Paste("plain".into())],
+            true,
+            false,
+            true,
+            Some(&mut DefaultClipboard),
+        );
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(copied) if copied == &text)
+        }));
+        assert_eq!(editor.document().plain_text(), "plain");
+        assert_eq!(editor.undo_len(), 1);
+    }
+
+    #[test]
+    fn rich_clipboard_preserves_accessibility_selection_replacement_and_keyboard_undo() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, TextSelection, TreeId};
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut editor = styled_clipboard_editor();
+        let original = Fragment::from_document(editor.document());
+        frame(&context, &mut editor, vec![], true);
+        let id = context.memory(|memory| memory.focused()).unwrap();
+        let snapshot = context
+            .data(|data| data.get_temp::<Cache>(id))
+            .unwrap()
+            .accessibility
+            .unwrap();
+        let selected = Selection::new(Position::new(0, 6), Position::new(0, 12));
+        let fragment = editor.document().fragment(selected.range()).unwrap();
+        assert_eq!(fragment.plain_text(), "日本");
+        let select = Event::AccessKitActionRequest(ActionRequest {
+            action: Action::SetTextSelection,
+            target_node: id.accesskit_id(),
+            target_tree: TreeId::ROOT,
+            data: Some(ActionData::SetTextSelection(TextSelection {
+                anchor: snapshot.position(selected.anchor).unwrap(),
+                focus: snapshot.position(selected.focus).unwrap(),
+            })),
+        });
+        let replace = Event::AccessKitActionRequest(ActionRequest {
+            action: Action::ReplaceSelectedText,
+            target_node: id.accesskit_id(),
+            target_tree: TreeId::ROOT,
+            data: Some(ActionData::Value("replacement".into())),
+        });
+        let mut clipboard = TestClipboard {
+            accept_copy: true,
+            ..Default::default()
+        };
+        let output = clipboard_frame(
+            &context,
+            &mut editor,
+            vec![
+                select,
+                Event::Copy,
+                replace,
+                key(Key::Z, Modifiers::COMMAND),
+                Event::Copy,
+            ],
+            true,
+            false,
+            true,
+            Some(&mut clipboard),
+        );
+        assert_eq!(
+            clipboard.calls,
+            vec![
+                ClipboardCall::Copy(fragment.clone()),
+                ClipboardCall::Copy(fragment)
+            ]
+        );
+        assert_eq!(Fragment::from_document(editor.document()), original);
+        assert_eq!(editor.selection(), selected);
+        assert!(!editor.can_undo());
+        assert!(editor.can_redo());
+        assert!(output.platform_output.commands.is_empty());
+        assert!(output.platform_output.accesskit_update.is_some());
+        assert!(context.input(|input| input.events.is_empty()));
     }
 
     fn key(key: Key, modifiers: Modifiers) -> Event {

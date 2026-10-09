@@ -2,26 +2,43 @@
 
 ## 1.0 validation status
 
-Local Linux validation on 2026-10-09 passed all eight test/doctest feature
-combinations with Rust 1.99.0 stable and Rust 1.95.0. The all-feature suite passes 212 unit and
-integration tests and four doctests, including the compile-fail accessibility
-API check: 216 passing tests in total. One egui host widget snippet is
-intentionally ignored. All library targets and the standalone native host also
-compile with Rust 1.95.0.
+Baseline Linux validation on 2026-10-09 passed all eight test/doctest feature
+combinations with Rust 1.99.0 stable and Rust 1.95.0. The current library's
+all-feature suite passes 221 unit and integration tests and four doctests,
+including the compile-fail accessibility API check: 225 passing tests in total.
+One egui host widget snippet is intentionally ignored. The standalone native
+host has six passing CLI/report tests. The egui clipboard-hook tests also pass
+with Rust 1.95.0; final complete feature and host checks remain required after
+the current changes.
 
-The complete stable-toolchain release script passed on the candidate working
+The complete stable-toolchain release script passed on an earlier candidate working
 tree: formatting, strict Clippy, warning-free API documentation, benchmark smoke
 tests, headless examples, package inventory verification, and tests and all-target
 compilation from the extracted crate. Native host formatting, strict Clippy,
 and compilation against both the source and extracted library also passed.
+That run preceded the latest native focus diagnostics; it does not verify the
+final working tree. Repeat the complete script after all current changes.
 
-The complete [CI run for commit `15bdda0`](https://github.com/Cameron-Lyons/textloom/actions/runs/37908584789)
+The complete [CI run for commit `49ecb6f`](https://github.com/Cameron-Lyons/textloom/actions/runs/37910912372)
 passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
 and macOS/Windows all-target compilation, native host compilation, tests, and
 doctests. Further working-tree fixes require the same checks on their final
 clean commit; the baseline result does not verify subsequent changes.
 
-The 1.0.0 working tree is an unreleased candidate. Linux Wayland rendering has
+The candidate workflow adds required native renderer smoke checks on Linux X11
+with Xvfb/Mesa and on macOS, in editable, read-only, and disabled modes. Results
+for these new checks remain pending. The optional Windows OpenGL probe is a
+separate manual-dispatch experiment; its supported runner configuration and
+runtime outcome remain unverified. Renderer smoke results establish native
+initialization and frame completion, leaving interactive platform checks below
+required on Linux, macOS, and Windows.
+Renderer jobs validate the source revision, platform, mode, graceful completion,
+error counts, and snapshot integrity before archiving content-free JSON reports
+alongside smoke logs. Five validator regressions pass locally; observations
+never certify manual signoff.
+
+The 1.0.0 working tree is an unreleased candidate in
+[draft PR #1](https://github.com/Cameron-Lyons/textloom/pull/1). Linux Wayland rendering has
 passed at 200% display scale with optional Noto CJK and Liberation Bold fonts.
 Native ASCII typing and plain-text copy passed with exact clipboard content
 verified. Native Unicode paste/copy, keyboard undo/redo, grouped adjacent caret
@@ -30,6 +47,13 @@ and rendered styles were checked before and after undo. Read-only selection/copy
 typing/deletion/paste suppression, and non-destructive cut passed. IME candidate
 placement, screen-reader behavior, dead keys/AltGr, rich clipboard transport,
 and macOS and Windows native interaction checks still require signoff.
+Linux virtual-keyboard `dead_acute` followed by `e`, and Compose apostrophe
+followed by `e`, produced a visually observed `é` with undo. These exploratory
+results leave physical-keyboard signoff pending. An isolated AltGr virtual-keyboard
+attempt recorded a text event and a document change before compositor focus moved
+away from the native host. The report recorded native window focus loss with
+widget keyboard focus retained and no editing/accessibility errors. Visual,
+undo, and physical-keyboard AltGr signoff remain pending.
 
 Before publication, record the final commit, native host and version, operating
 system and display backend, IMEs and screen readers used, and the outcome of each
@@ -42,8 +66,14 @@ The standalone host in `examples/native-editor` uses eframe/egui 0.36.2 and
 winit 0.30.13. It is available from a repository checkout and is intentionally
 excluded from the published library archive. Its renderer, window, clipboard,
 and platform accessibility dependencies remain outside the library's dependency
-graph. The example transports plain text through the system clipboard; rich MIME
-transport requires a host integration using Textloom's fragment API.
+graph. The example transports plain text through the system clipboard.
+`RichTextEditor::rich_clipboard()` now accepts a host-owned `RichClipboard`
+callback: successful rich copies include a plain alternative and suppress egui's
+later plain overwrite; rich paste replaces the selection in one undo step, with
+plain fallback when the callback returns no fragment. The callbacks preserve
+input order and focus, read-only/disabled, empty-paste, and IME guards. The native
+example still has no rich MIME backend; transport implementation and native
+validation remain pending.
 
 Reproduce the Linux host used for rendering checks from the repository root:
 
@@ -54,10 +84,26 @@ cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-di
 ```
 
 These optional font paths require the corresponding local font files; the host
-does not install or change system fonts. Add `--smoke-test` to render 20 native
-frames and exit, or `--read-only` for selection/copy checks with editing disabled.
+does not install or change system fonts. Add `--smoke-test` to request a graceful
+close after 20 native frames, `--read-only` for selection/copy checks with editing
+suppressed, or `--disabled` to disable document focus and interaction. The toolbar
+can toggle enabled and read-only modes during a session.
 The smoke mode fails if the widget reports an editing or accessibility error;
 native IME, clipboard, and screen-reader behavior need separate interaction tests.
+
+Use `--qa-report PATH` to capture opt-in JSON observations on graceful exit.
+Choose a new path with an existing parent directory; reports do not overwrite
+existing files, and write failures return a nonzero exit status. Reports include
+platform/scale information, host-wide input counts, observed editor transitions,
+error counts, final-state metrics, and an in-memory TLFR round trip. Document,
+clipboard, search and preedit text are omitted. Native window focus and retained
+widget focus are recorded separately to diagnose focus loss. Counters describe
+observed input and state changes; they do not prove document acceptance or a
+manual check's outcome. Every report records `manual_signoff: "not_recorded"`.
+Supply `TEXTLOOM_QA_REVISION` at build time to label the source revision, and label
+builds with local changes accordingly. The native example guide describes
+platform commands. Attach exact steps, IME/screen-reader versions, OS/backend,
+and outcomes separately for final-commit signoff.
 
 Partial QA record for 2026-10-09: uncommitted 1.0.0 candidate; Omarchy
 4.0.0.r6815.g50d687a (Arch-based Linux), kernel 7.2.8-5-omarchy-bore,
@@ -74,7 +120,8 @@ remain pending.
 | Native read-only selection/copy | Passed; exact clipboard content verified |
 | Native read-only editing suppression | Passed; typing, Backspace/Delete, Enter, paste, and undo preserve the document; cut copies without deleting |
 | Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Manual validation pending |
-| Dead keys and AltGr | Manual validation pending |
+| Dead keys and Compose | Virtual `dead_acute`/Compose sequences produced visually observed `é` with undo; physical-keyboard/platform signoff pending |
+| AltGr | Virtual-keyboard attempt recorded text/document changes before compositor focus loss; visual, undo, and physical-keyboard/platform signoff pending |
 | Screen-reader selection and replacement | Manual validation pending |
 | Rich clipboard MIME transport | Host integration and validation pending |
 | macOS and Windows native host checks | Manual validation pending |
@@ -117,7 +164,7 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
    pending changes. This requires a matching changelog entry and checks formatting,
    every feature combination, doctests, Clippy, documentation, benchmarks, and
    headless examples. It also checks formatting and strict Clippy for the native
-   host without opening a window. It then runs all-feature tests and compiles
+   host, plus its six CLI/report tests, without opening a window. It then runs all-feature tests and compiles
    every target from the extracted Cargo package. An explicit inventory check
    requires every packaged source, test, fixture, headless example, benchmark,
    and release document before those checks, so accidentally omitting an entire
@@ -132,10 +179,13 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
    on the clean checkout. Run `cargo +1.95.0 test --locked --all-features` and
    `cargo +1.95.0 check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target`.
    Confirm the MSRV feature checks and macOS/Windows jobs pass on that commit;
-   they compile the standalone native host as well as the library targets.
+   they compile and test the standalone native host as well as the library targets.
+   Confirm required Linux X11 and macOS renderer smoke checks pass in editable,
+   read-only, and disabled modes. A Windows probe can supply additional runtime
+   evidence; native Windows interaction signoff remains required independently.
 5. Exercise a native host on Linux, macOS, and Windows. Check focus loss during
    composition, Japanese/Chinese IME replacement and candidate placement,
-   dead keys and AltGr, platform shortcuts, plain/rich clipboard transport,
+   physical-keyboard dead keys and AltGr, platform shortcuts, plain/rich clipboard transport,
    read-only/disabled widgets, high DPI, and screen-reader selection/replacement.
    Headless tests validate routing and semantics; hosts supply these platform
    services. Record the host/platform results in the release notes. Any failed

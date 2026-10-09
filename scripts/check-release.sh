@@ -46,6 +46,8 @@ cargo fmt --manifest-path "$native_example_manifest" --package textloom-native-e
 for features in '' egui winit accesskit egui,winit egui,accesskit winit,accesskit egui,winit,accesskit; do
     cargo test --locked --no-default-features --features "$features"
 done
+# The repository-only host has CLI/report tests that need no display.
+cargo test --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir"
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo clippy --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir" -- -D warnings
 RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --locked --all-features --no-deps
