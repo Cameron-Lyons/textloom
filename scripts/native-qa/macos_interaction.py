@@ -89,7 +89,23 @@ on run argv
             else if not ((name of window 1) contains windowName) then
                 error "Wrong foreground window"
             end if
-            if commandName is "focus" then
+            if commandName is "diagnostic" then
+                set focusedRole to "unavailable"
+                set focusedDescription to "unavailable"
+                set focusedValue to "unavailable"
+                try
+                    set focusedElement to value of attribute "AXFocusedUIElement" of targetProcess
+                    set focusedRole to (value of attribute "AXRole" of focusedElement) as text
+                    set focusedDescription to (value of attribute "AXDescription" of focusedElement) as text
+                end try
+                try
+                    set focusedValue to (value of attribute "AXValue" of focusedElement) as text
+                    if (count of characters of focusedValue) > 2048 then
+                        set focusedValue to (characters 1 thru 2048 of focusedValue) as text
+                    end if
+                end try
+                return "PID=" & targetPID & linefeed & "window=" & (name of window 1) & linefeed & "focused_role=" & focusedRole & linefeed & "focused_description=" & focusedDescription & linefeed & "fixture_focused_value=" & focusedValue
+            else if commandName is "focus" then
                 return "foreground-confirmed"
             else if commandName is "chord" then
                 keystroke (item 4 of argv) using {command down}
@@ -226,6 +242,18 @@ class Probe:
         self.action(self.textedit_pid, self.external_file.stem, "chord", "c")
         return self.clipboard("external-fixture", changed_from=generation)
 
+    def diagnostic(self, label):
+        result = self.run([self.helper, "diagnose", OUTPUT, label], check=False, timeout=20)
+        (OUTPUT / f"macos-fixture-{label}.clipboard.json").write_text(
+            result.stdout + result.stderr, encoding="utf-8"
+        )
+        if self.textedit_pid is not None:
+            documents = self.document_urls[self.import_file.stem]
+            result = self.apple("diagnostic", self.textedit_pid, self.import_file.stem, "", *documents, check=False)
+            (OUTPUT / f"macos-fixture-{label}.ax.txt").write_text(
+                (result.stdout + result.stderr)[:8192], encoding="utf-8"
+            )
+
     def start(self, mode):
         stdout_path = OUTPUT / f"macos-{mode}.stdout.log"
         stdout = stdout_path.open("w", encoding="utf-8")
@@ -290,12 +318,16 @@ class Probe:
     def editable(self):
         process, report = self.start("editable")
         self.note("editable: native fixture representations verified", **self.clipboard("native-fixture"))
+        self.diagnostic("native-offer")
         self.open_textedit(self.import_file)
         self.action(self.textedit_pid, self.import_file.stem, "chord", "a")
+        self.diagnostic("textedit-before-paste")
         self.action(self.textedit_pid, self.import_file.stem, "chord", "v")
+        self.diagnostic("textedit-after-paste")
         generation = self.clipboard("state")["change_count"]
         self.action(self.textedit_pid, self.import_file.stem, "chord", "a")
         self.action(self.textedit_pid, self.import_file.stem, "chord", "c")
+        self.diagnostic("textedit-after-copy")
         self.note("editable: TextEdit imported native HTML", **self.clipboard("textedit-import", changed_from=generation))
         # Save the already named private file so closing it needs no dialog.
         self.action(self.textedit_pid, self.import_file.stem, "chord", "s")

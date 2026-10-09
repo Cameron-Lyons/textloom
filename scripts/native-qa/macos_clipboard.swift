@@ -172,6 +172,53 @@ func expectPlain(_ arguments: [String], fallback: Bool) throws {
     try emit(["plain_exact": true, "plain_fallback_formatting": fallback, "types": types()])
 }
 
+func diagnose(_ arguments: [String]) throws {
+    try require(arguments.count == 2, "diagnose requires an artifact directory and fixture label")
+    let labels = ["native-offer", "textedit-before-paste", "textedit-after-paste", "textedit-after-copy", "failure"]
+    try require(labels.contains(arguments[1]), "Unexpected fixture diagnostic label")
+    let directory = URL(fileURLWithPath: arguments[0], isDirectory: true)
+    let label = arguments[1]
+    var observation: [String: Any] = ["fixture_only": true, "types": types()]
+    // These files contain only this probe's private fixture, never a real
+    // desktop's clipboard. A separate small cap bounds diagnostic artifacts.
+    let diagnosticLimit = 64 * 1024
+    if let value = NSPasteboard.general.string(forType: .string) {
+        try require(value.utf8.count <= diagnosticLimit, "Fixture diagnostic text exceeds its cap")
+        try value.write(to: directory.appendingPathComponent("macos-fixture-\(label).plain.txt"), atomically: true, encoding: .utf8)
+    }
+    for (name, type) in [("plain", NSPasteboard.PasteboardType.string), ("html", .html), ("rtf", .rtf)] {
+        guard let data = try boundedData(type) else { continue }
+        try require(data.count <= diagnosticLimit, "Fixture diagnostic representation exceeds its cap")
+        try data.write(to: directory.appendingPathComponent("macos-fixture-\(label).\(name)"), options: .atomic)
+        observation["\(name)_bytes"] = data.count
+        if type == .rtf {
+            let parsed = try NSAttributedString(
+                data: data, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil
+            )
+            try require(parsed.string.utf8.count <= diagnosticLimit, "Parsed fixture RTF exceeds its diagnostic cap")
+            try parsed.string.write(to: directory.appendingPathComponent("macos-fixture-\(label).rtf.txt"), atomically: true, encoding: .utf8)
+        }
+        if type == .html && label == "native-offer" {
+            // Distinguish an HTML encoding contract issue from keyboard/focus
+            // mistakes, without substituting this parser for the TextEdit test.
+            for explicitUTF8 in [false, true] {
+                let name = explicitUTF8 ? "explicit-utf8" : "default"
+                var options: [NSAttributedString.DocumentReadingOptionKey: Any] = [.documentType: NSAttributedString.DocumentType.html]
+                if explicitUTF8 { options[.characterEncoding] = String.Encoding.utf8.rawValue }
+                do {
+                    let parsed = try NSAttributedString(data: data, options: options, documentAttributes: nil)
+                    try require(parsed.string.utf8.count <= diagnosticLimit, "Parsed fixture HTML exceeds its diagnostic cap")
+                    try parsed.string.write(to: directory.appendingPathComponent("macos-fixture-native-offer.html-\(name).txt"), atomically: true, encoding: .utf8)
+                    observation["html_\(name)_contains_exact_unicode"] = parsed.string.contains("café 日本語👩🏽‍💻")
+                } catch {
+                    observation["html_\(name)_error"] = String(describing: error)
+                }
+            }
+        }
+    }
+    try emit(observation)
+}
+
 do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     try require(!arguments.isEmpty, "Missing inspector command")
@@ -183,6 +230,7 @@ do {
     case "state": try emit(["types": types()])
     case "plain": try expectPlain(Array(arguments.dropFirst()), fallback: false)
     case "fallback": try expectPlain(Array(arguments.dropFirst()), fallback: true)
+    case "diagnose": try diagnose(Array(arguments.dropFirst()))
     default: throw ProbeError.failed("Unknown inspector command")
     }
 } catch {

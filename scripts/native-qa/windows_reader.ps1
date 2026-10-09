@@ -48,6 +48,8 @@ $Evidence = [ordered]@{
     speech_evidence = "reader_generated_synthesis_queue"
     audible_speech_verified = $false
     physical_keyboard_verified = $false
+    teardown_order = "reader_before_native"
+    close_with_reader_active_verified = $false
     manual_signoff = "not_recorded"
     fixture_content_in_capture = $true
     checks = $Checks
@@ -414,6 +416,15 @@ automaticUpdates = disabled
     Assert-ReaderSpeech $barrier.sequence @("TextLoom", "café", "日本語") "native_reader_restored_selection"
     $captureErrors = @(Get-ReaderEvents | Where-Object { $_.kind -eq "capture_error" })
     if ($captureErrors.Count) { throw "NVDA capture recorded an error." }
+    # Finish the reader session before tearing down its UIA provider window.
+    # Successful text/speech assertions remain above; neither process may be
+    # forcibly terminated on the success path.
+    Invoke-ReaderRequest "quit" | Out-Null
+    Wait-Condition { $VerifiedReader.HasExited } "Owned NVDA did not exit gracefully." 15 | Out-Null
+    if ($VerifiedReader.ExitCode -ne 0) { throw "Owned NVDA reported exit failure." }
+    $terminated = @(Get-ReaderEvents | Where-Object { $_.kind -eq "terminated" })
+    if (-not $terminated.Count) { throw "NVDA plugin did not record orderly termination." }
+    $Checks.reader_graceful_exit = $true
     Assert-EditorForeground
     if (-not [TextloomReaderInput]::PostMessage($Window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
         throw "Cannot request graceful editor exit."
