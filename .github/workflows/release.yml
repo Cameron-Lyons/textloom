@@ -38,9 +38,14 @@ jobs:
     needs: version
     uses: ./.github/workflows/ci.yml
 
+  native-interaction:
+    name: Native interaction
+    needs: version
+    uses: ./.github/workflows/native-qa.yml
+
   package:
     name: Verified package artifact
-    needs: checks
+    needs: [checks, native-interaction]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

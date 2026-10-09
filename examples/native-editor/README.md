@@ -93,6 +93,13 @@ editable mode. Isolated widget fixtures passed on Linux X11/Wayland, macOS, and
 Windows; the root `RELEASING.md` records source revisions and validation evidence.
 External-application interoperability still needs manual platform signoff.
 
+Hosted interaction probes additionally verify macOS TextEdit HTML/RTF clipboard
+interoperability and native editing guards, and Windows NVDA generated speech,
+selection, replacement/history, and graceful close. macOS clipboard HTML declares
+UTF-8 so TextEdit decodes Unicode correctly. See the
+[probe guide](../../scripts/native-qa/README.md) for scope and evidence; physical
+desktop signoff remains required.
+
 For native QA, pass `--qa-report PATH` and close the window normally after testing.
 The host writes a JSON report only on graceful exit. Existing paths are protected
 from overwrite; a report write failure or smoke-test failure returns a nonzero

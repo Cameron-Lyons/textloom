@@ -2,54 +2,63 @@
 
 ## 1.0 validation status
 
-Validation of commit `3e39b17` on 2026-10-09 passed all eight test/doctest feature
-combinations with Rust 1.99.0 stable and Rust 1.95.0. The library's
-all-feature suite passes 221 unit and integration tests and four doctests,
-including the compile-fail accessibility API check: 225 passing tests in total.
-One egui host widget snippet is intentionally ignored. The standalone native
-host passes 20 option/report/clipboard tests on Linux, including Rust 1.95.0,
-15 on macOS, and 19 on Windows. Final checks on the publication commit remain
-required.
+Clean implementation candidate `5f8ccfbb83279d962f8c5a16d6b9d80673bd88e8`
+passed all six [release CI jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/37931457171)
+and both [hosted interaction jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/37931457145)
+on 2026-10-09. All reports and checkout logs identify the checked-out PR merge
+`7eb9964451cb9d10b9d16c2dbfee97cd08af1588`. Publication still requires the human
+signoffs below; the maintainer confirmed that test desktops are not available yet.
 
-The complete stable-toolchain release script passed locally on clean commit `3e39b17`:
-formatting, strict Clippy, warning-free API documentation, benchmark smoke
-tests, headless examples, package inventory verification, and tests and all-target
-compilation from the extracted crate. Native host formatting, strict Clippy,
-and compilation against both the source and extracted library also passed.
-The crates.io publish dry run and archive verification also passed on that
-commit, without uploading a release. Repeat the complete checks on the final
-publication commit.
+The library passes 223 unit/integration tests and four doctests with all features;
+one egui host snippet is intentionally ignored. Rust 1.95.0 checks all eight
+feature combinations. Stable Rust 1.99.0 checks formatting, strict Clippy,
+warning-free API documentation, benchmarks, headless examples, package inventory,
+extracted-package tests/targets, and the standalone native host against the
+extracted library. Native host tests pass 20 cases on Linux, 15 on macOS, and 19
+on Windows. Nine Python regressions reject incomplete or content-bearing report
+evidence. A local complete release check and publication dry run previously
+passed on clean `f05a518`, without upload; repeat publication checks on the final
+clean commit.
 
-All six required jobs in the [CI run for commit `3e39b17`](https://github.com/Cameron-Lyons/textloom/actions/runs/37921095007)
-passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
-macOS/Windows compilation and tests, Linux X11 rendering, and Windows Mesa
-rendering. Native renderer checks passed editable, read-only, and disabled modes
-on all three platforms. Linux uses an isolated Xvfb display with Mesa and the
-X11 xkbcommon runtime. Windows uses signed MSYS2 Mesa packages with
-application-local OpenGL DLLs; the verified run used Mesa 26.2.4-1 and LLVM
-22.1.8-3. Reports independently validated zero errors and equal TLFR round trips.
-The native rich clipboard fixture passed through the widget's copy/paste callbacks
-on Linux X11, macOS, and Windows. All three mode reports per platform independently
-validated against the checked-out PR merge `3e618d6`, with 21 rendered frames,
-zero errors, correct rich-clipboard flags, and equal TLFR round trips. macOS used
-an ARM64 runner on macOS 26.6.2; Windows used the Mesa configuration above.
+All nine Linux X11/macOS/Windows renderer mode reports independently validated
+21 frames, graceful exit, zero errors, clipboard request/completion flags, equal
+TLFR round trips, and disabled focus suppression. Editable widget clipboard
+roundtrip/undo/redo markers passed on all platforms. Runners used Ubuntu 24.04.5,
+macOS 26.6.2 ARM64, and Windows 10.0.26100 with signed MSYS2 Mesa 26.2.4-1 and
+LLVM 22.1.8-3. Linux uses private Xvfb; Windows uses application-local OpenGL DLLs.
+Earlier private Sway 1.12/wlroots 0.20/pixman checks also passed all three modes,
+Wayland MIME aliases, multi-megabyte transfers, and owner replacement without
+changing the current desktop.
 
-Commit `9db3221` also passed all three modes in a private, headless Wayland
-session using Sway 1.12, wlroots 0.20, and the pixman renderer with Xwayland
-disabled. The rich fixture passed; each mode completed 21 frames with zero errors
-and a validated report. No clipboard helper remained after graceful close.
-Independent Wayland tests verified all plain-text MIME aliases, multi-megabyte
-transfers, and clipboard owner replacement. These isolated tests did not change
-the current desktop clipboard or configuration.
+Hosted interaction results on clean `5f8ccfb`:
 
-Renderer jobs now request `--rich-clipboard` in every mode and require
-`--clipboard-self-test` in editable mode on isolated CI desktops. They check the
-exact native clipboard roundtrip/undo/redo completion marker and validate
-source revision, platform, mode, graceful completion, clipboard request/result
-flags, error counts, and snapshot integrity before archiving content-free JSON
-reports alongside smoke logs. Nine validator regressions pass locally. These
-observations never certify manual signoff; interactive platform checks below
-remain required on Linux, macOS, and Windows.
+- macOS TextEdit preserved both Unicode paragraphs, bold/italic, ordered-list
+  start 4, and exact RGBA `[42, 100, 200, 255]` after native HTML paste and RTF
+  copy. AppKit default and explicit UTF-8 decoding agreed. The host declares
+  UTF-8 in its macOS clipboard HTML document; without metadata, TextEdit had
+  interpreted the UTF-8 bytes as legacy text. The library fragment exporter,
+  plain text, and TLFR remain unchanged. External rich TextEdit input correctly
+  used plain fallback. Native replacement undo/redo, focus-separated typing
+  groups, read-only copy/cut and editing suppression, and disabled guards passed.
+  All three reports had zero errors, graceful exit, and equal TLFR round trips;
+  all native processes and the owned TextEdit process were reaped.
+- Windows NVDA 2026.2 passed all 15 probe checks: ordinary document announcement,
+  Unicode line/selection speech, UIA text/caret/selection exposure, native
+  replacement, undo/redo and exact final restoration, editor close with NVDA
+  still active, report validation, and reader exit code 0. Eleven actual
+  reader-generated speech events were captured from the synthesis queue using
+  its silent synthesizer. This proves generated speech, not audible speech
+  usability. The probe verifies the real editor window: .NET's cached main
+  window had selected winit's hidden thread tool window in earlier failed
+  trials. Correct window targeting resolved closure without a host shutdown
+  change. No owned processes remained.
+
+The separate native interaction workflow archives bounded public fixture
+captures alongside strict content-free host reports. It refuses ordinary desktop
+invocation and never certifies manual signoff. The release workflow requires both
+interaction jobs and the complete CI matrix before archiving a release package.
+See the repository's `scripts/native-qa/README.md` for probe scope and the
+`examples/native-editor/NATIVE_QA.md` protocol for physical desktop signoff.
 
 The 1.0.0 working tree is an unreleased candidate in
 [draft PR #1](https://github.com/Cameron-Lyons/textloom/pull/1). Linux Wayland rendering has
@@ -159,8 +168,8 @@ available after close only if a clipboard manager retains it; macOS/Windows use
 eager native data. All platform dependencies are host-only safe wrapper APIs,
 and unsafe code remains forbidden in the example. Automated native fixtures pass
 on all three platforms and Linux Wayland. Linux Qt interoperability passed in the
-isolated sessions above; other external applications and macOS/Windows interaction
-signoffs remain required.
+isolated sessions above; hosted macOS TextEdit interoperability and Windows NVDA
+interaction also passed. Remaining desktop signoffs are still required.
 
 Reproduce the Linux host used for rendering checks from the repository root:
 
@@ -201,8 +210,8 @@ builds with local changes accordingly. The native example guide describes
 platform commands. Attach exact steps, IME/screen-reader versions, OS/backend,
 and outcomes separately for final-commit signoff.
 
-Partial QA record for 2026-10-09: uncommitted 1.0.0 candidate; earlier desktop
-observations used Omarchy
+Partial QA record for 2026-10-09: clean implementation candidate `5f8ccfb`;
+earlier desktop observations used an uncommitted candidate on Omarchy
 4.0.0.r6815.g50d687a (Arch-based Linux), kernel 7.2.8-5-omarchy-bore,
 Hyprland/Wayland, 200% display scale. The isolated Linux sessions above add IME,
 reader, and external clipboard evidence. Final commit and complete platform
@@ -220,9 +229,9 @@ signoff remain pending.
 | Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input; physical-keyboard and macOS/Windows signoff pending |
 | Dead keys and Compose | German XKB virtual sequences on clean `f05a518` produced visible `é`, exact copied bytes, and complete undo restoration; physical-keyboard/platform signoff pending |
 | AltGr | German XKB virtual AltGr on clean `f05a518` produced visible `@€`, exact copied bytes, and complete undo restoration without focus loss; physical-keyboard/platform signoff pending |
-| Screen-reader selection and replacement | Linux Orca narration, accessible selection/caret, and native typing/undo/redo passed; direct AT-SPI EditableText unavailable; macOS/Windows signoff pending |
-| Rich clipboard MIME transport | Automated native widget fixtures passed on Linux X11/Wayland, macOS, and Windows; Linux Qt interoperability passed; remaining external applications/platforms pending |
-| macOS and Windows native host checks | Manual validation pending |
+| Screen-reader selection and replacement | Linux Orca and hosted Windows NVDA generated speech, accessible selection/caret, native replacement and undo/redo passed; direct AT-SPI EditableText unavailable; VoiceOver, audible Windows speech, and full manual signoff pending |
+| Rich clipboard MIME transport | Widget fixtures passed on all platforms; Linux Qt and macOS TextEdit interoperability passed; Windows external applications and full manual signoff pending |
+| macOS and Windows native host checks | Hosted macOS native editing/focus/guard checks and Windows NVDA interaction passed; physical keyboards, IMEs, VoiceOver, scale changes, and full manual signoff pending |
 
 ## Compatibility contract
 
@@ -284,7 +293,9 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
    editable-mode clipboard fixture read-back and undo/redo. Validate the fresh
    content-free reports against the run's source revision; pull-request reports
    identify the checked-out merge revision. Native platform interaction signoff
-   remains required independently.
+   remains required independently. Confirm the hosted macOS TextEdit and Windows
+   NVDA interaction jobs also pass, with strict interaction report validation and
+   owned-process cleanup. They do not certify audible speech or physical input.
 5. Exercise a native host on Linux, macOS, and Windows. Check focus loss during
    composition, Japanese/Chinese IME replacement and candidate placement,
    physical-keyboard dead keys and AltGr, platform shortcuts, plain/rich clipboard
@@ -292,7 +303,10 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
    read-only/disabled widgets, high DPI, and screen-reader selection/replacement.
    Headless tests validate routing and semantics; hosts supply these platform
    services. Record the host/platform results in the release notes. Any failed
-   host behavior claimed by this release is a release blocker.
+   host behavior claimed by this release is a release blocker. Use the native
+   signoff protocol in `examples/native-editor/NATIVE_QA.md` and record unavailable
+   checks explicitly. Test desktops are currently unavailable, so these human
+   gates remain open and the candidate remains unreleased.
 
 ## Publish
 
@@ -309,8 +323,8 @@ and CI never publish to crates.io or create a GitHub release.
    git push origin v1.0.0
    ```
 
-4. The tag workflow runs the complete CI matrix, rejects a version/tag mismatch,
-   and uploads the verified `.crate` archive and its SHA-256 checksum. Confirm it
+4. The tag workflow runs the complete CI matrix and hosted native interaction
+   probes, rejects a version/tag mismatch, and uploads the verified `.crate` archive and its SHA-256 checksum. Confirm it
    passes before creating a GitHub release using the matching changelog entry.
 
 Crates.io versions cannot be overwritten. Fix a published defect in a new patch

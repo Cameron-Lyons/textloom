@@ -35,6 +35,12 @@ First stable release of the native Rust rich-text editing library.
   DLLs. Rich clipboard is requested in all modes; editable runs additionally
   require native clipboard roundtrip and undo/redo evidence. Renderer and fixture
   checks do not replace manual platform interaction signoffs.
+- Hosted native interaction checks cover macOS TextEdit rich clipboard import,
+  native typing/history/focus and guarded modes, and Windows NVDA generated
+  speech, accessible selection, native replacement/history and graceful close.
+  Release package verification requires these probes. macOS clipboard HTML
+  explicitly declares UTF-8 so TextEdit preserves Unicode; library HTML fragments
+  and the TLFR format remain unchanged. Physical desktop signoffs remain required.
 - HTML export uses six-digit opaque colors and `rgba()` for translucent colors,
   preserving channel order and all 256 alpha values in Qt's HTML importer as well
   as CSS consumers. Native Qt clipboard checks preserve Unicode text, emphasis,

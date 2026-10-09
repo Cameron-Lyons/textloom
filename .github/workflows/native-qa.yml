@@ -2,10 +2,14 @@ name: Native interaction QA
 
 on:
   workflow_dispatch:
+  workflow_call:
   pull_request:
     paths:
       - '.github/workflows/native-qa.yml'
+      - '.github/workflows/release.yml'
       - 'scripts/native-qa/**'
+      - 'scripts/check_native_report.py'
+      - 'scripts/test_native_report.py'
       - 'examples/native-editor/**'
       - 'src/**'
 
