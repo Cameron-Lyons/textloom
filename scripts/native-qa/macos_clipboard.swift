@@ -89,25 +89,6 @@ func textEditImport() throws {
     let value = attributed.string as NSString
     let first = value.range(of: "café 日本語👩🏽‍💻")
     try require(first.location != NSNotFound, "TextEdit lost the Unicode first paragraph")
-    let attributes = attributed.attributes(at: first.location, effectiveRange: nil)
-    guard let font = attributes[.font] as? NSFont else {
-        throw ProbeError.failed("TextEdit imported text has no font")
-    }
-    let traits = NSFontManager.shared.traits(of: font)
-    try require(traits.contains(.boldFontMask), "TextEdit lost bold from native HTML")
-    try require(traits.contains(.italicFontMask), "TextEdit lost italic from native HTML")
-    guard let color = (attributes[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB) else {
-        throw ProbeError.failed("TextEdit imported text has no sRGB foreground")
-    }
-    let rgba = [color.redComponent, color.greenComponent, color.blueComponent, color.alphaComponent]
-        .map { Int(($0 * 255).rounded()) }
-    try require(rgba == [42, 100, 200, 255], "TextEdit changed native HTML RGBA: \(rgba)")
-    guard let paragraph = attributes[.paragraphStyle] as? NSParagraphStyle,
-          let list = paragraph.textLists.last else {
-        throw ProbeError.failed("TextEdit lost the ordered list from native HTML")
-    }
-    try require(list.markerFormat.rawValue.contains(NSTextList.MarkerFormat.decimal.rawValue),
-                "TextEdit changed the ordered-list kind")
     // AppKit represents displayed list markers as literal tabs plus a marker in
     // RTF text. Accept that native representation only when every payload line
     // remains exact and each prefix matches its actual NSTextList marker.
@@ -116,14 +97,46 @@ func textEditImport() throws {
     if lines.last == "" { lines.removeLast() }
     let expected = fixture.components(separatedBy: "\n")
     try require(lines.count == expected.count, "TextEdit changed the paragraph count")
+    var paragraphOffset = 0
     for index in lines.indices {
-        let marker = list.marker(forItemNumber: list.startingItemNumber + index)
+        let payload = (lines[index] as NSString).range(of: expected[index])
+        try require(payload.location != NSNotFound, "TextEdit changed Unicode paragraph payload \(index)")
+        let payloadRange = NSRange(location: paragraphOffset + payload.location, length: payload.length)
+        let attributes = attributed.attributes(at: payloadRange.location, effectiveRange: nil)
+        guard let paragraph = attributes[.paragraphStyle] as? NSParagraphStyle,
+              let list = paragraph.textLists.last else {
+            throw ProbeError.failed("TextEdit lost the ordered list in paragraph \(index)")
+        }
+        try require(list.markerFormat.rawValue.contains(NSTextList.MarkerFormat.decimal.rawValue),
+                    "TextEdit changed the ordered-list kind in paragraph \(index)")
+        try require(list.startingItemNumber == 4, "TextEdit reset the ordered-list start in paragraph \(index)")
+        let marker = list.marker(forItemNumber: 4 + index)
         let allowed = [expected[index], "\t\(marker)\t\(expected[index])", "\(marker)\t\(expected[index])"]
         try require(allowed.contains(lines[index]), "TextEdit changed Unicode paragraph payload \(index)")
+        var offset = payloadRange.location
+        while offset < NSMaxRange(payloadRange) {
+            var effective = NSRange(location: 0, length: 0)
+            let attributes = attributed.attributes(at: offset, effectiveRange: &effective)
+            guard let font = attributes[.font] as? NSFont else {
+                throw ProbeError.failed("TextEdit imported payload has no font in paragraph \(index)")
+            }
+            let traits = NSFontManager.shared.traits(of: font)
+            try require(traits.contains(.boldFontMask), "TextEdit lost bold in paragraph \(index)")
+            try require(traits.contains(.italicFontMask), "TextEdit lost italic in paragraph \(index)")
+            guard let color = (attributes[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB) else {
+                throw ProbeError.failed("TextEdit payload has no sRGB foreground in paragraph \(index)")
+            }
+            let rgba = [color.redComponent, color.greenComponent, color.blueComponent, color.alphaComponent]
+                .map { Int(($0 * 255).rounded()) }
+            try require(rgba == [42, 100, 200, 255], "TextEdit changed native HTML RGBA in paragraph \(index): \(rgba)")
+            try require(NSMaxRange(effective) > offset, "TextEdit returned an invalid attribute range")
+            offset = min(NSMaxRange(effective), NSMaxRange(payloadRange))
+        }
+        paragraphOffset += (lines[index] as NSString).length + 1
     }
     try emit(["textedit_html_import_unicode_exact": true, "bold": true, "italic": true,
-              "ordered_list": true, "list_start": list.startingItemNumber,
-              "rgba": rgba, "types": types()])
+              "ordered_list": true, "list_start": 4, "paragraphs_checked": expected.count,
+              "rgba": [42, 100, 200, 255], "types": types()])
 }
 
 func externalFixture() throws {

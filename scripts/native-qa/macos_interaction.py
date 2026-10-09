@@ -45,10 +45,33 @@ on run argv
         end if
         set targetPID to (item 2 of argv) as integer
         set windowName to item 3 of argv
+        set expectedDocument to item 5 of argv
+        set resolvedDocument to item 6 of argv
         set targetProcess to first application process whose unix id is targetPID
         tell targetProcess
-            set candidates to windows whose name contains windowName
-            if (count of candidates) is not 1 then error "Missing or ambiguous target window"
+            set candidates to {}
+            set windowDescriptions to {}
+            repeat with candidate in windows
+                set candidateName to name of candidate
+                set candidateDocument to ""
+                try
+                    set candidateDocument to (value of attribute "AXDocument" of candidate) as text
+                end try
+                set end of windowDescriptions to candidateName & " [" & candidateDocument & "]"
+                if expectedDocument is not "" then
+                    if candidateDocument is expectedDocument or candidateDocument is resolvedDocument then
+                        set end of candidates to contents of candidate
+                    end if
+                else if candidateName contains windowName then
+                    set end of candidates to contents of candidate
+                end if
+            end repeat
+            if (count of candidates) is not 1 then
+                set AppleScript's text item delimiters to "; "
+                set inventory to windowDescriptions as text
+                set AppleScript's text item delimiters to ""
+                error "Target window count " & (count of candidates) & " for " & commandName & " / " & windowName & ": " & inventory
+            end if
             set targetWindow to item 1 of candidates
             set frontmost to true
             perform action "AXRaise" of targetWindow
@@ -58,7 +81,14 @@ on run argv
             error "Target PID did not become foreground"
         end if
         tell targetProcess
-            if not ((name of window 1) contains windowName) then error "Wrong foreground window"
+            if expectedDocument is not "" then
+                set foregroundDocument to (value of attribute "AXDocument" of window 1) as text
+                if foregroundDocument is not expectedDocument and foregroundDocument is not resolvedDocument then
+                    error "Wrong foreground document"
+                end if
+            else if not ((name of window 1) contains windowName) then
+                error "Wrong foreground window"
+            end if
             if commandName is "focus" then
                 return "foreground-confirmed"
             else if commandName is "chord" then
@@ -89,6 +119,10 @@ class Probe:
         self.helper = work / "macos-clipboard"
         self.import_file = work / "textloom-html-import.rtf"
         self.external_file = work / "textloom-external-source.rtf"
+        self.document_urls = {
+            path.stem: (path.absolute().as_uri(), path.resolve().as_uri())
+            for path in (self.import_file, self.external_file)
+        }
         self.textedit_pid = None
         self.hosts = []
         self.handles = []
@@ -132,7 +166,20 @@ class Probe:
         return None if value == "absent" else int(value)
 
     def action(self, pid, window, command, value=""):
-        self.apple(command, pid, window, value)
+        self.observations["last_native_action"] = {"pid": pid, "window": window, "command": command, "value": value}
+        self.save()
+        documents = self.document_urls.get(window, ("", ""))
+        deadline = time.monotonic() + 5
+        while True:
+            result = self.apple(command, pid, window, value, *documents, check=False)
+            if result.returncode == 0:
+                return
+            # This error occurs before any keystroke. A startup/autosave window
+            # transition may briefly remove the target; never replay an action
+            # after an ambiguous window or a post-input failure.
+            if "Target window count 0" not in result.stderr or time.monotonic() >= deadline:
+                raise RuntimeError(f"Native {command} on PID {pid} / {window}: {result.stderr[-4000:]}")
+            time.sleep(0.2)
 
     def focus(self, pid, window, host=None):
         deadline = time.monotonic() + 15
@@ -140,7 +187,8 @@ class Probe:
         while time.monotonic() < deadline:
             if host is not None and host.poll() is not None:
                 raise RuntimeError(f"Native process exited early ({host.returncode})")
-            result = self.apple("focus", pid, window, check=False)
+            documents = self.document_urls.get(window, ("", ""))
+            result = self.apple("focus", pid, window, "", *documents, check=False)
             if result.returncode == 0:
                 # Allow the focus event to reach a rendered frame before input.
                 time.sleep(0.35)
@@ -237,6 +285,7 @@ class Probe:
             if self.textedit_pid is None:
                 time.sleep(0.2)
         self.focus(self.textedit_pid, path.stem)
+        self.note("TextEdit private document and foreground PID verified", pid=self.textedit_pid, window=path.stem)
 
     def editable(self):
         process, report = self.start("editable")

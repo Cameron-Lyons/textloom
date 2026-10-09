@@ -17,6 +17,7 @@ import api
 import config
 import core
 import globalPluginHandler
+from logHandler import log
 from NVDAState import WritePaths
 from speech.extensions import pre_speechQueued
 import textInfos
@@ -38,6 +39,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._sequence = 0
         self._lock = threading.Lock()
         self._stopped = False
+        self._observation_failed = False
         self._timer = wx.PyTimer(self._poll)
         pre_speechQueued.register(self._speech)
         core.postNvdaStartup.register(self._ready)
@@ -61,11 +63,29 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._write("ready", reader_pid=os.getpid(), target_pid=self._target,
                     synth=config.conf["speech"]["synth"])
 
-    def _focus(self):
+    def _focus(self, allow_other=False):
         obj = api.getFocusObject()
         if obj is None or obj.processID != self._target:
+            if allow_other:
+                return None
             raise RuntimeError("owned editor is not NVDA's focus object")
         return obj
+
+    def _capture_error(self, error, location, request_id=None):
+        self._observation_failed = True
+        record = {"error_type": type(error).__name__, "location": location,
+                  "request_id": request_id}
+        # A separate marker makes an observation failure visible even when the
+        # normal append failed. Its content never includes exception messages.
+        try:
+            (self._root / "reader-capture-failed.json").write_text(
+                json.dumps(record), encoding="utf-8")
+        except Exception:
+            log.error("Textloom QA capture failure marker could not be written")
+        try:
+            self._write("capture_error", **record)
+        except Exception:
+            log.error("Textloom QA observation could not be recorded")
 
     @staticmethod
     def _bounded(value):
@@ -76,19 +96,25 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _speech(self, speechSequence, **kwargs):
         # Filtering by NVDA's own focus avoids capturing other applications.
         try:
-            obj = self._focus()
-        except RuntimeError:
-            return
-        parts = [self._bounded(part) for part in speechSequence if isinstance(part, str)]
-        if parts:
-            self._write("speech_queued", target_pid=obj.processID,
-                        text=self._bounded(" ".join(parts)))
+            obj = self._focus(allow_other=True)
+            if obj is None:
+                return
+            parts = [self._bounded(part) for part in speechSequence if isinstance(part, str)]
+            if parts:
+                self._write("speech_queued", target_pid=obj.processID,
+                            text=self._bounded(" ".join(parts)))
+        except Exception as error:
+            self._capture_error(error, "speech")
 
     def event_gainFocus(self, obj, nextHandler):
-        if obj.processID == self._target:
-            self._write("focus", target_pid=obj.processID,
-                        name=self._bounded(obj.name or ""), role=str(obj.role))
-        nextHandler()
+        try:
+            if obj.processID == self._target:
+                self._write("focus", target_pid=obj.processID,
+                            name=self._bounded(obj.name or ""), role=str(obj.role))
+        except Exception as error:
+            self._capture_error(error, "focus")
+        finally:
+            nextHandler()
 
     def _snapshot(self, request_id):
         obj = self._focus()
@@ -117,6 +143,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 return
             self._last_request = request_id
             operation = request["operation"]
+            if self._observation_failed and operation != "quit":
+                raise RuntimeError("an observation callback failed")
             if operation == "snapshot":
                 self._snapshot(request_id)
             elif operation == "barrier":
@@ -128,8 +156,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 raise ValueError("unknown request operation")
         except Exception as error:
             # Exception messages can contain provider/document text.
-            self._write("capture_error", request_id=request_id,
-                        error_type=type(error).__name__)
+            self._capture_error(error, "request", request_id)
 
     def terminate(self):
         self._timer.Stop()

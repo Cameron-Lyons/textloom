@@ -32,6 +32,7 @@ if (-not $Revision) { $Revision = (& git rev-parse HEAD).Trim() }
 if ($Revision -notmatch "^[0-9a-f]{40}$") { throw "A full source revision is required." }
 $NativeProcess = $null
 $ReaderProcess = $null
+$VerifiedReader = $null
 $LauncherProcess = $null
 $ReaderId = 0
 $Window = [IntPtr]::Zero
@@ -177,6 +178,9 @@ function Wait-Condition([scriptblock]$Condition, [string]$Message, [int]$Seconds
 }
 
 function Get-ReaderEvents {
+    if (Test-Path -LiteralPath (Join-Path $Profile "reader-capture-failed.json")) {
+        throw "NVDA observation callback failed."
+    }
     if (-not (Test-Path -LiteralPath $EventsPath)) { return @() }
     $lines = [IO.File]::ReadAllLines($EventsPath)
     $events = [Collections.Generic.List[object]]::new()
@@ -236,16 +240,25 @@ function Wait-Snapshot([scriptblock]$Expected, [string]$Message) {
     } $Message 15
 }
 
-function Assert-ReaderSpeech([long]$After, [string[]]$Expected, [string]$Name) {
+function Assert-ReaderSpeech(
+    [long]$After, [string[]]$Expected, [string]$Name, [switch]$ExactToken
+) {
+    if ($ExactToken -and $Expected.Count -ne 1) {
+        throw "Exact token speech assertions require one expected token."
+    }
     Wait-Condition {
         $events = @(Get-ReaderEvents | Where-Object {
             $_.kind -eq "speech_queued" -and $_.sequence -gt $After
         })
         $text = Normalize-Text (($events | ForEach-Object { $_.text }) -join " ")
+        if ($ExactToken) {
+            return @($text -split "\s+") -ccontains (Normalize-Text $Expected[0])
+        }
         # Synthesis can split words into several strings at language boundaries.
         $joined = $text -replace "\s", ""
         foreach ($part in $Expected) {
-            if (-not $joined.Contains((Normalize-Text $part) -replace "\s", "")) { return $false }
+            $expectedText = (Normalize-Text $part) -replace "\s", ""
+            if (-not $joined.Contains($expectedText)) { return $false }
         }
         return $true
     } ("NVDA did not generate expected speech for " + $Name) 15 | Out-Null
@@ -328,6 +341,7 @@ automaticUpdates = disabled
     if ($runningReader.SessionId -ne $Evidence.session_id -or $ready.synth -ne "silence") {
         throw "Reader session or synthesizer does not match the isolated profile."
     }
+    $VerifiedReader = $runningReader
     $Evidence.reader_pid = $ReaderId
     $Evidence.native_pid = $NativeProcess.Id
     $Checks.reader_started_in_private_profile = $true
@@ -372,7 +386,7 @@ automaticUpdates = disabled
     # Prevent a second NVDA+Up from being interpreted as the repeat/spelling gesture.
     Start-Sleep -Milliseconds 650
     Send-Chord @(0x2d) 0x26
-    Assert-ReaderSpeech $barrier.sequence @("x") "native_reader_replacement"
+    Assert-ReaderSpeech $barrier.sequence @("x") "native_reader_replacement" -ExactToken
 
     Send-Chord @(0x11) 0x5a # Ctrl+Z.
     Wait-Snapshot {
@@ -450,23 +464,28 @@ finally {
     foreach ($process in $ownedReaders) {
         try { $process.Kill($true); $process.WaitForExit(5000) | Out-Null } catch { }
     }
-    foreach ($process in @($LauncherProcess, $ReaderProcess)) {
+    foreach ($process in @($LauncherProcess, $ReaderProcess, $VerifiedReader)) {
         if ($process -and -not $process.HasExited) {
             try { $process.Kill($true); $process.WaitForExit(5000) | Out-Null } catch { }
         }
     }
+    $ownedIds = @($NativeProcess, $LauncherProcess, $ReaderProcess, $VerifiedReader) |
+        Where-Object { $null -ne $_ } | ForEach-Object { $_.Id }
     $OwnedProcessesRemaining = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        if ($ownedIds -contains $_.Id) { return $true }
         try {
-            $_.Path -and ($_.Path.StartsWith($Portable + [IO.Path]::DirectorySeparatorChar,
-                [StringComparison]::OrdinalIgnoreCase) `
-                -or ($NativeProcess -and $_.Id -eq $NativeProcess.Id) `
-                -or ($LauncherProcess -and $_.Id -eq $LauncherProcess.Id))
+            $_.Path -and $_.Path.StartsWith($Portable + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase)
         } catch { $false }
     })
     $Evidence.cleanup_succeeded = $OwnedProcessesRemaining.Count -eq 0
     $Evidence.owned_processes_remaining = $OwnedProcessesRemaining.Count
     if (Test-Path -LiteralPath $EventsPath) {
         Copy-Item -LiteralPath $EventsPath -Destination (Join-Path $OutputDirectory "nvda-reader-events.jsonl") -Force
+    }
+    $captureFailure = Join-Path $Profile "reader-capture-failed.json"
+    if (Test-Path -LiteralPath $captureFailure) {
+        Copy-Item -LiteralPath $captureFailure -Destination $OutputDirectory -Force
     }
     $Evidence | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $OutputDirectory "windows-reader-evidence.json") -Encoding utf8NoBOM
