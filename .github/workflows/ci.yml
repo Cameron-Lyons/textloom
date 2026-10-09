@@ -149,7 +149,7 @@ jobs:
       - name: Install virtual display and software renderer
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 xauth xvfb
+          sudo apt-get install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
       - name: Build native renderer
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
       - name: Native rendering smoke
@@ -203,10 +203,39 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native renderer
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Install signed Mesa software renderer
+        id: mesa
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          release: false
+          update: true
+          install: mingw-w64-ucrt-x86_64-mesa
+      - name: Record renderer package versions
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -Q | tee native-smoke-mesa-packages.log
       - name: Native OpenGL renderer probe
         timeout-minutes: 2
         shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.mesa.outputs.msys2-location }}
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
         run: |
+          $mesaRuntimeDirectory = Join-Path $env:MSYS2_LOCATION 'ucrt64\bin'
+          $nativeProbeDirectory = Join-Path $env:RUNNER_TEMP 'textloom-mesa-smoke'
+          New-Item -ItemType Directory -Path $nativeProbeDirectory | Out-Null
+          Copy-Item -LiteralPath ./target/debug/textloom-native-example.exe -Destination $nativeProbeDirectory
+          # Glutin imports WGL from opengl32.dll as well as loading OpenGL
+          # dynamically. Stage Mesa beside this copied executable for both
+          # paths, leaving system DLLs and Cargo's build cache untouched.
+          Copy-Item -LiteralPath "$mesaRuntimeDirectory\opengl32.dll" -Destination $nativeProbeDirectory
+          Copy-Item -LiteralPath "$mesaRuntimeDirectory\libgallium_wgl.dll" -Destination $nativeProbeDirectory
+          $env:PATH = "$mesaRuntimeDirectory;$env:PATH"
+          $env:GLUTIN_WGL_OPENGL_DLL = Join-Path $nativeProbeDirectory 'opengl32.dll'
+          $nativeProbeExecutable = Join-Path $nativeProbeDirectory 'textloom-native-example.exe'
           New-Item -ItemType Directory -Path native-observations | Out-Null
           foreach ($mode in @('editable', 'read-only', 'disabled')) {
             $smokeArguments = @('--smoke-test', '--qa-report', "native-smoke-$mode.json")
@@ -215,7 +244,7 @@ jobs:
             } elseif ($mode -eq 'disabled') {
               $smokeArguments += '--disabled'
             }
-            & ./target/debug/textloom-native-example.exe @smokeArguments 2>&1 | Tee-Object -FilePath "native-smoke-$mode.log"
+            & $nativeProbeExecutable @smokeArguments 2>&1 | Tee-Object -FilePath "native-smoke-$mode.log"
             if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
             }

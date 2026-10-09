@@ -21,8 +21,8 @@ First stable release of the native Rust rich-text editing library.
   host checks. Rich MIME transport remains a host integration requirement.
 - The candidate CI workflow adds required Linux X11/Mesa and macOS native
   rendering smoke checks for editable, read-only, and disabled hosts, plus a
-  separate optional Windows OpenGL probe. Runtime results remain pending;
-  renderer checks do not replace manual platform interaction signoffs.
+  separate optional Windows OpenGL probe. Renderer checks do not replace manual
+  platform interaction signoffs.
 - Bold, italic, and underline shortcuts in both input adapters apply emphasis
   uniformly to mixed selections, matching toolbar behavior, and disable it only
   when the whole selection already has that emphasis.

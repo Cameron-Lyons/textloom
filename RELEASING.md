@@ -2,22 +2,21 @@
 
 ## 1.0 validation status
 
-Baseline Linux validation on 2026-10-09 passed all eight test/doctest feature
+Linux validation of commit `d60c77d` on 2026-10-09 passed all eight test/doctest feature
 combinations with Rust 1.99.0 stable and Rust 1.95.0. The current library's
 all-feature suite passes 221 unit and integration tests and four doctests,
 including the compile-fail accessibility API check: 225 passing tests in total.
 One egui host widget snippet is intentionally ignored. The standalone native
-host has six passing CLI/report tests. The egui clipboard-hook tests also pass
-with Rust 1.95.0; final complete feature and host checks remain required after
-the current changes.
+host has six passing CLI/report tests, including on Rust 1.95.0. Final checks on
+the publication commit remain required after subsequent changes.
 
-The complete stable-toolchain release script passed on an earlier candidate working
-tree: formatting, strict Clippy, warning-free API documentation, benchmark smoke
+The complete stable-toolchain release script passed on clean commit `d60c77d`:
+formatting, strict Clippy, warning-free API documentation, benchmark smoke
 tests, headless examples, package inventory verification, and tests and all-target
 compilation from the extracted crate. Native host formatting, strict Clippy,
 and compilation against both the source and extracted library also passed.
-That run preceded the latest native focus diagnostics; it does not verify the
-final working tree. Repeat the complete script after all current changes.
+The crates.io publish dry run also passed without uploading a release. Repeat
+the complete checks on the final publication commit.
 
 The complete [CI run for commit `49ecb6f`](https://github.com/Cameron-Lyons/textloom/actions/runs/37910912372)
 passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
@@ -26,10 +25,16 @@ doctests. Further working-tree fixes require the same checks on their final
 clean commit; the baseline result does not verify subsequent changes.
 
 The candidate workflow adds required native renderer smoke checks on Linux X11
-with Xvfb/Mesa and on macOS, in editable, read-only, and disabled modes. Results
-for these new checks remain pending. The optional Windows OpenGL probe is a
-separate manual-dispatch experiment; its supported runner configuration and
-runtime outcome remain unverified. Renderer smoke results establish native
+with Xvfb/Mesa and on macOS, in editable, read-only, and disabled modes.
+The [macOS renderer job for `d60c77d`](https://github.com/Cameron-Lyons/textloom/actions/runs/37915371512/job/113770134648)
+passed all three modes and archived valid reports. The initial Linux X11 job
+failed because the runner lacked `libxkbcommon-x11.so`; its runtime package is
+now included, with the next run required to verify the correction.
+The [default Windows OpenGL probe](https://github.com/Cameron-Lyons/textloom/actions/runs/37915424851/job/113770313537)
+built successfully but failed before rendering because the hosted driver did
+not provide OpenGL 2.0. The optional probe is configured with signed
+MSYS2 Mesa software rendering; its outcome remains unverified.
+Renderer smoke results establish native
 initialization and frame completion, leaving interactive platform checks below
 required on Linux, macOS, and Windows.
 Renderer jobs validate the source revision, platform, mode, graceful completion,
