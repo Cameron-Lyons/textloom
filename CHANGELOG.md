@@ -35,6 +35,17 @@ First stable release of the native Rust rich-text editing library.
   DLLs. Rich clipboard is requested in all modes; editable runs additionally
   require native clipboard roundtrip and undo/redo evidence. Renderer and fixture
   checks do not replace manual platform interaction signoffs.
+- HTML export uses six-digit opaque colors and `rgba()` for translucent colors,
+  preserving channel order and all 256 alpha values in Qt's HTML importer as well
+  as CSS consumers. Native Qt clipboard checks preserve Unicode text, emphasis,
+  lists, and color; external plain paste retains one-step undo/redo.
+- The native host forwards the composing caret rectangle to winit so Japanese
+  and Chinese candidate windows follow the caret. It retires processed IME events
+  after rendering its text fields to prevent a Fcitx preedit/redraw feedback loop
+  in Find and Replace. Its Linux example workspace
+  backports upstream AccessKit activation and application-parent fixes for
+  current AT-SPI and Orca while retaining the documented AccessKit 0.24 API.
+  The vendored dependency and its licenses remain outside the library archive.
 - Bold, italic, and underline shortcuts in both input adapters apply emphasis
   uniformly to mixed selections, matching toolbar behavior, and disable it only
   when the whole selection already has that emphasis.
@@ -99,6 +110,9 @@ First stable release of the native Rust rich-text editing library.
   cancellations in the same frame no longer prevent focus release.
 - Empty winit IME reset events preserve selected text; an active composition's
   empty commit still replaces its captured selection.
+- Empty egui preedit restores the visible document and selection while retaining
+  the captured replacement for a later commit. Canceling native composition no
+  longer leaves selected text hidden until the next input.
 - Direct AccessKit trees keep distinct node IDs for repeated rich paragraphs
   that share the same underlying allocation.
 - Release checks test and compile the extracted package, including its fixtures,

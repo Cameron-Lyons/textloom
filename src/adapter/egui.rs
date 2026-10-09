@@ -884,7 +884,13 @@ impl Cache {
         editor: &Editor,
         appearance: &Appearance,
     ) -> Result<Option<Arc<[ParagraphLayout]>>, Error> {
-        let Some(composition) = editor.composition() else {
+        // Empty preedit can mean cancellation or precede an empty Commit.
+        // Keep its captured replacement, but show the source until Commit
+        // rather than hiding the selection behind an empty preview.
+        let Some(composition) = editor
+            .composition()
+            .filter(|composition| !composition.text.is_empty())
+        else {
             self.preview = None;
             return Ok(None);
         };
@@ -4171,6 +4177,62 @@ mod tests {
         assert_eq!(editor.document().plain_text(), "");
         assert!(editor.undo());
         assert_eq!(editor.document().plain_text(), "selected");
+    }
+
+    #[test]
+    fn empty_preedit_restores_visible_selection_before_a_later_empty_commit() {
+        for backward in [false, true] {
+            let context = egui::Context::default();
+            let mut editor = Editor::from_text("selected 色\nsecond");
+            editor.select_all();
+            if backward {
+                let selection = editor.selection();
+                editor
+                    .set_selection(Selection::new(selection.focus, selection.anchor))
+                    .unwrap();
+            }
+            let selection = editor.selection();
+            frame(
+                &context,
+                &mut editor,
+                vec![Event::Ime(ImeEvent::Preedit {
+                    text: "candidate".into(),
+                    active_range_chars: None,
+                })],
+                true,
+            );
+            let output = frame(
+                &context,
+                &mut editor,
+                vec![Event::Ime(ImeEvent::Preedit {
+                    text: String::new(),
+                    active_range_chars: None,
+                })],
+                true,
+            );
+            let painted_text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(painted_text, ["selected 色", "second"]);
+            assert_eq!(editor.selection(), selection);
+            assert_eq!(editor.composition().unwrap().replacement, selection);
+            assert!(!editor.can_undo());
+            frame(
+                &context,
+                &mut editor,
+                vec![Event::Ime(ImeEvent::Commit(String::new()))],
+                true,
+            );
+            assert_eq!(editor.document().plain_text(), "");
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "selected 色\nsecond");
+            assert_eq!(editor.selection(), selection);
+        }
     }
 
     #[test]

@@ -89,6 +89,7 @@ cargo check --locked --all-features --all-targets --manifest-path "$package_mani
 native_package_check_dir=$(mktemp -d "$package_target_dir/native-package-check.XXXXXX")
 trap 'rm -rf -- "$native_package_check_dir"' EXIT
 cp -R examples/native-editor/src "$native_package_check_dir/src"
+cp -R examples/native-editor/vendor "$native_package_check_dir/vendor"
 cp examples/native-editor/Cargo.lock "$native_package_check_dir/Cargo.lock"
 cp examples/native-editor/README.md "$native_package_check_dir/README.md"
 awk -v package_path="../package/textloom-$version" '

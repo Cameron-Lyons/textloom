@@ -2,7 +2,7 @@
 
 ## 1.0 validation status
 
-Validation of commit `9db3221` on 2026-10-09 passed all eight test/doctest feature
+Validation of commit `3e39b17` on 2026-10-09 passed all eight test/doctest feature
 combinations with Rust 1.99.0 stable and Rust 1.95.0. The library's
 all-feature suite passes 221 unit and integration tests and four doctests,
 including the compile-fail accessibility API check: 225 passing tests in total.
@@ -11,7 +11,7 @@ host passes 20 option/report/clipboard tests on Linux, including Rust 1.95.0,
 15 on macOS, and 19 on Windows. Final checks on the publication commit remain
 required.
 
-The complete stable-toolchain release script passed locally on clean commit `9db3221`:
+The complete stable-toolchain release script passed locally on clean commit `3e39b17`:
 formatting, strict Clippy, warning-free API documentation, benchmark smoke
 tests, headless examples, package inventory verification, and tests and all-target
 compilation from the extracted crate. Native host formatting, strict Clippy,
@@ -20,7 +20,7 @@ The crates.io publish dry run and archive verification also passed on that
 commit, without uploading a release. Repeat the complete checks on the final
 publication commit.
 
-All six required jobs in the [CI run for commit `9db3221`](https://github.com/Cameron-Lyons/textloom/actions/runs/37920484668)
+All six required jobs in the [CI run for commit `3e39b17`](https://github.com/Cameron-Lyons/textloom/actions/runs/37921095007)
 passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
 macOS/Windows compilation and tests, Linux X11 rendering, and Windows Mesa
 rendering. Native renderer checks passed editable, read-only, and disabled modes
@@ -30,11 +30,11 @@ application-local OpenGL DLLs; the verified run used Mesa 26.2.4-1 and LLVM
 22.1.8-3. Reports independently validated zero errors and equal TLFR round trips.
 The native rich clipboard fixture passed through the widget's copy/paste callbacks
 on Linux X11, macOS, and Windows. All three mode reports per platform independently
-validated against the checked-out PR merge `58dc2af`, with 21 rendered frames,
+validated against the checked-out PR merge `3e618d6`, with 21 rendered frames,
 zero errors, correct rich-clipboard flags, and equal TLFR round trips. macOS used
 an ARM64 runner on macOS 26.6.2; Windows used the Mesa configuration above.
 
-The same clean source also passed all three modes in a private, headless Wayland
+Commit `9db3221` also passed all three modes in a private, headless Wayland
 session using Sway 1.12, wlroots 0.20, and the pixman renderer with Xwayland
 disabled. The rich fixture passed; each mode completed 21 frames with zero errors
 and a validated report. No clipboard helper remained after graceful close.
@@ -58,10 +58,10 @@ Native ASCII typing and plain-text copy passed with exact clipboard content
 verified. Native Unicode paste/copy, keyboard undo/redo, grouped adjacent caret
 typing, and formatting shortcuts passed. Bold/italic/underline toolbar states
 and rendered styles were checked before and after undo. Read-only selection/copy,
-typing/deletion/paste suppression, and non-destructive cut passed. IME candidate
-placement, screen-reader behavior, dead keys/AltGr, rich clipboard
-external-application interoperability, and macOS and Windows native interaction
-checks still require signoff.
+typing/deletion/paste suppression, and non-destructive cut passed. The isolated
+Linux IME, Orca, and Qt interaction evidence below supplements these observations.
+Physical dead keys/AltGr and complete macOS and Windows IME, screen-reader, and
+external-application interaction checks still require signoff.
 Linux virtual-keyboard `dead_acute` followed by `e`, and Compose apostrophe
 followed by `e`, produced a visually observed `é` with undo. These exploratory
 results leave physical-keyboard signoff pending. An isolated AltGr virtual-keyboard
@@ -69,6 +69,54 @@ attempt recorded a text event and a document change before compositor focus move
 away from the native host. The report recorded native window focus loss with
 widget keyboard focus retained and no editing/accessibility errors. Visual,
 undo, and physical-keyboard AltGr signoff remain pending.
+
+Additional Linux interaction checks on 2026-10-09 used builds explicitly labelled
+`3e39b17-native-integration-dirty`, `3e39b17-native-integration-v2-dirty`, and
+`3e39b17-native-integration-v3-dirty`/`3e39b17-native-integration-v4-dirty`.
+They used private headless Wayland
+Sway 1.12/wlroots 0.20/pixman sessions or isolated Xvfb displays, private D-Bus
+buses and XDG directories, and virtual input. They did not modify the current
+desktop's clipboard, configuration, or audio devices. No private-session process
+remained after close. Repeat the interaction checks on the publication commit
+with the intended desktop and physical keyboard.
+
+- Real Fcitx 5.1.23 with Japanese Mozc 3.34.6239.2 and Chinese Pinyin 5.1.15
+  (LibIME 1.1.17) passed preedit, native candidate navigation, full-selection
+  replacement, undo/redo, and resumed plain input. Candidate popups followed the
+  caret at the top of a replacement and after movement into a Unicode list
+  paragraph. Focus loss during preedit canceled without changing content or
+  history; read-only and disabled modes suppressed editing. Find committed the
+  Japanese/Chinese query without changing document selection, content, or history.
+  Retiring processed IME events stopped the host's unchanged cursor-area feedback
+  loop: comparable search sessions reduced Japanese preedit events from 950 to 17
+  and rendered frames from 964 to 126, and Chinese events from 891 to 19 and
+  frames from 900 to 76.
+  The final empty-preview check verified that canceling native preedit over a
+  full selection immediately restores visible source text and selection while
+  retaining the replacement for a later commit. Resumed plain typing and undo
+  restored the exact original document and directional selection.
+- Real Orca 51.0 with AT-SPI 2.62.0.1, Speech Dispatcher 0.12.1, and espeak-ng
+  1.52.0 passed ordinary document-focus narration, Unicode document reading,
+  selection and caret requests, and native typing over the accessible selection.
+  One-character replacement, undo, redo, and final undo restored the exact
+  fixture. Speech logs and synthesized nonzero PCM captured the document and
+  selection announcements through a private file sink. The example's compatible
+  [AccessKit backports](examples/native-editor/vendor/accesskit_unix/BACKPORT.md)
+  fix current AT-SPI activation and the application's desktop parent.
+  This Unix adapter exposes `Text` but does not expose `EditableText`; direct
+  AT-SPI text replacement is unsupported and was not certified.
+- A separate Qt 6.12 text editor received the native HTML/plain offer with exact
+  Unicode multiline text, bold/italic emphasis, list structure, and foreground
+  RGBA preserved. Its external HTML/plain offer without TLFR used the host's plain
+  fallback, with exact copied text and one-step undo/redo. Qt's HTML parser also
+  preserved every alpha byte in a 256-case color probe. The exporter uses
+  six-digit opaque colors and `rgba()` with enough precision to support both
+  rounding and truncating alpha consumers.
+
+All checked reports had zero editing/accessibility/host/clipboard errors and
+equal TLFR round trips. These reports remain content-free and record
+`manual_signoff: "not_recorded"`; virtual input and captured synthesized speech
+do not establish complete physical-keyboard or platform manual signoff.
 
 Before publication, record the final commit, native host and version, operating
 system and display backend, IMEs and screen readers used, and the outcome of each
@@ -108,8 +156,9 @@ joins pipe workers, and retires its owner on close. Linux clipboard data remains
 available after close only if a clipboard manager retains it; macOS/Windows use
 eager native data. All platform dependencies are host-only safe wrapper APIs,
 and unsafe code remains forbidden in the example. Automated native fixtures pass
-on all three platforms and Linux Wayland; external-application interoperability
-signoff remains required.
+on all three platforms and Linux Wayland. Linux Qt interoperability passed in the
+isolated sessions above; other external applications and macOS/Windows interaction
+signoffs remain required.
 
 Reproduce the Linux host used for rendering checks from the repository root:
 
@@ -150,10 +199,12 @@ builds with local changes accordingly. The native example guide describes
 platform commands. Attach exact steps, IME/screen-reader versions, OS/backend,
 and outcomes separately for final-commit signoff.
 
-Partial QA record for 2026-10-09: uncommitted 1.0.0 candidate; Omarchy
+Partial QA record for 2026-10-09: uncommitted 1.0.0 candidate; earlier desktop
+observations used Omarchy
 4.0.0.r6815.g50d687a (Arch-based Linux), kernel 7.2.8-5-omarchy-bore,
-Hyprland/Wayland, 200% display scale. Final commit and complete platform signoff
-remain pending.
+Hyprland/Wayland, 200% display scale. The isolated Linux sessions above add IME,
+reader, and external clipboard evidence. Final commit and complete platform
+signoff remain pending.
 
 | Check | Result |
 | --- | --- |
@@ -164,11 +215,11 @@ remain pending.
 | Native formatting shortcuts | Passed; bold/italic/underline and their undo verified in toolbar and rendered text |
 | Native read-only selection/copy | Passed; exact clipboard content verified |
 | Native read-only editing suppression | Passed; typing, Backspace/Delete, Enter, paste, and undo preserve the document; cut copies without deleting |
-| Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Manual validation pending |
+| Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input; physical-keyboard and macOS/Windows signoff pending |
 | Dead keys and Compose | Virtual `dead_acute`/Compose sequences produced visually observed `é` with undo; physical-keyboard/platform signoff pending |
 | AltGr | Virtual-keyboard attempt recorded text/document changes before compositor focus loss; visual, undo, and physical-keyboard/platform signoff pending |
-| Screen-reader selection and replacement | Manual validation pending |
-| Rich clipboard MIME transport | Automated native widget fixtures passed on Linux X11/Wayland, macOS, and Windows; external-application interoperability signoff pending |
+| Screen-reader selection and replacement | Linux Orca narration, accessible selection/caret, and native typing/undo/redo passed; direct AT-SPI EditableText unavailable; macOS/Windows signoff pending |
+| Rich clipboard MIME transport | Automated native widget fixtures passed on Linux X11/Wayland, macOS, and Windows; Linux Qt interoperability passed; remaining external applications/platforms pending |
 | macOS and Windows native host checks | Manual validation pending |
 
 ## Compatibility contract

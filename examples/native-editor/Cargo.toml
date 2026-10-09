@@ -8,6 +8,11 @@ publish = false
 # Keep the renderer and window integration out of Textloom's dependency graph.
 [workspace]
 
+# Keep AccessKit's 0.24 API while backporting Unix activation and app-parent fixes.
+# The compatible published patch line predates current AT-SPI; see vendor notes.
+[patch.crates-io]
+accesskit_unix = { path = "vendor/accesskit_unix" }
+
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 textloom = { path = "../..", version = "1.0", features = ["egui"] }

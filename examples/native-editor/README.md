@@ -24,6 +24,14 @@ editing mode. **Document**, **Find**, and **Replace** labels are associated with
 their widgets for native accessibility.
 
 The host provides the system's plain-text clipboard and native IME caret area.
+It adapts egui-winit 0.36.2's cursor-area output to the composing caret rectangle,
+so native candidate windows follow the caret within a multiline document.
+After its text fields process IME input, the host retires those events to avoid
+repeated unchanged cursor-area requests and Fcitx preedit/redraw feedback.
+On Linux, the example workspace includes two upstream AccessKit compatibility
+backports for current AT-SPI activation and the application's desktop parent.
+See [the source and removal notes](vendor/accesskit_unix/BACKPORT.md). These
+host dependencies do not change the library's optional AccessKit 0.24 API.
 Plain clipboard behavior remains the default. Add `--rich-clipboard` to enable
 the example's native rich backend on Linux (Wayland/X11), macOS, or Windows:
 
