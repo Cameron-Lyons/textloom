@@ -35,6 +35,7 @@ $ReaderProcess = $null
 $VerifiedReader = $null
 $LauncherProcess = $null
 $ReaderId = 0
+$ReaderHandle = [IntPtr]::Zero
 $Window = [IntPtr]::Zero
 $RequestId = 0
 $Failure = $null
@@ -48,7 +49,7 @@ $Evidence = [ordered]@{
     speech_evidence = "reader_generated_synthesis_queue"
     audible_speech_verified = $false
     physical_keyboard_verified = $false
-    teardown_order = "reader_before_native"
+    teardown_order = "native_before_reader"
     close_with_reader_active_verified = $false
     manual_signoff = "not_recorded"
     fixture_content_in_capture = $true
@@ -64,6 +65,13 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class TextloomReaderInput {
+    public sealed class WindowInfo {
+        public string Handle;
+        public uint ProcessId;
+        public string Title, Class;
+        public long ExtendedStyle;
+        public bool Visible, ToolWindow, NoActivate;
+    }
     [StructLayout(LayoutKind.Sequential)]
     private struct KEYBDINPUT {
         public ushort wVk, wScan;
@@ -90,8 +98,21 @@ public static class TextloomReaderInput {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", SetLastError=true)]
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int maximum);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr window, StringBuilder text, int maximum);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")]
+    private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+    private delegate bool EnumerateWindow(IntPtr window, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumerateWindow callback, IntPtr parameter);
     [DllImport("user32.dll", SetLastError=true)]
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint code);
     [DllImport("user32.dll", SetLastError=true)]
     private static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("user32.dll", SetLastError=true)]
@@ -104,6 +125,62 @@ public static class TextloomReaderInput {
         uint id;
         GetWindowThreadProcessId(GetForegroundWindow(), out id);
         return id;
+    }
+    public static uint ReadExitCode(IntPtr process) {
+        uint code;
+        if (process == IntPtr.Zero || !GetExitCodeProcess(process, out code))
+            throw new InvalidOperationException("Cannot read the retained reader process exit status.");
+        return code;
+    }
+    public static WindowInfo DescribeWindow(IntPtr window) {
+        uint id;
+        GetWindowThreadProcessId(window, out id);
+        var title = new StringBuilder(1024);
+        var windowClass = new StringBuilder(256);
+        GetWindowText(window, title, title.Capacity);
+        GetClassName(window, windowClass, windowClass.Capacity);
+        long style = GetWindowLongPtr(window, -20).ToInt64();
+        return new WindowInfo {
+            Handle = "0x" + window.ToInt64().ToString("x"), ProcessId = id,
+            Title = title.ToString(), Class = windowClass.ToString(),
+            ExtendedStyle = style, Visible = IsWindowVisible(window),
+            ToolWindow = (style & 0x80) != 0, NoActivate = (style & 0x08000000) != 0
+        };
+    }
+    public static WindowInfo[] OwnedWindows(uint owner) {
+        var result = new List<WindowInfo>();
+        EnumWindows((window, parameter) => {
+            uint id;
+            GetWindowThreadProcessId(window, out id);
+            if (id == owner) result.Add(DescribeWindow(window));
+            return true;
+        }, IntPtr.Zero);
+        return result.ToArray();
+    }
+    public static bool IsEditorWindow(WindowInfo info, uint owner) {
+        return info.ProcessId == owner && info.Visible && !info.ToolWindow && !info.NoActivate
+            && info.Title == "TextLoom native example" && info.Class.Length != 0
+            && info.Class != "Winit Thread Event Target";
+    }
+    public static IntPtr FindEditorWindow(uint owner) {
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, parameter) => {
+            uint id;
+            GetWindowThreadProcessId(window, out id);
+            if (id != owner) return true;
+            if (IsEditorWindow(DescribeWindow(window), owner)) {
+                result = window;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
+    public static IntPtr VerifiedForegroundEditor(uint owner) {
+        IntPtr window = GetForegroundWindow();
+        if (!IsEditorWindow(DescribeWindow(window), owner))
+            throw new InvalidOperationException("Foreground window is not the owned editor's real native window.");
+        return window;
     }
     public static string InputDesktopName() {
         IntPtr desktop = OpenInputDesktop(0, false, 1); // DESKTOP_READOBJECTS
@@ -324,6 +401,12 @@ automaticUpdates = disabled
         if ($NativeProcess.HasExited) { throw "Native editor failed to start." }
         if ($NativeProcess.MainWindowHandle -ne [IntPtr]::Zero) { return $NativeProcess.MainWindowHandle }
     } "Native editor did not create a window." 30
+    $Evidence.initial_main_window = [TextloomReaderInput]::DescribeWindow($Window)
+    $Window = Wait-Condition {
+        $actual = [TextloomReaderInput]::FindEditorWindow([uint32]$NativeProcess.Id)
+        if ($actual -ne [IntPtr]::Zero) { return $actual }
+    } "Native editor did not create its visible non-tool window." 15
+    $Evidence.focus_window = [TextloomReaderInput]::DescribeWindow($Window)
     [TextloomReaderInput]::ShowWindow($Window, 9) | Out-Null
     [TextloomReaderInput]::SetForegroundWindow($Window) | Out-Null
     Wait-Condition {
@@ -343,7 +426,12 @@ automaticUpdates = disabled
     if ($runningReader.SessionId -ne $Evidence.session_id -or $ready.synth -ne "silence") {
         throw "Reader session or synthesizer does not match the isolated profile."
     }
-    $VerifiedReader = $runningReader
+    $VerifiedReader = if ($ReaderProcess.Id -eq $ReaderId) { $ReaderProcess } else { $runningReader }
+    # Get-Process can observe an existing PID lazily. Retain its process handle
+    # while it is alive so its actual exit status remains available after exit.
+    $ReaderHandle = $VerifiedReader.Handle
+    $Evidence.reader_launcher_pid = $ReaderProcess.Id
+    $Evidence.reader_runtime_handle_retained = $ReaderHandle -ne [IntPtr]::Zero
     $Evidence.reader_pid = $ReaderId
     $Evidence.native_pid = $NativeProcess.Id
     $Checks.reader_started_in_private_profile = $true
@@ -416,21 +504,20 @@ automaticUpdates = disabled
     Assert-ReaderSpeech $barrier.sequence @("TextLoom", "café", "日本語") "native_reader_restored_selection"
     $captureErrors = @(Get-ReaderEvents | Where-Object { $_.kind -eq "capture_error" })
     if ($captureErrors.Count) { throw "NVDA capture recorded an error." }
-    # Finish the reader session before tearing down its UIA provider window.
-    # Successful text/speech assertions remain above; neither process may be
-    # forcibly terminated on the success path.
-    Invoke-ReaderRequest "quit" | Out-Null
-    Wait-Condition { $VerifiedReader.HasExited } "Owned NVDA did not exit gracefully." 15 | Out-Null
-    if ($VerifiedReader.ExitCode -ne 0) { throw "Owned NVDA reported exit failure." }
-    $terminated = @(Get-ReaderEvents | Where-Object { $_.kind -eq "terminated" })
-    if (-not $terminated.Count) { throw "NVDA plugin did not record orderly termination." }
-    $Checks.reader_graceful_exit = $true
     Assert-EditorForeground
+    # MainWindowHandle may name Winit's visible, unowned thread tool window.
+    # Re-resolve the actual editor from the foreground and verify its identity.
+    $Window = [TextloomReaderInput]::VerifiedForegroundEditor([uint32]$NativeProcess.Id)
+    $Evidence.close_window = [TextloomReaderInput]::DescribeWindow($Window)
+    $Evidence.owned_windows_at_close = [TextloomReaderInput]::OwnedWindows([uint32]$NativeProcess.Id)
+    if ($VerifiedReader.HasExited) { throw "NVDA exited before the native close test." }
+    $Checks.reader_active_at_native_close = $true
     if (-not [TextloomReaderInput]::PostMessage($Window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
         throw "Cannot request graceful editor exit."
     }
     Wait-Condition { $NativeProcess.HasExited } "Native editor did not exit gracefully." 15 | Out-Null
     if ($NativeProcess.ExitCode -ne 0) { throw "Native editor reported failure." }
+    if ($VerifiedReader.HasExited) { throw "NVDA exited during the native close test." }
     & python scripts/check_native_report.py $ReportPath --revision $Revision --os windows --mode editable --interaction
     if ($LASTEXITCODE -ne 0) { throw "Native report validation failed." }
     $report = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
@@ -442,6 +529,14 @@ automaticUpdates = disabled
         throw "Native report lacks the expected input and restored fixture evidence."
     }
     $Checks.native_report_validated = $true
+    $Evidence.close_with_reader_active_verified = $true
+    Invoke-ReaderRequest "quit" | Out-Null
+    Wait-Condition { $VerifiedReader.HasExited } "Owned NVDA did not exit gracefully." 15 | Out-Null
+    $Evidence.reader_exit_code = [TextloomReaderInput]::ReadExitCode($ReaderHandle)
+    if ($Evidence.reader_exit_code -ne 0) { throw "Owned NVDA reported exit failure." }
+    $terminated = @(Get-ReaderEvents | Where-Object { $_.kind -eq "terminated" })
+    if (-not $terminated.Count) { throw "NVDA plugin did not record orderly termination." }
+    $Checks.reader_graceful_exit = $true
     $Evidence.succeeded = $true
 }
 catch {
@@ -479,6 +574,9 @@ finally {
         if ($process -and -not $process.HasExited) {
             try { $process.Kill($true); $process.WaitForExit(5000) | Out-Null } catch { }
         }
+    }
+    if ($VerifiedReader -and $VerifiedReader.HasExited -and $ReaderHandle -ne [IntPtr]::Zero) {
+        try { $Evidence.reader_exit_code = [TextloomReaderInput]::ReadExitCode($ReaderHandle) } catch { }
     }
     $ownedIds = @($NativeProcess, $LauncherProcess, $ReaderProcess, $VerifiedReader) |
         Where-Object { $null -ne $_ } | ForEach-Object { $_.Id }

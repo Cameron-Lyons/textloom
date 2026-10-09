@@ -76,7 +76,7 @@ impl NativeItem {
         if plain.contains('\0') {
             return Err("Native text clipboard cannot represent embedded NUL".into());
         }
-        let html = fragment.to_html();
+        let html = native_html(fragment);
         if plain.len() > MAX_NATIVE_BYTES || html.len() > MAX_NATIVE_BYTES {
             return Err("Clipboard representation exceeds the native transport limit".into());
         }
@@ -133,6 +133,18 @@ impl NativeItem {
             && self.html == expected.html
             && matches!((self.envelope(), expected.envelope()), (Ok(actual), Ok(expected)) if actual == expected)
     }
+}
+
+fn native_html(fragment: &Fragment) -> String {
+    let html = fragment.to_html();
+    // AppKit's HTML importer defaults to a legacy encoding when public.html
+    // contains UTF-8 bytes without document metadata. Keep this transport
+    // wrapper out of the library's reusable HTML fragment export.
+    #[cfg(target_os = "macos")]
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{html}</body></html>"
+    );
+    html
 }
 
 fn normalize_text(text: &str) -> String {
@@ -455,7 +467,7 @@ impl NativeClipboard {
             .capture()?
             .ok_or("Native rich clipboard format was unavailable")?;
         if normalize_text(&captured.plain) != fragment.plain_text()
-            || captured.html != fragment.to_html()
+            || captured.html != native_html(&fragment)
             || captured.fragment()? != fragment
         {
             return Err("Native clipboard rich/HTML/plain roundtrip failed".into());
