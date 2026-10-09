@@ -75,6 +75,14 @@ check_package_file() {
 for path in "${required_files[@]}"; do
     check_package_file "$path"
 done
+# Bare include names match nested basenames too. Keep host and QA artifacts out
+# even if a future manifest edit broadens an include pattern accidentally.
+for path in scripts .github examples/native-editor target; do
+    if [[ -e "$package_root/$path" ]]; then
+        echo "Repository-only path was included in the package: $path" >&2
+        exit 1
+    fi
+done
 # Cargo excludes nested packages; the native host is a repository-only example.
 # pipefail also rejects missing/unreadable source directories during discovery.
 find src tests examples benches -type d \( -name target -o -path examples/native-editor \) -prune -o -type f -print0 |

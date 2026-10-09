@@ -7,6 +7,8 @@ on:
     paths:
       - '.github/workflows/native-qa.yml'
       - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'scripts/native-qa/**'
       - 'scripts/check_native_report.py'
       - 'scripts/test_native_report.py'

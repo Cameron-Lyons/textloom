@@ -282,7 +282,9 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
 3. Review `cargo package --locked --list --allow-dirty`. Source, headless examples,
    tests, fixtures, benchmark documentation, changelog, and license must be
    included. The repository-only native host, workflows, and local build output
-   must be absent.
+   must be absent. Include patterns are anchored to the package root so nested
+   QA README/license files are excluded. The release script rejects repository-only
+   directories in the extracted crate as well as requiring the intended inventory.
 4. Commit the release changes, then run `./scripts/check-release.sh --tag v1.0.0`
    on the clean checkout. Run `cargo +1.95.0 test --locked --all-features` and
    `cargo +1.95.0 check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target`.
