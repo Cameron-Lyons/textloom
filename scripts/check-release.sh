@@ -46,6 +46,8 @@ cargo fmt --manifest-path "$native_example_manifest" --package textloom-native-e
 for features in '' egui winit accesskit egui,winit egui,accesskit winit,accesskit egui,winit,accesskit; do
     cargo test --locked --no-default-features --features "$features"
 done
+# The repository-only host has CLI/report tests that need no display.
+cargo test --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir"
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo clippy --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir" -- -D warnings
 RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --locked --all-features --no-deps
@@ -73,6 +75,14 @@ check_package_file() {
 for path in "${required_files[@]}"; do
     check_package_file "$path"
 done
+# Bare include names match nested basenames too. Keep host and QA artifacts out
+# even if a future manifest edit broadens an include pattern accidentally.
+for path in scripts .github examples/native-editor target; do
+    if [[ -e "$package_root/$path" ]]; then
+        echo "Repository-only path was included in the package: $path" >&2
+        exit 1
+    fi
+done
 # Cargo excludes nested packages; the native host is a repository-only example.
 # pipefail also rejects missing/unreadable source directories during discovery.
 find src tests examples benches -type d \( -name target -o -path examples/native-editor \) -prune -o -type f -print0 |
@@ -87,6 +97,7 @@ cargo check --locked --all-features --all-targets --manifest-path "$package_mani
 native_package_check_dir=$(mktemp -d "$package_target_dir/native-package-check.XXXXXX")
 trap 'rm -rf -- "$native_package_check_dir"' EXIT
 cp -R examples/native-editor/src "$native_package_check_dir/src"
+cp -R examples/native-editor/vendor "$native_package_check_dir/vendor"
 cp examples/native-editor/Cargo.lock "$native_package_check_dir/Cargo.lock"
 cp examples/native-editor/README.md "$native_package_check_dir/README.md"
 awk -v package_path="../package/textloom-$version" '

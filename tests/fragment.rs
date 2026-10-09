@@ -555,9 +555,9 @@ fn html_escapes_text_and_exports_all_inline_styles_and_heading_levels() {
     let html = rich_fragment().to_html();
     assert!(html.starts_with("<div style=\"white-space:pre-wrap\"><h3>"));
     assert!(html.contains(
-        "<em><u><s><code><span style=\"color:#0080ff7f\">&lt;Hello&gt;</span></code></s></u></em>"
+        "<em><u><s><code><span style=\"color:rgba(0,128,255,0.498040)\">&lt;Hello&gt;</span></code></s></u></em>"
     ));
-    assert!(html.contains("<strong><em><u><s><code><span style=\"color:#0080ff7f\"> &amp; &quot;世界&quot; e\u{301}</span></code></s></u></em></strong>"));
+    assert!(html.contains("<strong><em><u><s><code><span style=\"color:rgba(0,128,255,0.498040)\"> &amp; &quot;世界&quot; e\u{301}</span></code></s></u></em></strong>"));
     assert!(
         html.contains("<ol start=\"17\"><li>nested</li><li value=\"4294967295\">last</li></ol>")
     );
@@ -566,6 +566,38 @@ fn html_escapes_text_and_exports_all_inline_styles_and_heading_levels() {
         Fragment::from_text("<script>alert('x')</script> & 🦀").to_html(),
         "<div style=\"white-space:pre-wrap\"><p>&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; 🦀</p></div>"
     );
+}
+
+#[test]
+fn html_colors_preserve_channels_and_alpha_with_rounding_or_truncating_importers() {
+    for alpha in 0..=255 {
+        let mut editor = Editor::from_text("色");
+        select_paragraph(&mut editor, 0);
+        editor
+            .apply_style(StylePatch {
+                foreground: Some(Some(Color([42, 100, 200, alpha]))),
+                ..Default::default()
+            })
+            .unwrap();
+        let html = editor.document().to_html();
+        assert_eq!(Fragment::from_document(editor.document()).to_html(), html);
+        if alpha == 255 {
+            assert!(html.contains("color:#2a64c8\""));
+        } else {
+            let opacity = html
+                .split_once("color:rgba(42,100,200,")
+                .unwrap()
+                .1
+                .split_once(')')
+                .unwrap()
+                .0
+                .parse::<f64>()
+                .unwrap();
+            assert!((0.0..=1.0).contains(&opacity));
+            assert_eq!((opacity * 255.0).round() as u8, alpha);
+            assert_eq!((opacity * 255.0).trunc() as u8, alpha);
+        }
+    }
 }
 
 #[test]

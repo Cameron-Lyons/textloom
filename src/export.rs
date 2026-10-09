@@ -110,11 +110,23 @@ fn inline(output: &mut String, paragraph: &Paragraph) {
             output.push_str("<code>");
         }
         if let Some(Color([red, green, blue, alpha])) = style.foreground {
-            write!(
-                output,
-                "<span style=\"color:#{red:02x}{green:02x}{blue:02x}{alpha:02x}\">"
-            )
-            .unwrap();
+            if alpha == 255 {
+                write!(
+                    output,
+                    "<span style=\"color:#{red:02x}{green:02x}{blue:02x}\">"
+                )
+                .unwrap();
+            } else {
+                // Eight-digit hex has differing channel orders in CSS and Qt's
+                // HTML importer. Round up at six decimals so importers that
+                // truncate alpha and those that round both recover its byte.
+                let opacity = (u32::from(alpha) * 1_000_000).div_ceil(255);
+                write!(
+                    output,
+                    "<span style=\"color:rgba({red},{green},{blue},0.{opacity:06})\">"
+                )
+                .unwrap();
+            }
         }
         escape(output, &paragraph.text()[span.range.clone()]);
         if style.foreground.is_some() {

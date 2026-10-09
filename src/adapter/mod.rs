@@ -6,3 +6,18 @@
 pub mod egui;
 #[cfg(feature = "winit")]
 pub mod winit;
+
+#[cfg(any(feature = "egui", feature = "winit"))]
+fn delete_to_paragraph_start(editor: &mut crate::Editor) -> Result<(), crate::Error> {
+    let selection = editor.selection();
+    if !selection.is_caret() {
+        return editor.delete_backward();
+    }
+    if selection.focus.byte == 0 {
+        return Ok(());
+    }
+    editor.replace_range(
+        crate::Position::new(selection.focus.paragraph, 0)..selection.focus,
+        "",
+    )
+}

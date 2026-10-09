@@ -234,3 +234,36 @@ The results describe nearby matches in short paragraphs. Missing queries can
 still visit every paragraph, large visited paragraphs still require text scans,
 and queries containing paragraph breaks retain the flattened document-wide
 match stream. The optimization does not make every search constant time.
+
+## October 9 continuation: whole-word searches with no matches
+
+Two copies of the same source snapshot were compared, differing only in
+`src/search.rs`. The baseline used the search implementation at commit
+`15bdda0182b6bf01877c39be1acef6c0536306ac`; the updated source defers word-boundary
+indexes and lowercase coordinate maps until a literal candidate appears.
+Both were built with Rust 1.99.0, locked dependencies, default features,
+Cargo's default release profile, and separate Cargo target directories on the
+same machine. Distinct benchmark binary hashes were verified before timing.
+
+The four full-search workloads from `benches/editing.rs` were isolated in an
+otherwise identical standalone harness. Each source ran three times, alternating
+baseline and updated binaries. The table reports the median of those runs, in
+microseconds per search. Each run averages 20 missing searches and 10 matching
+searches without an explicit warmup. The document repeats
+`A short paragraph with Unicode café 👩‍💻.\n` 100,000 times. Missing queries use
+`absent`; matching queries use `Unicode` with case-sensitive whole-word search
+or its lowercase equivalent with case-insensitive whole-word search.
+
+| Operation, 100,000 paragraphs | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Whole-word query, no matches | 48,780.87 | 3,372.72 |
+| Lowercase whole-word query, no matches | 59,961.75 | 7,737.62 |
+| Whole-word query, 100,000 matches | 59,849.26 | 59,858.88 |
+| Lowercase whole-word query, 100,000 matches | 64,018.01 | 64,447.86 |
+
+The missing queries improved by about 14× and 8× on this workload. Matching
+queries retained similar timings because their Unicode indexes are still
+needed. Every paragraph is still visited, case-insensitive searches still build
+lowercase text, and paragraphs with rejected literal candidates can still need
+word indexing. This change avoids preprocessing paragraphs without candidates;
+it does not cache whole-word results across searches.

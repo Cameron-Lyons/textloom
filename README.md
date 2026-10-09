@@ -75,7 +75,29 @@ The widget draws rich paragraphs, selections, list markers, headings, and preedi
 
 Pointer clicks retain the chosen visual row at wrap boundaries, and selection highlighting extends a hard paragraph break only after the final wrapped row. Focused caret and preedit changes scroll into view even when the widget starts outside the viewport. Keyboard and accessibility actions follow their input batch order; accessibility actions based on content changed by an earlier event are rejected as stale.
 
+Both input adapters support Ctrl/Command+B, I, and U for bold, italic, and underline. A mixed selection becomes uniformly emphasized; a uniformly emphasized selection becomes plain for that attribute. Ctrl/Command+0 returns selected paragraphs to body text, and Ctrl/Command+1–6 applies headings. Command+Backspace deletes to the paragraph start, or deletes the selected text, in one undo step. Losing widget or window focus ends the current typing undo group.
+
 `.read_only(true)` retains selection, copy, and accessibility while suppressing edits and IME. Ctrl/Alt+Backspace/Delete deletes Unicode words; Tab/Shift+Tab indents/outdents selected lists. Body-text Tab stays available for host focus traversal.
+
+Attach `.rich_clipboard(&mut host_clipboard)` to use an implementation of
+`adapter::egui::RichClipboard`. Its `copy(&Fragment)` callback can publish TLFR,
+HTML, and plain text using the fragment's export methods. Return `true` after
+publishing a plain-text alternative alongside the rich formats: this suppresses
+egui's plain copy command and retires older queued text/image copies that would
+overwrite the newer clipboard item. Return `false` for
+egui's plain fallback. `paste(&str)` receives the paste event's plain alternative;
+return a decoded `Fragment` for one undoable rich replacement, or `None` to paste
+that plain text. Rich data must belong to that paste event; capture native rich
+and plain representations together when producing the event. Equal text alone
+cannot identify clipboard items with different formatting. Native access and
+transport errors remain the host's responsibility.
+
+The callbacks follow input order and the widget's focus, disabled, read-only,
+and IME rules. Read-only cut copies without deleting; empty paste events preserve
+selection and history. A nonempty preedit blocks paste and cut, while an empty
+preedit is canceled before a nonempty paste. Plain clipboard behavior remains
+the default and does not capture rich fragments. Egui hosts may omit a paste
+event when native plain text is unavailable, so rich writers also need that fallback.
 
 Run `cargo run --example egui_editor --features egui` for a display-independent integration example. A native window/renderer is supplied by your existing egui host; this crate does not select one for you. Register a bold font family for actual bold glyphs; egui's default fonts use strong color as a fallback.
 
@@ -85,7 +107,38 @@ For a complete native window, run the repository's standalone eframe host:
 cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
 ```
 
-The host demonstrates mixed selection state, formatting, lists, find/replace, snapshots, and read-only mode with a system plain-text clipboard and native IME caret area. It has its own Cargo workspace and lockfile and is maintained in the repository outside the published library archive. `--read-only` starts a selectable viewer; `--font PATH` and `--bold-font PATH` register application fonts; `--smoke-test` renders 20 native frames and exits. Pass these arguments after `--` in the command above. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md) for font examples and host checks.
+The host demonstrates mixed selection state, formatting, lists, find/replace,
+snapshots, and read-only/disabled modes with a system plain-text clipboard and
+native IME caret area. Add `--rich-clipboard` for its native Linux (Wayland/X11),
+macOS, and Windows backend. Copies publish HTML and plain text alongside a framed
+TLFR fragment with a generation token, and verify all representations through
+bounded helper processes. Paste uses one validated native snapshot; ambiguous,
+unavailable, malformed, or mismatched inputs retain the event's plain fallback.
+Owner helpers are retired on replacement or close. Platform wrapper dependencies
+stay in the example's separate Cargo workspace and lockfile, outside the published
+library archive and library dependency graph. `--read-only` starts a selectable
+viewer; `--disabled` disables document focus and interaction. The toolbar can
+toggle both modes, and document/search fields have accessibility labels.
+`--font PATH` and `--bold-font PATH` register application fonts; `--smoke-test`
+requests a graceful close after 20 native frames. Pass these arguments after
+`--` in the command above.
+
+`--clipboard-self-test` requires `--rich-clipboard` and writes a fixture to the
+system clipboard, so use it only in isolated sessions. It checks native rich,
+HTML, and plain read-back plus widget rich insertion and undo/redo. Isolated
+fixtures passed on Linux X11/Wayland, macOS, and Windows; evidence is recorded in
+`RELEASING.md`. External-application interoperability, IME, dead keys/AltGr, and
+screen-reader behavior still need native platform signoff.
+
+`--qa-report PATH` writes a JSON report on graceful exit, protecting existing
+files from overwrite. It records platform, scale, event/error counts, observed
+editor transitions, final-state metrics, and an in-memory TLFR round trip without
+document, clipboard, search, or preedit text. Clipboard request/completion flags
+and a self-test error counter describe the opt-in fixture. The report always
+records manual signoff as unrecorded. Reports and smoke runs provide observations;
+manual native checks
+still need separate steps and outcomes. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md)
+for report revision labeling, font examples, and host checks.
 
 ## winit
 
@@ -113,7 +166,7 @@ Grapheme, scalar, and word indexes are built independently on first use and shar
 
 A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. Numbered-list edits may update the following continuation run. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers.
 
-Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. Each visited paragraph keeps ordinary forward nonoverlapping matching and complete lowercase context. A nearby match can be found without searching unrelated earlier paragraphs; missing queries may still visit the whole document. Cross-paragraph queries temporarily flatten the document and preserve its complete forward match stream. Literal searchers are reused across matches within each searched text; replace-all builds each affected paragraph once.
+Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Word indexes and lowercase coordinate maps are prepared only when a literal candidate needs validation. Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. Each visited paragraph keeps ordinary forward nonoverlapping matching and complete lowercase context. A nearby match can be found without searching unrelated earlier paragraphs; missing queries may still visit the whole document. Cross-paragraph queries temporarily flatten the document and preserve its complete forward match stream. Literal searchers are reused across matches within each searched text; replace-all builds each affected paragraph once.
 
 The egui widget retains galleys and layout geometry, invalidates them on content/font/DPI/appearance changes, and paints visible paragraphs. Idle cache validation takes constant time; editing still updates paragraph geometry across the document. Accessibility uses shared content tokens to validate text snapshots and an index to locate text runs, while reusing paragraph indexes and galley geometry. Direct AccessKit selection/label changes reuse paragraph nodes; unchanged trees return an empty update in constant time.
 
@@ -134,10 +187,24 @@ The dependency-free benchmark harnesses measure local insertion/undo, long Unico
 [GitHub Actions](https://github.com/Cameron-Lyons/textloom/actions/workflows/ci.yml) runs on pushes to `main`, pull requests, and manual dispatch:
 
 - Ubuntu stable runs `scripts/check-release.sh`: formatting, tests and doctests for all eight feature combinations, Clippy for all targets, complete API documentation with warnings denied, release benchmark smoke tests, the headless examples, explicit package inventory verification, and tests and all-target compilation from the extracted Cargo package.
-- Rust 1.95 tests every feature combination and compiles all targets plus the standalone native host.
-- macOS and Windows compile all targets and the native host, then run all-feature tests and doctests.
+- Rust 1.95 tests every feature combination, compiles all targets plus the standalone native host, and runs its CLI/report tests.
+- macOS and Windows compile all targets and the native host, then run all-feature tests, doctests, and host CLI/report tests.
 
-The Ubuntu release checks also compile the native host, check its formatting and Clippy warnings, and verify its dependency on the packaged library. CI compilation opens no native window.
+The Ubuntu release checks also test the native host, check its formatting and
+Clippy warnings, and verify its dependency on the packaged library. The candidate
+workflow runs required renderer smoke checks in editable, read-only, and disabled
+modes on Linux X11 with Xvfb/Mesa, macOS, and Windows with signed MSYS2 Mesa
+packages and application-local DLLs. Validation evidence is recorded in
+`RELEASING.md`. Renderer smoke checks open native windows and verify initialization
+and frame completion. They now enable rich clipboard in all modes and require
+the isolated clipboard roundtrip/undo/redo fixture in editable mode. IME, external
+clipboard interoperability, physical keyboard, and screen-reader interaction retain their manual release
+gates on all three platforms.
+
+Renderer jobs validate source-labelled, content-free JSON observations for
+graceful completion, zero errors, snapshot integrity, and the requested mode.
+They also validate rich clipboard activation and the requested fixture result.
+Validated reports and smoke logs are available as CI artifacts.
 
 Dependencies are locked, actions are pinned to commit SHAs, jobs have a 15-minute limit, and superseded runs are canceled. The workflow only reads repository contents and saves dependency caches on `main`. CI runs release benchmarks as smoke tests and records their output; timing thresholds are kept out of shared runners.
 

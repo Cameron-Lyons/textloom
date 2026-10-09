@@ -16,6 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  TEXTLOOM_QA_REVISION: ${{ github.sha }}
 
 jobs:
   quality:
@@ -35,6 +36,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Complete release checks
         run: ./scripts/check-release.sh
+      - name: Native report validator regression tests
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
   msrv:
     name: MSRV and feature combinations
@@ -60,6 +63,8 @@ jobs:
           cargo check --locked --all-features --all-targets
       - name: Native host example compiles
         run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native host CLI and report tests
+        run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
 
   native:
     name: Native (${{ matrix.os }})
@@ -83,5 +88,199 @@ jobs:
         run: cargo check --locked --all-features --all-targets
       - name: Native host example compiles
         run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native host CLI and report tests
+        run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
       - name: Tests and doctests
         run: cargo test --locked --all-features
+      - name: Build native renderer
+        if: runner.os == 'macOS'
+        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      # Upstream egui also runs its GPU tests on macos-latest:
+      # https://github.com/emilk/egui/blob/main/.github/workflows/rust.yml
+      # These isolated runners cover rendering and a fixture-based rich clipboard
+      # roundtrip. IME, external clipboard, and screen-reader interaction still
+      # require the RELEASING.md signoffs.
+      - name: Native rendering smoke (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mkdir -p native-observations
+          for mode in editable read-only disabled; do
+            args=(--smoke-test --rich-clipboard --qa-report "native-smoke-$mode.json")
+            case "$mode" in
+              editable) args+=(--clipboard-self-test) ;;
+              read-only) args+=(--read-only) ;;
+              disabled) args+=(--disabled) ;;
+            esac
+            smoke_status=0
+            ./target/debug/textloom-native-example "${args[@]}" 2> "native-smoke-$mode.log" | tee "native-smoke-$mode.stdout" || smoke_status=$?
+            cat "native-smoke-$mode.stdout" >> "native-smoke-$mode.log"
+            if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.stdout"
+            if [ "$mode" = editable ]; then
+              grep -Fx 'Native rich clipboard roundtrip and undo/redo passed' "native-smoke-$mode.stdout"
+            fi
+            python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode"
+            cp "native-smoke-$mode.json" "native-observations/$mode.json"
+          done
+      - name: Native rendering observations (macOS)
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-rendering-macos
+          path: |
+            native-observations/*.json
+            native-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux-renderer:
+    name: Native rendering (Linux X11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install virtual display and software renderer
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
+      - name: Build native renderer
+        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native rendering smoke
+        timeout-minutes: 2
+        shell: bash
+        env:
+          # Mesa supports this flag without requiring a GPU on the runner.
+          # https://docs.mesa3d.org/envvars.html#envvar-LIBGL_ALWAYS_SOFTWARE
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: |
+          mkdir -p native-observations
+          for mode in editable read-only disabled; do
+            args=(--smoke-test --rich-clipboard --qa-report "native-smoke-$mode.json")
+            case "$mode" in
+              editable) args+=(--clipboard-self-test) ;;
+              read-only) args+=(--read-only) ;;
+              disabled) args+=(--disabled) ;;
+            esac
+            smoke_status=0
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' ./target/debug/textloom-native-example "${args[@]}" 2> "native-smoke-$mode.log" | tee "native-smoke-$mode.stdout" || smoke_status=$?
+            cat "native-smoke-$mode.stdout" >> "native-smoke-$mode.log"
+            if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.stdout"
+            if [ "$mode" = editable ]; then
+              grep -Fx 'Native rich clipboard roundtrip and undo/redo passed' "native-smoke-$mode.stdout"
+            fi
+            python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os linux --mode "$mode"
+            cp "native-smoke-$mode.json" "native-observations/$mode.json"
+          done
+      - name: Native rendering observations (Linux X11)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-rendering-linux-x11
+          path: |
+            native-observations/*.json
+            native-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Hosted Windows runners need Mesa for modern OpenGL. This software-rendered
+  # check validates rendering and a fixture-based rich clipboard roundtrip on
+  # an isolated desktop. IME, external clipboard, and screen-reader interaction
+  # still require the RELEASING.md signoffs.
+  windows-renderer:
+    name: Native rendering (Windows Mesa)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build native renderer
+        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Install signed Mesa software renderer
+        id: mesa
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          release: false
+          update: true
+          install: mingw-w64-ucrt-x86_64-mesa
+      - name: Record renderer package versions
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -Q | tee native-smoke-mesa-packages.log
+      - name: Native rendering smoke (Windows Mesa)
+        timeout-minutes: 2
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.mesa.outputs.msys2-location }}
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: |
+          $mesaRuntimeDirectory = Join-Path $env:MSYS2_LOCATION 'ucrt64\bin'
+          $nativeProbeDirectory = Join-Path $env:RUNNER_TEMP 'textloom-mesa-smoke'
+          New-Item -ItemType Directory -Path $nativeProbeDirectory | Out-Null
+          Copy-Item -LiteralPath ./target/debug/textloom-native-example.exe -Destination $nativeProbeDirectory
+          # Glutin imports WGL from opengl32.dll as well as loading OpenGL
+          # dynamically. Stage Mesa beside this copied executable for both
+          # paths, leaving system DLLs and Cargo's build cache untouched.
+          Copy-Item -LiteralPath "$mesaRuntimeDirectory\opengl32.dll" -Destination $nativeProbeDirectory
+          Copy-Item -LiteralPath "$mesaRuntimeDirectory\libgallium_wgl.dll" -Destination $nativeProbeDirectory
+          $env:PATH = "$mesaRuntimeDirectory;$env:PATH"
+          $env:GLUTIN_WGL_OPENGL_DLL = Join-Path $nativeProbeDirectory 'opengl32.dll'
+          $nativeProbeExecutable = Join-Path $nativeProbeDirectory 'textloom-native-example.exe'
+          New-Item -ItemType Directory -Path native-observations | Out-Null
+          foreach ($mode in @('editable', 'read-only', 'disabled')) {
+            $smokeArguments = @('--smoke-test', '--rich-clipboard', '--qa-report', "native-smoke-$mode.json")
+            if ($mode -eq 'editable') {
+              $smokeArguments += '--clipboard-self-test'
+            } elseif ($mode -eq 'read-only') {
+              $smokeArguments += '--read-only'
+            } elseif ($mode -eq 'disabled') {
+              $smokeArguments += '--disabled'
+            }
+            & $nativeProbeExecutable @smokeArguments 2> "native-smoke-$mode.log" | Tee-Object -Variable smokeStdout
+            $nativeSmokeExitCode = $LASTEXITCODE
+            $smokeStdout | Add-Content -LiteralPath "native-smoke-$mode.log"
+            if ($nativeSmokeExitCode -ne 0) {
+              exit $nativeSmokeExitCode
+            }
+            if (-not ($smokeStdout -cmatch '^Rendered 20 native frames at [0-9.]+ pixels per point$')) {
+              throw "The $mode native renderer did not complete 20 frames"
+            }
+            if ($mode -eq 'editable' -and -not (@($smokeStdout) -ccontains 'Native rich clipboard roundtrip and undo/redo passed')) {
+              throw 'The native rich clipboard roundtrip and undo/redo did not pass'
+            }
+            python scripts/check_native_report.py "native-smoke-$mode.json" --revision "$env:TEXTLOOM_QA_REVISION" --os windows --mode "$mode"
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+            Copy-Item -LiteralPath "native-smoke-$mode.json" -Destination "native-observations/$mode.json"
+          }
+      - name: Native rendering observations (Windows Mesa)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-rendering-windows-mesa
+          path: |
+            native-observations/*.json
+            native-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14

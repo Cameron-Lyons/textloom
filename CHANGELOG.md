@@ -6,6 +6,62 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- `RichTextEditor::rich_clipboard()` accepts a host-owned `RichClipboard`
+  transport. Hosts receive selected fragments before cut, can publish TLFR/HTML
+  with plain alternatives, and can supply rich paste as one undo step. Successful
+  host copies suppress egui's plain clipboard overwrite and retire older queued
+  text/image copies; unavailable rich formats
+  retain plain fallback. Focus, read-only/disabled, IME, accessibility, and input
+  ordering rules remain enforced without adding native clipboard dependencies.
+- The standalone native host adds independently toggleable disabled/read-only
+  modes, associated document/search accessibility labels, and opt-in content-free
+  JSON QA reports on graceful exit. Reports capture native input/state/error
+  observations and snapshot checks, protect existing paths, and explicitly leave
+  manual signoff unrecorded. CLI/report and clipboard regression tests join local
+  and cross-platform host checks.
+- The repository-only native host adds opt-in `--rich-clipboard` backends for
+  Linux Wayland/X11, macOS, and Windows. Copies publish HTML/plain alternatives
+  and a framed TLFR payload with a generation token, verify read-back through
+  bounded helper processes, and retire owned helpers on replacement or close.
+  Rich paste uses a captured native item with plain fallback for unavailable,
+  invalid, mismatched, or ambiguous inputs. Safe platform wrappers remain outside
+  the library dependency graph. `--clipboard-self-test` writes a deterministic
+  fixture for isolated sessions; QA reports record request/completion flags and
+  its error counter. Isolated native widget fixtures passed on Linux X11/Wayland,
+  macOS, and Windows; external-app interoperability signoff remains required.
+- The candidate CI workflow adds required Linux X11/Mesa and macOS native
+  rendering smoke checks for editable, read-only, and disabled hosts, together
+  with required Windows rendering using signed MSYS2 Mesa and application-local
+  DLLs. Rich clipboard is requested in all modes; editable runs additionally
+  require native clipboard roundtrip and undo/redo evidence. Renderer and fixture
+  checks do not replace manual platform interaction signoffs.
+- Hosted native interaction checks cover macOS TextEdit rich clipboard import,
+  native typing/history/focus and guarded modes, and Windows NVDA generated
+  speech, accessible selection, native replacement/history and graceful close.
+  Release package verification requires these probes. macOS clipboard HTML
+  explicitly declares UTF-8 so TextEdit preserves Unicode; library HTML fragments
+  and the TLFR format remain unchanged. Physical desktop signoffs remain required.
+- HTML export uses six-digit opaque colors and `rgba()` for translucent colors,
+  preserving channel order and all 256 alpha values in Qt's HTML importer as well
+  as CSS consumers. Native Qt clipboard checks preserve Unicode text, emphasis,
+  lists, and color; external plain paste retains one-step undo/redo.
+- The native host forwards the composing caret rectangle to winit so Japanese
+  and Chinese candidate windows follow the caret. It retires processed IME events
+  after rendering its text fields to prevent a Fcitx preedit/redraw feedback loop
+  in Find and Replace. Its Linux example workspace
+  backports upstream AccessKit activation and application-parent fixes for
+  current AT-SPI and Orca while retaining the documented AccessKit 0.24 API.
+  The vendored dependency and its licenses remain outside the library archive.
+- Bold, italic, and underline shortcuts in both input adapters apply emphasis
+  uniformly to mixed selections, matching toolbar behavior, and disable it only
+  when the whole selection already has that emphasis.
+- Widget/window focus loss ends the typing undo group in both adapters. Winit
+  adds body/heading shortcuts matching egui, and Command+Backspace deletes to
+  the paragraph start in both adapters while preserving the original undo
+  selection and read-only/IME behavior.
+- Whole-word searches build Unicode word indexes and lowercase coordinate maps
+  only after finding a literal candidate, reducing work for missing and sparse
+  queries without changing match boundaries or navigation order.
 - Inline clear-formatting preserves paragraph kinds and selection direction,
   supports caret typing-style reset, and restores rich state through undo/redo.
 - `SelectionStyle` reports uniform and mixed inline attributes independently for
@@ -60,6 +116,9 @@ First stable release of the native Rust rich-text editing library.
   cancellations in the same frame no longer prevent focus release.
 - Empty winit IME reset events preserve selected text; an active composition's
   empty commit still replaces its captured selection.
+- Empty egui preedit restores the visible document and selection while retaining
+  the captured replacement for a later commit. Canceling native composition no
+  longer leaves selected text hidden until the next input.
 - Direct AccessKit trees keep distinct node IDs for repeated rich paragraphs
   that share the same underlying allocation.
 - Release checks test and compile the extracted package, including its fixtures,

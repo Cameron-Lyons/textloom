@@ -139,10 +139,15 @@ impl WinitAdapter {
         self.modifiers = modifiers;
     }
 
-    /// Set widget focus, canceling composition and clearing modifiers on blur.
+    /// Set widget focus, canceling composition, clearing modifiers, and ending
+    /// the current typing undo group on blur.
     pub fn set_focused(&mut self, focused: bool, editor: &mut Editor) -> InputOutcome {
+        let was_focused = self.is_focused();
         let changed = self.focused != focused;
         self.focused = focused;
+        if was_focused && !self.is_focused() {
+            editor.break_history_group();
+        }
         let composition_changed = if !focused {
             self.ime_enabled = false;
             self.modifiers = ModifiersState::empty();
@@ -185,8 +190,12 @@ impl WinitAdapter {
                 Ok(InputOutcome::default())
             }
             WindowEvent::Focused(focused) => {
+                let was_focused = self.is_focused();
                 let changed = self.window_unfocused == *focused;
                 self.window_unfocused = !focused;
+                if was_focused && !self.is_focused() {
+                    editor.break_history_group();
+                }
                 let canceled = if !focused {
                     self.ime_enabled = false;
                     self.modifiers = ModifiersState::empty();
@@ -257,7 +266,20 @@ impl WinitAdapter {
             if self.read_only
                 && (matches!(
                     shortcut.as_str(),
-                    "v" | "z" | "y" | "b" | "i" | "u" | "[" | "]"
+                    "v" | "z"
+                        | "y"
+                        | "b"
+                        | "i"
+                        | "u"
+                        | "["
+                        | "]"
+                        | "0"
+                        | "1"
+                        | "2"
+                        | "3"
+                        | "4"
+                        | "5"
+                        | "6"
                 ) || shift && matches!(shortcut.as_str(), "7" | "8" | "&" | "*"))
             {
                 outcome.changed = before.changed(editor);
@@ -303,17 +325,23 @@ impl WinitAdapter {
                     editor.redo();
                 }
                 "b" => editor.apply_style(StylePatch {
-                    bold: Some(!editor.typing_style().bold),
+                    bold: Some(editor.selection_style().bold != Some(true)),
                     ..StylePatch::default()
                 })?,
                 "i" => editor.apply_style(StylePatch {
-                    italic: Some(!editor.typing_style().italic),
+                    italic: Some(editor.selection_style().italic != Some(true)),
                     ..StylePatch::default()
                 })?,
                 "u" => editor.apply_style(StylePatch {
-                    underline: Some(!editor.typing_style().underline),
+                    underline: Some(editor.selection_style().underline != Some(true)),
                     ..StylePatch::default()
                 })?,
+                "0" => editor.set_paragraph_kind(ParagraphKind::Body)?,
+                "1" | "2" | "3" | "4" | "5" | "6" => {
+                    editor.set_paragraph_kind(ParagraphKind::Heading {
+                        level: shortcut.as_bytes()[0] - b'0',
+                    })?
+                }
                 "7" | "&" if shift => editor.set_paragraph_kind(ParagraphKind::Ordered {
                     indent: 0,
                     start: 1,
@@ -356,6 +384,9 @@ impl WinitAdapter {
                 Key::Named(NamedKey::Enter | NamedKey::Backspace | NamedKey::Delete)
                     if self.read_only => {}
                 Key::Named(NamedKey::Enter) if !command => editor.insert_paragraph()?,
+                Key::Named(NamedKey::Backspace) if super_command => {
+                    super::delete_to_paragraph_start(editor)?
+                }
                 Key::Named(NamedKey::Backspace) if word => editor.delete_word_backward()?,
                 Key::Named(NamedKey::Delete) if word => editor.delete_word_forward()?,
                 Key::Named(NamedKey::Backspace) => editor.delete_backward()?,
@@ -601,6 +632,331 @@ mod tests {
         adapter
             .handle_key(&key, ElementState::Pressed, text, editor)
             .unwrap()
+    }
+
+    #[test]
+    fn widget_and_window_blur_separate_typing_undo_groups() {
+        for window_blur in [false, true] {
+            let mut editor = Editor::default();
+            let mut adapter = focused(&mut editor);
+            for text in ["a", "b"] {
+                key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Character(text.into()),
+                    Some(text),
+                );
+            }
+            assert_eq!(editor.undo_len(), 1);
+
+            if window_blur {
+                adapter
+                    .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+                    .unwrap();
+            } else {
+                adapter.set_focused(false, &mut editor);
+            }
+            assert!(!adapter.is_focused());
+            assert!(
+                !key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Character("ignored".into()),
+                    Some("ignored"),
+                )
+                .handled
+            );
+            if window_blur {
+                adapter
+                    .handle_window_event(&WindowEvent::Focused(true), &mut editor)
+                    .unwrap();
+            } else {
+                adapter.set_focused(true, &mut editor);
+            }
+            for text in ["c", "d"] {
+                key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Character(text.into()),
+                    Some(text),
+                );
+            }
+            assert_eq!(editor.document().plain_text(), "abcd");
+            assert_eq!(editor.undo_len(), 2);
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "ab");
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "");
+        }
+    }
+
+    #[test]
+    fn heading_shortcuts_follow_platform_command_modifiers_and_read_only_mode() {
+        for (command_modifier, modifiers) in [
+            (CommandModifier::Control, ModifiersState::CONTROL),
+            (CommandModifier::Super, ModifiersState::SUPER),
+        ] {
+            let mut editor = Editor::from_text("first\nsecond");
+            editor.select_all();
+            let selection = editor.selection();
+            let mut adapter = WinitAdapter::new().command_modifier(command_modifier);
+            adapter.set_focused(true, &mut editor);
+            adapter.set_modifiers(modifiers);
+            for level in 1..=6 {
+                let outcome = key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Character(level.to_string().into()),
+                    None,
+                );
+                assert!(outcome.handled && outcome.changed);
+                assert!(
+                    editor
+                        .document()
+                        .paragraphs()
+                        .iter()
+                        .all(|paragraph| { paragraph.kind() == ParagraphKind::Heading { level } })
+                );
+                assert_eq!(editor.selection(), selection);
+            }
+            assert!(key(&mut adapter, &mut editor, Key::Character("0".into()), None).changed);
+            assert!(
+                editor
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .all(|paragraph| { paragraph.kind() == ParagraphKind::Body })
+            );
+            assert!(editor.undo());
+            assert!(
+                editor
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .all(|paragraph| { paragraph.kind() == ParagraphKind::Heading { level: 6 } })
+            );
+            let history = editor.undo_len();
+            let revision = editor.document().revision();
+            adapter.set_read_only(true, &mut editor);
+            for shortcut in ["0", "1", "2", "3", "4", "5", "6"] {
+                let outcome = key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Character(shortcut.into()),
+                    None,
+                );
+                assert!(outcome.handled && !outcome.changed);
+                assert_eq!(editor.document().revision(), revision);
+                assert_eq!(editor.undo_len(), history);
+                assert_eq!(editor.selection(), selection);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_keys_and_altgr_text_do_not_trigger_heading_shortcuts() {
+        let mut editor = Editor::default();
+        let mut adapter = focused(&mut editor);
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("1".into()),
+            Some("1"),
+        );
+        adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::ALT);
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("2".into()),
+            Some("²"),
+        );
+        assert_eq!(editor.document().plain_text(), "1²");
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().kind(),
+            ParagraphKind::Body
+        );
+        for modifiers in [
+            ModifiersState::SUPER,
+            ModifiersState::CONTROL | ModifiersState::SUPER,
+        ] {
+            adapter.set_modifiers(modifiers);
+            let outcome = key(&mut adapter, &mut editor, Key::Character("3".into()), None);
+            assert!(!outcome.handled && !outcome.changed);
+        }
+        adapter.set_read_only(true, &mut editor);
+        adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::ALT);
+        let outcome = key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("4".into()),
+            Some("⁴"),
+        );
+        assert!(outcome.handled && !outcome.changed);
+        assert_eq!(editor.document().plain_text(), "1²");
+    }
+
+    #[test]
+    fn super_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
+        let text = "prefix\ncafé 👩🏽‍💻 tail";
+        let end = Position::new(1, "café 👩🏽‍💻".len());
+        let caret = Selection::caret(end);
+        for selection in [
+            caret,
+            Selection::new(Position::new(0, 1), end),
+            Selection::new(end, Position::new(0, 1)),
+        ] {
+            let mut editor = Editor::from_text(text);
+            editor.set_selection(selection).unwrap();
+            let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+            adapter.set_focused(true, &mut editor);
+            adapter.set_modifiers(ModifiersState::SUPER);
+            let outcome = key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Backspace),
+                None,
+            );
+            assert!(outcome.handled && outcome.changed);
+            assert_eq!(
+                editor.document().plain_text(),
+                if selection == caret {
+                    "prefix\n tail"
+                } else {
+                    "p tail"
+                }
+            );
+            assert_eq!(editor.undo_len(), 1);
+            if selection == caret {
+                let revision = editor.document().revision();
+                let outcome = key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Named(NamedKey::Backspace),
+                    None,
+                );
+                assert!(outcome.handled && !outcome.changed);
+                assert_eq!(editor.document().revision(), revision);
+                assert_eq!(editor.undo_len(), 1);
+            }
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), text);
+            assert_eq!(editor.selection(), selection);
+        }
+    }
+
+    #[test]
+    fn super_backspace_respects_read_only_ime_and_modifier_guards() {
+        let mut editor = Editor::from_text("one two");
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+        adapter.set_focused(true, &mut editor);
+        adapter.set_modifiers(ModifiersState::SUPER);
+        adapter.set_read_only(true, &mut editor);
+        let outcome = key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::Backspace),
+            None,
+        );
+        assert!(outcome.handled && !outcome.changed);
+        adapter.set_read_only(false, &mut editor);
+        editor.update_composition("候", None).unwrap();
+        let outcome = key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::Backspace),
+            None,
+        );
+        assert!(outcome.handled && !outcome.changed);
+        assert!(editor.composition().is_some());
+        editor.cancel_composition();
+        assert_eq!(editor.document().plain_text(), "one two");
+        assert!(!editor.can_undo());
+
+        for (modifiers, expected) in [
+            (ModifiersState::CONTROL | ModifiersState::ALT, "one "),
+            (ModifiersState::CONTROL | ModifiersState::SUPER, "one tw"),
+        ] {
+            adapter.set_modifiers(modifiers);
+            key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Backspace),
+                None,
+            );
+            assert_eq!(editor.document().plain_text(), expected);
+            assert!(editor.undo());
+        }
+    }
+
+    #[test]
+    fn emphasis_shortcuts_normalize_mixed_selections_in_both_directions() {
+        for (shortcut, patch) in [
+            (
+                "b",
+                StylePatch {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "i",
+                StylePatch {
+                    italic: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "u",
+                StylePatch {
+                    underline: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            for reverse in [false, true] {
+                let mut editor = Editor::from_text("aé");
+                editor
+                    .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
+                    .unwrap();
+                editor.apply_style(patch).unwrap();
+                let selection = if reverse {
+                    Selection::new(editor.document().end(), Position::default())
+                } else {
+                    Selection::new(Position::default(), editor.document().end())
+                };
+                editor.set_selection(selection).unwrap();
+                editor.clear_history();
+                let original = editor.document().to_bytes();
+                let mut adapter = focused(&mut editor);
+                adapter.set_modifiers(ModifiersState::CONTROL);
+
+                for enabled in [true, false] {
+                    let outcome = key(
+                        &mut adapter,
+                        &mut editor,
+                        Key::Character(shortcut.into()),
+                        None,
+                    );
+                    assert!(outcome.handled && outcome.changed);
+                    let style = editor.selection_style();
+                    let actual = match shortcut {
+                        "b" => style.bold,
+                        "i" => style.italic,
+                        _ => style.underline,
+                    };
+                    assert_eq!(actual, Some(enabled));
+                    assert_eq!(editor.selection(), selection);
+                }
+                assert_eq!(editor.undo_len(), 2);
+                assert!(editor.undo());
+                assert!(editor.undo());
+                assert_eq!(editor.document().to_bytes(), original);
+                assert_eq!(editor.selection(), selection);
+            }
+        }
     }
 
     #[test]

@@ -11,17 +11,17 @@ readme = "README.md"
 repository = "https://github.com/Cameron-Lyons/textloom"
 documentation = "https://docs.rs/textloom"
 include = [
-    "src/**",
-    "tests/**",
-    "examples/*.rs",
-    "benches/**",
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-    "BENCHMARKS.md",
-    "CHANGELOG.md",
-    "RELEASING.md",
-    "LICENSE",
+    "/src/**",
+    "/tests/**",
+    "/examples/*.rs",
+    "/benches/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/BENCHMARKS.md",
+    "/CHANGELOG.md",
+    "/RELEASING.md",
+    "/LICENSE",
 ]
 
 [package.metadata.docs.rs]
