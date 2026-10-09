@@ -77,13 +77,13 @@ preedit/candidate windows or screen readers.
 
 `--clipboard-self-test` requires `--rich-clipboard` and **writes a deterministic
 fixture to the system clipboard**. Use it only in an isolated test session. It
-verifies rich/HTML/plain publication and read-back, then rich insertion and one-step
+verifies rich/HTML/plain publication and read-back, then widget rich insertion and one-step
 undo/redo. It can be combined with `--smoke-test` and `--qa-report`; successful
 completion prints `Native rich clipboard roundtrip and undo/redo passed`.
 Renderer CI requests rich clipboard in all three modes and this self-test in
-editable mode. The isolated Linux X11 fixture has passed locally. Wayland,
-macOS, and Windows rich runtime checks and final clean CI remain pending;
-external-application interoperability still needs manual platform signoff.
+editable mode. Isolated widget fixtures passed on Linux X11/Wayland, macOS, and
+Windows; the root `RELEASING.md` records source revisions and validation evidence.
+External-application interoperability still needs manual platform signoff.
 
 For native QA, pass `--qa-report PATH` and close the window normally after testing.
 The host writes a JSON report only on graceful exit. Existing paths are protected

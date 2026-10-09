@@ -27,15 +27,14 @@ First stable release of the native Rust rich-text editing library.
   invalid, mismatched, or ambiguous inputs. Safe platform wrappers remain outside
   the library dependency graph. `--clipboard-self-test` writes a deterministic
   fixture for isolated sessions; QA reports record request/completion flags and
-  its error counter. The isolated Linux X11 fixture passed locally; remaining
-  native runtime and external-app interoperability signoff remain pending.
+  its error counter. Isolated native widget fixtures passed on Linux X11/Wayland,
+  macOS, and Windows; external-app interoperability signoff remains required.
 - The candidate CI workflow adds required Linux X11/Mesa and macOS native
   rendering smoke checks for editable, read-only, and disabled hosts, together
   with required Windows rendering using signed MSYS2 Mesa and application-local
   DLLs. Rich clipboard is requested in all modes; editable runs additionally
-  require native clipboard roundtrip and undo/redo evidence. Final clean CI for
-  the new clipboard checks remains pending. Renderer and fixture checks do not
-  replace manual platform interaction signoffs.
+  require native clipboard roundtrip and undo/redo evidence. Renderer and fixture
+  checks do not replace manual platform interaction signoffs.
 - Bold, italic, and underline shortcuts in both input adapters apply emphasis
   uniformly to mixed selections, matching toolbar behavior, and disable it only
   when the whole selection already has that emphasis.

@@ -125,9 +125,9 @@ requests a graceful close after 20 native frames. Pass these arguments after
 
 `--clipboard-self-test` requires `--rich-clipboard` and writes a fixture to the
 system clipboard, so use it only in isolated sessions. It checks native rich,
-HTML, and plain read-back plus rich insertion and undo/redo. The isolated Linux
-X11 fixture passed locally; other native rich runtime checks and final clean CI
-remain pending. External-application interoperability, IME, dead keys/AltGr, and
+HTML, and plain read-back plus widget rich insertion and undo/redo. Isolated
+fixtures passed on Linux X11/Wayland, macOS, and Windows; evidence is recorded in
+`RELEASING.md`. External-application interoperability, IME, dead keys/AltGr, and
 screen-reader behavior still need native platform signoff.
 
 `--qa-report PATH` writes a JSON report on graceful exit, protecting existing
@@ -197,9 +197,8 @@ modes on Linux X11 with Xvfb/Mesa, macOS, and Windows with signed MSYS2 Mesa
 packages and application-local DLLs. Validation evidence is recorded in
 `RELEASING.md`. Renderer smoke checks open native windows and verify initialization
 and frame completion. They now enable rich clipboard in all modes and require
-the isolated clipboard roundtrip/undo/redo fixture in editable mode. Final clean
-CI for that extension remains pending. IME, external clipboard interoperability,
-physical keyboard, and screen-reader interaction retain their manual release
+the isolated clipboard roundtrip/undo/redo fixture in editable mode. IME, external
+clipboard interoperability, physical keyboard, and screen-reader interaction retain their manual release
 gates on all three platforms.
 
 Renderer jobs validate source-labelled, content-free JSON observations for

@@ -2,27 +2,25 @@
 
 ## 1.0 validation status
 
-Linux validation of commit `d697471` on 2026-10-09 passed all eight test/doctest feature
-combinations with Rust 1.99.0 stable and Rust 1.95.0. The current library's
+Validation of commit `9db3221` on 2026-10-09 passed all eight test/doctest feature
+combinations with Rust 1.99.0 stable and Rust 1.95.0. The library's
 all-feature suite passes 221 unit and integration tests and four doctests,
 including the compile-fail accessibility API check: 225 passing tests in total.
 One egui host widget snippet is intentionally ignored. The standalone native
-host CLI/report tests passed, including on Rust 1.95.0. The current Linux host
-has 20 passing option/report/clipboard tests on stable; Rust 1.95 passed the same
-20 tests before the latest fixture callback extension. Strict stable Clippy
-passed after that extension. Final checks on the publication commit remain
+host passes 20 option/report/clipboard tests on Linux, including Rust 1.95.0,
+15 on macOS, and 19 on Windows. Final checks on the publication commit remain
 required.
 
-The complete stable-toolchain release script passed on clean commit `d697471`:
+The complete stable-toolchain release script passed locally on clean commit `9db3221`:
 formatting, strict Clippy, warning-free API documentation, benchmark smoke
 tests, headless examples, package inventory verification, and tests and all-target
 compilation from the extracted crate. Native host formatting, strict Clippy,
 and compilation against both the source and extracted library also passed.
 The crates.io publish dry run and archive verification also passed on that
 commit, without uploading a release. Repeat the complete checks on the final
-publication commit after the new clipboard changes.
+publication commit.
 
-All six required jobs in the [CI run for commit `d697471`](https://github.com/Cameron-Lyons/textloom/actions/runs/37916826884)
+All six required jobs in the [CI run for commit `9db3221`](https://github.com/Cameron-Lyons/textloom/actions/runs/37920484668)
 passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
 macOS/Windows compilation and tests, Linux X11 rendering, and Windows Mesa
 rendering. Native renderer checks passed editable, read-only, and disabled modes
@@ -30,12 +28,19 @@ on all three platforms. Linux uses an isolated Xvfb display with Mesa and the
 X11 xkbcommon runtime. Windows uses signed MSYS2 Mesa packages with
 application-local OpenGL DLLs; the verified run used Mesa 26.2.4-1 and LLVM
 22.1.8-3. Reports independently validated zero errors and equal TLFR round trips.
-This is the baseline before the current opt-in rich clipboard changes. An
-isolated Linux X11/Xvfb run of the new callback-based rich fixture passed locally
-on `d697471-dirty`: native rich/HTML/plain roundtrip, one-step undo/redo, 21 frames,
-zero errors, and an accepted content-free report. Rich-enabled read-only and
-disabled runs also passed locally before that fixture callback extension.
-Wayland, macOS, and Windows rich runtime checks and final clean CI remain pending.
+The native rich clipboard fixture passed through the widget's copy/paste callbacks
+on Linux X11, macOS, and Windows. All three mode reports per platform independently
+validated against the checked-out PR merge `58dc2af`, with 21 rendered frames,
+zero errors, correct rich-clipboard flags, and equal TLFR round trips. macOS used
+an ARM64 runner on macOS 26.6.2; Windows used the Mesa configuration above.
+
+The same clean source also passed all three modes in a private, headless Wayland
+session using Sway 1.12, wlroots 0.20, and the pixman renderer with Xwayland
+disabled. The rich fixture passed; each mode completed 21 frames with zero errors
+and a validated report. No clipboard helper remained after graceful close.
+Independent Wayland tests verified all plain-text MIME aliases, multi-megabyte
+transfers, and clipboard owner replacement. These isolated tests did not change
+the current desktop clipboard or configuration.
 
 Renderer jobs now request `--rich-clipboard` in every mode and require
 `--clipboard-self-test` in editable mode on isolated CI desktops. They check the
@@ -54,7 +59,7 @@ verified. Native Unicode paste/copy, keyboard undo/redo, grouped adjacent caret
 typing, and formatting shortcuts passed. Bold/italic/underline toolbar states
 and rendered styles were checked before and after undo. Read-only selection/copy,
 typing/deletion/paste suppression, and non-destructive cut passed. IME candidate
-placement, screen-reader behavior, dead keys/AltGr, rich clipboard runtime and
+placement, screen-reader behavior, dead keys/AltGr, rich clipboard
 external-application interoperability, and macOS and Windows native interaction
 checks still require signoff.
 Linux virtual-keyboard `dead_acute` followed by `e`, and Compose apostrophe
@@ -102,8 +107,9 @@ The host retains one verified owner helper, reaps replaced or stalled children,
 joins pipe workers, and retires its owner on close. Linux clipboard data remains
 available after close only if a clipboard manager retains it; macOS/Windows use
 eager native data. All platform dependencies are host-only safe wrapper APIs,
-and unsafe code remains forbidden in the example. Beyond the local X11 fixture,
-native runtime checks and external-application interoperability signoff are pending.
+and unsafe code remains forbidden in the example. Automated native fixtures pass
+on all three platforms and Linux Wayland; external-application interoperability
+signoff remains required.
 
 Reproduce the Linux host used for rendering checks from the repository root:
 
@@ -162,7 +168,7 @@ remain pending.
 | Dead keys and Compose | Virtual `dead_acute`/Compose sequences produced visually observed `é` with undo; physical-keyboard/platform signoff pending |
 | AltGr | Virtual-keyboard attempt recorded text/document changes before compositor focus loss; visual, undo, and physical-keyboard/platform signoff pending |
 | Screen-reader selection and replacement | Manual validation pending |
-| Rich clipboard MIME transport | Isolated Linux X11 fixture passed locally; remaining native runtime and external-application interoperability signoff pending |
+| Rich clipboard MIME transport | Automated native widget fixtures passed on Linux X11/Wayland, macOS, and Windows; external-application interoperability signoff pending |
 | macOS and Windows native host checks | Manual validation pending |
 
 ## Compatibility contract
