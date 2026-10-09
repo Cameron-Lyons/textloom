@@ -178,11 +178,10 @@ The dependency-free benchmark harnesses measure local insertion/undo, long Unico
 
 The Ubuntu release checks also test the native host, check its formatting and
 Clippy warnings, and verify its dependency on the packaged library. The candidate
-workflow adds required renderer smoke checks in editable, read-only, and disabled
-modes on Linux X11 with Xvfb/Mesa and on macOS. Their results on the final clean
-commit remain pending in `RELEASING.md`. A separate optional Windows OpenGL probe
-can be requested by manual workflow dispatch; it needs runtime evidence before
-becoming a required renderer check. Renderer smoke checks open native windows
+workflow runs required renderer smoke checks in editable, read-only, and disabled
+modes on Linux X11 with Xvfb/Mesa, macOS, and Windows with signed MSYS2 Mesa
+packages and application-local DLLs. Validation evidence is recorded in
+`RELEASING.md`. Renderer smoke checks open native windows
 and verify initialization and frame completion. IME, clipboard, physical keyboard,
 and screen-reader interaction retain their manual release gates on all three
 platforms.

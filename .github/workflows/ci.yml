@@ -5,11 +5,6 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      windows_native_probe:
-        description: Probe native OpenGL rendering on the Windows hosted runner
-        type: boolean
-        default: false
   workflow_call:
 
 permissions:
@@ -183,12 +178,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # OpenGL availability is not guaranteed on Windows hosted runners. Keep this
-  # explicit experiment separate from the required platform gates until a run
-  # establishes a supported renderer configuration.
-  windows-renderer-probe:
-    name: Native OpenGL probe (Windows)
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_native_probe
+  # Hosted Windows runners need Mesa for modern OpenGL. This software-rendered
+  # check validates native initialization and rendering; IME, clipboard, and
+  # screen-reader interaction still require the RELEASING.md signoffs.
+  windows-renderer:
+    name: Native rendering (Windows Mesa)
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -216,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           pacman -Q | tee native-smoke-mesa-packages.log
-      - name: Native OpenGL renderer probe
+      - name: Native rendering smoke (Windows Mesa)
         timeout-minutes: 2
         shell: pwsh
         env:
@@ -257,11 +251,11 @@ jobs:
             }
             Copy-Item -LiteralPath "native-smoke-$mode.json" -Destination "native-observations/$mode.json"
           }
-      - name: Native rendering observations (Windows probe)
+      - name: Native rendering observations (Windows Mesa)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: native-rendering-windows-probe
+          name: native-rendering-windows-mesa
           path: |
             native-observations/*.json
             native-smoke-*.log

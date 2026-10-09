@@ -18,22 +18,25 @@ and compilation against both the source and extracted library also passed.
 The crates.io publish dry run also passed without uploading a release. Repeat
 the complete checks on the final publication commit.
 
-The complete [CI run for commit `49ecb6f`](https://github.com/Cameron-Lyons/textloom/actions/runs/37910912372)
+The complete [CI run for commit `41c39b9`](https://github.com/Cameron-Lyons/textloom/actions/runs/37916029331)
 passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
 and macOS/Windows all-target compilation, native host compilation, tests, and
 doctests. Further working-tree fixes require the same checks on their final
 clean commit; the baseline result does not verify subsequent changes.
 
 The candidate workflow adds required native renderer smoke checks on Linux X11
-with Xvfb/Mesa and on macOS, in editable, read-only, and disabled modes.
-The [macOS renderer job for `d60c77d`](https://github.com/Cameron-Lyons/textloom/actions/runs/37915371512/job/113770134648)
-passed all three modes and archived valid reports. The initial Linux X11 job
-failed because the runner lacked `libxkbcommon-x11.so`; its runtime package is
-now included, with the next run required to verify the correction.
+with Xvfb/Mesa, on macOS, and on Windows with signed MSYS2 Mesa and
+application-local DLLs, in editable, read-only, and disabled modes.
+Linux X11 and macOS rendering passed all three modes in the CI run above.
+The initial Linux X11 job failed because the runner lacked
+`libxkbcommon-x11.so`; adding its runtime package resolved the failure.
 The [default Windows OpenGL probe](https://github.com/Cameron-Lyons/textloom/actions/runs/37915424851/job/113770313537)
 built successfully but failed before rendering because the hosted driver did
-not provide OpenGL 2.0. The optional probe is configured with signed
-MSYS2 Mesa software rendering; its outcome remains unverified.
+not provide OpenGL 2.0. The [Mesa probe for `41c39b9`](https://github.com/Cameron-Lyons/textloom/actions/runs/37916040100/job/113772342110)
+passed all three modes; downloaded reports independently passed validation with
+zero errors and equal TLFR round trips. That run used Mesa 26.2.4-1 and LLVM
+22.1.8-3. Its demonstrated configuration is now a required Windows renderer job;
+the final clean CI run must verify that promotion.
 Renderer smoke results establish native
 initialization and frame completion, leaving interactive platform checks below
 required on Linux, macOS, and Windows.
@@ -185,9 +188,9 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
    `cargo +1.95.0 check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target`.
    Confirm the MSRV feature checks and macOS/Windows jobs pass on that commit;
    they compile and test the standalone native host as well as the library targets.
-   Confirm required Linux X11 and macOS renderer smoke checks pass in editable,
-   read-only, and disabled modes. A Windows probe can supply additional runtime
-   evidence; native Windows interaction signoff remains required independently.
+   Confirm required Linux X11, macOS, and Windows Mesa renderer smoke checks pass
+   in editable, read-only, and disabled modes. Native platform interaction
+   signoff remains required independently.
 5. Exercise a native host on Linux, macOS, and Windows. Check focus loss during
    composition, Japanese/Chinese IME replacement and candidate placement,
    physical-keyboard dead keys and AltGr, platform shortcuts, plain/rich clipboard transport,
