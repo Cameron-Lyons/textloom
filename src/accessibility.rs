@@ -487,55 +487,107 @@ mod accesskit_bridge {
                 });
             }
             let mut next_id = self.next_id;
-            let mut cached: HashMap<(usize, bool), Vec<&Arc<CachedParagraph>>> = HashMap::new();
-            // Rich paste can repeat the same shared paragraph allocation. Each
-            // occurrence needs its own IDs, and each cached occurrence is used
-            // at most once. Reverse insertion preserves document order on pop.
-            for paragraph in self.paragraphs.iter().rev() {
-                cached
-                    .entry((
-                        Arc::as_ptr(&paragraph.paragraph) as usize,
-                        paragraph.line_break,
-                    ))
-                    .or_default()
-                    .push(paragraph);
-            }
-            let mut paragraphs = Vec::with_capacity(editor.document().paragraphs().len());
+            let source = editor.document().paragraphs();
+            let mut changed_index = None;
+            // A single changed slot cannot move surviving paragraphs. Stage
+            // just that replacement so ordinary typing and local formatting
+            // retain the paragraph Vec and run lookup table. Wider edits use
+            // occurrence-aware matching below to retain IDs after index shifts.
+            let local_change = self.paragraphs.len() == source.len()
+                && self.paragraphs.iter().zip(source).enumerate().all(
+                    |(index, (cached, paragraph))| {
+                        (Arc::ptr_eq(&cached.paragraph, paragraph)
+                            && cached.line_break == (index + 1 < source.len()))
+                            || changed_index.replace(index).is_none()
+                    },
+                );
             let mut nodes = Vec::new();
-            for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
-                let line_break = index + 1 < editor.document().paragraphs().len();
-                let key = (Arc::as_ptr(paragraph) as usize, line_break);
-                let existing = cached.get_mut(&key).and_then(Vec::pop);
-                let next = if let Some(existing) = existing {
-                    Arc::clone(existing)
-                } else {
-                    Arc::new(build_paragraph(
-                        Arc::clone(paragraph),
-                        index,
-                        line_break,
-                        &mut next_id,
-                    )?)
-                };
-                if existing.is_none() || !self.initialized {
-                    nodes.push((next.id, next.node.clone()));
-                    nodes.extend(next.runs.iter().map(|run| (run.id, run.node.clone())));
+            let (paragraphs, replacement) = if local_change {
+                let replacement = changed_index
+                    .map(|index| {
+                        build_paragraph(
+                            Arc::clone(&source[index]),
+                            index,
+                            index + 1 < source.len(),
+                            &mut next_id,
+                        )
+                        .map(|paragraph| (index, Arc::new(paragraph)))
+                    })
+                    .transpose()?;
+                (None, replacement)
+            } else {
+                let mut cached: HashMap<(usize, bool), Vec<&Arc<CachedParagraph>>> = HashMap::new();
+                // Rich paste can repeat the same shared paragraph allocation.
+                // Each occurrence needs its own IDs and is used at most once.
+                // Reverse insertion preserves document order on pop.
+                for paragraph in self.paragraphs.iter().rev() {
+                    cached
+                        .entry((
+                            Arc::as_ptr(&paragraph.paragraph) as usize,
+                            paragraph.line_break,
+                        ))
+                        .or_default()
+                        .push(paragraph);
                 }
-                paragraphs.push(next);
-            }
+                let mut paragraphs = Vec::with_capacity(source.len());
+                for (index, paragraph) in source.iter().enumerate() {
+                    let line_break = index + 1 < source.len();
+                    let key = (Arc::as_ptr(paragraph) as usize, line_break);
+                    let existing = cached.get_mut(&key).and_then(Vec::pop);
+                    let next = if let Some(existing) = existing {
+                        Arc::clone(existing)
+                    } else {
+                        Arc::new(build_paragraph(
+                            Arc::clone(paragraph),
+                            index,
+                            line_break,
+                            &mut next_id,
+                        )?)
+                    };
+                    if existing.is_none() || !self.initialized {
+                        nodes.push((next.id, next.node.clone()));
+                        nodes.extend(next.runs.iter().map(|run| (run.id, run.node.clone())));
+                    }
+                    paragraphs.push(next);
+                }
+                (Some(paragraphs), None)
+            };
+            let current = paragraphs.as_deref().unwrap_or(&self.paragraphs);
+            let paragraph_at = |index| {
+                replacement
+                    .as_ref()
+                    .filter(|(changed, _)| *changed == index)
+                    .map(|(_, paragraph)| paragraph)
+                    .or_else(|| current.get(index))
+            };
             let mut editor_node = Node::new(Role::MultilineTextInput);
             editor_node.set_label(label);
             editor_node.add_action(Action::Focus);
             editor_node.add_action(Action::SetTextSelection);
             set_editable_actions(&mut editor_node, self.read_only);
             editor_node.set_children(
-                paragraphs
+                current
                     .iter()
-                    .map(|paragraph| paragraph.id)
+                    .enumerate()
+                    .map(|(index, paragraph)| {
+                        let next = paragraph_at(index).unwrap_or(paragraph);
+                        if local_change && (changed_index == Some(index) || !self.initialized) {
+                            nodes.push((next.id, next.node.clone()));
+                            nodes.extend(next.runs.iter().map(|run| (run.id, run.node.clone())));
+                        }
+                        next.id
+                    })
                     .collect::<Vec<_>>(),
             );
             editor_node.set_text_selection(TextSelection {
-                anchor: to_text_position(&paragraphs, editor.selection().anchor)?,
-                focus: to_text_position(&paragraphs, editor.selection().focus)?,
+                anchor: paragraph_text_position(
+                    paragraph_at(selection.anchor.paragraph).map(Arc::as_ref),
+                    selection.anchor,
+                )?,
+                focus: paragraph_text_position(
+                    paragraph_at(selection.focus.paragraph).map(Arc::as_ref),
+                    selection.focus,
+                )?,
             });
             if self.last_editor.as_ref() != Some(&editor_node) {
                 nodes.push((self.editor_id, editor_node.clone()));
@@ -554,18 +606,28 @@ mod accesskit_bridge {
                 None
             };
             self.next_id = next_id;
-            self.run_locations = paragraphs
-                .iter()
-                .enumerate()
-                .flat_map(|(paragraph_index, paragraph)| {
-                    paragraph
-                        .runs
-                        .iter()
-                        .enumerate()
-                        .map(move |(run_index, run)| (run.id, (paragraph_index, run_index)))
-                })
-                .collect();
-            self.paragraphs = paragraphs;
+            if let Some(paragraphs) = paragraphs {
+                self.run_locations = paragraphs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(paragraph_index, paragraph)| {
+                        paragraph
+                            .runs
+                            .iter()
+                            .enumerate()
+                            .map(move |(run_index, run)| (run.id, (paragraph_index, run_index)))
+                    })
+                    .collect();
+                self.paragraphs = paragraphs;
+            } else if let Some((index, replacement)) = replacement {
+                for run in &self.paragraphs[index].runs {
+                    self.run_locations.remove(&run.id);
+                }
+                for (run_index, run) in replacement.runs.iter().enumerate() {
+                    self.run_locations.insert(run.id, (index, run_index));
+                }
+                self.paragraphs[index] = replacement;
+            }
             self.last_editor = Some(editor_node);
             self.last_selection = Some(selection);
             self.document_identity = Some(document_identity);
@@ -814,7 +876,17 @@ mod accesskit_bridge {
         paragraphs: &[Arc<CachedParagraph>],
         position: Position,
     ) -> Result<TextPosition, AccessKitError> {
-        if let Some(paragraph) = paragraphs.get(position.paragraph) {
+        paragraph_text_position(
+            paragraphs.get(position.paragraph).map(Arc::as_ref),
+            position,
+        )
+    }
+
+    fn paragraph_text_position(
+        paragraph: Option<&CachedParagraph>,
+        position: Position,
+    ) -> Result<TextPosition, AccessKitError> {
+        if let Some(paragraph) = paragraph {
             // Prefer the preceding run at a shared style boundary, preserving
             // the adapter's published selection representation.
             let index = paragraph
@@ -1130,6 +1202,193 @@ mod accesskit_bridge {
             editor.insert_text("q").unwrap();
             adapter.update(&editor, "Notes", true).unwrap();
             assert_eq!(adapter.paragraph_node(1), Some(unchanged_id));
+        }
+
+        #[test]
+        fn local_rich_paste_keeps_untouched_duplicate_occurrences_and_run_locations() {
+            let mut editor = Editor::from_text("copy\n\nlast");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let storage = adapter.paragraphs.as_ptr();
+            let before = adapter.paragraphs.clone();
+            let removed = adapter
+                .to_text_position(&editor, Position::new(1, 0))
+                .unwrap();
+            let fragment = editor
+                .document()
+                .fragment(Position::new(0, 0)..Position::new(0, 4))
+                .unwrap();
+            editor
+                .set_selection(Selection::caret(Position::new(1, 0)))
+                .unwrap();
+            editor.insert_fragment(&fragment).unwrap();
+            assert!(Arc::ptr_eq(
+                &editor.document().paragraphs()[0],
+                &editor.document().paragraphs()[1]
+            ));
+
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(update.nodes.len(), 3);
+            assert_eq!(adapter.paragraphs.as_ptr(), storage);
+            for index in [0, 2] {
+                assert!(Arc::ptr_eq(&before[index], &adapter.paragraphs[index]));
+            }
+            assert_ne!(adapter.paragraph_node(0), adapter.paragraph_node(1));
+            assert_eq!(
+                adapter.from_text_position(&editor, removed),
+                Err(AccessKitError::InvalidTextPosition(removed))
+            );
+            for index in 0..3 {
+                let position = Position::new(index, 2);
+                let published = adapter.to_text_position(&editor, position).unwrap();
+                assert_eq!(
+                    adapter.from_text_position(&editor, published).unwrap(),
+                    position
+                );
+                let run = &adapter.paragraphs[index].runs[0];
+                assert_eq!(run.line_break, index < 2);
+                if run.line_break {
+                    assert_eq!(
+                        adapter
+                            .from_text_position(
+                                &editor,
+                                TextPosition {
+                                    node: run.id,
+                                    character_index: run.character_offsets.len(),
+                                }
+                            )
+                            .unwrap(),
+                        Position::new(index + 1, 0)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn failed_local_updates_keep_the_published_tree_and_id_allocator() {
+            let mut editor = Editor::from_text("first\nmiddle\nlast");
+            let published_editor = Editor::new(editor.document().clone());
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let before = adapter.paragraphs.clone();
+            let storage = adapter.paragraphs.as_ptr();
+            let locations = adapter.run_locations.clone();
+            let position = Position::new(1, 2);
+            let published = adapter.to_text_position(&editor, position).unwrap();
+            editor
+                .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 6)))
+                .unwrap();
+            editor
+                .insert_text(&format!("x{}", "\u{301}".repeat(200)))
+                .unwrap();
+            let next_id = adapter.next_id;
+            assert!(matches!(
+                adapter.update(&editor, "Failed", false),
+                Err(AccessKitError::CharacterTooLong {
+                    position: Position {
+                        paragraph: 1,
+                        byte: 0
+                    },
+                    bytes: 401,
+                })
+            ));
+            assert_eq!(adapter.next_id, next_id);
+            assert_eq!(adapter.paragraphs.as_ptr(), storage);
+            assert_eq!(adapter.run_locations, locations);
+            for (previous, current) in before.iter().zip(&adapter.paragraphs) {
+                assert!(Arc::ptr_eq(previous, current));
+            }
+            assert_eq!(adapter.last_editor.as_ref().unwrap().label(), Some("Notes"));
+            assert_eq!(
+                adapter
+                    .from_text_position(&published_editor, published)
+                    .unwrap(),
+                position
+            );
+            assert_eq!(
+                adapter.from_text_position(&editor, published),
+                Err(AccessKitError::StaleDocument)
+            );
+
+            assert!(editor.undo());
+            editor.insert_text("supported").unwrap();
+            adapter.next_id = Some(u64::MAX);
+            assert_eq!(
+                adapter.update(&editor, "Failed", false),
+                Err(AccessKitError::NodeIdExhausted)
+            );
+            assert_eq!(adapter.next_id, Some(u64::MAX));
+            assert_eq!(adapter.paragraphs.as_ptr(), storage);
+            assert_eq!(adapter.run_locations, locations);
+            assert_eq!(
+                adapter
+                    .from_text_position(&published_editor, published)
+                    .unwrap(),
+                position
+            );
+            assert!(
+                adapter
+                    .update(&published_editor, "Notes", true)
+                    .unwrap()
+                    .nodes
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn same_count_reordering_keeps_ids_and_moves_run_locations() {
+            let editor = Editor::from_text("first\nsecond\nlast");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let first = adapter
+                .to_text_position(&editor, Position::new(0, 2))
+                .unwrap();
+            let second = adapter
+                .to_text_position(&editor, Position::new(1, 2))
+                .unwrap();
+            let before = adapter.paragraphs.clone();
+            let source = editor.document().paragraphs();
+            let fragment = crate::Fragment::from_paragraphs(vec![
+                Arc::clone(&source[1]),
+                Arc::clone(&source[0]),
+                Arc::clone(&source[2]),
+            ]);
+            let reordered = Editor::new(crate::Document::from_fragment(&fragment));
+            let update = adapter.update(&reordered, "Notes", true).unwrap();
+            assert_eq!(update.nodes.len(), 1);
+            assert!(Arc::ptr_eq(&before[0], &adapter.paragraphs[1]));
+            assert!(Arc::ptr_eq(&before[1], &adapter.paragraphs[0]));
+            assert!(Arc::ptr_eq(&before[2], &adapter.paragraphs[2]));
+            assert_eq!(
+                adapter.from_text_position(&reordered, first).unwrap(),
+                Position::new(1, 2)
+            );
+            assert_eq!(
+                adapter.from_text_position(&reordered, second).unwrap(),
+                Position::new(0, 2)
+            );
+        }
+
+        #[test]
+        fn reinitializing_an_unchanged_tree_republishes_cached_nodes() {
+            let editor = Editor::from_text("first\nlast");
+            let mut adapter = AccessKitAdapter::default();
+            let initial = adapter.update(&editor, "Notes", true).unwrap();
+            let storage = adapter.paragraphs.as_ptr();
+            let next_id = adapter.next_id;
+            adapter = adapter.with_tree_id(TreeId::ROOT);
+            let rebuilt = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(rebuilt.nodes, initial.nodes);
+            assert!(rebuilt.tree.is_some());
+            assert_eq!(adapter.next_id, next_id);
+            assert_eq!(adapter.paragraphs.as_ptr(), storage);
+            assert!(
+                adapter
+                    .update(&editor, "Notes", true)
+                    .unwrap()
+                    .nodes
+                    .is_empty()
+            );
         }
 
         #[test]

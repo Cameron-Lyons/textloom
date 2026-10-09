@@ -324,7 +324,7 @@ impl Editor {
             return Ok(0);
         }
         let before = self.state();
-        let (delta, caret) = self.document.replace_matches(&matches, replacement)?;
+        let (delta, caret) = self.document.replace_matches(&matches, replacement);
         self.selection = Selection::caret(caret);
         self.typing_style = self.document.style_at(caret);
         self.preferred_column = None;

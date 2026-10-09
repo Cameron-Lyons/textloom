@@ -28,7 +28,9 @@ impl Default for Fragment {
 impl Fragment {
     /// Import plain text, normalizing CRLF and lone CR to paragraph breaks.
     pub fn from_text(text: &str) -> Self {
-        Self::from_document(&Document::from_text(text))
+        Self {
+            paragraphs: Document::from_text(text).into_paragraphs(),
+        }
     }
 
     /// Capture an entire document, sharing its immutable paragraph allocations.
@@ -44,6 +46,10 @@ impl Fragment {
         } else {
             Self { paragraphs }
         }
+    }
+
+    pub(crate) fn into_paragraphs(self) -> Vec<Arc<Paragraph>> {
+        self.paragraphs
     }
 
     /// Return the ordered, immutable paragraphs, including an empty paragraph
@@ -187,7 +193,7 @@ impl Fragment {
             let length = input.length()?;
             let text =
                 std::str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidUtf8)?;
-            if text.contains(['\r', '\n']) {
+            if text.as_bytes().contains(&b'\r') || text.as_bytes().contains(&b'\n') {
                 return Err(FragmentError::InvalidParagraphText);
             }
             let span_count = input.length()?;
@@ -225,7 +231,7 @@ impl Fragment {
             }
             // The paragraph constructor validates grapheme boundaries in one
             // forward scan; repeating segmentation here doubles import work.
-            let paragraph = Paragraph::from_parts(text.to_owned(), spans, kind)
+            let paragraph = Paragraph::from_parts(text, spans, kind)
                 .map_err(|_| FragmentError::InvalidSpans)?;
             paragraphs.push(Arc::new(paragraph));
         }

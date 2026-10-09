@@ -553,6 +553,83 @@ fn local_navigation_keeps_forward_nonoverlap_and_complete_lowercase_context() {
 }
 
 #[test]
+fn literal_navigation_agrees_with_forward_matches_around_rejected_unicode_candidates() {
+    let mut editor = Editor::from_text(
+        "e\u{301} e e\u{301}\n👩‍💻 👩 👩‍💻\n🇺🇸 🇺 🇨🇺\ncafé café\n\u{0600}word word\nabca abcabca\nana banana\n",
+    );
+    let positions: Vec<_> = editor
+        .document()
+        .paragraphs()
+        .iter()
+        .enumerate()
+        .flat_map(|(index, paragraph)| {
+            (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+            })
+        })
+        .collect();
+    let options = SearchOptions::default();
+    for query in [
+        "e",
+        "\u{301}",
+        "👩",
+        "👩‍💻",
+        "🇺",
+        "café",
+        "word",
+        "abc",
+        "abca",
+        "ana",
+    ] {
+        let matches = editor.document().find(query, options);
+        let selections =
+            positions
+                .iter()
+                .copied()
+                .map(Selection::caret)
+                .chain(matches.iter().flat_map(|range| {
+                    [
+                        Selection::new(range.start, range.end),
+                        Selection::new(range.end, range.start),
+                    ]
+                }));
+        for selection in selections {
+            let range = selection.range();
+            for backward in [false, true] {
+                for wrap in [false, true] {
+                    let expected = if backward {
+                        matches
+                            .iter()
+                            .rev()
+                            .find(|item| item.end <= range.start)
+                            .or_else(|| wrap.then(|| matches.last()).flatten())
+                    } else {
+                        matches
+                            .iter()
+                            .find(|item| item.start >= range.end)
+                            .or_else(|| wrap.then(|| matches.first()).flatten())
+                    };
+                    editor.set_selection(selection).unwrap();
+                    let found = if backward {
+                        editor.find_previous(query, options, wrap).unwrap()
+                    } else {
+                        editor.find_next(query, options, wrap).unwrap()
+                    };
+                    assert_eq!(found, expected.is_some());
+                    assert_eq!(
+                        editor.selection(),
+                        expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                        "query={query:?}, selection={selection:?}, wrap={wrap}, backward={backward}",
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(editor.document().revision(), 0);
+    assert_eq!(editor.undo_len(), 0);
+}
+
+#[test]
 fn navigation_matches_global_results_for_sparse_paragraphs_and_crossing_selections() {
     let mut paragraphs = vec![""; 257];
     for index in [0, 64, 127, 255] {

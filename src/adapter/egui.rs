@@ -5,7 +5,7 @@
 //! For a true bold face, register one in `FontDefinitions` and select it with
 //! [`RichTextEditor::bold_font_family`]. Default fonts use egui's strong text color.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use egui::{
     Color32, Event, FontFamily, FontId, Galley, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
@@ -582,7 +582,12 @@ impl<'a> RichTextEditor<'a> {
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.is_current(self.editor, &layouts))
             {
-                match accessibility::build(self.editor, &layouts, id) {
+                match accessibility::build_cached(
+                    self.editor,
+                    &layouts,
+                    id,
+                    cache.accessibility.as_deref(),
+                ) {
                     Ok(snapshot) => cache.accessibility = Some(Arc::new(snapshot)),
                     Err(error) => {
                         cache.accessibility = None;
@@ -895,42 +900,43 @@ impl Cache {
             return Ok(None);
         };
         let style = editor.typing_style();
-        if !self
-            .preview
-            .as_ref()
-            .is_some_and(|preview| preview.composition == *composition && preview.style == style)
-        {
+        if !self.preview.as_ref().is_some_and(|preview| {
+            preview.composition.text == composition.text
+                && preview.composition.replacement == composition.replacement
+                && preview.style == style
+        }) {
             let mut document = editor.document().clone();
             let range = composition.replacement.range();
             let mut preedit_style = style;
             preedit_style.underline = true;
-            document.replace(range.clone(), &composition.text, preedit_style)?;
-            let caret_byte = composition
-                .selection
-                .as_ref()
-                .map_or(composition.text.len(), |range| range.end);
-            let caret =
-                position_after_prefix(&document, range.start, &composition.text[..caret_byte]);
-            let selection = composition.selection.as_ref().map(|selection| {
-                Selection::new(
-                    position_after_prefix(
-                        &document,
-                        range.start,
-                        &composition.text[..selection.start],
-                    ),
-                    caret,
-                )
-            });
+            document.replace(range, &composition.text, preedit_style)?;
+            let (caret, selection) = preedit_selection(&document, composition);
+            // Successive preedits share the untouched source paragraphs. Keep
+            // their layouts; normal content, appearance, and font invalidation
+            // still applies when the new preview is laid out below.
+            let render_cache = self
+                .preview
+                .take()
+                .map_or_else(Cache::default, |preview| preview.render_cache);
             self.preview = Some(Box::new(CompositionPreview {
                 composition: composition.clone(),
                 style,
                 document,
-                render_cache: Cache::default(),
+                render_cache,
                 caret,
                 selection,
             }));
         }
         let preview = self.preview.as_mut().expect("preview initialized above");
+        if preview.composition.selection != composition.selection {
+            // Native IMEs can move the cursor without changing preedit text.
+            // Update its coordinates without rebuilding the preview document.
+            (preview.caret, preview.selection) = preedit_selection(&preview.document, composition);
+            preview
+                .composition
+                .selection
+                .clone_from(&composition.selection);
+        }
         Ok(Some(preview.render_cache.layout_document(
             ui,
             &preview.document,
@@ -939,8 +945,27 @@ impl Cache {
     }
 }
 
+fn preedit_selection(
+    document: &Document,
+    composition: &Composition,
+) -> (Position, Option<Selection>) {
+    let start = composition.replacement.range().start;
+    let caret_byte = composition
+        .selection
+        .as_ref()
+        .map_or(composition.text.len(), |range| range.end);
+    let caret = position_after_prefix(document, start, &composition.text[..caret_byte]);
+    let selection = composition.selection.as_ref().map(|selection| {
+        Selection::new(
+            position_after_prefix(document, start, &composition.text[..selection.start]),
+            caret,
+        )
+    });
+    (caret, selection)
+}
+
 fn position_after_prefix(document: &Document, start: Position, prefix: &str) -> Position {
-    let normalized = prefix.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = crate::document::normalize_newlines(prefix);
     let paragraphs = normalized.bytes().filter(|byte| *byte == b'\n').count();
     let byte = if paragraphs == 0 {
         start.byte + normalized.len()
@@ -1180,53 +1205,57 @@ fn pointer_navigation(
     })
 }
 
-fn byte_from_char(text: &str, index: usize) -> usize {
-    text.char_indices()
-        .nth(index)
-        .map_or(text.len(), |(byte, _)| byte)
+fn preedit_byte_range(text: &str, range: &Range<usize>) -> Result<Range<usize>, Error> {
+    if range.start > range.end {
+        return Err(Error::InvalidCompositionSelection);
+    }
+    let mut boundaries = text
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain([text.len()]);
+    let start = boundaries
+        .nth(range.start)
+        .ok_or(Error::InvalidCompositionSelection)?;
+    let end = if range.start == range.end {
+        start
+    } else {
+        boundaries
+            .nth(range.end - range.start - 1)
+            .ok_or(Error::InvalidCompositionSelection)?
+    };
+    Ok(start..end)
 }
 
-fn snap_grapheme(text: &str, byte: usize) -> usize {
-    let mut previous = 0;
-    for (next, _) in text.grapheme_indices(true) {
-        if next >= byte {
-            return if byte - previous <= next - byte {
-                previous
-            } else {
-                next
-            };
-        }
-        previous = next;
-    }
-    if byte - previous <= text.len() - byte {
-        previous
+fn snap_grapheme(paragraph: &Paragraph, byte: usize) -> usize {
+    let before = paragraph.boundary_at_or_before(byte);
+    let after = paragraph.boundary_at_or_after(byte);
+    if byte - before <= after - byte {
+        before
     } else {
-        text.len()
+        after
     }
 }
 
 fn word_selection(editor: &Editor, position: Position) -> Selection {
-    let Some(text) = editor
-        .document()
-        .paragraph(position.paragraph)
-        .map(Paragraph::text)
-    else {
+    let Some(paragraph) = editor.document().paragraph(position.paragraph) else {
         return Selection::caret(position);
     };
+    let text = paragraph.text();
     // Hit testing snaps the right half of the final grapheme to paragraph end.
     // Double clicking there should still select the trailing word or symbol.
     let byte = if position.byte == text.len() {
-        text.grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(start, _)| start)
+        paragraph.boundary_at_or_before(text.len().saturating_sub(1))
     } else {
         position.byte
     };
     for (start, word) in text.split_word_bound_indices() {
         if start <= byte && byte < start + word.len() {
             return Selection::new(
-                Position::new(position.paragraph, snap_grapheme(text, start)),
-                Position::new(position.paragraph, snap_grapheme(text, start + word.len())),
+                Position::new(position.paragraph, snap_grapheme(paragraph, start)),
+                Position::new(
+                    position.paragraph,
+                    snap_grapheme(paragraph, start + word.len()),
+                ),
             );
         }
     }
@@ -1546,16 +1575,18 @@ fn handle_event(
             text,
             active_range_chars,
         }) => {
-            if let Some(range) = active_range_chars
-                && (range.start > range.end || range.end > text.chars().count())
+            let range = match active_range_chars
+                .as_ref()
+                .map(|range| preedit_byte_range(text, range))
+                .transpose()
             {
-                errors.push(Error::InvalidCompositionSelection);
-                return true;
-            }
+                Ok(range) => range,
+                Err(error) => {
+                    errors.push(error);
+                    return true;
+                }
+            };
             if !text.is_empty() || editor.composition().is_some() {
-                let range = active_range_chars.as_ref().map(|range| {
-                    byte_from_char(text, range.start)..byte_from_char(text, range.end)
-                });
                 record(editor.update_composition(text, range), errors);
             }
             true
@@ -2635,6 +2666,170 @@ mod tests {
         layouts
     }
 
+    fn cached_preview_frame(
+        context: &egui::Context,
+        cache: &mut Cache,
+        editor: &Editor,
+        appearance: &Appearance,
+    ) -> Arc<[ParagraphLayout]> {
+        let mut layouts = Arc::from([]);
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                cache.layout(ui, editor, appearance);
+                layouts = cache
+                    .layout_preview(ui, editor, appearance)
+                    .unwrap()
+                    .expect("active nonempty preedit");
+            })
+            .drop_without_applying_deltas();
+        layouts
+    }
+
+    #[test]
+    fn successive_preedits_reuse_paragraph_storage_and_unchanged_galleys() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text("first\nOLD\nlast");
+        let appearance = appearance();
+        editor
+            .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 3)))
+            .unwrap();
+        editor.update_composition("あ", None).unwrap();
+        let first = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        let paragraphs = &mut cache.preview.as_mut().unwrap().render_cache.paragraphs;
+        paragraphs.reserve(32);
+        let storage = paragraphs.as_ptr();
+        let capacity = paragraphs.capacity();
+
+        editor.update_composition("あい", None).unwrap();
+        let second = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert_eq!(
+            storage,
+            cache
+                .preview
+                .as_ref()
+                .unwrap()
+                .render_cache
+                .paragraphs
+                .as_ptr()
+        );
+        assert_eq!(
+            capacity,
+            cache
+                .preview
+                .as_ref()
+                .unwrap()
+                .render_cache
+                .paragraphs
+                .capacity()
+        );
+        assert!(Arc::ptr_eq(&first[0].galley, &second[0].galley));
+        assert!(!Arc::ptr_eq(&first[1].galley, &second[1].galley));
+        assert!(Arc::ptr_eq(&first[2].galley, &second[2].galley));
+        assert_eq!(second[1].galley.job.text, "あい");
+
+        assert_eq!(
+            editor.update_composition("invalid", Some(9..9)),
+            Err(Error::InvalidCompositionSelection)
+        );
+        let unchanged = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert!(Arc::ptr_eq(&second, &unchanged));
+
+        editor.update_composition("あい\nう", None).unwrap();
+        let multiline = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert_eq!(multiline.len(), 4);
+        assert!(Arc::ptr_eq(&first[0].galley, &multiline[0].galley));
+        assert!(Arc::ptr_eq(&first[2].galley, &multiline[3].galley));
+        assert_eq!(editor.document().plain_text(), "first\nOLD\nlast");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text("first\nOLD\nlast");
+        let appearance = appearance();
+        editor
+            .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 3)))
+            .unwrap();
+        let text = "あ\r\n👩‍💻";
+        editor.update_composition(text, Some(0..3)).unwrap();
+        let first = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        let identity = cache.preview.as_ref().unwrap().document.content_identity();
+        assert_eq!(cache.preview.as_ref().unwrap().caret, Position::new(1, 3));
+
+        // The native caret may stop within an unfinished grapheme. Display it
+        // at the complete cluster boundary in the normalized preview document.
+        editor.update_composition(text, Some(5..9)).unwrap();
+        let moved = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        let preview = cache.preview.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first, &moved));
+        assert!(Arc::ptr_eq(&identity, &preview.document.content_identity()));
+        assert_eq!(preview.caret, Position::new(2, 11));
+        assert_eq!(
+            preview.selection,
+            Some(Selection::new(Position::new(2, 0), Position::new(2, 11)))
+        );
+        assert_eq!(preview.composition.selection, Some(5..9));
+
+        editor.update_composition(text, None).unwrap();
+        let hidden = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        let preview = cache.preview.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first, &hidden));
+        assert!(Arc::ptr_eq(&identity, &preview.document.content_identity()));
+        assert_eq!(preview.caret, Position::new(2, 11));
+        assert_eq!(preview.selection, None);
+
+        editor.update_composition(text, Some(0..0)).unwrap();
+        let restored = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        let preview = cache.preview.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first, &restored));
+        assert_eq!(preview.caret, Position::new(1, 0));
+        assert_eq!(preview.document.plain_text(), "first\nあ\n👩‍💻\nlast");
+        assert_eq!(editor.document().plain_text(), "first\nOLD\nlast");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn reused_preedit_cache_refreshes_for_width_fonts_and_color() {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text(&"words ".repeat(30));
+        let mut appearance = appearance();
+        editor.update_composition("あ", None).unwrap();
+        let wide = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+
+        editor.update_composition("あい", None).unwrap();
+        appearance.width = 100.0;
+        let narrow = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert!(narrow[0].galley.size().y > wide[0].galley.size().y);
+
+        context.set_pixels_per_point(2.0);
+        let scaled = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert!(!Arc::ptr_eq(&narrow[0].galley, &scaled[0].galley));
+        let mut definitions = egui::FontDefinitions::default();
+        definitions.families.insert(
+            FontFamily::Proportional,
+            definitions.families[&FontFamily::Monospace].clone(),
+        );
+        context.set_fonts(definitions);
+        let replaced_fonts = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert!(!Arc::ptr_eq(&scaled[0].galley, &replaced_fonts[0].galley));
+
+        editor.update_composition("あいう", None).unwrap();
+        appearance.color = Color32::RED;
+        let recolored = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert!(
+            recolored[0]
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|section| section.format.color == Color32::RED)
+        );
+    }
+
     #[test]
     fn idle_layouts_and_unchanged_paragraph_galleys_are_reused() {
         let context = egui::Context::default();
@@ -3376,12 +3571,13 @@ mod tests {
     fn ime_preedit_is_transient_then_commits_once() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("hello");
+        let preedit = "に\r\n👩‍💻e\u{301}";
         frame(
             &context,
             &mut editor,
             vec![Event::Ime(ImeEvent::Preedit {
-                text: "に".into(),
-                active_range_chars: Some(1..1),
+                text: preedit.into(),
+                active_range_chars: Some(3..7),
             })],
             true,
         );
@@ -3390,8 +3586,9 @@ mod tests {
             editor
                 .composition()
                 .map(|composition| composition.text.as_str()),
-            Some("に")
+            Some(preedit)
         );
+        assert_eq!(editor.composition().unwrap().selection, Some(5..17));
         frame(
             &context,
             &mut editor,
@@ -3402,6 +3599,78 @@ mod tests {
         assert!(editor.composition().is_none());
         assert!(editor.undo());
         assert_eq!(editor.document().plain_text(), "hello");
+    }
+
+    #[test]
+    fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges() {
+        for text in ["", "plain", "に\r\n👩‍💻e\u{301}"] {
+            let boundaries: Vec<_> = text
+                .char_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for start in 0..boundaries.len() {
+                for end in start..boundaries.len() {
+                    assert_eq!(
+                        preedit_byte_range(text, &(start..end)),
+                        Ok(boundaries[start]..boundaries[end]),
+                        "text={text:?}, scalars={start}..{end}"
+                    );
+                }
+            }
+            for range in [
+                Range { start: 1, end: 0 },
+                0..boundaries.len(),
+                boundaries.len()..boundaries.len(),
+                usize::MAX..usize::MAX,
+            ] {
+                assert_eq!(
+                    preedit_byte_range(text, &range),
+                    Err(Error::InvalidCompositionSelection)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_native_preedit_ranges_preserve_the_active_composition() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("hello");
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::Ime(ImeEvent::Preedit {
+                text: "に".into(),
+                active_range_chars: Some(1..1),
+            })],
+            true,
+        );
+        let composition = editor.composition().cloned();
+        for range in [Range { start: 3, end: 1 }, 0..99, usize::MAX..usize::MAX] {
+            let mut errors = Vec::new();
+            context
+                .run_ui(
+                    egui::RawInput {
+                        events: vec![Event::Ime(ImeEvent::Preedit {
+                            text: "changed\r\n👩‍💻".into(),
+                            active_range_chars: Some(range),
+                        })],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let id = ui.make_persistent_id("editor");
+                            ui.memory_mut(|memory| memory.request_focus(id));
+                            errors = RichTextEditor::new(&mut editor).id(id).show(ui).errors;
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
+            assert_eq!(errors, vec![Error::InvalidCompositionSelection]);
+            assert_eq!(editor.composition(), composition.as_ref());
+            assert_eq!(editor.document().plain_text(), "hello");
+            assert!(!editor.can_undo());
+        }
     }
 
     #[test]
@@ -3510,15 +3779,26 @@ mod tests {
 
     #[test]
     fn character_hit_positions_snap_to_whole_graphemes() {
-        let text = "a👨‍👩‍👧‍👦e\u{301}";
-        for char_index in 0..=text.chars().count() {
-            let byte = snap_grapheme(text, byte_from_char(text, char_index));
-            assert!(
-                byte == text.len()
-                    || text
-                        .grapheme_indices(true)
-                        .any(|(boundary, _)| boundary == byte)
-            );
+        for text in ["", "plain", "a👨‍👩‍👧‍👦e\u{301} 🇺🇸", "\u{600}a b"] {
+            let editor = Editor::from_text(text);
+            let paragraph = editor.document().paragraph(0).unwrap();
+            let boundaries: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for byte in 0..=text.len() {
+                let expected = boundaries
+                    .iter()
+                    .copied()
+                    .min_by_key(|boundary| (boundary.abs_diff(byte), *boundary))
+                    .unwrap();
+                assert_eq!(
+                    snap_grapheme(paragraph, byte),
+                    expected,
+                    "text={text:?}, byte={byte}"
+                );
+            }
         }
     }
 
@@ -3836,6 +4116,7 @@ mod tests {
         for (text, expected) in [
             ("hello café", "café"),
             ("hello 👩🏽‍💻", "👩🏽‍💻"),
+            ("hello 🇺🇸🇨🇦", "🇨🇦"),
             ("e\u{301}", "e\u{301}"),
             ("hello ", " "),
         ] {
@@ -3855,6 +4136,14 @@ mod tests {
                 .validate_position(selection.focus)
                 .unwrap();
         }
+        let cluster = format!("x{}", "\u{301}".repeat(1_024));
+        let text = format!("hello {cluster}");
+        let editor = Editor::from_text(&text);
+        let selection = word_selection(&editor, editor.document().end());
+        assert_eq!(
+            &text[selection.range().start.byte..selection.range().end.byte],
+            cluster
+        );
         let editor = Editor::from_text("");
         assert!(word_selection(&editor, editor.document().end()).is_caret());
     }

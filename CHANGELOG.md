@@ -61,7 +61,39 @@ First stable release of the native Rust rich-text editing library.
   selection and read-only/IME behavior.
 - Whole-word searches build Unicode word indexes and lowercase coordinate maps
   only after finding a literal candidate, reducing work for missing and sparse
-  queries without changing match boundaries or navigation order.
+  queries without changing match boundaries or navigation order. Word indexes
+  extend only through the prefix needed to validate candidates.
+- Case-sensitive find-next/previous without whole-word matching can scan
+  directly from the selection in either direction when the query's first
+  Unicode scalar occurs only once, retaining original grapheme boundaries
+  and the forward nonoverlapping match set.
+- Sparse replace-all operations retain complete untouched paragraphs without
+  copying their text and spans into temporary buffers. Joined paragraphs still
+  normalize grapheme boundaries and formatting. Batched replacement reuses
+  validated search ranges and prepares replacement chunks once per operation.
+- Successive egui IME preedits retain unchanged paragraph layouts, while width,
+  font, DPI, and appearance changes still invalidate the preview cache. Preedit
+  coordinate calculation reuses the shared newline-normalization helper, and
+  cursor-only updates retain the preview document. Native scalar ranges convert
+  to byte offsets in one scan without counting the full preedit first, and word
+  selection reuses paragraph boundary queries.
+- Egui accessibility snapshots share unchanged paragraphs' text runs and
+  geometry after local edits, retain static run node properties, and register
+  run widgets without allocating a separate UI per run. Publication applies the
+  current coordinate transforms. Direct AccessKit updates affecting at most one
+  paragraph without changing paragraph count retain paragraph storage and
+  update only changed run index entries. Structural updates preserve distinct
+  occurrence IDs, and failed updates leave the previous tree intact.
+- Paragraph rebuilds reuse owned span vectors for ASCII and uniform Unicode
+  text. Fragment text imports and document snapshot imports move their paragraph
+  vectors instead of copying temporary references. Snapshot decoding validates
+  borrowed text before retaining it, checks CR/LF bytes without decoding every
+  scalar, and merges validated spans in place.
+- Position validation, style lookup, and grapheme snapping inspect bounded local
+  Unicode context when no full index exists. Incomplete context falls back to
+  the shared full index, preserving long regional-indicator, emoji, and Indic
+  sequences. Release checks now run search/replacement oracles with debug
+  assertions disabled.
 - Inline clear-formatting preserves paragraph kinds and selection direction,
   supports caret typing-style reset, and restores rich state through undo/redo.
 - `SelectionStyle` reports uniform and mixed inline attributes independently for

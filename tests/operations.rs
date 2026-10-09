@@ -245,6 +245,93 @@ fn structural_replace_all_shares_untouched_paragraphs_after_index_shifts() {
 }
 
 #[test]
+fn replace_all_joins_shared_paragraphs_and_normalizes_the_final_caret_and_styles() {
+    for (suffix, replacement) in [("\u{301}b", ""), ("b", "\u{301}")] {
+        let mut editor = Editor::from_text(&format!("a\n{suffix}"));
+        style(
+            &mut editor,
+            0,
+            0,
+            1,
+            StylePatch {
+                italic: Some(true),
+                ..Default::default()
+            },
+        );
+        style(
+            &mut editor,
+            1,
+            0,
+            suffix.len(),
+            StylePatch {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        kind(&mut editor, 0, ParagraphKind::Heading { level: 2 });
+        kind(&mut editor, 1, ParagraphKind::Bullet { indent: 3 });
+        let selection = Selection::new(editor.document().end(), Position::default());
+        editor.set_selection(selection).unwrap();
+        let before = Fragment::from_document(editor.document());
+        let paragraphs = editor.document().paragraphs().to_vec();
+        editor.clear_history();
+
+        assert_eq!(
+            editor
+                .replace_all("\n", replacement, SearchOptions::default())
+                .unwrap(),
+            1
+        );
+        assert_eq!(editor.document().plain_text(), "a\u{301}b");
+        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 3)));
+        let paragraph = editor.document().paragraph(0).unwrap();
+        assert_eq!(paragraph.kind(), ParagraphKind::Heading { level: 2 });
+        assert_eq!(paragraph.spans().len(), 2);
+        assert_eq!(paragraph.spans()[0].range, 0..3);
+        assert!(paragraph.spans()[0].style.italic);
+        assert!(!paragraph.spans()[0].style.bold);
+        assert_eq!(paragraph.spans()[1].range, 3..4);
+        assert!(paragraph.spans()[1].style.bold);
+        assert!(!paragraph.spans()[1].style.italic);
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(Fragment::from_document(editor.document()), before);
+        assert_eq!(editor.selection(), selection);
+        for (source, restored) in paragraphs.iter().zip(editor.document().paragraphs()) {
+            assert!(Arc::ptr_eq(source, restored));
+        }
+        assert!(editor.redo());
+        assert_eq!(editor.document().plain_text(), "a\u{301}b");
+        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 3)));
+    }
+}
+
+#[test]
+fn sparse_identical_replacements_preserve_empty_paragraph_metadata_and_allocations() {
+    let mut editor = Editor::from_text("match\n\nkeep\n\nmatch");
+    kind(&mut editor, 1, ParagraphKind::Heading { level: 3 });
+    kind(&mut editor, 3, ParagraphKind::Bullet { indent: 2 });
+    let before = Fragment::from_document(editor.document());
+    let paragraphs = editor.document().paragraphs().to_vec();
+    let revision = editor.document().revision();
+    editor.clear_history();
+
+    assert_eq!(
+        editor
+            .replace_all("match", "match", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(Fragment::from_document(editor.document()), before);
+    assert_eq!(editor.document().revision(), revision);
+    assert_eq!(editor.undo_len(), 0);
+    assert_eq!(editor.selection(), Selection::caret(Position::new(4, 5)));
+    for (source, unchanged) in paragraphs.iter().zip(editor.document().paragraphs()) {
+        assert!(Arc::ptr_eq(source, unchanged));
+    }
+}
+
+#[test]
 fn structural_replace_all_continues_ordered_numbering_and_undo_restores_metadata() {
     let mut editor = Editor::from_text("one\nkeep\none\ntail");
     editor.select_all();
@@ -382,7 +469,17 @@ fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restor
         "ab",
         "\r\n",
     ];
-    let replacements = ["", "X", "x\ny", "\u{301}", "👨‍💻", "e\u{301}", "\r\nZ"];
+    let replacements = [
+        "",
+        "X",
+        "x\ny",
+        "\u{301}",
+        "👨‍💻",
+        "e\u{301}",
+        "\r\nZ",
+        "\n\nX\n",
+        "\r\r\n",
+    ];
     let mut seed = 0x173a_491e_028b_d65cu64;
     for case in 0..96 {
         let mut text = String::new();

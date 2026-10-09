@@ -62,7 +62,7 @@ impl Document {
     }
 
     /// Local queries start near the selection instead of walking every earlier
-    /// paragraph. Each paragraph still uses forward nonoverlapping matches.
+    /// paragraph. Each paragraph preserves the forward nonoverlapping match set.
     pub(crate) fn find_relative(
         &self,
         query: &str,
@@ -103,6 +103,16 @@ impl Document {
             return found.or(wrapped);
         }
 
+        // If the first scalar occurs only once, literal candidates cannot
+        // overlap. Starting at the selection or scanning backward therefore
+        // preserves the forward scanner's accepted match set.
+        let direct_literal = options.case_sensitive
+            && !options.whole_word
+            && needle
+                .chars()
+                .next()
+                .is_some_and(|first| !needle[first.len_utf8()..].contains(first));
+
         let boundary = if backward {
             selection.start
         } else {
@@ -116,15 +126,21 @@ impl Document {
                     options,
                     (index == boundary.paragraph).then_some(boundary),
                     true,
+                    direct_literal,
                 ) {
                     return Some(found);
                 }
             }
             if wrap {
                 for index in (boundary.paragraph..self.paragraphs().len()).rev() {
-                    if let Some(found) =
-                        self.find_paragraph_match(index, &needle, options, None, true)
-                    {
+                    if let Some(found) = self.find_paragraph_match(
+                        index,
+                        &needle,
+                        options,
+                        None,
+                        true,
+                        direct_literal,
+                    ) {
                         return Some(found);
                     }
                 }
@@ -137,15 +153,21 @@ impl Document {
                     options,
                     (index == boundary.paragraph).then_some(boundary),
                     false,
+                    direct_literal,
                 ) {
                     return Some(found);
                 }
             }
             if wrap {
                 for index in 0..=boundary.paragraph {
-                    if let Some(found) =
-                        self.find_paragraph_match(index, &needle, options, None, false)
-                    {
+                    if let Some(found) = self.find_paragraph_match(
+                        index,
+                        &needle,
+                        options,
+                        None,
+                        false,
+                        direct_literal,
+                    ) {
                         return Some(found);
                     }
                 }
@@ -161,6 +183,7 @@ impl Document {
         options: SearchOptions,
         boundary: Option<Position>,
         backward: bool,
+        direct_literal: bool,
     ) -> Option<Range<Position>> {
         if boundary.is_some_and(|position| {
             if backward {
@@ -170,6 +193,29 @@ impl Document {
             }
         }) {
             return None;
+        }
+        if direct_literal {
+            let text = self.paragraphs()[index].text();
+            let edge = boundary.map_or(if backward { text.len() } else { 0 }, |position| {
+                position.byte
+            });
+            let valid_match = |start| {
+                let range = Position::new(index, start)..Position::new(index, start + needle.len());
+                // Slicing narrows eligible candidates, but grapheme boundaries
+                // still belong to the complete original paragraph.
+                (self.validate_position(range.start).is_ok()
+                    && self.validate_position(range.end).is_ok())
+                .then_some(range)
+            };
+            return if backward {
+                text[..edge]
+                    .rmatch_indices(needle)
+                    .find_map(|(start, _)| valid_match(start))
+            } else {
+                text[edge..]
+                    .match_indices(needle)
+                    .find_map(|(start, _)| valid_match(edge + start))
+            };
         }
         let mut found = None;
         let _ = self.visit_paragraph_matches(index, needle, options, |range| {
@@ -332,15 +378,25 @@ fn visit_text_matches(
             .zip(original_byte(bytes.end))
             .and_then(|(start, end)| {
                 if options.whole_word {
-                    let word_boundaries = word_boundaries.get_or_insert_with(|| {
-                        source
-                            .split_word_bound_indices()
-                            .map(|(byte, _)| byte)
-                            .chain([source.len()])
-                            .collect::<Vec<_>>()
+                    let (boundaries, remaining) = word_boundaries.get_or_insert_with(|| {
+                        (
+                            Vec::new(),
+                            source
+                                .split_word_bound_indices()
+                                .map(|(byte, _)| byte)
+                                .chain([source.len()]),
+                        )
                     });
-                    if word_boundaries.binary_search(&start).is_err()
-                        || word_boundaries.binary_search(&end).is_err()
+                    // Cache only the prefix needed by candidates so a nearby
+                    // match does not index an unrelated paragraph suffix.
+                    while boundaries.last().is_none_or(|byte| *byte < end) {
+                        let Some(byte) = remaining.next() else {
+                            break;
+                        };
+                        boundaries.push(byte);
+                    }
+                    if boundaries.binary_search(&start).is_err()
+                        || boundaries.binary_search(&end).is_err()
                     {
                         return None;
                     }
