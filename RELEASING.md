@@ -47,7 +47,7 @@ Renderer jobs now request `--rich-clipboard` in every mode and require
 exact native clipboard roundtrip/undo/redo completion marker and validate
 source revision, platform, mode, graceful completion, clipboard request/result
 flags, error counts, and snapshot integrity before archiving content-free JSON
-reports alongside smoke logs. Six validator regressions pass locally. These
+reports alongside smoke logs. Nine validator regressions pass locally. These
 observations never certify manual signoff; interactive platform checks below
 remain required on Linux, macOS, and Windows.
 
@@ -62,13 +62,15 @@ typing/deletion/paste suppression, and non-destructive cut passed. The isolated
 Linux IME, Orca, and Qt interaction evidence below supplements these observations.
 Physical dead keys/AltGr and complete macOS and Windows IME, screen-reader, and
 external-application interaction checks still require signoff.
-Linux virtual-keyboard `dead_acute` followed by `e`, and Compose apostrophe
-followed by `e`, produced a visually observed `é` with undo. These exploratory
-results leave physical-keyboard signoff pending. An isolated AltGr virtual-keyboard
-attempt recorded a text event and a document change before compositor focus moved
-away from the native host. The report recorded native window focus loss with
-widget keyboard focus retained and no editing/accessibility errors. Visual,
-undo, and physical-keyboard AltGr signoff remain pending.
+Linux keyboard checks on clean `f05a5187dc6ffe4a3d5396658c8fc3c10875f331`
+used a persistent German XKB keymap in a private Sway session. Native virtual
+AltGr+Q and AltGr+E produced visible `@€`, independently copied as exact UTF-8
+bytes `40e282ac`. Dead acute followed by `e`, and Compose apostrophe followed
+by `e`, each produced visible `é`, copied as `c3a9`. Undo restored the complete
+styled fixture and selection: two entries for AltGr, one for each composed
+character. All three sessions retained native focus, reported zero errors, and
+left no isolated processes running. These checks supersede the earlier
+inconclusive virtual AltGr attempt. Physical-keyboard signoff remains pending.
 
 Additional Linux interaction checks on 2026-10-09 used builds explicitly labelled
 `3e39b17-native-integration-dirty`, `3e39b17-native-integration-v2-dirty`, and
@@ -216,8 +218,8 @@ signoff remain pending.
 | Native read-only selection/copy | Passed; exact clipboard content verified |
 | Native read-only editing suppression | Passed; typing, Backspace/Delete, Enter, paste, and undo preserve the document; cut copies without deleting |
 | Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input; physical-keyboard and macOS/Windows signoff pending |
-| Dead keys and Compose | Virtual `dead_acute`/Compose sequences produced visually observed `é` with undo; physical-keyboard/platform signoff pending |
-| AltGr | Virtual-keyboard attempt recorded text/document changes before compositor focus loss; visual, undo, and physical-keyboard/platform signoff pending |
+| Dead keys and Compose | German XKB virtual sequences on clean `f05a518` produced visible `é`, exact copied bytes, and complete undo restoration; physical-keyboard/platform signoff pending |
+| AltGr | German XKB virtual AltGr on clean `f05a518` produced visible `@€`, exact copied bytes, and complete undo restoration without focus loss; physical-keyboard/platform signoff pending |
 | Screen-reader selection and replacement | Linux Orca narration, accessible selection/caret, and native typing/undo/redo passed; direct AT-SPI EditableText unavailable; macOS/Windows signoff pending |
 | Rich clipboard MIME transport | Automated native widget fixtures passed on Linux X11/Wayland, macOS, and Windows; Linux Qt interoperability passed; remaining external applications/platforms pending |
 | macOS and Windows native host checks | Manual validation pending |

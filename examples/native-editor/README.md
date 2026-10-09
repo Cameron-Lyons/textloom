@@ -146,6 +146,9 @@ cargo test --locked --manifest-path examples/native-editor/Cargo.toml --target-d
 ```
 
 Before publishing, exercise the native checks in the root `RELEASING.md` on each
-supported host/platform and record the results. Do not route raw winit editing
+supported host/platform and record the results. The
+[native signoff protocol](NATIVE_QA.md) provides exact steps and a result record
+for physical keyboards, IMEs, readers, and external clipboard applications.
+Do not route raw winit editing
 events to Textloom alongside this egui host: eframe already supplies those events
 through egui.

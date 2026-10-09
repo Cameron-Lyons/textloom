@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate native rendering and clipboard observations without certifying manual QA."""
+"""Validate native renderer/interaction observations without certifying manual QA."""
 
 import argparse
 import json
@@ -89,8 +89,8 @@ def check_schema(value, schema, path="report"):
         raise ValueError(f"{path}: expected a finite nonnegative number")
 
 
-def validate(report, revision, os_name, mode):
-    """Reject stale, malformed, failed, or content-bearing renderer evidence."""
+def validate(report, revision, os_name, mode, interaction=False):
+    """Check report integrity; interaction callers also assert observed behavior."""
     check_schema(report, SCHEMA)
 
     def require(condition, message):
@@ -110,18 +110,28 @@ def validate(report, revision, os_name, mode):
     require(host["source_revision"] == revision, "source revision does not match this run")
     require(host["os"] == os_name, "host OS does not match this run")
     session = report["session"]
+    require(session["graceful_exit"], "missing graceful completion")
     require(
-        session["graceful_exit"] and session["smoke_test_requested"],
-        "missing graceful smoke completion",
+        session["smoke_test_requested"] == (not interaction),
+        "unexpected smoke-test request for this validation mode",
     )
-    require(session["rendered_frames"] >= 20, "fewer than 20 native frames")
+    require(
+        session["rendered_frames"] >= (1 if interaction else 20),
+        "insufficient native frames",
+    )
     require(session["rich_clipboard_requested"], "native rich clipboard was not requested")
+    if interaction:
+        require(
+            not session["clipboard_self_test_requested"] or mode == "editable",
+            "clipboard self-test requested in a guarded interaction mode",
+        )
+    else:
+        require(
+            session["clipboard_self_test_requested"] == (mode == "editable"),
+            "unexpected clipboard self-test request for this mode",
+        )
     require(
-        session["clipboard_self_test_requested"] == (mode == "editable"),
-        "unexpected clipboard self-test request for this mode",
-    )
-    require(
-        session["clipboard_self_test_passed"] == (mode == "editable"),
+        session["clipboard_self_test_passed"] == session["clipboard_self_test_requested"],
         "missing or unexpected clipboard self-test completion",
     )
     require(all(count == 0 for count in report["errors"].values()), "native host reported errors")
@@ -170,6 +180,10 @@ def main():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--os", required=True, choices=("linux", "macos", "windows"))
     parser.add_argument("--mode", required=True, choices=("editable", "read-only", "disabled"))
+    parser.add_argument(
+        "--interaction", action="store_true",
+        help="Check non-smoke report integrity; the interaction driver asserts behavior",
+    )
     arguments = parser.parse_args()
     try:
         report = json.loads(
@@ -177,11 +191,12 @@ def main():
             object_pairs_hook=unique_object,
             parse_constant=reject_constant,
         )
-        validate(report, arguments.revision, arguments.os, arguments.mode)
+        validate(report, arguments.revision, arguments.os, arguments.mode, arguments.interaction)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"Native report validation failed: {error}", file=sys.stderr)
         return 1
-    print(f"Validated {arguments.os} {arguments.mode} rendering observations; manual QA remains separate")
+    kind = "interaction" if arguments.interaction else "rendering"
+    print(f"Validated {arguments.os} {arguments.mode} {kind} observations; manual QA remains separate")
     return 0
 
 

@@ -39,6 +39,40 @@ class NativeReportTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 validate(specimen(mode), "candidate", "linux", mode)
 
+    def test_interaction_reports_do_not_certify_smoke_completion(self):
+        for mode in ("editable", "read-only", "disabled"):
+            with self.subTest(mode=mode):
+                report = specimen(mode)
+                report["session"].update(
+                    smoke_test_requested=False, rendered_frames=5,
+                    clipboard_self_test_requested=False, clipboard_self_test_passed=False,
+                )
+                validate(report, "candidate", "linux", mode, interaction=True)
+                with self.assertRaises(ValueError):
+                    validate(report, "candidate", "linux", mode)
+                report["session"]["rendered_frames"] = 0
+                with self.assertRaises(ValueError):
+                    validate(report, "candidate", "linux", mode, interaction=True)
+
+    def test_interaction_fixture_completion_must_match_a_valid_request(self):
+        for mode in ("editable", "read-only", "disabled"):
+            for requested, passed in ((False, True), (True, False), (True, True)):
+                if mode == "editable" and requested and passed:
+                    continue
+                with self.subTest(mode=mode, requested=requested, passed=passed):
+                    report = specimen(mode)
+                    report["session"].update(
+                        smoke_test_requested=False,
+                        clipboard_self_test_requested=requested,
+                        clipboard_self_test_passed=passed,
+                    )
+                    with self.assertRaises(ValueError):
+                        validate(report, "candidate", "linux", mode, interaction=True)
+
+    def test_smoke_evidence_is_rejected_as_an_interaction_session(self):
+        with self.assertRaises(ValueError):
+            validate(specimen(), "candidate", "linux", "editable", interaction=True)
+
     def test_stale_incomplete_or_failed_evidence(self):
         for section, key, value in (
             ("host", "source_revision", "old-commit"),
