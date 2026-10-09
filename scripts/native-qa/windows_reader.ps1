@@ -261,7 +261,13 @@ function Get-ReaderEvents {
         throw "NVDA observation callback failed."
     }
     if (-not (Test-Path -LiteralPath $EventsPath)) { return @() }
-    $lines = [IO.File]::ReadAllLines($EventsPath)
+    # NVDA appends while the driver polls. Open with compatible sharing flags;
+    # ReadAllLines uses FileShare.Read and can conflict with an active writer.
+    $stream = [IO.FileStream]::new($EventsPath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false))
+    try { $lines = $reader.ReadToEnd() -split "`r?`n" }
+    finally { $reader.Dispose() }
     $events = [Collections.Generic.List[object]]::new()
     for ($index = 0; $index -lt $lines.Length; $index++) {
         if (-not $lines[$index]) { continue }
