@@ -3,9 +3,9 @@
 ## 1.0 validation status
 
 Local Linux validation on 2026-10-09 passed all eight test/doctest feature
-combinations with Rust 1.99.0 stable and Rust 1.95.0. The all-feature suite passes 201 unit and
+combinations with Rust 1.99.0 stable and Rust 1.95.0. The all-feature suite passes 212 unit and
 integration tests and four doctests, including the compile-fail accessibility
-API check: 205 passing tests in total. One egui host widget snippet is
+API check: 216 passing tests in total. One egui host widget snippet is
 intentionally ignored. All library targets and the standalone native host also
 compile with Rust 1.95.0.
 
@@ -15,12 +15,21 @@ tests, headless examples, package inventory verification, and tests and all-targ
 compilation from the extracted crate. Native host formatting, strict Clippy,
 and compilation against both the source and extracted library also passed.
 
+The complete [CI run for commit `15bdda0`](https://github.com/Cameron-Lyons/textloom/actions/runs/37908584789)
+passed on 2026-10-09: Linux release checks, all Rust 1.95 feature combinations,
+and macOS/Windows all-target compilation, native host compilation, tests, and
+doctests. Further working-tree fixes require the same checks on their final
+clean commit; the baseline result does not verify subsequent changes.
+
 The 1.0.0 working tree is an unreleased candidate. Linux Wayland rendering has
 passed at 200% display scale with optional Noto CJK and Liberation Bold fonts.
 Native ASCII typing and plain-text copy passed with exact clipboard content
-verified. Unicode paste, native formatting/undo/redo, read-only behavior, IME
-candidate placement, screen-reader behavior, and macOS and Windows native host
-checks still require manual signoff.
+verified. Native Unicode paste/copy, keyboard undo/redo, grouped adjacent caret
+typing, and formatting shortcuts passed. Bold/italic/underline toolbar states
+and rendered styles were checked before and after undo. Read-only selection/copy,
+typing/deletion/paste suppression, and non-destructive cut passed. IME candidate
+placement, screen-reader behavior, dead keys/AltGr, rich clipboard transport,
+and macOS and Windows native interaction checks still require signoff.
 
 Before publication, record the final commit, native host and version, operating
 system and display backend, IMEs and screen readers used, and the outcome of each
@@ -59,9 +68,11 @@ remain pending.
 | --- | --- |
 | Native window rendering at 200% scale with Noto CJK and Liberation Bold | Passed |
 | Native ASCII typing and plain-text copy | Passed; exact clipboard content verified |
-| Unicode clipboard paste | Validation pending |
-| Native formatting shortcuts and undo/redo | Validation pending |
-| Native read-only input and copy | Validation pending |
+| Unicode clipboard paste/copy | Passed; exact UTF-8 content with Japanese, combining marks, emoji sequences, flag, and paragraph break verified |
+| Native keyboard/paste undo and redo | Passed; document restored exactly, adjacent caret typing undoes in one step |
+| Native formatting shortcuts | Passed; bold/italic/underline and their undo verified in toolbar and rendered text |
+| Native read-only selection/copy | Passed; exact clipboard content verified |
+| Native read-only editing suppression | Passed; typing, Backspace/Delete, Enter, paste, and undo preserve the document; cut copies without deleting |
 | Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Manual validation pending |
 | Dead keys and AltGr | Manual validation pending |
 | Screen-reader selection and replacement | Manual validation pending |

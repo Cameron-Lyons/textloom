@@ -186,6 +186,7 @@ impl<'a> RichTextEditor<'a> {
             height.max(font.size * self.min_rows as f32) + PADDING * 2.0,
         ));
         let mut response = ui.interact(rect, id, Sense::click_and_drag());
+        cache.observe_focus(self.editor, ui.is_enabled() && response.has_focus());
         let origin = rect.min + Vec2::splat(PADDING);
 
         if ui.is_enabled() {
@@ -234,6 +235,7 @@ impl<'a> RichTextEditor<'a> {
                     pointer_navigation(self.editor, &layouts, position, prefer_next_row);
             }
 
+            cache.observe_focus(self.editor, response.has_focus());
             if response.has_focus() {
                 cache.validate_navigation(self.editor.selection());
                 ui.memory_mut(|memory| {
@@ -319,6 +321,7 @@ impl<'a> RichTextEditor<'a> {
             }
         }
 
+        cache.observe_focus(self.editor, ui.is_enabled() && response.has_focus());
         if interrupted {
             ui.memory_mut(|memory| memory.interrupt_ime());
         }
@@ -584,6 +587,7 @@ struct Cache {
     navigation: Option<VerticalNavigation>,
     caret_rect: Option<Rect>,
     scroll_to_caret: bool,
+    focused: bool,
 }
 
 #[derive(Clone)]
@@ -612,6 +616,13 @@ struct ParagraphLayout {
 }
 
 impl Cache {
+    fn observe_focus(&mut self, editor: &mut Editor, focused: bool) {
+        if self.focused && !focused {
+            editor.break_history_group();
+        }
+        self.focused = focused;
+    }
+
     fn validate_navigation(&mut self, selection: Selection) {
         if self
             .navigation
@@ -1558,7 +1569,7 @@ fn handle_key(
             Key::B => {
                 record(
                     editor.apply_style(StylePatch {
-                        bold: Some(!editor.typing_style().bold),
+                        bold: Some(editor.selection_style().bold != Some(true)),
                         ..Default::default()
                     }),
                     errors,
@@ -1568,7 +1579,7 @@ fn handle_key(
             Key::I => {
                 record(
                     editor.apply_style(StylePatch {
-                        italic: Some(!editor.typing_style().italic),
+                        italic: Some(editor.selection_style().italic != Some(true)),
                         ..Default::default()
                     }),
                     errors,
@@ -1578,7 +1589,7 @@ fn handle_key(
             Key::U => {
                 record(
                     editor.apply_style(StylePatch {
-                        underline: Some(!editor.typing_style().underline),
+                        underline: Some(editor.selection_style().underline != Some(true)),
                         ..Default::default()
                     }),
                     errors,
@@ -1681,7 +1692,9 @@ fn handle_key(
         }
         Key::Backspace => {
             record(
-                if by_word {
+                if command && modifiers.mac_cmd {
+                    super::delete_to_paragraph_start(editor)
+                } else if by_word {
                     editor.delete_word_backward()
                 } else {
                     editor.delete_backward()
@@ -1869,6 +1882,59 @@ mod tests {
             pressed: true,
             repeat: false,
             modifiers,
+        }
+    }
+
+    #[test]
+    fn widget_window_and_escape_blur_separate_typing_undo_groups() {
+        for blur in 0..3 {
+            let context = egui::Context::default();
+            let mut editor = Editor::default();
+            frame(
+                &context,
+                &mut editor,
+                vec![Event::Text("a".into()), Event::Text("b".into())],
+                true,
+            );
+            assert_eq!(editor.undo_len(), 1);
+            let id = context.memory(|memory| memory.focused()).unwrap();
+            if blur == 0 {
+                context.memory_mut(|memory| memory.surrender_focus(id));
+            }
+            let mut events = vec![Event::Text("ignored".into())];
+            if blur == 2 {
+                events.insert(0, key(Key::Escape, Modifiers::NONE));
+            }
+            context
+                .run_ui(
+                    egui::RawInput {
+                        focused: blur != 1,
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let output = RichTextEditor::new(&mut editor).id(id).show(ui);
+                            assert!(!output.response.has_focus());
+                            assert!(output.errors.is_empty());
+                            assert!(output.accessibility_errors.is_empty());
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
+            assert_eq!(editor.document().plain_text(), "ab");
+            frame(
+                &context,
+                &mut editor,
+                vec![Event::Text("c".into()), Event::Text("d".into())],
+                true,
+            );
+            assert_eq!(editor.document().plain_text(), "abcd");
+            assert_eq!(editor.undo_len(), 2);
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "ab");
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "");
         }
     }
 
@@ -2399,6 +2465,94 @@ mod tests {
     }
 
     #[test]
+    fn command_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
+        let text = "prefix\ncafé 👩🏽‍💻 tail";
+        let end = Position::new(1, "café 👩🏽‍💻".len());
+        let caret = Selection::caret(end);
+        for selection in [
+            caret,
+            Selection::new(Position::new(0, 1), end),
+            Selection::new(end, Position::new(0, 1)),
+        ] {
+            let context = egui::Context::default();
+            let mut editor = Editor::from_text(text);
+            editor.set_selection(selection).unwrap();
+            let command = Modifiers::MAC_CMD | Modifiers::COMMAND;
+            frame(
+                &context,
+                &mut editor,
+                vec![key(Key::Backspace, command)],
+                true,
+            );
+            assert_eq!(
+                editor.document().plain_text(),
+                if selection == caret {
+                    "prefix\n tail"
+                } else {
+                    "p tail"
+                }
+            );
+            assert_eq!(editor.undo_len(), 1);
+            if selection == caret {
+                let revision = editor.document().revision();
+                frame(
+                    &context,
+                    &mut editor,
+                    vec![key(Key::Backspace, command)],
+                    true,
+                );
+                assert_eq!(editor.document().revision(), revision);
+                assert_eq!(editor.undo_len(), 1);
+            }
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), text);
+            assert_eq!(editor.selection(), selection);
+        }
+    }
+
+    #[test]
+    fn command_backspace_respects_read_only_ime_and_modifier_guards() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("one two");
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let command = Modifiers::MAC_CMD | Modifiers::COMMAND;
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::Backspace, command)],
+            true,
+            true,
+        );
+        editor.update_composition("候", None).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Backspace, command)],
+            true,
+        );
+        assert!(editor.composition().is_some());
+        editor.cancel_composition();
+        assert_eq!(editor.document().plain_text(), "one two");
+        assert!(!editor.can_undo());
+
+        for modifiers in [
+            Modifiers::CTRL | Modifiers::ALT | Modifiers::COMMAND,
+            Modifiers::CTRL | Modifiers::MAC_CMD | Modifiers::COMMAND,
+        ] {
+            frame(
+                &context,
+                &mut editor,
+                vec![key(Key::Backspace, modifiers)],
+                true,
+            );
+            assert_eq!(editor.document().plain_text(), "one ");
+            assert!(editor.undo());
+        }
+    }
+
+    #[test]
     fn modifier_delete_shortcuts_remove_whole_words_and_restore_selection_on_undo() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("café 東京 next");
@@ -2623,6 +2777,72 @@ mod tests {
         assert!(editor.composition().is_none());
         assert!(editor.undo());
         assert_eq!(editor.document().plain_text(), "hello");
+    }
+
+    #[test]
+    fn emphasis_shortcuts_normalize_mixed_selections_in_both_directions() {
+        for (shortcut, patch) in [
+            (
+                Key::B,
+                StylePatch {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                Key::I,
+                StylePatch {
+                    italic: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                Key::U,
+                StylePatch {
+                    underline: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            for reverse in [false, true] {
+                let context = egui::Context::default();
+                let mut editor = Editor::from_text("aé");
+                editor
+                    .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
+                    .unwrap();
+                editor.apply_style(patch).unwrap();
+                let selection = if reverse {
+                    Selection::new(editor.document().end(), Position::default())
+                } else {
+                    Selection::new(Position::default(), editor.document().end())
+                };
+                editor.set_selection(selection).unwrap();
+                editor.clear_history();
+                let original = editor.document().to_bytes();
+
+                for enabled in [true, false] {
+                    frame(
+                        &context,
+                        &mut editor,
+                        vec![key(shortcut, Modifiers::CTRL | Modifiers::COMMAND)],
+                        true,
+                    );
+                    let style = editor.selection_style();
+                    let actual = match shortcut {
+                        Key::B => style.bold,
+                        Key::I => style.italic,
+                        _ => style.underline,
+                    };
+                    assert_eq!(actual, Some(enabled));
+                    assert_eq!(editor.selection(), selection);
+                }
+                assert_eq!(editor.undo_len(), 2);
+                assert!(editor.undo());
+                assert!(editor.undo());
+                assert_eq!(editor.document().to_bytes(), original);
+                assert_eq!(editor.selection(), selection);
+            }
+        }
     }
 
     #[test]

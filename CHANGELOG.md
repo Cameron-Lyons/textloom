@@ -6,6 +6,16 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- Bold, italic, and underline shortcuts in both input adapters apply emphasis
+  uniformly to mixed selections, matching toolbar behavior, and disable it only
+  when the whole selection already has that emphasis.
+- Widget/window focus loss ends the typing undo group in both adapters. Winit
+  adds body/heading shortcuts matching egui, and Command+Backspace deletes to
+  the paragraph start in both adapters while preserving the original undo
+  selection and read-only/IME behavior.
+- Whole-word searches build Unicode word indexes and lowercase coordinate maps
+  only after finding a literal candidate, reducing work for missing and sparse
+  queries without changing match boundaries or navigation order.
 - Inline clear-formatting preserves paragraph kinds and selection direction,
   supports caret typing-style reset, and restores rich state through undo/redo.
 - `SelectionStyle` reports uniform and mixed inline attributes independently for

@@ -130,6 +130,17 @@ fn literal_search() {
         assert_eq!(matches.len(), 100_000);
         black_box(matches);
     });
+    measure("100000 paragraph whole-word matches", 10, || {
+        let matches = document.find(
+            black_box("Unicode"),
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: true,
+            },
+        );
+        assert_eq!(matches.len(), 100_000);
+        black_box(matches);
+    });
     measure("100000 paragraph lowercase whole-word matches", 10, || {
         let matches = document.find(
             black_box("unicode"),
@@ -148,6 +159,29 @@ fn literal_search() {
                 .is_empty()
         );
     });
+    for case_sensitive in [true, false] {
+        measure(
+            if case_sensitive {
+                "100000 paragraph whole-word miss"
+            } else {
+                "100000 paragraph lowercase whole-word miss"
+            },
+            20,
+            || {
+                assert!(
+                    document
+                        .find(
+                            black_box("absent"),
+                            SearchOptions {
+                                case_sensitive,
+                                whole_word: true,
+                            },
+                        )
+                        .is_empty()
+                );
+            },
+        );
+    }
     measure("100000 paragraphs shorter than query", 20, || {
         assert!(
             document

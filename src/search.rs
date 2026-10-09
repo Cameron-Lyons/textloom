@@ -282,39 +282,35 @@ fn visit_text_matches(
     if needle.len() > searched.len() {
         return ControlFlow::Continue(());
     }
-    let word_boundaries: Vec<_> = if options.whole_word {
-        source
-            .split_word_bound_indices()
-            .map(|(byte, _)| byte)
-            .chain([source.len()])
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut lowercase_changes = Vec::new();
-    if !options.case_sensitive && !source.is_ascii() {
-        let mut lower_byte = 0;
-        for (byte, character) in source.char_indices() {
-            // String lowercase additionally handles contextual final
-            // sigma, whose UTF-8 length equals its scalar lowercase.
-            let lowered_len = if character.is_ascii() {
-                1
-            } else {
-                character.to_lowercase().map(char::len_utf8).sum::<usize>()
-            };
-            if lowered_len != character.len_utf8() {
-                lowercase_changes.push((
-                    lower_byte..lower_byte + lowered_len,
-                    byte..byte + character.len_utf8(),
-                ));
+    // Most paragraphs in a missing or sparse search have no literal candidate.
+    // Prepare Unicode coordinates and word boundaries only after one is found.
+    let mut word_boundaries = None;
+    let mut lowercase_changes = None;
+    let mut original_byte = |byte: usize| -> Option<usize> {
+        let lowercase_changes = lowercase_changes.get_or_insert_with(|| {
+            let mut changes = Vec::new();
+            if !options.case_sensitive && !source.is_ascii() {
+                let mut lower_byte = 0;
+                for (byte, character) in source.char_indices() {
+                    // String lowercase additionally handles contextual final
+                    // sigma, whose UTF-8 length equals its scalar lowercase.
+                    let lowered_len = if character.is_ascii() {
+                        1
+                    } else {
+                        character.to_lowercase().map(char::len_utf8).sum::<usize>()
+                    };
+                    if lowered_len != character.len_utf8() {
+                        changes.push((
+                            lower_byte..lower_byte + lowered_len,
+                            byte..byte + character.len_utf8(),
+                        ));
+                    }
+                    lower_byte += lowered_len;
+                }
+                debug_assert_eq!(lower_byte, searched.len());
             }
-            lower_byte += lowered_len;
-        }
-        debug_assert_eq!(lower_byte, searched.len());
-    }
-
-    let original_byte = |byte: usize| -> Option<usize> {
+            changes
+        });
         let index = lowercase_changes.partition_point(|(lowered, _)| lowered.end <= byte);
         if let Some((lowered, original)) = lowercase_changes.get(index)
             && byte >= lowered.start
@@ -335,11 +331,19 @@ fn visit_text_matches(
         let range = original_byte(bytes.start)
             .zip(original_byte(bytes.end))
             .and_then(|(start, end)| {
-                if options.whole_word
-                    && (word_boundaries.binary_search(&start).is_err()
-                        || word_boundaries.binary_search(&end).is_err())
-                {
-                    return None;
+                if options.whole_word {
+                    let word_boundaries = word_boundaries.get_or_insert_with(|| {
+                        source
+                            .split_word_bound_indices()
+                            .map(|(byte, _)| byte)
+                            .chain([source.len()])
+                            .collect::<Vec<_>>()
+                    });
+                    if word_boundaries.binary_search(&start).is_err()
+                        || word_boundaries.binary_search(&end).is_err()
+                    {
+                        return None;
+                    }
                 }
                 Some(start..end)
             });

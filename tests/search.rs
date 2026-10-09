@@ -1,6 +1,7 @@
 //! Literal and Unicode lowercase search coordinates and boundary contracts.
 
 use textloom::{Document, Editor, Position, SearchOptions, Selection};
+use unicode_segmentation::UnicodeSegmentation;
 
 fn default_options() -> SearchOptions {
     SearchOptions::default()
@@ -291,6 +292,138 @@ fn longer_lowercase_queries_match_expansions_but_skip_short_paragraphs() {
             ]
         );
         assert!(document.find(&"absent".repeat(100), options).is_empty());
+    }
+}
+
+#[test]
+fn generated_unicode_matches_agree_with_a_grapheme_reference() {
+    // The reference tries every complete original grapheme, rather than using
+    // literal candidates or the implementation's sparse lowercase byte map.
+    fn reference(
+        document: &Document,
+        query: &str,
+        options: SearchOptions,
+    ) -> Vec<std::ops::Range<Position>> {
+        let source = document.plain_text();
+        let needle = query.replace("\r\n", "\n").replace('\r', "\n");
+        let needle = if options.case_sensitive {
+            needle
+        } else {
+            needle.to_lowercase()
+        };
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let searched = if options.case_sensitive {
+            source.clone()
+        } else {
+            source.to_lowercase()
+        };
+        let coordinates: Vec<_> = source
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain([source.len()])
+            .map(|byte| {
+                let lowered = if options.case_sensitive {
+                    byte
+                } else {
+                    source[..byte].to_lowercase().len()
+                };
+                (lowered, byte)
+            })
+            .collect();
+        let word_boundaries: Vec<_> = source
+            .split_word_bound_indices()
+            .map(|(byte, _)| byte)
+            .chain([source.len()])
+            .collect();
+        let position = |byte| {
+            let prefix = &source[..byte];
+            Position::new(
+                prefix.bytes().filter(|&byte| byte == b'\n').count(),
+                prefix
+                    .rfind('\n')
+                    .map_or(byte, |newline| byte - newline - 1),
+            )
+        };
+        let mut matches = Vec::new();
+        let mut next = 0;
+        for &(lowered, start) in &coordinates {
+            if start < next || !searched[lowered..].starts_with(&needle) {
+                continue;
+            }
+            let Ok(end_index) = coordinates
+                .binary_search_by_key(&(lowered + needle.len()), |&(lowered, _)| lowered)
+            else {
+                continue;
+            };
+            let end = coordinates[end_index].1;
+            if options.whole_word
+                && (word_boundaries.binary_search(&start).is_err()
+                    || word_boundaries.binary_search(&end).is_err())
+            {
+                continue;
+            }
+            matches.push(position(start)..position(end));
+            next = end;
+        }
+        matches
+    }
+
+    let tokens = [
+        "a",
+        "aa",
+        " ",
+        "-",
+        "'",
+        "\n",
+        "\n\n",
+        "İ",
+        "i\u{307}",
+        "K",
+        "K",
+        "Ⱥ",
+        "ⱥ",
+        "ΟΣ",
+        "ΟΣΑ",
+        "οσ",
+        "ος",
+        "e\u{301}",
+        "é",
+        "🇨🇺🇺🇺",
+        "👩‍💻",
+        "\u{0600}word",
+        "你好",
+    ];
+    let queries = [
+        "a", "aa", " ", "-", "i", "I", "i\u{307}", "k", "ⱥ", "οσ", "ΟΣ", "ος", "é", "e", "\u{301}",
+        "🇺🇺", "👩", "word", "你", "\r\n", "a\r\n", "\nİ", "missing", "",
+    ];
+    let mut seed = 0x6a09_e667_f3bc_c909_u64;
+    for case in 0..32 {
+        let mut source = tokens.join("");
+        for _ in 0..32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            source.push_str(tokens[seed as usize % tokens.len()]);
+        }
+        let document = Document::from_text(&source);
+        for case_sensitive in [true, false] {
+            for whole_word in [true, false] {
+                let options = SearchOptions {
+                    case_sensitive,
+                    whole_word,
+                };
+                for query in queries {
+                    assert_eq!(
+                        document.find(query, options),
+                        reference(&document, query, options),
+                        "case={case}, query={query:?}, options={options:?}, source={source:?}",
+                    );
+                }
+            }
+        }
     }
 }
 
