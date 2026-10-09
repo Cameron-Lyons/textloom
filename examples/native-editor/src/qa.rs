@@ -12,13 +12,15 @@ use std::{
 use eframe::egui;
 use textloom::{Composition, Editor, InlineStyle, Selection};
 
-pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--font PATH] [--bold-font PATH] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH must not already exist; reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
+pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--rich-clipboard] [--clipboard-self-test] [--font PATH] [--bold-font PATH] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--rich-clipboard enables the example's native rich clipboard transport.\n--clipboard-self-test runs a deterministic rich clipboard fixture check.\n                      Requires --rich-clipboard and writes the system clipboard;\n                      use only in an isolated test session.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH must not already exist; reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub smoke_test: bool,
     pub read_only: bool,
     pub disabled: bool,
+    pub rich_clipboard: bool,
+    pub clipboard_self_test: bool,
     pub regular_font: Option<PathBuf>,
     pub bold_font: Option<PathBuf>,
     pub qa_report: Option<PathBuf>,
@@ -36,6 +38,10 @@ impl Options {
                 options.read_only = true;
             } else if argument == "--disabled" {
                 options.disabled = true;
+            } else if argument == "--rich-clipboard" {
+                options.rich_clipboard = true;
+            } else if argument == "--clipboard-self-test" {
+                options.clipboard_self_test = true;
             } else if argument == "--help" || argument == "-h" {
                 options.help = true;
             } else {
@@ -61,6 +67,9 @@ impl Options {
                     })?;
                 *target = Some(path.into());
             }
+        }
+        if options.clipboard_self_test && !options.rich_clipboard {
+            return Err("--clipboard-self-test requires --rich-clipboard".to_owned());
         }
         Ok(options)
     }
@@ -114,6 +123,9 @@ pub struct Session {
     path: PathBuf,
     started_unix_seconds: u64,
     smoke_test: bool,
+    rich_clipboard_requested: bool,
+    clipboard_self_test_requested: bool,
+    clipboard_self_test_passed: bool,
     regular_font_supplied: bool,
     bold_font_supplied: bool,
     frames: u64,
@@ -137,6 +149,7 @@ pub struct Session {
     editing_errors: u64,
     accessibility_errors: u64,
     host_command_errors: u64,
+    clipboard_self_test_errors: u64,
     snapshot_restores: u64,
     pixels_per_point: Option<f32>,
     minimum_pixels_per_point: Option<f32>,
@@ -150,6 +163,9 @@ impl Session {
             path: options.qa_report.clone()?,
             started_unix_seconds: unix_seconds(),
             smoke_test: options.smoke_test,
+            rich_clipboard_requested: options.rich_clipboard,
+            clipboard_self_test_requested: options.clipboard_self_test,
+            clipboard_self_test_passed: false,
             regular_font_supplied: options.regular_font.is_some(),
             bold_font_supplied: options.bold_font.is_some(),
             frames: 0,
@@ -173,6 +189,7 @@ impl Session {
             editing_errors: 0,
             accessibility_errors: 0,
             host_command_errors: 0,
+            clipboard_self_test_errors: 0,
             snapshot_restores: 0,
             pixels_per_point: None,
             minimum_pixels_per_point: None,
@@ -246,6 +263,18 @@ impl Session {
         self.host_command_errors += 1;
     }
 
+    /// Record the requested fixture check. A failure remains recorded and is
+    /// counted once, even if the host reports the result more than once.
+    pub fn clipboard_self_test_result(&mut self, passed: bool) {
+        if !self.clipboard_self_test_requested {
+            return;
+        }
+        if !passed {
+            self.clipboard_self_test_errors = 1;
+        }
+        self.clipboard_self_test_passed = passed && self.clipboard_self_test_errors == 0;
+    }
+
     pub fn snapshot_restored(&mut self) {
         self.snapshot_restores += 1;
     }
@@ -265,11 +294,11 @@ impl Session {
                 "  \"manual_signoff\": \"not_recorded\",\n",
                 "  \"document_content_included\": false,\n",
                 "  \"host\": {{\"name\": \"textloom-native-example\", \"egui_api_version\": \"0.36\", \"eframe_api_version\": \"0.36\", \"os\": {os}, \"architecture\": {arch}, \"source_revision\": {source_revision}}},\n",
-                "  \"session\": {{\"started_unix_seconds\": {started}, \"ended_unix_seconds\": {ended}, \"graceful_exit\": true, \"smoke_test_requested\": {smoke}, \"rendered_frames\": {frames}, \"regular_font_supplied\": {regular_font}, \"bold_font_supplied\": {bold_font}}},\n",
+                "  \"session\": {{\"started_unix_seconds\": {started}, \"ended_unix_seconds\": {ended}, \"graceful_exit\": true, \"smoke_test_requested\": {smoke}, \"rich_clipboard_requested\": {rich_clipboard}, \"clipboard_self_test_requested\": {clipboard_test}, \"clipboard_self_test_passed\": {clipboard_passed}, \"rendered_frames\": {frames}, \"regular_font_supplied\": {regular_font}, \"bold_font_supplied\": {bold_font}}},\n",
                 "  \"display\": {{\"pixels_per_point\": {scale}, \"minimum_pixels_per_point\": {minimum_scale}, \"maximum_pixels_per_point\": {maximum_scale}, \"native_pixels_per_point\": {native_scale}}},\n",
                 "  \"host_input_events\": {{\"text\": {text}, \"key_press\": {key}, \"paste\": {paste}, \"copy\": {copy}, \"cut\": {cut}, \"ime_preedit\": {preedit}, \"ime_commit\": {commit}, \"ime_delete_surrounding\": {delete_surrounding}, \"accessibility_action\": {accessibility_action}, \"window_focus_gained\": {window_focus_gained}, \"window_focus_lost\": {window_focus_lost}}},\n",
                 "  \"observed_state_changes\": {{\"document_revision\": {revision_changes}, \"selection\": {selection_changes}, \"typing_style\": {typing_changes}, \"composition\": {composition_changes}, \"focus_gains\": {focus_gains}, \"focus_losses\": {focus_losses}, \"enabled\": {enabled_changes}, \"read_only\": {read_only_changes}, \"snapshot_restores\": {snapshot_restores}}},\n",
-                "  \"errors\": {{\"editing\": {editing_errors}, \"accessibility\": {accessibility_errors}, \"host_command\": {host_errors}}},\n",
+                "  \"errors\": {{\"editing\": {editing_errors}, \"accessibility\": {accessibility_errors}, \"host_command\": {host_errors}, \"clipboard_self_test\": {clipboard_errors}}},\n",
                 "  \"final_widget\": {{\"enabled\": {enabled}, \"read_only\": {read_only}, \"focused\": {focused}, \"window_focused\": {window_focused}, \"widget_focus_retained\": {widget_focus_retained}, \"composition_active\": {composition_active}}},\n",
                 "  \"final_document\": {{\"paragraphs\": {paragraphs}, \"text_utf8_bytes_excluding_paragraph_breaks\": {text_bytes}, \"revision\": {revision}, \"tlfr_bytes\": {tlfr_bytes}, \"tlfr_round_trip_equal\": {round_trip}, \"html_bytes\": {html_bytes}, \"undo_steps\": {undo}, \"redo_steps\": {redo}}},\n",
                 "  \"final_selection\": {{\"anchor\": {{\"paragraph\": {anchor_paragraph}, \"byte\": {anchor_byte}}}, \"focus\": {{\"paragraph\": {focus_paragraph}, \"byte\": {focus_byte}}}}},\n",
@@ -282,6 +311,9 @@ impl Session {
             started = self.started_unix_seconds,
             ended = unix_seconds(),
             smoke = self.smoke_test,
+            rich_clipboard = self.rich_clipboard_requested,
+            clipboard_test = self.clipboard_self_test_requested,
+            clipboard_passed = self.clipboard_self_test_passed,
             frames = self.frames,
             regular_font = self.regular_font_supplied,
             bold_font = self.bold_font_supplied,
@@ -312,6 +344,7 @@ impl Session {
             editing_errors = self.editing_errors,
             accessibility_errors = self.accessibility_errors,
             host_errors = self.host_command_errors,
+            clipboard_errors = self.clipboard_self_test_errors,
             enabled = self.enabled,
             read_only = self.read_only,
             focused = self.focused,
@@ -429,6 +462,68 @@ mod tests {
         ] {
             assert!(options(arguments).is_err(), "{arguments:?}");
         }
+    }
+
+    #[test]
+    fn clipboard_fixture_requires_explicit_transport_opt_in_in_either_order() {
+        assert_eq!(
+            options(&["--clipboard-self-test"]).unwrap_err(),
+            "--clipboard-self-test requires --rich-clipboard"
+        );
+        for arguments in [
+            ["--rich-clipboard", "--clipboard-self-test"],
+            ["--clipboard-self-test", "--rich-clipboard"],
+        ] {
+            let parsed = options(&arguments).unwrap();
+            assert!(parsed.rich_clipboard && parsed.clipboard_self_test);
+        }
+        let parsed = options(&["--rich-clipboard"]).unwrap();
+        assert!(parsed.rich_clipboard && !parsed.clipboard_self_test);
+        assert!(HELP.contains("writes the system clipboard"));
+        assert!(HELP.contains("isolated test session"));
+    }
+
+    #[test]
+    fn clipboard_fixture_report_distinguishes_unrun_passed_and_sticky_failure() {
+        let editor = Editor::from_text("PRIVATE_FIXTURE_TEXT");
+        let mut session = Session::new(
+            &options(&[
+                "--qa-report",
+                "unused.json",
+                "--rich-clipboard",
+                "--clipboard-self-test",
+            ])
+            .unwrap(),
+            &editor,
+        )
+        .unwrap();
+        let report = session.report(&editor, None);
+        assert!(report.contains("\"rich_clipboard_requested\": true"));
+        assert!(report.contains("\"clipboard_self_test_requested\": true"));
+        assert!(report.contains("\"clipboard_self_test_passed\": false"));
+        assert!(report.contains("\"clipboard_self_test\": 0"));
+        session.clipboard_self_test_result(true);
+        session.clipboard_self_test_result(true);
+        let report = session.report(&editor, None);
+        assert!(report.contains("\"clipboard_self_test_passed\": true"));
+        assert!(report.contains("\"clipboard_self_test\": 0"));
+        session.clipboard_self_test_result(false);
+        session.clipboard_self_test_result(false);
+        session.clipboard_self_test_result(true);
+        let report = session.report(&editor, None);
+        assert!(report.contains("\"clipboard_self_test_passed\": false"));
+        assert!(report.contains("\"clipboard_self_test\": 1"));
+        assert!(report.contains("\"manual_signoff\": \"not_recorded\""));
+        assert!(!report.contains("PRIVATE"));
+
+        let mut unrequested =
+            Session::new(&options(&["--qa-report", "unused.json"]).unwrap(), &editor).unwrap();
+        unrequested.clipboard_self_test_result(true);
+        let report = unrequested.report(&editor, None);
+        assert!(report.contains("\"rich_clipboard_requested\": false"));
+        assert!(report.contains("\"clipboard_self_test_requested\": false"));
+        assert!(report.contains("\"clipboard_self_test_passed\": false"));
+        assert!(report.contains("\"clipboard_self_test\": 0"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::sync::{
 use eframe::egui;
 use textloom::{Editor, ParagraphKind, Position, SearchOptions, Selection, StylePatch};
 
+mod clipboard;
 mod qa;
 
 struct NativeEditor {
@@ -26,10 +27,17 @@ struct NativeEditor {
     last_frame: Option<u64>,
     qa: Option<qa::Session>,
     failed: Arc<AtomicBool>,
+    clipboard: Option<clipboard::NativeClipboard>,
+    clipboard_self_test: bool,
+    document_id: Option<egui::Id>,
 }
 
 impl NativeEditor {
-    fn new(options: &qa::Options, failed: Arc<AtomicBool>) -> Self {
+    fn new(
+        options: &qa::Options,
+        failed: Arc<AtomicBool>,
+        clipboard: Option<clipboard::NativeClipboard>,
+    ) -> Self {
         let mut editor = Editor::from_text(
             "TextLoom\nSelect text to format it, or start writing.\nUnicode: café, 日本語, 👨‍👩‍👧‍👦.\nLists, undo, search, and rich snapshots.\nEnter continues a list; Enter on an empty item exits it.",
         );
@@ -63,6 +71,9 @@ impl NativeEditor {
             last_frame: None,
             qa,
             failed,
+            clipboard,
+            clipboard_self_test: options.clipboard_self_test,
+            document_id: None,
         }
     }
 
@@ -322,6 +333,25 @@ fn kind_name(kind: ParagraphKind) -> String {
 }
 
 impl eframe::App for NativeEditor {
+    fn raw_input_hook(&mut self, context: &egui::Context, input: &mut egui::RawInput) {
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard.clear_staged_paste();
+            if self.enabled
+                && !self.read_only
+                && input.focused
+                && self
+                    .document_id
+                    .is_some_and(|id| context.memory(|memory| memory.has_focus(id)))
+                && self
+                    .editor
+                    .composition()
+                    .is_none_or(|composition| composition.text.is_empty())
+            {
+                clipboard.stage_paste(input);
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let frame = ui.ctx().cumulative_frame_nr();
         let new_frame = self.last_frame != Some(frame);
@@ -329,6 +359,25 @@ impl eframe::App for NativeEditor {
             self.last_frame = Some(frame);
             if let Some(qa) = &mut self.qa {
                 qa.begin_frame(ui.ctx());
+            }
+        }
+        if self.clipboard_self_test {
+            self.clipboard_self_test = false;
+            let result = self
+                .clipboard
+                .as_mut()
+                .ok_or_else(|| "Native rich clipboard was not enabled".to_owned())
+                .and_then(clipboard::NativeClipboard::self_test);
+            if let Some(qa) = &mut self.qa {
+                qa.clipboard_self_test_result(result.is_ok());
+            }
+            match result {
+                Ok(()) => println!("Native rich clipboard roundtrip and undo/redo passed"),
+                Err(error) => {
+                    self.status = error;
+                    self.smoke_error = true;
+                    self.failed.store(true, Ordering::Relaxed);
+                }
             }
         }
         egui::CentralPanel::default().show(ui, |ui| {
@@ -354,14 +403,19 @@ impl eframe::App for NativeEditor {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let output = ui
                     .add_enabled_ui(self.enabled, |ui| {
-                        textloom::adapter::egui::RichTextEditor::new(&mut self.editor)
-                            .id_salt("native-document")
-                            .min_rows(18)
-                            .read_only(self.read_only)
-                            .show(ui)
+                        let mut widget =
+                            textloom::adapter::egui::RichTextEditor::new(&mut self.editor)
+                                .id_salt("native-document")
+                                .min_rows(18)
+                                .read_only(self.read_only);
+                        if let Some(clipboard) = &mut self.clipboard {
+                            widget = widget.rich_clipboard(clipboard);
+                        }
+                        widget.show(ui)
                     })
                     .inner;
                 let response = output.response.labelled_by(document_label.id);
+                self.document_id = Some(response.id);
                 if self.focus_editor && self.enabled {
                     response.request_focus();
                     self.focus_editor = false;
@@ -389,6 +443,12 @@ impl eframe::App for NativeEditor {
                 }
             });
         });
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard.clear_staged_paste();
+            if let Some(error) = clipboard.take_error() {
+                self.status = format!("{error}; copied plain text instead");
+            }
+        }
         if self.smoke_frames.is_some() && self.smoke_error {
             self.failed.store(true, Ordering::Relaxed);
         }
@@ -423,7 +483,15 @@ impl eframe::App for NativeEditor {
 }
 
 fn main() -> eframe::Result {
-    let arguments = match qa::Options::parse(qa::arguments()) {
+    let raw_arguments: Vec<_> = qa::arguments().collect();
+    if let Some(result) = clipboard::helper(&raw_arguments) {
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let arguments = match qa::Options::parse(raw_arguments) {
         Ok(arguments) => arguments,
         Err(error) => {
             eprintln!("{error}");
@@ -473,7 +541,14 @@ fn main() -> eframe::Result {
                     .insert(egui::FontFamily::Name("Bold".into()), fallback);
             }
             context.egui_ctx.set_fonts(fonts);
-            Ok(Box::new(NativeEditor::new(&arguments, app_failed)))
+            let clipboard = if arguments.rich_clipboard {
+                Some(clipboard::NativeClipboard::new(context).map_err(std::io::Error::other)?)
+            } else {
+                None
+            };
+            Ok(Box::new(NativeEditor::new(
+                &arguments, app_failed, clipboard,
+            )))
         }),
     )?;
     if failed.load(Ordering::Relaxed) {

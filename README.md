@@ -109,20 +109,34 @@ cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-di
 
 The host demonstrates mixed selection state, formatting, lists, find/replace,
 snapshots, and read-only/disabled modes with a system plain-text clipboard and
-native IME caret area. Native rich MIME transport still requires a host backend;
-the example does not implement one. Its separate Cargo workspace and lockfile
-remain outside the published library archive. `--read-only` starts a selectable
+native IME caret area. Add `--rich-clipboard` for its native Linux (Wayland/X11),
+macOS, and Windows backend. Copies publish HTML and plain text alongside a framed
+TLFR fragment with a generation token, and verify all representations through
+bounded helper processes. Paste uses one validated native snapshot; ambiguous,
+unavailable, malformed, or mismatched inputs retain the event's plain fallback.
+Owner helpers are retired on replacement or close. Platform wrapper dependencies
+stay in the example's separate Cargo workspace and lockfile, outside the published
+library archive and library dependency graph. `--read-only` starts a selectable
 viewer; `--disabled` disables document focus and interaction. The toolbar can
 toggle both modes, and document/search fields have accessibility labels.
 `--font PATH` and `--bold-font PATH` register application fonts; `--smoke-test`
 requests a graceful close after 20 native frames. Pass these arguments after
 `--` in the command above.
 
+`--clipboard-self-test` requires `--rich-clipboard` and writes a fixture to the
+system clipboard, so use it only in isolated sessions. It checks native rich,
+HTML, and plain read-back plus rich insertion and undo/redo. The isolated Linux
+X11 fixture passed locally; other native rich runtime checks and final clean CI
+remain pending. External-application interoperability, IME, dead keys/AltGr, and
+screen-reader behavior still need native platform signoff.
+
 `--qa-report PATH` writes a JSON report on graceful exit, protecting existing
 files from overwrite. It records platform, scale, event/error counts, observed
 editor transitions, final-state metrics, and an in-memory TLFR round trip without
-document, clipboard, search, or preedit text. It always records manual signoff as
-unrecorded. Reports and smoke runs provide observations; manual native checks
+document, clipboard, search, or preedit text. Clipboard request/completion flags
+and a self-test error counter describe the opt-in fixture. The report always
+records manual signoff as unrecorded. Reports and smoke runs provide observations;
+manual native checks
 still need separate steps and outcomes. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md)
 for report revision labeling, font examples, and host checks.
 
@@ -181,13 +195,16 @@ Clippy warnings, and verify its dependency on the packaged library. The candidat
 workflow runs required renderer smoke checks in editable, read-only, and disabled
 modes on Linux X11 with Xvfb/Mesa, macOS, and Windows with signed MSYS2 Mesa
 packages and application-local DLLs. Validation evidence is recorded in
-`RELEASING.md`. Renderer smoke checks open native windows
-and verify initialization and frame completion. IME, clipboard, physical keyboard,
-and screen-reader interaction retain their manual release gates on all three
-platforms.
+`RELEASING.md`. Renderer smoke checks open native windows and verify initialization
+and frame completion. They now enable rich clipboard in all modes and require
+the isolated clipboard roundtrip/undo/redo fixture in editable mode. Final clean
+CI for that extension remains pending. IME, external clipboard interoperability,
+physical keyboard, and screen-reader interaction retain their manual release
+gates on all three platforms.
 
 Renderer jobs validate source-labelled, content-free JSON observations for
 graceful completion, zero errors, snapshot integrity, and the requested mode.
+They also validate rich clipboard activation and the requested fixture result.
 Validated reports and smoke logs are available as CI artifacts.
 
 Dependencies are locked, actions are pinned to commit SHAs, jobs have a 15-minute limit, and superseded runs are canceled. The workflow only reads repository contents and saves dependency caches on `main`. CI runs release benchmarks as smoke tests and records their output; timing thresholds are kept out of shared runners.

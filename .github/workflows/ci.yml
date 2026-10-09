@@ -97,8 +97,9 @@ jobs:
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
       # Upstream egui also runs its GPU tests on macos-latest:
       # https://github.com/emilk/egui/blob/main/.github/workflows/rust.yml
-      # These checks cover native initialization and rendering. IME, clipboard,
-      # and screen-reader interaction still require the RELEASING.md signoffs.
+      # These isolated runners cover rendering and a fixture-based rich clipboard
+      # roundtrip. IME, external clipboard, and screen-reader interaction still
+      # require the RELEASING.md signoffs.
       - name: Native rendering smoke (macOS)
         if: runner.os == 'macOS'
         timeout-minutes: 2
@@ -106,13 +107,20 @@ jobs:
         run: |
           mkdir -p native-observations
           for mode in editable read-only disabled; do
-            args=(--smoke-test --qa-report "native-smoke-$mode.json")
+            args=(--smoke-test --rich-clipboard --qa-report "native-smoke-$mode.json")
             case "$mode" in
+              editable) args+=(--clipboard-self-test) ;;
               read-only) args+=(--read-only) ;;
               disabled) args+=(--disabled) ;;
             esac
-            ./target/debug/textloom-native-example "${args[@]}" 2>&1 | tee "native-smoke-$mode.log"
-            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.log"
+            smoke_status=0
+            ./target/debug/textloom-native-example "${args[@]}" 2> "native-smoke-$mode.log" | tee "native-smoke-$mode.stdout" || smoke_status=$?
+            cat "native-smoke-$mode.stdout" >> "native-smoke-$mode.log"
+            if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.stdout"
+            if [ "$mode" = editable ]; then
+              grep -Fx 'Native rich clipboard roundtrip and undo/redo passed' "native-smoke-$mode.stdout"
+            fi
             python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode"
             cp "native-smoke-$mode.json" "native-observations/$mode.json"
           done
@@ -157,13 +165,20 @@ jobs:
         run: |
           mkdir -p native-observations
           for mode in editable read-only disabled; do
-            args=(--smoke-test --qa-report "native-smoke-$mode.json")
+            args=(--smoke-test --rich-clipboard --qa-report "native-smoke-$mode.json")
             case "$mode" in
+              editable) args+=(--clipboard-self-test) ;;
               read-only) args+=(--read-only) ;;
               disabled) args+=(--disabled) ;;
             esac
-            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' ./target/debug/textloom-native-example "${args[@]}" 2>&1 | tee "native-smoke-$mode.log"
-            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.log"
+            smoke_status=0
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' ./target/debug/textloom-native-example "${args[@]}" 2> "native-smoke-$mode.log" | tee "native-smoke-$mode.stdout" || smoke_status=$?
+            cat "native-smoke-$mode.stdout" >> "native-smoke-$mode.log"
+            if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-$mode.stdout"
+            if [ "$mode" = editable ]; then
+              grep -Fx 'Native rich clipboard roundtrip and undo/redo passed' "native-smoke-$mode.stdout"
+            fi
             python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os linux --mode "$mode"
             cp "native-smoke-$mode.json" "native-observations/$mode.json"
           done
@@ -179,8 +194,9 @@ jobs:
           retention-days: 14
 
   # Hosted Windows runners need Mesa for modern OpenGL. This software-rendered
-  # check validates native initialization and rendering; IME, clipboard, and
-  # screen-reader interaction still require the RELEASING.md signoffs.
+  # check validates rendering and a fixture-based rich clipboard roundtrip on
+  # an isolated desktop. IME, external clipboard, and screen-reader interaction
+  # still require the RELEASING.md signoffs.
   windows-renderer:
     name: Native rendering (Windows Mesa)
     runs-on: windows-latest
@@ -232,18 +248,25 @@ jobs:
           $nativeProbeExecutable = Join-Path $nativeProbeDirectory 'textloom-native-example.exe'
           New-Item -ItemType Directory -Path native-observations | Out-Null
           foreach ($mode in @('editable', 'read-only', 'disabled')) {
-            $smokeArguments = @('--smoke-test', '--qa-report', "native-smoke-$mode.json")
-            if ($mode -eq 'read-only') {
+            $smokeArguments = @('--smoke-test', '--rich-clipboard', '--qa-report', "native-smoke-$mode.json")
+            if ($mode -eq 'editable') {
+              $smokeArguments += '--clipboard-self-test'
+            } elseif ($mode -eq 'read-only') {
               $smokeArguments += '--read-only'
             } elseif ($mode -eq 'disabled') {
               $smokeArguments += '--disabled'
             }
-            & $nativeProbeExecutable @smokeArguments 2>&1 | Tee-Object -FilePath "native-smoke-$mode.log"
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
+            & $nativeProbeExecutable @smokeArguments 2> "native-smoke-$mode.log" | Tee-Object -Variable smokeStdout
+            $nativeSmokeExitCode = $LASTEXITCODE
+            $smokeStdout | Add-Content -LiteralPath "native-smoke-$mode.log"
+            if ($nativeSmokeExitCode -ne 0) {
+              exit $nativeSmokeExitCode
             }
-            if (-not (Select-String -Path "native-smoke-$mode.log" -Pattern '^Rendered 20 native frames at [0-9.]+ pixels per point$' -Quiet)) {
+            if (-not ($smokeStdout -cmatch '^Rendered 20 native frames at [0-9.]+ pixels per point$')) {
               throw "The $mode native renderer did not complete 20 frames"
+            }
+            if ($mode -eq 'editable' -and -not (@($smokeStdout) -ccontains 'Native rich clipboard roundtrip and undo/redo passed')) {
+              throw 'The native rich clipboard roundtrip and undo/redo did not pass'
             }
             python scripts/check_native_report.py "native-smoke-$mode.json" --revision "$env:TEXTLOOM_QA_REVISION" --os windows --mode "$mode"
             if ($LASTEXITCODE -ne 0) {

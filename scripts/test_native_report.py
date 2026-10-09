@@ -19,7 +19,11 @@ def specimen(mode="editable"):
         eframe_api_version="0.36", os="linux", architecture="x86_64",
         source_revision="candidate",
     )
-    report["session"].update(graceful_exit=True, smoke_test_requested=True, rendered_frames=21)
+    report["session"].update(
+        graceful_exit=True, smoke_test_requested=True, rendered_frames=21,
+        rich_clipboard_requested=True, clipboard_self_test_requested=mode == "editable",
+        clipboard_self_test_passed=mode == "editable",
+    )
     report["display"].update(
         pixels_per_point=2, minimum_pixels_per_point=1,
         maximum_pixels_per_point=2, native_pixels_per_point=None,
@@ -72,6 +76,30 @@ class NativeReportTests(unittest.TestCase):
             with self.subTest(report=index):
                 with self.assertRaises(ValueError):
                     validate(report, "candidate", "linux", "editable")
+
+    def test_rich_clipboard_missing_failed_or_impossible_completion_is_rejected(self):
+        for section, key, value in (
+            ("session", "rich_clipboard_requested", False),
+            ("session", "clipboard_self_test_requested", False),
+            ("session", "clipboard_self_test_passed", False),
+            ("errors", "clipboard_self_test", 1),
+        ):
+            with self.subTest(section=section, key=key):
+                report = specimen()
+                report[section][key] = value
+                with self.assertRaises(ValueError):
+                    validate(report, "candidate", "linux", "editable")
+        report = specimen()
+        del report["session"]["clipboard_self_test_passed"]
+        with self.assertRaises(ValueError):
+            validate(report, "candidate", "linux", "editable")
+        for mode in ("read-only", "disabled"):
+            for field in ("clipboard_self_test_requested", "clipboard_self_test_passed"):
+                with self.subTest(mode=mode, field=field):
+                    report = specimen(mode)
+                    report["session"][field] = True
+                    with self.assertRaises(ValueError):
+                        validate(report, "candidate", "linux", mode)
 
     def test_disabled_retained_focus_and_focus_gain_are_rejected(self):
         for section, key in (

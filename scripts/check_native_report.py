@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate native rendering observations without certifying manual QA."""
+"""Validate native rendering and clipboard observations without certifying manual QA."""
 
 import argparse
 import json
@@ -27,6 +27,9 @@ SCHEMA = {
         "ended_unix_seconds": int,
         "graceful_exit": bool,
         "smoke_test_requested": bool,
+        "rich_clipboard_requested": bool,
+        "clipboard_self_test_requested": bool,
+        "clipboard_self_test_passed": bool,
         "rendered_frames": int,
         "regular_font_supplied": bool,
         "bold_font_supplied": bool,
@@ -46,7 +49,9 @@ SCHEMA = {
         ("document_revision", "selection", "typing_style", "composition",
          "focus_gains", "focus_losses", "enabled", "read_only", "snapshot_restores"), int
     ),
-    "errors": dict.fromkeys(("editing", "accessibility", "host_command"), int),
+    "errors": dict.fromkeys(
+        ("editing", "accessibility", "host_command", "clipboard_self_test"), int
+    ),
     "final_widget": dict.fromkeys(
         ("enabled", "read_only", "focused", "window_focused",
          "widget_focus_retained", "composition_active"), bool
@@ -110,6 +115,15 @@ def validate(report, revision, os_name, mode):
         "missing graceful smoke completion",
     )
     require(session["rendered_frames"] >= 20, "fewer than 20 native frames")
+    require(session["rich_clipboard_requested"], "native rich clipboard was not requested")
+    require(
+        session["clipboard_self_test_requested"] == (mode == "editable"),
+        "unexpected clipboard self-test request for this mode",
+    )
+    require(
+        session["clipboard_self_test_passed"] == (mode == "editable"),
+        "missing or unexpected clipboard self-test completion",
+    )
     require(all(count == 0 for count in report["errors"].values()), "native host reported errors")
     require(report["final_document"]["tlfr_round_trip_equal"], "TLFR snapshot roundtrip failed")
     widget = report["final_widget"]

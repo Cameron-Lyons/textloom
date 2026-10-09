@@ -17,13 +17,25 @@ First stable release of the native Rust rich-text editing library.
   modes, associated document/search accessibility labels, and opt-in content-free
   JSON QA reports on graceful exit. Reports capture native input/state/error
   observations and snapshot checks, protect existing paths, and explicitly leave
-  manual signoff unrecorded. Six CLI/report tests join local and cross-platform
-  host checks. Rich MIME transport remains a host integration requirement.
+  manual signoff unrecorded. CLI/report and clipboard regression tests join local
+  and cross-platform host checks.
+- The repository-only native host adds opt-in `--rich-clipboard` backends for
+  Linux Wayland/X11, macOS, and Windows. Copies publish HTML/plain alternatives
+  and a framed TLFR payload with a generation token, verify read-back through
+  bounded helper processes, and retire owned helpers on replacement or close.
+  Rich paste uses a captured native item with plain fallback for unavailable,
+  invalid, mismatched, or ambiguous inputs. Safe platform wrappers remain outside
+  the library dependency graph. `--clipboard-self-test` writes a deterministic
+  fixture for isolated sessions; QA reports record request/completion flags and
+  its error counter. The isolated Linux X11 fixture passed locally; remaining
+  native runtime and external-app interoperability signoff remain pending.
 - The candidate CI workflow adds required Linux X11/Mesa and macOS native
   rendering smoke checks for editable, read-only, and disabled hosts, together
   with required Windows rendering using signed MSYS2 Mesa and application-local
-  DLLs. Renderer checks do not replace manual
-  platform interaction signoffs.
+  DLLs. Rich clipboard is requested in all modes; editable runs additionally
+  require native clipboard roundtrip and undo/redo evidence. Final clean CI for
+  the new clipboard checks remains pending. Renderer and fixture checks do not
+  replace manual platform interaction signoffs.
 - Bold, italic, and underline shortcuts in both input adapters apply emphasis
   uniformly to mixed selections, matching toolbar behavior, and disable it only
   when the whole selection already has that emphasis.
