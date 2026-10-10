@@ -1,7 +1,7 @@
 //! Egui's stock text helper selects scalar values. These runs use the same
 //! extended grapheme boundaries as Textloom, including paragraph separators.
 
-use super::ParagraphLayout;
+use super::{ParagraphLayout, ParagraphLayouts, layout::LayoutIdentity};
 use crate::{Editor, InlineStyle, Paragraph, ParagraphKind, Position};
 use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, text::CCursor};
 use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
@@ -86,6 +86,9 @@ struct ParagraphSnapshot {
 pub(super) struct Snapshot {
     paragraphs: Vec<Arc<ParagraphSnapshot>>,
     document_identity: Arc<()>,
+    layout_identity: LayoutIdentity,
+    environment_identity: Arc<()>,
+    widget_id: Id,
     run_locations: HashMap<accesskit::NodeId, (usize, usize)>,
 }
 
@@ -96,7 +99,7 @@ fn paragraph_id(widget_id: Id, paragraph: usize) -> Id {
 #[cfg(test)]
 fn build(
     editor: &Editor,
-    layouts: &[ParagraphLayout],
+    layouts: &ParagraphLayouts,
     widget_id: Id,
 ) -> Result<Snapshot, AccessibilityError> {
     build_cached(editor, layouts, widget_id, None)
@@ -104,7 +107,7 @@ fn build(
 
 pub(super) fn build_cached(
     editor: &Editor,
-    layouts: &[ParagraphLayout],
+    layouts: &ParagraphLayouts,
     widget_id: Id,
     previous: Option<&Snapshot>,
 ) -> Result<Snapshot, AccessibilityError> {
@@ -116,7 +119,7 @@ pub(super) fn build_cached(
         .document()
         .paragraphs()
         .iter()
-        .zip(layouts)
+        .zip(layouts.iter())
         .enumerate()
     {
         let id = paragraph_id(widget_id, index);
@@ -132,111 +135,9 @@ pub(super) fn build_cached(
             paragraphs.push(Arc::clone(cached));
             continue;
         }
-        let text = source.text();
-        if layout.galley.job.text != text || layout.galley.rows.is_empty() {
-            return Err(AccessibilityError::InvalidLayout);
-        }
-        let mut row_ends = Vec::with_capacity(layout.galley.rows.len());
-        let mut scalar_end = 0;
-        for row in &layout.galley.rows {
-            scalar_end += row.char_count_including_newline().0;
-            row_ends.push(scalar_end);
-        }
-        let mut runs: Vec<RunBuilder> = Vec::new();
-        let mut span_index = 0;
-        let mut scalar_start = 0;
-        for (byte, grapheme) in text.grapheme_indices(true) {
-            let length =
-                u8::try_from(grapheme.len()).map_err(|_| AccessibilityError::CharacterTooLong {
-                    position: Position::new(index, byte),
-                    bytes: grapheme.len(),
-                })?;
-            while source
-                .spans()
-                .get(span_index)
-                .is_some_and(|span| span.range.end <= byte)
-            {
-                span_index += 1;
-            }
-            let style = source
-                .spans()
-                .get(span_index)
-                .map_or(InlineStyle::default(), |span| span.style);
-            let scalar_end = scalar_start + grapheme.chars().count();
-            let row = row_ends
-                .partition_point(|end| *end <= scalar_start)
-                .min(row_ends.len() - 1);
-            let new_run = runs
-                .last()
-                .is_none_or(|run| run.row != row || run.style != style || run.lengths.len() == 255);
-            if new_run {
-                runs.push(RunBuilder {
-                    id: id.with(("grapheme_run", runs.len())),
-                    range: byte..byte,
-                    value: String::new(),
-                    lengths: Vec::new(),
-                    offsets: vec![byte],
-                    scalar_offsets: vec![scalar_start],
-                    style,
-                    row,
-                    line_break: false,
-                });
-            }
-            let run = runs.last_mut().expect("a run was created");
-            run.range.end = byte + grapheme.len();
-            run.value.push_str(grapheme);
-            run.lengths.push(length);
-            run.offsets.push(run.range.end);
-            run.scalar_offsets.push(scalar_end);
-            scalar_start = scalar_end;
-        }
-        if runs.is_empty() {
-            runs.push(RunBuilder {
-                id: id.with(("grapheme_run", 0usize)),
-                range: 0..0,
-                value: String::new(),
-                lengths: Vec::new(),
-                offsets: vec![0],
-                scalar_offsets: vec![0],
-                style: InlineStyle::default(),
-                row: 0,
-                line_break: false,
-            });
-        }
-        if line_break {
-            let last = runs.last_mut().expect("empty paragraphs also have a run");
-            last.value.push('\n');
-            last.lengths.push(1);
-            last.line_break = true;
-        }
-        // Freeze text, style, line links, and geometry once. Publication only
-        // clones the node properties and applies the current widget transform.
-        let mut builders = runs.into_iter().peekable();
-        let mut runs = Vec::with_capacity(builders.len());
-        let mut previous = None;
-        while let Some(builder) = builders.next() {
-            let previous_on_line = previous
-                .filter(|(_, row)| *row == builder.row)
-                .map(|(id, _)| id);
-            let next_on_line = builders
-                .peek()
-                .filter(|next| next.row == builder.row)
-                .map(|next| next.id);
-            previous = Some((builder.id, builder.row));
-            runs.push(freeze_run(
-                builder,
-                &layout.galley,
-                previous_on_line,
-                next_on_line,
-            ));
-        }
-        paragraphs.push(Arc::new(ParagraphSnapshot {
-            source: Arc::clone(source),
-            galley: Arc::clone(&layout.galley),
-            id,
-            line_break,
-            runs,
-        }));
+        paragraphs.push(build_paragraph_snapshot(
+            source, &layout, index, widget_id, line_break,
+        )?);
     }
     let run_locations = paragraphs
         .iter()
@@ -252,8 +153,188 @@ pub(super) fn build_cached(
     Ok(Snapshot {
         paragraphs,
         document_identity: editor.document().content_identity(),
+        layout_identity: layouts.identity(),
+        environment_identity: layouts.environment_identity(),
+        widget_id,
         run_locations,
     })
+}
+
+fn build_paragraph_snapshot(
+    source: &Arc<Paragraph>,
+    layout: &ParagraphLayout,
+    index: usize,
+    widget_id: Id,
+    line_break: bool,
+) -> Result<Arc<ParagraphSnapshot>, AccessibilityError> {
+    let id = paragraph_id(widget_id, index);
+    let text = source.text();
+    if layout.galley.job.text != text || layout.galley.rows.is_empty() {
+        return Err(AccessibilityError::InvalidLayout);
+    }
+    let mut row_ends = Vec::with_capacity(layout.galley.rows.len());
+    let mut scalar_end = 0;
+    for row in &layout.galley.rows {
+        scalar_end += row.char_count_including_newline().0;
+        row_ends.push(scalar_end);
+    }
+    let mut runs: Vec<RunBuilder> = Vec::new();
+    let mut span_index = 0;
+    let mut scalar_start = 0;
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        let length =
+            u8::try_from(grapheme.len()).map_err(|_| AccessibilityError::CharacterTooLong {
+                position: Position::new(index, byte),
+                bytes: grapheme.len(),
+            })?;
+        while source
+            .spans()
+            .get(span_index)
+            .is_some_and(|span| span.range.end <= byte)
+        {
+            span_index += 1;
+        }
+        let style = source
+            .spans()
+            .get(span_index)
+            .map_or(InlineStyle::default(), |span| span.style);
+        let scalar_end = scalar_start + grapheme.chars().count();
+        let row = row_ends
+            .partition_point(|end| *end <= scalar_start)
+            .min(row_ends.len() - 1);
+        let new_run = runs
+            .last()
+            .is_none_or(|run| run.row != row || run.style != style || run.lengths.len() == 255);
+        if new_run {
+            runs.push(RunBuilder {
+                id: id.with(("grapheme_run", runs.len())),
+                range: byte..byte,
+                value: String::new(),
+                lengths: Vec::new(),
+                offsets: vec![byte],
+                scalar_offsets: vec![scalar_start],
+                style,
+                row,
+                line_break: false,
+            });
+        }
+        let run = runs.last_mut().expect("a run was created");
+        run.range.end = byte + grapheme.len();
+        run.value.push_str(grapheme);
+        run.lengths.push(length);
+        run.offsets.push(run.range.end);
+        run.scalar_offsets.push(scalar_end);
+        scalar_start = scalar_end;
+    }
+    if runs.is_empty() {
+        runs.push(RunBuilder {
+            id: id.with(("grapheme_run", 0usize)),
+            range: 0..0,
+            value: String::new(),
+            lengths: Vec::new(),
+            offsets: vec![0],
+            scalar_offsets: vec![0],
+            style: InlineStyle::default(),
+            row: 0,
+            line_break: false,
+        });
+    }
+    if line_break {
+        let last = runs.last_mut().expect("empty paragraphs also have a run");
+        last.value.push('\n');
+        last.lengths.push(1);
+        last.line_break = true;
+    }
+    // Freeze text, style, line links, and geometry once. Publication only
+    // clones the node properties and applies the current widget transform.
+    let mut builders = runs.into_iter().peekable();
+    let mut runs = Vec::with_capacity(builders.len());
+    let mut previous = None;
+    while let Some(builder) = builders.next() {
+        let previous_on_line = previous
+            .filter(|(_, row)| *row == builder.row)
+            .map(|(id, _)| id);
+        let next_on_line = builders
+            .peek()
+            .filter(|next| next.row == builder.row)
+            .map(|next| next.id);
+        previous = Some((builder.id, builder.row));
+        runs.push(freeze_run(
+            builder,
+            &layout.galley,
+            previous_on_line,
+            next_on_line,
+        ));
+    }
+    Ok(Arc::new(ParagraphSnapshot {
+        source: Arc::clone(source),
+        galley: Arc::clone(&layout.galley),
+        id,
+        line_break,
+        runs,
+    }))
+}
+
+pub(super) fn update_cached(
+    editor: &Editor,
+    layouts: &ParagraphLayouts,
+    widget_id: Id,
+    snapshot: &mut Option<Arc<Snapshot>>,
+) -> Result<(), AccessibilityError> {
+    if layouts.len() != editor.document().paragraphs().len() {
+        return Err(AccessibilityError::InvalidLayout);
+    }
+    if let Some(previous) = snapshot.as_ref() {
+        if previous.widget_id == widget_id && previous.is_current(editor, layouts) {
+            return Ok(());
+        }
+        let change = editor.document().change_since(&previous.document_identity);
+        if let Some(change) = change
+            && change.range.len() == 1
+            && change.new_len == 1
+            && previous.paragraphs.len() == layouts.len()
+            && previous.widget_id == widget_id
+            && Arc::strong_count(previous) == 1
+            && Arc::weak_count(previous) == 0
+            && Arc::ptr_eq(
+                &previous.environment_identity,
+                &layouts.environment_identity(),
+            )
+        {
+            let index = change.range.start;
+            let source = &editor.document().paragraphs()[index];
+            let layout = layouts
+                .get(index)
+                .ok_or(AccessibilityError::InvalidLayout)?;
+            // Stage all fallible work before touching the published snapshot.
+            let replacement = build_paragraph_snapshot(
+                source,
+                &layout,
+                index,
+                widget_id,
+                index + 1 < layouts.len(),
+            )?;
+            if let Some(previous) = snapshot.as_mut().and_then(Arc::get_mut) {
+                for run in &previous.paragraphs[index].runs {
+                    previous.run_locations.remove(&run.id.accesskit_id());
+                }
+                for (run_index, run) in replacement.runs.iter().enumerate() {
+                    previous
+                        .run_locations
+                        .insert(run.id.accesskit_id(), (index, run_index));
+                }
+                previous.paragraphs[index] = replacement;
+                previous.document_identity = editor.document().content_identity();
+                previous.layout_identity = layouts.identity();
+                return Ok(());
+            }
+        }
+    }
+    // Retained snapshots, structural edits, missed updates, and layout
+    // invalidation keep the immutable rebuild path and its validated reuse.
+    let next = build_cached(editor, layouts, widget_id, snapshot.as_deref())?;
+    *snapshot = Some(Arc::new(next));
+    Ok(())
 }
 
 impl Snapshot {
@@ -264,14 +345,8 @@ impl Snapshot {
         )
     }
 
-    pub(super) fn is_current(&self, editor: &Editor, layouts: &[ParagraphLayout]) -> bool {
-        self.matches_document(editor)
-            && self.paragraphs.len() == layouts.len()
-            && self
-                .paragraphs
-                .iter()
-                .zip(layouts)
-                .all(|(cached, layout)| Arc::ptr_eq(&cached.galley, &layout.galley))
+    pub(super) fn is_current(&self, editor: &Editor, layouts: &ParagraphLayouts) -> bool {
+        self.matches_document(editor) && self.layout_identity.matches(layouts)
     }
 
     pub(super) fn position(&self, position: Position) -> Option<accesskit::TextPosition> {
@@ -310,7 +385,7 @@ impl Snapshot {
         ui: &Ui,
         widget_id: Id,
         editor: &Editor,
-        layouts: &[ParagraphLayout],
+        layouts: &ParagraphLayouts,
         origin: Pos2,
         read_only: bool,
     ) {
@@ -344,7 +419,11 @@ impl Snapshot {
             .ctx()
             .layer_transform_to_global(ui.layer_id())
             .unwrap_or_default();
-        for (paragraph, layout) in self.paragraphs.iter().zip(layouts) {
+        for (paragraph, layout) in self
+            .paragraphs
+            .iter()
+            .zip(layouts.views_range(0..layouts.len()))
+        {
             let paragraph_rect = layout.rect.translate(origin.to_vec2());
             let paragraph_ui = Ui::new(
                 ui.ctx().clone(),
@@ -554,7 +633,7 @@ mod tests {
         (editor, result)
     }
 
-    fn layout_frame(context: &egui::Context, editor: &Editor, width: f32) -> Vec<ParagraphLayout> {
+    fn layout_frame(context: &egui::Context, editor: &Editor, width: f32) -> ParagraphLayouts {
         let mut layouts = Vec::new();
         let appearance = super::super::Appearance {
             font: egui::FontId::proportional(16.0),
@@ -586,7 +665,161 @@ mod tests {
                     .collect();
             })
             .drop_without_applying_deltas();
-        layouts
+        ParagraphLayouts::from_test_layouts(layouts)
+    }
+
+    fn cached_layout_frame(
+        context: &egui::Context,
+        cache: &mut super::super::Cache,
+        editor: &Editor,
+        width: f32,
+    ) -> ParagraphLayouts {
+        let appearance = super::super::Appearance {
+            font: egui::FontId::proportional(16.0),
+            bold_family: None,
+            color: egui::Color32::WHITE,
+            strong_color: egui::Color32::WHITE,
+            code_background: egui::Color32::BLACK,
+            width,
+        };
+        let mut layouts = None;
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                layouts = Some(cache.layout(ui, editor, &appearance));
+            })
+            .drop_without_applying_deltas();
+        layouts.unwrap()
+    }
+
+    fn assert_matches_fresh(
+        snapshot: &Snapshot,
+        editor: &Editor,
+        layouts: &ParagraphLayouts,
+        widget_id: Id,
+    ) {
+        let fresh = build(editor, layouts, widget_id).unwrap();
+        assert!(snapshot.is_current(editor, layouts));
+        assert_eq!(snapshot.run_locations, fresh.run_locations);
+        assert_eq!(snapshot.paragraphs.len(), fresh.paragraphs.len());
+        for (actual, expected) in snapshot.paragraphs.iter().zip(&fresh.paragraphs) {
+            assert_eq!(actual.runs.len(), expected.runs.len());
+            for (actual, expected) in actual.runs.iter().zip(&expected.runs) {
+                assert_eq!(actual.node, expected.node);
+                assert_eq!(actual.offsets, expected.offsets);
+                assert_eq!(actual.geometry.bounds, expected.geometry.bounds);
+                assert_eq!(actual.geometry.positions, expected.geometry.positions);
+                assert_eq!(actual.geometry.widths, expected.geometry.widths);
+            }
+        }
+        for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
+            for grapheme in 0..=paragraph.grapheme_count() {
+                let position =
+                    Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap());
+                assert_eq!(
+                    snapshot.decode(snapshot.position(position).unwrap()),
+                    Some(position)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_updates_match_fresh_snapshots_and_preserve_retained_values() {
+        let context = egui::Context::default();
+        let mut cache = super::super::Cache::default();
+        let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
+        let widget_id = Id::new("editor");
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        let mut snapshot = None;
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        let identity = Arc::as_ptr(snapshot.as_ref().unwrap());
+        let storage = snapshot.as_ref().unwrap().paragraphs.as_ptr();
+        let unchanged = Arc::clone(&snapshot.as_ref().unwrap().paragraphs[0]);
+        editor
+            .set_selection(crate::Selection::caret(Position::new(1, 0)))
+            .unwrap();
+        editor.insert_text("changed ").unwrap();
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        assert_eq!(identity, Arc::as_ptr(snapshot.as_ref().unwrap()));
+        assert_eq!(storage, snapshot.as_ref().unwrap().paragraphs.as_ptr());
+        assert!(Arc::ptr_eq(
+            &unchanged,
+            &snapshot.as_ref().unwrap().paragraphs[0]
+        ));
+        assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+
+        let retained = Arc::clone(snapshot.as_ref().unwrap());
+        let retained_editor = Editor::new(editor.document().clone());
+        let retained_layouts = layouts.clone();
+        editor.insert_text("é ").unwrap();
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        assert!(!Arc::ptr_eq(&retained, snapshot.as_ref().unwrap()));
+        assert_matches_fresh(&retained, &retained_editor, &retained_layouts, widget_id);
+        assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+    }
+
+    #[test]
+    fn missed_updates_and_simultaneous_width_changes_match_fresh_snapshots() {
+        let context = egui::Context::default();
+        let mut cache = super::super::Cache::default();
+        let mut editor =
+            Editor::from_text("first second third fourth\naé👩‍💻 second\nlast words here");
+        let widget_id = Id::new("editor");
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        let mut snapshot = None;
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        for paragraph in [0, 2] {
+            editor
+                .set_selection(crate::Selection::caret(Position::new(paragraph, 0)))
+                .unwrap();
+            editor.insert_text("changed ").unwrap();
+        }
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+        let before = Arc::clone(&snapshot.as_ref().unwrap().paragraphs[1]);
+        editor.insert_text("another ").unwrap();
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 65.0);
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        assert!(!Arc::ptr_eq(
+            &before,
+            &snapshot.as_ref().unwrap().paragraphs[1]
+        ));
+        assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+    }
+
+    #[test]
+    fn failed_incremental_updates_keep_the_published_snapshot_intact() {
+        let context = egui::Context::default();
+        let mut cache = super::super::Cache::default();
+        let mut editor = Editor::from_text("first\nvalid\nlast");
+        let widget_id = Id::new("editor");
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        let mut snapshot = None;
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        let identity = Arc::as_ptr(snapshot.as_ref().unwrap());
+        let published_editor = Editor::new(editor.document().clone());
+        let published_layouts = layouts.clone();
+        editor
+            .set_selection(crate::Selection::caret(Position::new(1, 0)))
+            .unwrap();
+        editor
+            .insert_text(&format!("x{}", "\u{0301}".repeat(200)))
+            .unwrap();
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        assert!(matches!(
+            update_cached(&editor, &layouts, widget_id, &mut snapshot),
+            Err(AccessibilityError::CharacterTooLong { bytes: 401, .. })
+        ));
+        assert_eq!(identity, Arc::as_ptr(snapshot.as_ref().unwrap()));
+        assert_matches_fresh(
+            snapshot.as_deref().unwrap(),
+            &published_editor,
+            &published_layouts,
+            widget_id,
+        );
     }
 
     #[test]
@@ -729,7 +962,7 @@ mod tests {
         changed
             .insert_text(&format!("x{}", "\u{0301}".repeat(200)))
             .unwrap();
-        let mut layouts = layout_frame(&context, &changed, 500.0);
+        let layouts = layout_frame(&context, &changed, 500.0);
         assert!(matches!(
             build_cached(&changed, &layouts, widget_id, Some(&snapshot)),
             Err(AccessibilityError::CharacterTooLong { bytes: 401, .. })
@@ -738,13 +971,16 @@ mod tests {
         assert!(snapshot.matches_document(&editor));
         assert_eq!(snapshot.decode(position), Some(Position::new(1, 2)));
 
-        layouts[1].galley = Arc::clone(&layouts[0].galley);
+        let mut invalid: Vec<_> = layouts.iter().collect();
+        invalid[1].galley = Arc::clone(&invalid[0].galley);
+        let invalid = ParagraphLayouts::from_test_layouts(invalid);
         assert!(matches!(
-            build_cached(&changed, &layouts, widget_id, Some(&snapshot)),
+            build_cached(&changed, &invalid, widget_id, Some(&snapshot)),
             Err(AccessibilityError::InvalidLayout)
         ));
+        let truncated = ParagraphLayouts::from_test_layouts(layouts.iter().take(2).collect());
         assert!(matches!(
-            build_cached(&changed, &layouts[..2], widget_id, Some(&snapshot)),
+            build_cached(&changed, &truncated, widget_id, Some(&snapshot)),
             Err(AccessibilityError::InvalidLayout)
         ));
         assert_eq!(Arc::strong_count(&snapshot.paragraphs[0]), references);
@@ -876,12 +1112,12 @@ mod tests {
         context.enable_accesskit();
         let paragraph = &snapshot.paragraphs[0];
         let run_id = paragraph.runs[0].id.accesskit_id();
-        let layouts = vec![ParagraphLayout {
+        let layouts = ParagraphLayouts::from_test_layouts(vec![ParagraphLayout {
             galley: Arc::clone(&paragraph.galley),
             rect: Rect::from_min_size(Pos2::ZERO, paragraph.galley.size()),
             marker: None,
             marker_position: Pos2::ZERO,
-        }];
+        }]);
         let publish_bounds = |origin| {
             let mut output = context.run_ui(egui::RawInput::default(), |ui| {
                 snapshot.publish(ui, Id::new("editor"), &editor, &layouts, origin, false);
@@ -910,7 +1146,7 @@ mod tests {
     fn registration_frame(
         editor: &Editor,
         snapshot: &Snapshot,
-        layouts: &[ParagraphLayout],
+        layouts: &ParagraphLayouts,
         placement: (Pos2, egui::emath::TSTransform),
         enabled: bool,
         read_only: bool,
@@ -935,7 +1171,7 @@ mod tests {
             if legacy {
                 // Reference the previous empty-Ui registration and rebuild run
                 // nodes directly from source, without using cached templates.
-                for (paragraph, layout) in snapshot.paragraphs.iter().zip(layouts) {
+                for (paragraph, layout) in snapshot.paragraphs.iter().zip(layouts.iter()) {
                     let paragraph_rect = layout.rect.translate(origin.to_vec2());
                     let _paragraph_ui = Ui::new(
                         context.clone(),
@@ -1078,6 +1314,7 @@ mod tests {
                 marker_position: Pos2::ZERO,
             })
             .collect();
+        let layouts = ParagraphLayouts::from_test_layouts(layouts);
         let origin = Pos2::new(30.0, 40.0);
         let transform = egui::emath::TSTransform {
             translation: egui::vec2(70.0, 90.0),
@@ -1129,7 +1366,7 @@ mod tests {
                 widget.supports_action(accesskit::Action::ReplaceSelectedText),
                 enabled && !read_only
             );
-            for (paragraph, layout) in snapshot.paragraphs.iter().zip(&layouts) {
+            for (paragraph, layout) in snapshot.paragraphs.iter().zip(layouts.iter()) {
                 let id = paragraph.id.accesskit_id();
                 let children: Vec<_> = paragraph
                     .runs

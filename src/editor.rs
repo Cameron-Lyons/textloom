@@ -1,54 +1,17 @@
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
+
+mod composition;
+mod history;
+
+pub use composition::Composition;
+pub use history::HistoryLimits;
+use history::{EditState, History};
 
 use crate::document::Delta;
 use crate::{
     Document, Error, Fragment, InlineStyle, Movement, ParagraphKind, Position, SearchOptions,
     Selection, SelectionStyle, StylePatch,
 };
-
-/// Native IME preedit. It is rendered over `replacement` and never stored in the document.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Composition {
-    /// Uncommitted text supplied by the input method, without newline normalization.
-    pub text: String,
-    /// UTF-8 byte offsets supplied by the input method; `None` means a hidden cursor.
-    pub selection: Option<Range<usize>>,
-    /// Document selection that will be replaced when the composition is committed.
-    pub replacement: Selection,
-}
-
-/// Limits apply to retained undo and redo entries together.
-/// The default retains at most 256 entries and an estimated 8 MiB.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HistoryLimits {
-    /// Maximum total entries across both history directions; zero disables history.
-    pub max_entries: usize,
-    /// Maximum estimated retained bytes; zero disables history.
-    pub max_bytes: usize,
-}
-
-impl Default for HistoryLimits {
-    fn default() -> Self {
-        Self {
-            max_entries: 256,
-            max_bytes: 8 * 1024 * 1024,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct EditState {
-    selection: Selection,
-    style: InlineStyle,
-}
-
-struct HistoryEntry {
-    delta: Delta,
-    before: EditState,
-    after: EditState,
-    typing: bool,
-    bytes: usize,
-}
 
 /// A document, directional selection, bounded history, and transient IME state.
 ///
@@ -64,11 +27,7 @@ pub struct Editor {
     document: Document,
     selection: Selection,
     typing_style: InlineStyle,
-    undo: VecDeque<HistoryEntry>,
-    redo: VecDeque<HistoryEntry>,
-    history_bytes: usize,
-    limits: HistoryLimits,
-    coalesce_typing: bool,
+    history: History,
     preferred_column: Option<usize>,
     composition: Option<Arc<Composition>>,
 }
@@ -86,11 +45,7 @@ impl Editor {
             typing_style: document.style_at(Position::default()),
             document,
             selection: Selection::default(),
-            undo: VecDeque::new(),
-            redo: VecDeque::new(),
-            history_bytes: 0,
-            limits: HistoryLimits::default(),
-            coalesce_typing: false,
+            history: History::default(),
             preferred_column: None,
             composition: None,
         }
@@ -158,60 +113,46 @@ impl Editor {
         }
         result.unwrap_or_else(|| self.typing_style.into())
     }
-    /// Current transient IME preedit, or `None` when no composition is active.
-    pub fn composition(&self) -> Option<&Composition> {
-        self.composition.as_deref()
-    }
-    /// Retain immutable preedit state without copying text on each GUI frame.
-    #[cfg(feature = "egui")]
-    pub(crate) fn composition_snapshot(&self) -> Option<Arc<Composition>> {
-        self.composition.clone()
-    }
     /// Whether retained history contains an undo step.
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        self.history.undo_len() != 0
     }
     /// Whether retained history contains a redo step.
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        self.history.redo_len() != 0
     }
     /// Current limits shared by undo and redo history.
     pub fn history_limits(&self) -> HistoryLimits {
-        self.limits
+        self.history.limits()
     }
     /// Conservative estimate of text and formatting retained by undo and redo.
     /// Shared navigation indexes and allocator overhead are excluded.
     pub fn history_bytes(&self) -> usize {
-        self.history_bytes
+        self.history.bytes()
     }
     /// Number of retained undo steps; grouped typing counts as one step.
     pub fn undo_len(&self) -> usize {
-        self.undo.len()
+        self.history.undo_len()
     }
     /// Number of retained redo steps.
     pub fn redo_len(&self) -> usize {
-        self.redo.len()
+        self.history.redo_len()
     }
 
     /// Change limits, break the current typing group, and immediately evict excess history.
     /// Oldest undo entries are discarded first, then farthest redo entries.
     pub fn set_history_limits(&mut self, limits: HistoryLimits) {
-        self.limits = limits;
-        self.break_history_group();
-        self.enforce_limits();
+        self.history.set_limits(limits);
     }
 
     /// Discard undo and redo history while retaining document, selection, and IME preedit.
     pub fn clear_history(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
-        self.history_bytes = 0;
-        self.break_history_group();
+        self.history.clear();
     }
 
     /// Make the next text insertion a separate undo step from preceding typing.
     pub fn break_history_group(&mut self) {
-        self.coalesce_typing = false;
+        self.history.break_group();
     }
 
     /// Validate both endpoints before changing selection. Explicit selection cancels preedit.
@@ -611,97 +552,16 @@ impl Editor {
         Ok(())
     }
 
-    /// Begin transient IME preedit over the current selection and break the typing group.
-    /// Repeated calls preserve the existing composition and its replacement selection.
-    pub fn begin_composition(&mut self) {
-        if self.composition.is_none() {
-            self.break_history_group();
-            self.composition = Some(Arc::new(Composition {
-                text: String::new(),
-                selection: None,
-                replacement: self.selection,
-            }));
-        }
-    }
-
-    /// Preedit offsets follow native IME UTF-8 byte coordinates, which may be
-    /// Unicode scalar boundaries within an unfinished grapheme.
-    /// Starts a composition if necessary. Invalid or reversed offsets return
-    /// [`Error::InvalidCompositionSelection`] without changing existing preedit.
-    pub fn update_composition(
-        &mut self,
-        text: &str,
-        selection: Option<Range<usize>>,
-    ) -> Result<(), Error> {
-        if let Some(range) = &selection
-            && (range.start > range.end
-                || range.end > text.len()
-                || !text.is_char_boundary(range.start)
-                || !text.is_char_boundary(range.end))
-        {
-            return Err(Error::InvalidCompositionSelection);
-        }
-        self.begin_composition();
-        let composition = self
-            .composition
-            .as_mut()
-            .expect("composition just initialized");
-        let text_changed = composition.text != text;
-        if text_changed || composition.selection != selection {
-            if let Some(composition) = Arc::get_mut(composition) {
-                if text_changed {
-                    composition.text.clear();
-                    composition.text.push_str(text);
-                }
-                composition.selection = selection;
-            } else {
-                // Retained snapshots keep the previous value. Copy incoming
-                // text directly instead of cloning text that will be replaced.
-                *composition = Arc::new(Composition {
-                    text: text.to_owned(),
-                    selection,
-                    replacement: composition.replacement,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// A complete composition is a single undo step, including replacement of a selection.
-    /// Normalizes paragraph breaks and clears preedit. Without an active composition,
-    /// replaces the current selection. An empty commit deletes the replacement selection.
-    pub fn commit_composition(&mut self, text: &str) -> Result<(), Error> {
-        self.break_history_group();
-        if let Some(composition) = self.composition.take() {
-            self.selection = composition.replacement;
-        }
-        self.replace_selection(text, false)
-    }
-
-    /// Discard IME preedit and restore its replacement selection.
-    /// Returns whether a composition was active; document content and history are unchanged.
-    pub fn cancel_composition(&mut self) -> bool {
-        if let Some(composition) = self.composition.take() {
-            self.selection = composition.replacement;
-            self.break_history_group();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Cancel IME preedit and restore the previous document, selection, and typing style.
     /// Returns whether a retained undo step was applied. The document revision increases
     /// when history changes content, and the step becomes available to redo.
     pub fn undo(&mut self) -> bool {
         self.cancel_composition();
         self.break_history_group();
-        let Some(entry) = self.undo.pop_back() else {
+        let Some(state) = self.history.undo(&mut self.document) else {
             return false;
         };
-        self.document.replay(&entry.delta, false);
-        self.restore(entry.before);
-        self.redo.push_back(entry);
+        self.restore(state);
         true
     }
 
@@ -711,21 +571,11 @@ impl Editor {
     pub fn redo(&mut self) -> bool {
         self.cancel_composition();
         self.break_history_group();
-        let Some(entry) = self.redo.pop_back() else {
+        let Some(state) = self.history.redo(&mut self.document) else {
             return false;
         };
-        self.document.replay(&entry.delta, true);
-        self.restore(entry.after);
-        self.undo.push_back(entry);
+        self.restore(state);
         true
-    }
-
-    fn ensure_no_composition(&self) -> Result<(), Error> {
-        if self.composition.is_some() {
-            Err(Error::CompositionActive)
-        } else {
-            Ok(())
-        }
     }
 
     fn state(&self) -> EditState {
@@ -769,59 +619,7 @@ impl Editor {
     }
 
     fn record(&mut self, delta: Delta, before: EditState, typing: bool) {
-        for entry in self.redo.drain(..) {
-            self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
-        }
-        if self.limits.max_entries == 0 || self.limits.max_bytes == 0 {
-            self.coalesce_typing = false;
-            return;
-        }
-        let after = self.state();
-        let entry = HistoryEntry {
-            bytes: delta.retained_bytes(),
-            delta,
-            before,
-            after,
-            typing,
-        };
-        let merge = self.coalesce_typing
-            && typing
-            && self.undo.back().is_some_and(|previous| {
-                previous.typing
-                    && previous.after.selection == before.selection
-                    && previous.after.style == before.style
-                    && previous.delta.start == entry.delta.start
-                    && previous.delta.before.len() == 1
-                    && previous.delta.after.len() == 1
-                    && entry.delta.before.len() == 1
-                    && entry.delta.after.len() == 1
-            });
-        if merge {
-            let previous = self.undo.back_mut().expect("checked entry");
-            self.history_bytes = self.history_bytes.saturating_sub(previous.bytes);
-            previous.delta.after = entry.delta.after;
-            previous.after = after;
-            previous.bytes = previous.delta.retained_bytes();
-            self.history_bytes = self.history_bytes.saturating_add(previous.bytes);
-        } else {
-            self.history_bytes = self.history_bytes.saturating_add(entry.bytes);
-            self.undo.push_back(entry);
-        }
-        self.coalesce_typing = typing;
-        self.enforce_limits();
-    }
-
-    fn enforce_limits(&mut self) {
-        while self.undo.len() + self.redo.len() > self.limits.max_entries
-            || self.history_bytes > self.limits.max_bytes
-        {
-            // Dropping oldest undo or farthest redo preserves the applicable chain.
-            let entry = self.undo.pop_front().or_else(|| self.redo.pop_front());
-            let Some(entry) = entry else {
-                break;
-            };
-            self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
-        }
+        self.history.record(delta, before, self.state(), typing);
     }
 
     fn paragraph_text(&self, paragraph: usize) -> &str {
@@ -902,68 +700,5 @@ impl Editor {
                 .expect("valid paragraph")
                 .next_word(position.byte),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retained_composition_snapshots_preserve_text_selection_and_replacement() {
-        let mut editor = Editor::from_text("abc");
-        let replacement = Selection::new(Position::new(0, 3), Position::new(0, 1));
-        editor.set_selection(replacement).unwrap();
-        editor.update_composition("é", Some(0..2)).unwrap();
-        let first = Arc::clone(editor.composition.as_ref().unwrap());
-        assert_eq!(
-            editor.update_composition("x", Some(0..2)),
-            Err(Error::InvalidCompositionSelection)
-        );
-        editor.update_composition("é", Some(0..2)).unwrap();
-        assert!(Arc::ptr_eq(&first, editor.composition.as_ref().unwrap()));
-
-        editor.update_composition("é", Some(2..2)).unwrap();
-        let moved = Arc::clone(editor.composition.as_ref().unwrap());
-        assert_eq!(first.selection, Some(0..2));
-        assert_eq!(moved.selection, Some(2..2));
-        assert_eq!(first.text, "é");
-        assert_eq!(moved.text, "é");
-        assert!(!Arc::ptr_eq(&first, &moved));
-
-        editor.update_composition("日本", None).unwrap();
-        let changed = Arc::clone(editor.composition.as_ref().unwrap());
-        assert_eq!(changed.text, "日本");
-        for snapshot in [&first, &moved, &changed] {
-            assert_eq!(snapshot.replacement, replacement);
-        }
-        editor.commit_composition("日本語").unwrap();
-        assert_eq!(editor.document().plain_text(), "a日本語");
-        assert_eq!(changed.text, "日本");
-        assert!(editor.undo());
-        assert_eq!(editor.selection(), replacement);
-        assert_eq!(editor.document().plain_text(), "abc");
-
-        editor.update_composition("canceled", None).unwrap();
-        let canceled = Arc::clone(editor.composition.as_ref().unwrap());
-        assert!(editor.cancel_composition());
-        assert_eq!(canceled.text, "canceled");
-        assert_eq!(canceled.replacement, replacement);
-        assert_eq!(first.text, "é");
-        assert_eq!(moved.selection, Some(2..2));
-    }
-
-    #[test]
-    fn exclusive_composition_updates_reuse_text_storage() {
-        let mut editor = Editor::default();
-        editor.update_composition("café 👩‍💻", None).unwrap();
-        let storage = editor.composition().unwrap().text.as_ptr();
-        for text in ["café 👩‍💻", "café", "café 👩‍💻"] {
-            editor.update_composition(text, None).unwrap();
-            assert_eq!(editor.composition().unwrap().text.as_ptr(), storage);
-            assert_eq!(editor.composition().unwrap().text, text);
-        }
-        assert_eq!(editor.document().plain_text(), "");
-        assert!(!editor.can_undo());
     }
 }

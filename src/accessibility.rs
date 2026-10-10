@@ -493,14 +493,31 @@ mod accesskit_bridge {
             // just that replacement so ordinary typing and local formatting
             // retain the paragraph Vec and run lookup table. Wider edits use
             // occurrence-aware matching below to retain IDs after index shifts.
+            let precise_change = self
+                .document_identity
+                .as_ref()
+                .and_then(|identity| editor.document().change_since(identity));
             let local_change = self.paragraphs.len() == source.len()
-                && self.paragraphs.iter().zip(source).enumerate().all(
-                    |(index, (cached, paragraph))| {
-                        (Arc::ptr_eq(&cached.paragraph, paragraph)
-                            && cached.line_break == (index + 1 < source.len()))
-                            || changed_index.replace(index).is_none()
-                    },
-                );
+                && if same_document {
+                    true
+                } else if let Some(change) = precise_change {
+                    if change.range.len() == 1 && change.new_len == 1 {
+                        changed_index = Some(change.range.start);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    // A host can skip document updates or replace the editor.
+                    // Retain identity matching when its predecessor is unknown.
+                    self.paragraphs.iter().zip(source).enumerate().all(
+                        |(index, (cached, paragraph))| {
+                            (Arc::ptr_eq(&cached.paragraph, paragraph)
+                                && cached.line_break == (index + 1 < source.len()))
+                                || changed_index.replace(index).is_none()
+                        },
+                    )
+                };
             let mut nodes = Vec::new();
             let (paragraphs, replacement) = if local_change {
                 let replacement = changed_index
@@ -1202,6 +1219,52 @@ mod accesskit_bridge {
             editor.insert_text("q").unwrap();
             adapter.update(&editor, "Notes", true).unwrap();
             assert_eq!(adapter.paragraph_node(1), Some(unchanged_id));
+        }
+
+        #[test]
+        fn consecutive_and_skipped_edits_publish_current_runs_and_keep_untouched_ids() {
+            let mut editor = Editor::from_text("first\nsecond\nthird\nlast");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let first = adapter.paragraph_node(0).unwrap();
+            let last = adapter.paragraph_node(3).unwrap();
+            for text in ["é", "👩‍💻"] {
+                editor
+                    .set_selection(Selection::caret(Position::new(1, 0)))
+                    .unwrap();
+                editor.insert_text(text).unwrap();
+                adapter.update(&editor, "Notes", true).unwrap();
+                assert_eq!(adapter.paragraph_node(0), Some(first));
+                assert_eq!(adapter.paragraph_node(3), Some(last));
+            }
+            let obsolete = adapter
+                .to_text_position(&editor, Position::new(1, 0))
+                .unwrap();
+            // Hosts may redraw only after several unrelated edits.
+            for paragraph in [1, 2] {
+                editor
+                    .set_selection(Selection::caret(Position::new(paragraph, 0)))
+                    .unwrap();
+                editor.insert_text("changed ").unwrap();
+            }
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(adapter.paragraph_node(0), Some(first));
+            assert_eq!(adapter.paragraph_node(3), Some(last));
+            assert_eq!(
+                adapter.from_text_position(&editor, obsolete),
+                Err(AccessKitError::InvalidTextPosition(obsolete))
+            );
+            for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
+                for grapheme in 0..=paragraph.grapheme_count() {
+                    let position =
+                        Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap());
+                    let published = adapter.to_text_position(&editor, position).unwrap();
+                    assert_eq!(
+                        adapter.from_text_position(&editor, published).unwrap(),
+                        position
+                    );
+                }
+            }
         }
 
         #[test]
