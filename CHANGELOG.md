@@ -6,6 +6,13 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- Internal document/Unicode, history/IME, and egui layout/input/navigation/painting
+  responsibilities are separated without changing the public API or TLFR v1.
+  Precise paragraph-change notifications and a persistent layout index make
+  ordinary local layout updates proportional to the affected range and tree
+  paths. Accessibility preparation uses layout generations and localized run
+  updates while retaining complete egui tree publication.
+
 - `RichTextEditor::rich_clipboard()` accepts a host-owned `RichClipboard`
   transport. Hosts receive selected fragments before cut, can publish TLFR/HTML
   with plain alternatives, and can supply rich paste as one undo step. Successful

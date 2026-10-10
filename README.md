@@ -180,7 +180,39 @@ A text edit costs time proportional to the affected paragraph bytes and runs. In
 
 Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Word indexes and lowercase coordinate maps are prepared only when a literal candidate needs validation. Word indexes grow only through the prefix needed by candidates and remain local to each search. Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. For case-sensitive queries without whole-word matching, navigation scans directly from the selection when the query's first Unicode scalar occurs only once. Other queries retain the complete forward match stream and lowercase context. All matches respect the original paragraph's grapheme boundaries. A nearby match can be found without searching unrelated earlier text; missing queries may still visit the whole document. Cross-paragraph queries temporarily flatten the document and preserve its complete forward match stream. Literal searchers are reused across matches within each searched text; replace-all shares complete untouched paragraphs and builds text only for joined or edited paragraphs. It reuses validated search ranges and prepares replacement chunks once per operation.
 
-The egui widget retains galleys and layout geometry, invalidates them on content/font/DPI/appearance changes, and paints visible paragraphs. Paragraph splits, joins, and rich paste retain unchanged cache entries before and after the affected range, preparing a lookup table only for the changed middle. Appearance and font invalidation rebuild entries directly. Successive IME preedit updates reuse unchanged paragraph layouts in the preview cache; cursor-only changes reuse the preview document too. Native preedit scalar ranges convert to byte ranges in one scan through the requested endpoint. Word-selection snapping reuses paragraph boundary queries. Idle cache validation takes constant time; editing and preedit text changes still update paragraph geometry across the document. Accessibility uses shared content tokens to validate text snapshots and an index to locate text runs. Egui accessibility snapshots share unchanged paragraphs' text runs and geometry across local edits. Cached run nodes retain text and style properties; publication clones those properties and applies the current coordinate transforms. Text runs register hover widgets directly within their paragraph UI, avoiding a separate UI allocation per run. Direct AccessKit selection/label changes reuse paragraph nodes; updates affecting at most one paragraph without changing paragraph count retain paragraph storage and update only the changed run index entries. Content updates still visit paragraph references and build the editor's child list. Unchanged direct trees return an empty update in constant time.
+The egui widget separates layout, input, navigation, painting, and composition
+preview. It retains galleys and paints visible paragraphs. Committed edits carry
+a compact description of the replaced paragraph range to the adapters. Ordinary
+local edits update the affected cache entries and paths in a persistent layout
+index, which tracks paragraph heights, scalar totals, and list membership.
+Retained layout snapshots keep their original geometry. Structural edits also
+shift later paragraph-cache references; font, DPI, and appearance changes still
+rebuild all layouts. If an adapter misses an edit or receives an unrelated
+document, it compares paragraph identities to recover safely. Height totals use
+`f64` internally before conversion to egui coordinates, reducing accumulated
+rounding drift in long documents.
+
+Successive IME preedit updates reuse unchanged paragraph layouts in a separate
+preview layout cache; cursor-only changes reuse the preview document too.
+Native preedit scalar ranges convert to byte ranges in one scan through the
+requested endpoint. Word-selection snapping reuses paragraph boundary queries.
+Idle cache validation takes constant time. Accessibility validates text and
+layout snapshots with shared identity tokens and locates text runs through an
+index. A uniquely owned egui accessibility snapshot patches a single changed
+paragraph and its run locations; retained snapshots and broader invalidation
+use validated rebuilds. Publication still registers the complete tree required
+by egui, cloning cached run properties and applying current coordinate
+transforms. Direct AccessKit selection/label changes reuse paragraph nodes;
+precise single-paragraph edits update that paragraph and its run locations
+without scanning unchanged paragraph identities. The editor child list still
+scales with paragraph count. Unchanged direct trees return an empty update in
+constant time.
+
+The private editor modules keep history retention/coalescing and transient IME
+state separate from editing commands. Public types, TLFR v1 bytes, and the
+existing conservative history accounting remain unchanged. Change notifications
+retain one predecessor identity and no paragraph data; they do not grow with
+history or add allocations to the existing document identity updates.
 
 ```sh
 cargo test --locked --no-default-features
