@@ -1,5 +1,3 @@
-//! Immutable rich-text clipboard fragments and dependency-free interchange.
-
 use std::{fmt, sync::Arc};
 
 use crate::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
@@ -10,10 +8,6 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PARAGRAPHS: usize = 1_000_000;
 const MAX_SPANS: usize = 1_000_000;
 
-/// An immutable piece of a rich-text document, suitable for a clipboard.
-///
-/// Paragraphs are shared with the source document until edited. A fragment
-/// always contains at least one paragraph, including when its text is empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fragment {
     paragraphs: Vec<Arc<Paragraph>>,
@@ -26,14 +20,12 @@ impl Default for Fragment {
 }
 
 impl Fragment {
-    /// Import plain text, normalizing CRLF and lone CR to paragraph breaks.
     pub fn from_text(text: &str) -> Self {
         Self {
             paragraphs: Document::from_text(text).into_paragraphs(),
         }
     }
 
-    /// Capture an entire document, sharing its immutable paragraph allocations.
     pub fn from_document(document: &Document) -> Self {
         Self {
             paragraphs: document.paragraphs().to_vec(),
@@ -52,33 +44,14 @@ impl Fragment {
         self.paragraphs
     }
 
-    /// Return the ordered, immutable paragraphs, including an empty paragraph
-    /// when the fragment contains no text.
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
     }
 
-    /// Export text with LF between paragraphs, omitting visual list markers.
     pub fn plain_text(&self) -> String {
         crate::export::plain_text(self.paragraphs())
     }
 
-    /// Encode text, paragraph kinds and inline formatting without losing data.
-    ///
-    /// The native format begins with `TLFR`, version byte `1`, then a
-    /// little-endian `u64` paragraph count. Each paragraph contains a kind tag
-    /// (`0` body, `1` heading + `u8` level, `2` bullet + `u8` indent, or `3`
-    /// ordered + `u8` indent + little-endian `u32` start), a `u64` UTF-8 byte
-    /// length and its text, then a `u64` span count. Each span contains its
-    /// `u64` end offset, a style byte and optional four-byte sRGBA color. Span
-    /// starts follow the preceding end, initially zero. Style bits 0 through
-    /// 5 are bold, italic, underline, strike, code and color-present.
-    ///
-    /// The version and fixed integer widths make files independent of target
-    /// architecture. [`Self::from_bytes`] checks the complete format and
-    /// applies explicit resource limits to untrusted data. Encoding has no
-    /// size limit; fragments above those decoding limits cannot be imported
-    /// with [`Self::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         Self::encode_paragraphs(&self.paragraphs)
     }
@@ -127,12 +100,6 @@ impl Fragment {
         output
     }
 
-    /// Decode native rich text, rejecting invalid or noncanonical data.
-    ///
-    /// Inputs are limited to 64 MiB, one million paragraphs and one million
-    /// total spans. Declared lengths are checked against the remaining input
-    /// before allocation. UTF-8, complete span coverage, grapheme boundaries,
-    /// heading levels, flags and trailing bytes are validated.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FragmentError> {
         if bytes.len() > MAX_BYTES {
             return Err(FragmentError::LimitExceeded);
@@ -152,7 +119,6 @@ impl Fragment {
         if count > MAX_PARAGRAPHS {
             return Err(FragmentError::LimitExceeded);
         }
-        // Even an empty body paragraph needs one tag and two u64 lengths.
         if count > input.remaining() / 17 {
             return Err(FragmentError::Truncated);
         }
@@ -190,7 +156,6 @@ impl Fragment {
             if total_spans > MAX_SPANS {
                 return Err(FragmentError::LimitExceeded);
             }
-            // Every span needs at least its end offset and style byte.
             if span_count > input.remaining() / 9 {
                 return Err(FragmentError::Truncated);
             }
@@ -216,8 +181,6 @@ impl Fragment {
             if start != text.len() {
                 return Err(FragmentError::InvalidSpans);
             }
-            // The paragraph constructor validates grapheme boundaries in one
-            // forward scan; repeating segmentation here doubles import work.
             let paragraph = Paragraph::from_parts(text, spans, kind)
                 .map_err(|_| FragmentError::InvalidSpans)?;
             paragraphs.push(Arc::new(paragraph));
@@ -228,43 +191,24 @@ impl Fragment {
         Ok(Self { paragraphs })
     }
 
-    /// Export escaped HTML with semantic formatting, headings and nested lists.
-    ///
-    /// Text is escaped and the generated attributes contain only validated
-    /// numeric values. The wrapper preserves whitespace. Indentation increases
-    /// nest lists beneath the preceding item; gaps in indentation do not create
-    /// artificial empty list items. Explicit ordered numbering is preserved.
-    /// NUL characters become U+FFFD because HTML cannot represent them as text.
     pub fn to_html(&self) -> String {
         crate::export::html(self.paragraphs())
     }
 }
 
-/// A malformed or unsupported native rich-text fragment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FragmentError {
-    /// The input ends before a declared field or payload is complete.
     Truncated,
-    /// The input does not begin with the `TLFR` signature.
     InvalidMagic,
-    /// The version byte is not supported by this decoder.
     UnsupportedVersion(u8),
-    /// The input exceeds a size, paragraph count, span count, or platform limit.
     LimitExceeded,
-    /// The input declares no paragraphs.
     InvalidParagraphCount,
-    /// A paragraph kind tag or heading level is invalid.
     InvalidParagraphKind,
-    /// Paragraph text contains a CR or LF rather than a paragraph boundary.
     InvalidParagraphText,
-    /// Paragraph text is not valid UTF-8.
     InvalidUtf8,
-    /// Spans do not canonically cover the text at extended grapheme boundaries.
     InvalidSpans,
-    /// A style byte sets reserved bits.
     InvalidStyle,
-    /// Bytes remain after the last declared paragraph.
     TrailingData,
 }
 

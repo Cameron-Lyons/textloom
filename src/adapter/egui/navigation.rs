@@ -1,4 +1,3 @@
-//! Pointer hit testing, grapheme snapping, and visual caret navigation.
 use std::ops::Range;
 
 use egui::{
@@ -46,8 +45,6 @@ pub(super) fn hit_test(
     };
     let index = CharIndex(source.scalar_index(byte).expect("snapped scalar boundary"));
     let clicked_row = layout.galley.layout_from_cursor(cursor).row;
-    // A wrap seam has two visual caret positions. Preserve the row that was
-    // clicked even when a scalar hit was snapped to a grapheme boundary.
     let prefer_next_row = [cursor.prefer_next_row, !cursor.prefer_next_row]
         .into_iter()
         .find(|&prefer_next_row| {
@@ -92,8 +89,6 @@ pub(super) fn preedit_byte_range(text: &str, range: &Range<usize>) -> Result<Ran
     if range.start > range.end {
         return Err(Error::InvalidCompositionSelection);
     }
-    // Chars skips scalar prefixes in chunks; CharIndices uses a scalar-by-scalar
-    // fallback. Derive byte offsets from the remaining suffix without allocating.
     let mut chars = text.chars();
     if range.start != 0 && chars.nth(range.start - 1).is_none() {
         return Err(Error::InvalidCompositionSelection);
@@ -121,8 +116,6 @@ pub(super) fn word_selection(editor: &Editor, position: Position) -> Selection {
         return Selection::caret(position);
     };
     let text = paragraph.text();
-    // Hit testing snaps the right half of the final grapheme to paragraph end.
-    // Double clicking there should still select the trailing word or symbol.
     let byte = if position.byte == text.len() {
         paragraph.boundary_at_or_before(text.len().saturating_sub(1))
     } else {
@@ -256,9 +249,6 @@ pub(super) fn snap_vertical_cursor(
     if before == after {
         return Some((byte, cursor.prefer_next_row));
     }
-    // A space followed by combining marks can wrap between its scalar glyphs.
-    // Prefer a real caret boundary on the target row rather than snapping back
-    // onto the row we just left. Recompute affinity for the snapped boundary.
     let target_row = galley.layout_from_cursor(cursor).row;
     let on_target_row = |byte| {
         let index = CharIndex(source.scalar_index(byte)?);
@@ -282,9 +272,6 @@ pub(super) fn snap_vertical_cursor(
         }),
         (Some(affinity), None) => Some((before, affinity)),
         (None, Some(affinity)) => Some((after, affinity)),
-        // A grapheme spanning the entire target row has no legal caret there.
-        // Cross the cluster in the requested direction, using the closest row
-        // representation of that boundary when it falls on another wrap seam.
         (None, None) => Some(if down { (after, false) } else { (before, true) }),
     }
 }

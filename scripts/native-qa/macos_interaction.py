@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Exercise native macOS input and TextEdit clipboard on an isolated CI desktop.
-
-Only fixture text is used. Native reports remain content free and carry no
-manual signoff. This driver refuses to run on a person's macOS session.
-"""
 
 import json
 import os
@@ -27,8 +22,6 @@ ORIGINAL = (
 EXTERNAL = "external café 日本語👩🏽‍💻\nsecond"
 MARKER = "Native rich clipboard roundtrip and undo/redo passed"
 
-# Use the runner's pre-authorized osascript -> System Events path. All process,
-# window, and input values are argv, never interpolated AppleScript source.
 APPLESCRIPT = r'''
 on run argv
     set commandName to item 1 of argv
@@ -167,7 +160,6 @@ class Probe:
             capture_output=True, text=True, encoding="utf-8", timeout=timeout,
         )
         if check and result.returncode:
-            # Fixture-only diagnostic output is bounded; do not log argv/text.
             raise RuntimeError(
                 f"{Path(str(arguments[0])).name} exited {result.returncode}: "
                 f"{result.stderr[-4000:]}{result.stdout[-1000:]}"
@@ -190,9 +182,6 @@ class Probe:
             result = self.apple(command, pid, window, value, *documents, check=False)
             if result.returncode == 0:
                 return
-            # This error occurs before any keystroke. A startup/autosave window
-            # transition may briefly remove the target; never replay an action
-            # after an ambiguous window or a post-input failure.
             if "Target window count 0" not in result.stderr or time.monotonic() >= deadline:
                 raise RuntimeError(f"Native {command} on PID {pid} / {window}: {result.stderr[-4000:]}")
             time.sleep(0.2)
@@ -206,7 +195,6 @@ class Probe:
             documents = self.document_urls.get(window, ("", ""))
             result = self.apple("focus", pid, window, "", *documents, check=False)
             if result.returncode == 0:
-                # Allow the focus event to reach a rendered frame before input.
                 time.sleep(0.35)
                 return
             last_error = result.stderr.strip()
@@ -329,7 +317,6 @@ class Probe:
         self.action(self.textedit_pid, self.import_file.stem, "chord", "c")
         self.diagnostic("textedit-after-copy")
         self.note("editable: TextEdit imported native HTML", **self.clipboard("textedit-import", changed_from=generation))
-        # Save the already named private file so closing it needs no dialog.
         self.action(self.textedit_pid, self.import_file.stem, "chord", "s")
         self.open_textedit(self.external_file)
         self.note("editable: TextEdit external rich source verified", **self.external_copy())
@@ -342,7 +329,6 @@ class Probe:
         self.action(process.pid, TITLE, "shift-chord", "z")
         self.copy(process.pid, TITLE, EXTERNAL)
         self.note("editable: native replacement undo and redo restored exact Unicode text")
-        # Copy leaves the entire document selected; Right collapses it at its end.
         self.action(process.pid, TITLE, "keycode", "124")
         self.action(process.pid, TITLE, "type", "x")
         self.focus(self.textedit_pid, self.external_file.stem)
@@ -387,7 +373,7 @@ class Probe:
         clean = True
         for process in self.hosts:
             if process.poll() is None:
-                clean = False  # failure cleanup is not a successful graceful session
+                clean = False
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=3)
@@ -396,8 +382,6 @@ class Probe:
                     process.wait(timeout=3)
         self.observations["cleanup"]["native_processes_reaped"] = all(p.poll() is not None for p in self.hosts)
         self.observations["cleanup"]["native_sessions_closed_gracefully"] = clean
-        # TextEdit belongs to this probe only: preflight rejected an existing
-        # process. Check executable identity again before signalling its PID.
         if self.textedit_pid is not None:
             result = self.run(["/bin/ps", "-p", self.textedit_pid, "-o", "comm="], check=False)
             if result.returncode == 0:

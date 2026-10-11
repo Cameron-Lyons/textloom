@@ -3,29 +3,21 @@ use std::{ops::Range, sync::Arc};
 use super::Editor;
 use crate::{Error, Selection};
 
-/// Native IME preedit. It is rendered over `replacement` and never stored in the document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Composition {
-    /// Uncommitted text supplied by the input method, without newline normalization.
     pub text: String,
-    /// UTF-8 byte offsets supplied by the input method; `None` means a hidden cursor.
     pub selection: Option<Range<usize>>,
-    /// Document selection that will be replaced when the composition is committed.
     pub replacement: Selection,
 }
 
 impl Editor {
-    /// Current transient IME preedit, or `None` when no composition is active.
     pub fn composition(&self) -> Option<&Composition> {
         self.composition.as_deref()
     }
-    /// Retain immutable preedit state without copying text on each GUI frame.
     #[cfg(feature = "egui")]
     pub(crate) fn composition_snapshot(&self) -> Option<Arc<Composition>> {
         self.composition.clone()
     }
-    /// Begin transient IME preedit over the current selection and break the typing group.
-    /// Repeated calls preserve the existing composition and its replacement selection.
     pub fn begin_composition(&mut self) {
         if self.composition.is_none() {
             self.break_history_group();
@@ -37,10 +29,6 @@ impl Editor {
         }
     }
 
-    /// Preedit offsets follow native IME UTF-8 byte coordinates, which may be
-    /// Unicode scalar boundaries within an unfinished grapheme.
-    /// Starts a composition if necessary. Invalid or reversed offsets return
-    /// [`Error::InvalidCompositionSelection`] without changing existing preedit.
     pub fn update_composition(
         &mut self,
         text: &str,
@@ -68,8 +56,6 @@ impl Editor {
                 }
                 composition.selection = selection;
             } else {
-                // Retained snapshots keep the previous value. Copy incoming
-                // text directly instead of cloning text that will be replaced.
                 *composition = Arc::new(Composition {
                     text: text.to_owned(),
                     selection,
@@ -80,9 +66,6 @@ impl Editor {
         Ok(())
     }
 
-    /// A complete composition is a single undo step, including replacement of a selection.
-    /// Normalizes paragraph breaks and clears preedit. Without an active composition,
-    /// replaces the current selection. An empty commit deletes the replacement selection.
     pub fn commit_composition(&mut self, text: &str) -> Result<(), Error> {
         self.break_history_group();
         if let Some(composition) = self.composition.take() {
@@ -91,8 +74,6 @@ impl Editor {
         self.replace_selection(text, false)
     }
 
-    /// Discard IME preedit and restore its replacement selection.
-    /// Returns whether a composition was active; document content and history are unchanged.
     pub fn cancel_composition(&mut self) -> bool {
         if let Some(composition) = self.composition.take() {
             self.selection = composition.replacement;

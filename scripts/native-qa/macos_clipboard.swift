@@ -1,5 +1,3 @@
-// Original AppKit inspector for the isolated hosted macOS interaction probe.
-// This helper never sends input; osascript owns all PID-checked native actions.
 import AppKit
 import Foundation
 
@@ -89,9 +87,6 @@ func textEditImport() throws {
     let value = attributed.string as NSString
     let first = value.range(of: "café 日本語👩🏽‍💻")
     try require(first.location != NSNotFound, "TextEdit lost the Unicode first paragraph")
-    // AppKit represents displayed list markers as literal tabs plus a marker in
-    // RTF text. Accept that native representation only when every payload line
-    // remains exact and each prefix matches its actual NSTextList marker.
     var lines = attributed.string.replacingOccurrences(of: "\r\n", with: "\n")
         .replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n")
     if lines.last == "" { lines.removeLast() }
@@ -179,8 +174,6 @@ func diagnose(_ arguments: [String]) throws {
     let directory = URL(fileURLWithPath: arguments[0], isDirectory: true)
     let label = arguments[1]
     var observation: [String: Any] = ["fixture_only": true, "types": types()]
-    // These files contain only this probe's private fixture, never a real
-    // desktop's clipboard. A separate small cap bounds diagnostic artifacts.
     let diagnosticLimit = 64 * 1024
     if let value = NSPasteboard.general.string(forType: .string) {
         try require(value.utf8.count <= diagnosticLimit, "Fixture diagnostic text exceeds its cap")
@@ -199,8 +192,6 @@ func diagnose(_ arguments: [String]) throws {
             try parsed.string.write(to: directory.appendingPathComponent("macos-fixture-\(label).rtf.txt"), atomically: true, encoding: .utf8)
         }
         if type == .html && label == "native-offer" {
-            // Distinguish an HTML encoding contract issue from keyboard/focus
-            // mistakes, without substituting this parser for the TextEdit test.
             for explicitUTF8 in [false, true] {
                 let name = explicitUTF8 ? "explicit-utf8" : "default"
                 var options: [NSAttributedString.DocumentReadingOptionKey: Any] = [.documentType: NSAttributedString.DocumentType.html]

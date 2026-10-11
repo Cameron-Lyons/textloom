@@ -1,4 +1,3 @@
-//! Selection painting in visible paragraph layouts.
 use super::layout::ParagraphLayouts;
 use crate::{Document, Selection};
 use egui::{Color32, Pos2, Rect, text::CharIndex};

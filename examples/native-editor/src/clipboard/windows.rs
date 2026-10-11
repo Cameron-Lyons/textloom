@@ -1,5 +1,3 @@
-//! Windows rich clipboard operations. The parent runs these in a bounded helper process.
-
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +21,6 @@ pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
     if item.rich.is_empty() {
         return Err("Windows rich clipboard copy requires a framed rich payload".into());
     }
-    // Prepare and validate all buffers before emptying the existing clipboard.
     let plain = encode_unicode(&item.plain)?;
     let html = encode_html(&item.html)?;
     let rich_format = registered_format(MIME, "rich")?;
@@ -39,7 +36,6 @@ pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
         if raw::get_owner().map(|window| window.as_ptr() as usize) != Some(owner) {
             return Err("Windows clipboard owner verification failed".into());
         }
-        // Register the most descriptive representations first for format enumeration.
         for (format, bytes, label) in native_formats {
             raw::set_without_clear(format, bytes).map_err(|error| {
                 format!("Windows clipboard {label} publication failed: {error}")
@@ -47,7 +43,6 @@ pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
         }
         for (format, expected, label) in native_formats {
             let actual = read_bytes(format, label)?;
-            // GlobalAlloc may round up the allocation; clipboard-win uses zeroed memory.
             if !actual.starts_with(expected)
                 || actual[expected.len()..].iter().any(|byte| *byte != 0)
             {
@@ -92,13 +87,10 @@ fn with_clipboard<T>(
 ) -> Result<T, String> {
     let guard = open_clipboard(owner)?;
     let result = operation();
-    // Clipboard's Drop ignores CloseClipboard errors. Close explicitly so success means
-    // the three verified representations were also made available to other processes.
     let close = raw::close().map_err(|error| format!("Windows clipboard close failed: {error}"));
     if close.is_ok() {
         std::mem::forget(guard);
     }
-    // On a close error the guard gets one final cleanup attempt as it leaves scope.
     match (result, close) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -141,8 +133,6 @@ fn byte_buffer(size: usize, label: &str) -> Result<Vec<u8>, String> {
 }
 
 fn read_bytes(format: u32, label: &str) -> Result<Vec<u8>, String> {
-    // These safe APIs inspect native GlobalSize before any buffer allocation, then copy
-    // into a caller-sized slice. get_vec/get_string/get_html would allocate unchecked.
     let size = raw::size(format)
         .ok_or_else(|| format!("Windows clipboard {label} native byte size is unavailable"))?
         .get();
@@ -162,7 +152,7 @@ fn encode_unicode(text: &str) -> Result<Vec<u8>, String> {
     if text.contains('\0') {
         return Err("Windows Unicode clipboard text contains a NUL character".into());
     }
-    let mut units = 1_usize; // Terminator.
+    let mut units = 1_usize;
     let mut previous = None;
     for unit in text.encode_utf16() {
         units = units
@@ -233,7 +223,6 @@ fn encode_html(fragment: &str) -> Result<Vec<u8>, String> {
         .checked_add(1)
         .ok_or("Windows HTML clipboard byte size overflow")?;
     let mut bytes = byte_buffer(size, "HTML")?;
-    // CF_HTML offsets count UTF-8 bytes from the beginning, excluding the terminator.
     let header = format!(
         "Version:1.0\r\nStartHTML:{start_html:010}\r\nEndHTML:{end_html:010}\r\nStartFragment:{start_fragment:010}\r\nEndFragment:{end_fragment:010}\r\n"
     );

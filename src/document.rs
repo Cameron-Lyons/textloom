@@ -12,12 +12,6 @@ use paragraph::{append_slice, push_span};
 #[cfg(any(feature = "egui", feature = "accesskit"))]
 use change::LastChange;
 
-/// A document always contains at least one paragraph.
-///
-/// Paragraphs are shared with undo history. An edit rebuilds only its affected
-/// paragraphs; all other paragraph allocations remain intact.
-/// Equality compares rich content and the revision counter. To compare content
-/// independently of revision, compare [`Fragment::from_document`] values.
 #[derive(Clone, Debug)]
 pub struct Document {
     paragraphs: Vec<Arc<Paragraph>>,
@@ -42,12 +36,10 @@ impl Default for Document {
 }
 
 impl Document {
-    /// Create a document containing one empty body paragraph.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Import plain text, normalizing CRLF and lone CR to paragraph breaks.
     pub fn from_text(text: &str) -> Self {
         let text = normalize_newlines(text);
         Self::from_paragraphs(
@@ -57,7 +49,6 @@ impl Document {
         )
     }
 
-    /// Restore an immutable rich fragment, sharing its paragraph allocations.
     pub fn from_fragment(fragment: &Fragment) -> Self {
         Self::from_paragraphs(fragment.paragraphs().to_vec())
     }
@@ -72,29 +63,19 @@ impl Document {
         }
     }
 
-    /// Encode the complete document in Textloom's versioned native rich-text format.
-    /// See [`Fragment::to_bytes`] for compatibility and decoder resource limits.
     pub fn to_bytes(&self) -> Vec<u8> {
         Fragment::encode_paragraphs(self.paragraphs())
     }
 
-    /// Decode validated native rich text. See [`Fragment::from_bytes`] for resource limits.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::FragmentError> {
         Fragment::from_bytes(bytes)
             .map(|fragment| Self::from_paragraphs(fragment.into_paragraphs()))
     }
 
-    /// Export semantic HTML with escaped text and preserved formatting.
-    /// NUL characters become U+FFFD because HTML cannot preserve literal NULs.
     pub fn to_html(&self) -> String {
         crate::export::html(self.paragraphs())
     }
 
-    /// Capture a forward range with clipped inline runs and original paragraph kinds.
-    /// Complete paragraphs share their original allocations.
-    ///
-    /// Returns [`Error::InvalidRange`] for reversed endpoints or
-    /// [`Error::InvalidPosition`] for endpoints outside grapheme boundaries.
     pub fn fragment(&self, range: Range<Position>) -> Result<Fragment, Error> {
         self.validate_range(&range)?;
         let mut paragraphs = Vec::with_capacity(range.end.paragraph - range.start.paragraph + 1);
@@ -122,8 +103,6 @@ impl Document {
         Ok(Fragment::from_paragraphs(paragraphs))
     }
 
-    /// Paragraphs in document order, always containing at least one element.
-    /// Shared allocations may be retained by fragments or undo history.
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
     }
@@ -132,40 +111,28 @@ impl Document {
         self.paragraphs
     }
 
-    /// Look up a paragraph by zero-based index; out-of-range indices return `None`.
     pub fn paragraph(&self, index: usize) -> Option<&Paragraph> {
         self.paragraphs.get(index).map(Arc::as_ref)
     }
 
-    /// The valid caret position immediately after the final paragraph's text.
     pub fn end(&self) -> Position {
         let paragraph = self.paragraphs.len() - 1;
         Position::new(paragraph, self.paragraphs[paragraph].text.len())
     }
 
-    /// Increases on every actual edit, undo, or redo; it is never restored by undo.
-    /// Starts at zero on import and saturates at `u64::MAX`.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// A stable token for this content state, shared by document clones and
-    /// replaced only after actual changes. Renderers may compare its pointers
-    /// without retaining or comparing all paragraphs.
     #[cfg(any(feature = "egui", feature = "accesskit"))]
     pub(crate) fn content_identity(&self) -> Arc<()> {
         Arc::clone(&self.identity)
     }
 
-    /// Export text with LF between paragraphs. List markers are presentation.
     pub fn plain_text(&self) -> String {
         crate::export::plain_text(self.paragraphs())
     }
 
-    /// Read a forward range; paragraph breaks are returned as LF.
-    ///
-    /// Returns [`Error::InvalidRange`] for reversed endpoints or
-    /// [`Error::InvalidPosition`] for endpoints outside grapheme boundaries.
     pub fn text(&self, range: Range<Position>) -> Result<String, Error> {
         self.validate_range(&range)?;
         let mut result = String::new();
@@ -189,9 +156,6 @@ impl Document {
         Ok(result)
     }
 
-    /// Check that a position references an existing paragraph and a grapheme boundary.
-    /// Paragraph start and end are valid even for empty paragraphs.
-    /// Returns [`Error::InvalidPosition`] without changing the document on failure.
     pub fn validate_position(&self, position: Position) -> Result<(), Error> {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return Err(Error::InvalidPosition(position));
@@ -203,8 +167,6 @@ impl Document {
         }
     }
 
-    /// Return the preceding run's style at a boundary, or the first style at zero.
-    /// Invalid positions and empty paragraphs return the default style.
     pub fn style_at(&self, position: Position) -> InlineStyle {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return InlineStyle::default();
@@ -223,10 +185,6 @@ impl Document {
         self.validate_position(range.end)
     }
 
-    /// Replace text while preserving the formatting of both surviving edges.
-    /// Heading continuations become body paragraphs; list continuations retain
-    /// their kind. The returned caret is snapped forward if insertion joins a
-    /// surrounding grapheme, such as a combining mark or emoji sequence.
     pub(crate) fn replace(
         &mut self,
         range: Range<Position>,
@@ -269,8 +227,6 @@ impl Document {
                 );
             }
             let mut kind = if is_first {
-                // Deleting a complete leading paragraph preserves the suffix's
-                // paragraph metadata when no replacement text takes its place.
                 if is_last
                     && range.start.paragraph != range.end.paragraph
                     && range.start.byte == 0
@@ -295,8 +251,6 @@ impl Document {
                 ) = (first.kind, kind)
                 && first_indent == indent
             {
-                // Removing a complete list item moves the surviving suffix
-                // into its ordinal, rather than leaving a hole in the list.
                 kind = ParagraphKind::Ordered { indent, start };
             }
             after.push(Arc::new(Paragraph::styled(output, spans, kind)));
@@ -368,7 +322,6 @@ impl Document {
                 .expect("fragment has a paragraph")
                 .boundary_at_or_after(insertion_end),
         );
-        // Rich paste preserves explicit source numbering, including list restarts.
         let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
         Ok((delta, caret))
     }
@@ -416,11 +369,6 @@ impl Document {
         self.change(range, after)
     }
 
-    /// Build a batch replacement against the original text, normalizing joined
-    /// graphemes only after every match is applied. This avoids shifting ranges
-    /// and rebuilding the same paragraph once per match.
-    /// Matches must be a nonempty `find` result for the current document:
-    /// ordered, nonoverlapping ranges with valid grapheme-boundary endpoints.
     pub(crate) fn replace_matches(
         &mut self,
         matches: &[Range<Position>],
@@ -604,8 +552,6 @@ struct ReplacementBuilder {
     text: String,
     spans: Vec<Span>,
     kind: ParagraphKind,
-    // A complete source paragraph stays shared until more text is joined to it.
-    // While a candidate is present, the owned text and span buffers are empty.
     candidate: Option<Arc<Paragraph>>,
 }
 

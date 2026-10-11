@@ -1,5 +1,3 @@
-//! Batch replacement, search navigation, word deletion, and list indentation contracts.
-
 use std::sync::Arc;
 
 use textloom::{

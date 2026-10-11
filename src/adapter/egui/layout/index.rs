@@ -1,6 +1,3 @@
-//! Persistent paragraph geometry and prefix totals. Leaves share unchanged
-//! layouts across frames; an edit copies only boundary leaves and tree paths.
-
 #[cfg(test)]
 mod tests;
 
@@ -246,9 +243,6 @@ fn update(node: &Arc<Node>, at: usize, paragraphs: &[ParagraphCache]) -> Arc<Nod
     }
 }
 
-/// A generation token that keeps an allocation identity without retaining its
-/// geometry. A stale Weak allocation remains reserved, preventing pointer reuse
-/// from making an old accessibility generation match a newer layout.
 #[derive(Clone, Debug)]
 pub(crate) struct LayoutIdentity(Weak<LayoutVersion>);
 
@@ -271,8 +265,6 @@ struct LayoutVersion {
     environment: Arc<()>,
 }
 
-/// An immutable geometry snapshot. Empty placeholder caches allocate nothing;
-/// initialized snapshots clone one Arc and keep their complete generation.
 #[derive(Clone, Default)]
 pub(crate) struct ParagraphLayouts {
     version: Option<Arc<LayoutVersion>>,
@@ -355,8 +347,6 @@ impl ParagraphLayouts {
         left
     }
 
-    // Descend using subtree bounds rather than binary-searching materialized
-    // rectangles. No layout/galley clones are needed to locate the viewport.
     fn partition_y(&self, y: f32, bottom: bool, inclusive: bool, extra: f32) -> usize {
         let Some(mut node) = self.root().map(Arc::as_ref) else {
             return 0;
@@ -477,7 +467,6 @@ impl ParagraphLayouts {
             .version
             .as_ref()
             .map_or_else(|| Arc::new(()), |version| version.environment.clone());
-        // Generations stay immutable even when no strong snapshot is retained.
         self.version = Some(Arc::new(LayoutVersion { root, environment }));
     }
 

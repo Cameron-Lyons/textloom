@@ -1,12 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
-# Copyright (c) 2026 Textloom contributors
-"""Original, isolated NVDA QA plugin; never generates speech or edits text.
-
-The driver sends native keys. This plugin observes NVDA's synthesis queue and
-reads its focused object's TextInfo. Only the owned editor's public fixture is
-captured. Requests and results stay in the private profile; there is no server.
-"""
-
 import json
 import os
 from pathlib import Path
@@ -75,8 +66,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._observation_failed = True
         record = {"error_type": type(error).__name__, "location": location,
                   "request_id": request_id}
-        # A separate marker makes an observation failure visible even when the
-        # normal append failed. Its content never includes exception messages.
         try:
             (self._root / "reader-capture-failed.json").write_text(
                 json.dumps(record), encoding="utf-8")
@@ -94,7 +83,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         return value
 
     def _speech(self, speechSequence, **kwargs):
-        # Filtering by NVDA's own focus avoids capturing other applications.
         try:
             obj = self._focus(allow_other=True)
             if obj is None:
@@ -155,7 +143,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             else:
                 raise ValueError("unknown request operation")
         except Exception as error:
-            # Exception messages can contain provider/document text.
             self._capture_error(error, "request", request_id)
 
     def terminate(self):

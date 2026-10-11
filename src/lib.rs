@@ -1,8 +1,4 @@
-#![doc = include_str!("../README.md")]
-
-/// Borrowed editor semantics and optional AccessKit integration.
 pub mod accessibility;
-/// Optional egui rendering and winit native input integrations.
 pub mod adapter;
 mod document;
 mod editor;

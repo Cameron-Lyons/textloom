@@ -1,30 +1,16 @@
-//! Egui's stock text helper selects scalar values. These runs use the same
-//! extended grapheme boundaries as Textloom, including paragraph separators.
-
 use super::{ParagraphLayout, ParagraphLayouts, layout::LayoutIdentity};
 use crate::{Editor, InlineStyle, Paragraph, ParagraphKind, Position};
 use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, text::CCursor};
 use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Failure to publish or apply the widget's native accessibility text model.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccessibilityError {
-    /// A grapheme exceeds AccessKit's maximum selectable UTF-8 character length.
-    CharacterTooLong {
-        /// Start of the unsupported grapheme in document coordinates.
-        position: Position,
-        /// UTF-8 byte length of the grapheme.
-        bytes: usize,
-    },
-    /// The rendered paragraphs do not match the committed document.
+    CharacterTooLong { position: Position, bytes: usize },
     InvalidLayout,
-    /// An action targets a text snapshot superseded by an edit.
     StaleDocument,
-    /// A requested caret stop is absent from the published text runs.
     InvalidTextPosition,
-    /// A recognized text action has missing or incompatible data.
     InvalidActionData,
 }
 
@@ -51,7 +37,6 @@ impl std::error::Error for AccessibilityError {}
 struct Run {
     id: Id,
     range: Range<usize>,
-    /// Paragraph-local byte boundaries, without the synthetic separator.
     offsets: Vec<usize>,
     line_break: bool,
     node: accesskit::Node,
@@ -64,9 +49,7 @@ struct RunBuilder {
     range: Range<usize>,
     value: String,
     lengths: Vec<u8>,
-    /// Paragraph-local byte boundaries, without the synthetic separator.
     offsets: Vec<usize>,
-    /// Matching scalar indices for egui's layout API.
     scalar_offsets: Vec<usize>,
     style: InlineStyle,
     row: usize,
@@ -130,8 +113,6 @@ pub(super) fn build_cached(
             && Arc::ptr_eq(&cached.source, source)
             && Arc::ptr_eq(&cached.galley, &layout.galley)
         {
-            // Both immutable inputs were validated when this paragraph was
-            // built. Reuse its text runs and geometry after unrelated edits.
             paragraphs.push(Arc::clone(cached));
             continue;
         }
@@ -245,8 +226,6 @@ fn build_paragraph_snapshot(
         last.lengths.push(1);
         last.line_break = true;
     }
-    // Freeze text, style, line links, and geometry once. Publication only
-    // clones the node properties and applies the current widget transform.
     let mut builders = runs.into_iter().peekable();
     let mut runs = Vec::with_capacity(builders.len());
     let mut previous = None;
@@ -306,7 +285,6 @@ pub(super) fn update_cached(
             let layout = layouts
                 .get(index)
                 .ok_or(AccessibilityError::InvalidLayout)?;
-            // Stage all fallible work before touching the published snapshot.
             let replacement = build_paragraph_snapshot(
                 source,
                 &layout,
@@ -330,8 +308,6 @@ pub(super) fn update_cached(
             }
         }
     }
-    // Retained snapshots, structural edits, missed updates, and layout
-    // invalidation keep the immutable rebuild path and its validated reuse.
     let next = build_cached(editor, layouts, widget_id, snapshot.as_deref())?;
     *snapshot = Some(Arc::new(next));
     Ok(())
@@ -351,8 +327,6 @@ impl Snapshot {
 
     pub(super) fn position(&self, position: Position) -> Option<accesskit::TextPosition> {
         let paragraph = self.paragraphs.get(position.paragraph)?;
-        // Prefer the next run at a shared boundary. In particular, paragraph
-        // end must point before its synthetic newline, never after it.
         let index = paragraph
             .runs
             .partition_point(|run| run.range.start <= position.byte)
@@ -461,8 +435,6 @@ impl Snapshot {
             for run in &paragraph.runs {
                 let geometry = &run.geometry;
                 let local_rect = geometry.bounds.translate(paragraph_rect.min.to_vec2());
-                // Register the same empty hover widget and accessibility parent
-                // as a standalone Ui, without allocating its layout and stack.
                 paragraph_ui.interact(
                     Rect::from_min_size(local_rect.min, egui::Vec2::ZERO),
                     run.id,
@@ -507,8 +479,6 @@ fn freeze_run(run: RunBuilder, galley: &Galley, previous: Option<Id>, next: Opti
     node.set_text_direction(accesskit::TextDirection::LeftToRight);
     node.set_bounds(accesskit_rect(geometry.bounds));
     if geometry.positions.is_some() && geometry.widths.is_some() {
-        // Reserve property slots without retaining duplicate coordinate arrays.
-        // Publication fills them in the current global coordinate scale.
         node.set_character_positions(Vec::<f32>::new());
         node.set_character_widths(Vec::<f32>::new());
     }
@@ -1169,8 +1139,6 @@ mod tests {
                 egui::Sense::click_and_drag(),
             );
             if legacy {
-                // Reference the previous empty-Ui registration and rebuild run
-                // nodes directly from source, without using cached templates.
                 for (paragraph, layout) in snapshot.paragraphs.iter().zip(layouts.iter()) {
                     let paragraph_rect = layout.rect.translate(origin.to_vec2());
                     let _paragraph_ui = Ui::new(

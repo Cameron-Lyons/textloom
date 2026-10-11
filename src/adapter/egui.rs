@@ -1,10 +1,3 @@
-//! An egui widget that renders the document's rich spans directly.
-//!
-//! Use a stable [`RichTextEditor::id_salt`] when the widget can move in the UI.
-//! The host's egui integration provides the clipboard, IME, and platform accessibility.
-//! For a true bold face, register one in `FontDefinitions` and select it with
-//! [`RichTextEditor::bold_font_family`]. Default fonts use egui's strong text color.
-
 use crate::{Document, Editor, Error, Fragment, Position, Selection};
 #[cfg(test)]
 use crate::{ParagraphKind, StylePatch};
@@ -41,64 +34,16 @@ use navigation::{
 use navigation::{preedit_byte_range, snap_grapheme};
 use paint::paint_document_selection;
 
-/// Optional host transport for rich clipboard representations.
-///
-/// The host owns native clipboard access and any transport errors. These methods
-/// run synchronously when a focused, enabled widget handles a clipboard event,
-/// preserving its order relative to typing, selection, and IME input. Defaults
-/// retain egui's plain-text clipboard behavior, so a host can implement either
-/// direction independently.
 pub trait RichClipboard {
-    /// Publish a selected fragment for copy or cut, before cut removes text.
-    ///
-    /// Use [`Fragment::to_bytes`], [`Fragment::to_html`], and
-    /// [`Fragment::plain_text`] to provide native, HTML, and plain representations.
-    /// Return `true` only when the host has published the clipboard, including a
-    /// plain-text alternative. This suppresses egui's `CopyText` command, which
-    /// would otherwise overwrite the host's rich representations. Return `false`
-    /// to let egui copy the selected plain text instead.
-    /// Successful publication also discards earlier queued egui text/image copy
-    /// commands, so deferred writes cannot replace the newer rich clipboard item.
-    /// Unrelated commands and clipboard writes queued afterward remain intact.
-    ///
-    /// Caret selections do not call this method. Read-only cut calls it without
-    /// removing text. Copy during composition captures the committed document
-    /// selection, excluding preedit text.
     fn copy(&mut self, _fragment: &Fragment) -> bool {
         false
     }
 
-    /// Read a rich representation for a nonempty egui paste event.
-    ///
-    /// `plain_text` is that event's plain-text alternative. Return a decoded
-    /// fragment to replace the selection in one undo step, or `None` to insert
-    /// the event's plain text. Decode untrusted native data with
-    /// [`Fragment::from_bytes`]; an unavailable or rejected format should fall
-    /// back to plain text. The fragment must represent this paste event's
-    /// clipboard item. Hosts can capture rich and plain data together when
-    /// producing the event; a later clipboard read may retrieve a different item.
-    /// Comparing plain text can reject mismatches but cannot distinguish equal-text
-    /// items with different formatting. Do not infer clipboard identity from a
-    /// previously copied string.
-    ///
-    /// Empty paste events and read-only widgets do not call this method. Active
-    /// nonempty IME preedit blocks paste; an empty preedit is canceled first.
-    /// Egui integrations may emit no paste event when native plain text is absent
-    /// or empty, so rich clipboard writers must also publish plain text.
     fn paste(&mut self, _plain_text: &str) -> Option<Fragment> {
         None
     }
 }
 
-/// A reusable, multiline rich-text editor with pointer and keyboard selection.
-///
-/// Place it in `ScrollArea::vertical()` for a scrolling document. The core owns
-/// document and history state; egui owns focus and cached paragraph layouts.
-/// Clipboard interchange uses plain text by default; [`Self::rich_clipboard`]
-/// lets the host provide rich formats while retaining a plain-text alternative.
-/// Full text in egui output metadata is generated when accessibility, a screen
-/// reader, or the debug widget inspector needs it. Other output events retain
-/// their widget type and selection without copying the whole document.
 pub struct RichTextEditor<'a> {
     editor: &'a mut Editor,
     id: Option<Id>,
@@ -112,22 +57,13 @@ pub struct RichTextEditor<'a> {
     rich_clipboard: Option<&'a mut dyn RichClipboard>,
 }
 
-/// The response plus any rejected editor commands.
-///
-/// `ui.add(widget)` returns the standard response. Use `widget.show(ui)` when
-/// the application also wants to inspect errors. Invalid external IME ranges are
-/// reported here rather than panicking or altering the document.
 pub struct RichTextEditorOutput {
-    /// Focus, hover, interaction, and document-change state for the widget.
     pub response: Response,
-    /// Editor commands rejected by core validation.
     pub errors: Vec<Error>,
-    /// Errors from publishing or applying native accessibility text actions.
     pub accessibility_errors: Vec<AccessibilityError>,
 }
 
 impl<'a> RichTextEditor<'a> {
-    /// Borrow an editor for one frame, using the body font and four minimum rows.
     pub fn new(editor: &'a mut Editor) -> Self {
         Self {
             editor,
@@ -143,69 +79,51 @@ impl<'a> RichTextEditor<'a> {
         }
     }
 
-    /// Set the persistent widget ID, overriding any ID salt.
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
         self
     }
 
-    /// Derive a persistent ID from the containing UI and this salt.
     pub fn id_salt(mut self, salt: impl egui::AsIdSalt) -> Self {
         self.salt = Some(egui::IdSalt::new(salt));
         self
     }
 
-    /// Set the desired width in points, clamped to the UI width and at least 32.
     pub fn desired_width(mut self, width: f32) -> Self {
         self.desired_width = Some(width.max(32.0));
         self
     }
 
-    /// Reserve at least this many body-font rows, with a minimum of one.
     pub fn min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
         self
     }
 
-    /// Set the base font; headings scale its size and code uses monospace.
     pub fn font(mut self, font: FontId) -> Self {
         self.font = Some(font);
         self
     }
 
-    /// Select a host-registered font family for bold spans.
     pub fn bold_font_family(mut self, family: FontFamily) -> Self {
         self.bold_family = Some(family);
         self
     }
 
-    /// Display placeholder text when the document and composition are empty.
     pub fn hint_text(mut self, hint: impl Into<String>) -> Self {
         self.hint = hint.into();
         self
     }
 
-    /// Permit focus, selection, navigation, and copying while preventing edits.
-    ///
-    /// A read-only editor remains enabled and available to assistive technology.
-    /// Existing composition is canceled when the widget becomes read-only.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
     }
 
-    /// Use the host's rich clipboard transport for this frame.
-    ///
-    /// The widget applies normal focus, read-only, IME, and undo rules before
-    /// calling the transport. Without this hook, clipboard events remain plain
-    /// text and do not capture rich fragments. Native MIME transport and its
-    /// lifetime remain the host's responsibility.
     pub fn rich_clipboard(mut self, clipboard: &'a mut dyn RichClipboard) -> Self {
         self.rich_clipboard = Some(clipboard);
         self
     }
 
-    /// Process focused input, render the document, and return interaction errors.
     pub fn show(mut self, ui: &mut Ui) -> RichTextEditorOutput {
         let id = self.id.unwrap_or_else(|| {
             self.salt
@@ -384,7 +302,6 @@ impl<'a> RichTextEditor<'a> {
                 }
                 cache.validate_navigation(self.editor.selection());
             }
-            // Keep unrelated events in their original order for the host.
             if !consumed.is_empty() {
                 ui.input_mut(|input| {
                     let mut consumed = consumed.into_iter().peekable();
@@ -535,9 +452,6 @@ impl<'a> RichTextEditor<'a> {
                 || response.changed()
                 || composition_changed
             {
-                // Scroll even if the whole widget is clipped. Input can grow
-                // the displayed document after its space was allocated; repeat
-                // the request next frame after the new content height is known.
                 ui.scroll_to_rect(caret.expand(4.0), None);
                 cache.interaction.scroll_to_caret = display_layouts
                     .content_height()

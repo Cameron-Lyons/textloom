@@ -1,6 +1,3 @@
-//! Headless rich clipboard, native persistence, HTML export, and grouped replacement.
-//! Run with `cargo run --example rich_text`; no GUI features are required.
-
 use textloom::{
     Document, Editor, Fragment, ParagraphKind, Position, SearchOptions, Selection, StylePatch,
 };
@@ -16,7 +13,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     })?;
 
-    // A host clipboard can carry native bytes alongside plain text and HTML.
     editor.select_all();
     let clipboard = editor.selected_fragment();
     let bytes = clipboard.to_bytes();
@@ -26,7 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pasted.insert_fragment(&Fragment::from_document(&restored))?;
     assert_eq!(Fragment::from_document(pasted.document()), clipboard);
 
-    // A batch replacement retains formatting and creates exactly one undo step.
     let previous_steps = pasted.undo_len();
     let count = pasted.replace_all("Rust", "native", SearchOptions::default())?;
     assert_eq!(count, 2);
@@ -38,12 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(pasted.undo());
     assert_eq!(Fragment::from_document(pasted.document()), clipboard);
 
-    // Text is escaped; generated tags preserve inline and paragraph formatting.
     let html = pasted.document().to_html();
     assert!(html.contains("&amp; &lt;editors&gt;"));
     println!("\nNative snapshot: {} bytes\nHTML: {html}", bytes.len());
 
-    // Clear inline emphasis without changing the heading or list structure.
     pasted.select_all();
     pasted.clear_formatting()?;
     assert!(pasted.document().paragraphs().iter().all(|paragraph| {

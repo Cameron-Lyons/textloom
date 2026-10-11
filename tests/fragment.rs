@@ -1,5 +1,3 @@
-//! Rich clipboard, persisted-format compatibility, and HTML export regressions.
-
 use std::sync::Arc;
 
 use textloom::{
@@ -376,8 +374,6 @@ fn version_one_encoding_has_fixed_architecture_independent_layout() {
 
 #[test]
 fn version_one_rich_fixture_remains_readable_and_byte_identical() {
-    // This fixture was assembled directly from the documented v1 layout,
-    // independently of Textloom's encoder. Keep its bytes stable for 1.x.
     let bytes = include_bytes!("fixtures/native-v1.tlfr");
     let mut editor = Editor::from_text("\nAé👩‍💻\ne\u{301}\nZ\n");
     select_paragraph(&mut editor, 1);
@@ -512,7 +508,6 @@ fn rejects_invalid_utf8_line_breaks_noncovering_spans_and_grapheme_splits() {
             Err(FragmentError::InvalidSpans)
         );
     }
-    // A UTF-8 scalar boundary inside a combining grapheme is also invalid.
     assert_eq!(
         Fragment::from_bytes(&paragraph(&[0], "e\u{301}".as_bytes(), &[(1, 0), (3, 1)])),
         Err(FragmentError::InvalidSpans)
@@ -521,7 +516,6 @@ fn rejects_invalid_utf8_line_breaks_noncovering_spans_and_grapheme_splits() {
         Fragment::from_bytes(&paragraph(&[0], "🦀".as_bytes(), &[(1, 0), (4, 1)])),
         Err(FragmentError::InvalidSpans)
     );
-    // Canonical spans merge identical neighbors.
     assert_eq!(
         Fragment::from_bytes(&paragraph(&[0], b"ab", &[(1, 0), (2, 0)])),
         Err(FragmentError::InvalidSpans)
@@ -607,7 +601,6 @@ fn html_replaces_nulls_without_losing_surrounding_unicode_or_escaping() {
     assert_eq!(document.to_html(), expected);
     let fragment = Fragment::from_document(&document);
     assert_eq!(fragment.to_html(), expected);
-    // The native interchange remains lossless for text HTML cannot represent.
     assert_eq!(
         Fragment::from_bytes(&fragment.to_bytes()).unwrap(),
         fragment

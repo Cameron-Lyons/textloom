@@ -1,7 +1,3 @@
-//! Render a headless egui frame without a window or another dependency.
-//! Run: `cargo run --example egui_editor --features egui`
-//! Copy `editor_ui` into an eframe `App::update` or your native egui host.
-
 use textloom::{Editor, ParagraphKind, StylePatch, adapter::egui::RichTextEditor};
 
 fn editor_ui(ui: &mut egui::Ui, editor: &mut Editor) {

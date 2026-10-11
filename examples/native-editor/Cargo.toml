@@ -5,11 +5,8 @@ edition = "2024"
 rust-version = "1.95"
 publish = false
 
-# Keep the renderer and window integration out of Textloom's dependency graph.
 [workspace]
 
-# Keep AccessKit's 0.24 API while backporting Unix activation and app-parent fixes.
-# The compatible published patch line predates current AT-SPI; see vendor notes.
 [patch.crates-io]
 accesskit_unix = { path = "vendor/accesskit_unix" }
 

@@ -1,5 +1,3 @@
-//! A complete native host for Textloom, with a separate dependency graph.
-
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -443,17 +441,11 @@ impl eframe::App for NativeEditor {
                 }
             });
         });
-        // egui-winit 0.36.2 forwards IMEOutput.rect to winit's cursor area.
-        // Adapt its native output to the caret, keeping the widget's documented
-        // editor/cursor rectangles intact for other Textloom integrations.
         ui.ctx().output_mut(|output| {
             if let Some(ime) = &mut output.ime {
                 ime.rect = ime.cursor_rect;
             }
         });
-        // All text fields have processed this frame's IME events. Leaving them
-        // queued makes egui-winit resend an unchanged cursor area, which causes
-        // Fcitx to resend preedit and continuously redraw the search fields.
         ui.input_mut(|input| {
             input
                 .events

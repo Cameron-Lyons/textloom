@@ -1,7 +1,3 @@
-//! Headless egui frame benchmark. Run with `cargo bench --features egui --bench rendering`.
-//! Native rendering, GPU submission, and platform assistive technology are excluded.
-//! Initial-frame timers exclude editor/context construction and include lazy font setup.
-//! Invalidation setters run before the timed frame; each relayout follows warmup.
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -66,7 +62,6 @@ fn frame_config(
 
 fn main() {
     for paragraphs in [100, 10_000] {
-        // Unique paragraphs exercise the galley cache instead of one repeated job.
         let source = document_text(paragraphs);
         let mut editor = Editor::from_text(&source);
         let context = egui::Context::default();
@@ -208,7 +203,6 @@ fn invalidated_frames(
     let source = document_text(paragraphs);
     let mut editor = Editor::from_text(&source);
     let context = egui::Context::default();
-    // Warm both alternating configurations and finish on the second one.
     for index in 0..6 {
         let config = configure(&context, index);
         frame_config(&context, &mut editor, Vec::new(), config);

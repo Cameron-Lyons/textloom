@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Validate native renderer/interaction observations without certifying manual QA."""
 
 import argparse
 import json
@@ -8,8 +7,6 @@ from pathlib import Path
 import sys
 
 
-# Exact keys and scalar types prevent a report from silently including document
-# text, clipboard payloads, font paths, or composition strings in CI artifacts.
 SCHEMA = {
     "schema_version": int,
     "manual_signoff": str,
@@ -90,7 +87,6 @@ def check_schema(value, schema, path="report"):
 
 
 def validate(report, revision, os_name, mode, interaction=False):
-    """Check report integrity; interaction callers also assert observed behavior."""
     check_schema(report, SCHEMA)
 
     def require(condition, message):
@@ -175,7 +171,9 @@ def reject_constant(_value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Validate native renderer/interaction observations without certifying manual QA."
+    )
     parser.add_argument("report", type=Path)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--os", required=True, choices=("linux", "macos", "windows"))
