@@ -1,5 +1,3 @@
-//! Opt-in native QA evidence. Reports describe observations, never manual signoff.
-
 use std::{
     ffi::OsString,
     fmt::Write as _,
@@ -200,8 +198,6 @@ impl Session {
 
     pub fn begin_frame(&mut self, context: &egui::Context) {
         self.frames += 1;
-        // Raw events retain key presses consumed later by widgets. These are host-wide
-        // observations: the report does not claim the document processed each event.
         context.input(|input| self.input.observe(&input.raw.events));
         let scale = context.pixels_per_point();
         self.pixels_per_point = Some(scale);
@@ -263,8 +259,6 @@ impl Session {
         self.host_command_errors += 1;
     }
 
-    /// Record the requested fixture check. A failure remains recorded and is
-    /// counted once, even if the host reports the result more than once.
     pub fn clipboard_self_test_result(&mut self, passed: bool) {
         if !self.clipboard_self_test_requested {
             return;
@@ -374,7 +368,6 @@ impl Session {
 
     pub fn write_report(&self, editor: &Editor) -> io::Result<&Path> {
         let report = self.report(editor, option_env!("TEXTLOOM_QA_REVISION"));
-        // Preserve earlier runs, including when two hosts try to use the same path.
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

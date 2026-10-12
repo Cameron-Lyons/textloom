@@ -1,4 +1,3 @@
-//! Paragraph shaping and incremental layout invalidation.
 use super::PARAGRAPH_GAP;
 use crate::{Document, InlineStyle, Paragraph, ParagraphKind};
 use egui::{
@@ -35,7 +34,6 @@ pub(super) struct ParagraphLayout {
     pub(super) marker_position: Pos2,
 }
 
-/// Borrow immutable shaped text while materializing only its current rectangle.
 pub(crate) struct ParagraphLayoutView<'a> {
     pub(crate) galley: &'a Arc<Galley>,
     pub(crate) rect: Rect,
@@ -46,7 +44,6 @@ pub(crate) struct ParagraphLayoutView<'a> {
 #[derive(Clone, Default)]
 pub(super) struct LayoutCache {
     pub(super) appearance: Option<Appearance>,
-    // Egui invalidates this probe when its font cache/atlas changes.
     pub(super) font_probe: Option<Arc<Galley>>,
     pub(super) document_identity: Option<Arc<()>>,
     pub(super) paragraphs: Vec<ParagraphCache>,
@@ -120,9 +117,6 @@ impl LayoutCache {
                 let chars = paragraph.scalar_count();
                 let mut galley = fonts.layout_job(job);
                 if galley.end().index.0 != chars {
-                    // egui's shaper can duplicate scalar slots for descending
-                    // clusters. Retry independent scalars to retain valid text
-                    // coordinates and every original section's appearance.
                     galley = fonts.layout_job(scalar_layout_job(&galley.job));
                 }
                 ParagraphCache {
@@ -141,9 +135,6 @@ impl LayoutCache {
                 self.layouts.rebuild(&self.paragraphs, true);
             } else {
                 let source = document.paragraphs();
-                // An exact edit descriptor avoids discovering changed paragraphs.
-                // Missing/skipped edits or unrelated clones retain the identity
-                // comparison fallback, preserving untouched prefix/suffix layouts.
                 let (old, new) = if let Some(change) = self
                     .document_identity
                     .as_ref()
@@ -224,7 +215,6 @@ pub(super) fn paragraph_job(
         );
     }
     if job.sections.is_empty() {
-        // An empty paragraph still has a caret row with the right font height.
         job.append(
             "",
             0.0,

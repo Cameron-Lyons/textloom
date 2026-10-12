@@ -1,5 +1,3 @@
-"""Regression checks for false-green or content-bearing native smoke evidence."""
-
 import json
 import unittest
 

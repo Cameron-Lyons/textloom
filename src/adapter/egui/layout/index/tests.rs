@@ -27,8 +27,6 @@ impl Fixture {
     }
 
     fn cache(&self, id: usize) -> ParagraphCache {
-        // Numeric geometry is deliberately independent of font shaping. Unique
-        // character counts and widths detect lost, duplicated, or reordered entries.
         let mut galley = (*self.galley).clone();
         galley.rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -288,8 +286,6 @@ fn weak_generation_tokens_do_not_retain_geometry_or_environment_after_replacemen
     let environment = Arc::downgrade(&layouts.environment_identity());
     assert!(identity.matches(&layouts));
 
-    // Equal-length edits must publish a fresh generation even when this is the
-    // only strong snapshot. An accessibility token keeps only the old allocation.
     layouts.replace(0..4, &fixture.caches(100, 4));
     assert!(!identity.matches(&layouts));
     assert!(identity.0.upgrade().is_none());
@@ -330,8 +326,6 @@ fn y_partitions_match_rectangle_predicates_at_every_edge_and_gap_midpoint() {
         for large_first_paragraph in [false, true] {
             let mut caches = fixture.caches(0, len);
             if large_first_paragraph && let Some(first) = caches.first_mut() {
-                // Beyond f32's exact integer range, adjacent rectangle edges can
-                // coincide. Compare the same rounded predicates used by the widget.
                 Arc::make_mut(&mut first.galley).rect.max.y = 16_777_216.0;
             }
             let mut layouts = ParagraphLayouts::default();

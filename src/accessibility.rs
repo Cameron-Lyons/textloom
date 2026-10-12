@@ -1,53 +1,25 @@
-//! Borrowed semantics for custom GUI adapters, with an optional AccessKit tree.
-//!
-//! The renderer supplies screen bounds and caret geometry to its platform
-//! accessibility integration. This module exposes document semantics and maps
-//! editing actions without taking ownership of the window or event loop.
-
 use crate::{Composition, Document, Editor, Error, ParagraphKind, Position, Selection, Span};
 
-/// A paragraph-local caret stop expressed in extended graphemes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessiblePosition {
-    /// Zero-based paragraph index.
     pub paragraph: usize,
-    /// Extended grapheme index, independent of UTF-8 byte length.
     pub grapheme: usize,
 }
 
-/// A directional selection using grapheme indices rather than UTF-8 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessibleSelection {
-    /// The fixed endpoint when extending selection.
     pub anchor: AccessiblePosition,
-    /// The active caret endpoint.
     pub focus: AccessiblePosition,
 }
 
-/// Borrowed text, paragraph semantics, and inline styles for one paragraph.
 #[derive(Clone, Copy, Debug)]
 pub struct AccessibleParagraph<'a> {
-    /// Zero-based index in the document.
     pub index: usize,
-    /// Committed text, excluding the paragraph separator.
     pub text: &'a str,
-    /// Body, heading, or list semantics.
     pub kind: ParagraphKind,
-    /// Normalized inline styles with paragraph-local UTF-8 byte ranges.
     pub spans: &'a [Span],
 }
 
-/// A zero-copy semantic view. It remains coherent by borrowing the editor.
-///
-/// Snapshot state is immutable, so selection conversion always uses validated
-/// editor coordinates:
-///
-/// ```compile_fail
-/// use textloom::{Editor, Position, Selection, accessibility::AccessibilitySnapshot};
-/// let editor = Editor::from_text("text");
-/// let mut snapshot = AccessibilitySnapshot::new(&editor, "Notes", true);
-/// snapshot.selection = Selection::caret(Position::new(99, 99));
-/// ```
 #[derive(Debug)]
 pub struct AccessibilitySnapshot<'a> {
     label: &'a str,
@@ -59,7 +31,6 @@ pub struct AccessibilitySnapshot<'a> {
 }
 
 impl<'a> AccessibilitySnapshot<'a> {
-    /// Borrow a coherent editor view with a host-supplied name and focus state.
     pub fn new(editor: &'a Editor, label: &'a str, focused: bool) -> Self {
         Self {
             label,
@@ -71,32 +42,26 @@ impl<'a> AccessibilitySnapshot<'a> {
         }
     }
 
-    /// Return the human-readable name supplied by the host.
     pub fn label(&self) -> &'a str {
         self.label
     }
 
-    /// Whether the host considered the editor focused when captured.
     pub fn is_focused(&self) -> bool {
         self.focused
     }
 
-    /// Return the captured directional selection in validated byte coordinates.
     pub fn selection(&self) -> Selection {
         self.selection
     }
 
-    /// Return transient preedit text, separate from committed paragraphs.
     pub fn composition(&self) -> Option<&'a Composition> {
         self.composition
     }
 
-    /// Return the revision of the borrowed committed document.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Iterate committed paragraphs in document order without copying text.
     pub fn paragraphs(
         &self,
     ) -> impl ExactSizeIterator<Item = AccessibleParagraph<'a>> + DoubleEndedIterator {
@@ -112,7 +77,6 @@ impl<'a> AccessibilitySnapshot<'a> {
             })
     }
 
-    /// Convert the current directional selection to paragraph-local graphemes.
     pub fn selection_graphemes(&self) -> AccessibleSelection {
         AccessibleSelection {
             anchor: accessible_position(self.document, self.selection.anchor),
@@ -120,7 +84,6 @@ impl<'a> AccessibilitySnapshot<'a> {
         }
     }
 
-    /// Convert grapheme endpoints to validated document byte coordinates.
     pub fn selection_from_graphemes(
         &self,
         selection: AccessibleSelection,
@@ -160,32 +123,21 @@ fn editor_position(document: &Document, position: AccessiblePosition) -> Result<
     Ok(Position::new(position.paragraph, byte))
 }
 
-/// Renderer-independent actions offered to assistive technology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessibleAction<'a> {
-    /// Ask the host to focus the editor and its window.
     Focus,
-    /// Move or extend selection and cancel any active composition.
     SetSelection(Selection),
-    /// Cancel preedit and replace the committed selection as one undo step.
     ReplaceSelectedText(&'a str),
-    /// Cancel preedit and replace the entire document as one undo step.
-    /// Undo restores the selection that existed before the replacement.
     ReplaceAllText(&'a str),
 }
 
-/// Result of an accessibility action for the host to apply and redraw.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccessibilityOutcome {
-    /// Whether the action was recognized and applied.
     pub handled: bool,
-    /// The host should focus the editor widget and, if needed, its window.
     pub focus_requested: bool,
-    /// Whether document, selection, typing style, composition, or adapter capabilities changed.
     pub changed: bool,
 }
 
-/// All mutations pass through the editor's normal validation and undo history.
 pub fn apply_action(
     editor: &mut Editor,
     action: AccessibleAction<'_>,
@@ -242,27 +194,14 @@ mod accesskit_bridge {
     use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
     use unicode_segmentation::UnicodeSegmentation;
 
-    /// Failure to construct a tree or apply a validated AccessKit action.
     #[non_exhaustive]
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum AccessKitError {
-        /// The editing core rejected the requested operation.
         Editor(crate::Error),
-        /// The adapter has exhausted its reserved 64-bit node ID sequence.
         NodeIdExhausted,
-        /// AccessKit stores each selectable character's UTF-8 length in a u8.
-        /// Splitting a grapheme would incorrectly expose extra caret stops.
-        CharacterTooLong {
-            /// Start of the unsupported grapheme in document coordinates.
-            position: Position,
-            /// UTF-8 byte length of the grapheme.
-            bytes: usize,
-        },
-        /// An action refers to an unknown text run or invalid character index.
+        CharacterTooLong { position: Position, bytes: usize },
         InvalidTextPosition(TextPosition),
-        /// The requested action lacks its required data or uses the wrong type.
         InvalidActionData,
-        /// Publish a new update before applying actions against changed text.
         StaleDocument,
     }
 
@@ -308,7 +247,6 @@ mod accesskit_bridge {
         id: NodeId,
         node: Node,
         range: Range<usize>,
-        /// Includes the start and end boundary; excludes a synthetic newline.
         character_offsets: Vec<usize>,
         line_break: bool,
     }
@@ -322,15 +260,6 @@ mod accesskit_bridge {
         line_break: bool,
     }
 
-    /// Produces an AccessKit tree with a window root, a multiline text input,
-    /// semantic paragraph children, and styled grapheme-aware text runs.
-    ///
-    /// The host installs an AccessKit platform adapter, submits these updates,
-    /// and handles `focus_requested`. Supply layout bounds and character
-    /// geometry in the returned nodes for caret magnification and hit testing.
-    /// Node IDs start at the supplied root and are reserved exclusively for
-    /// this adapter. Unchanged paragraphs retain their IDs and cached nodes;
-    /// ordinary caret changes only publish the editor node.
     #[derive(Debug)]
     pub struct AccessKitAdapter {
         root_id: NodeId,
@@ -353,9 +282,6 @@ mod accesskit_bridge {
     }
 
     impl AccessKitAdapter {
-        /// Reserve IDs beginning at `root_id` for a window, editor, and descendants.
-        ///
-        /// Returns [`AccessKitError::NodeIdExhausted`] if no editor ID is available.
         pub fn new(root_id: NodeId) -> Result<Self, AccessKitError> {
             let editor_id = NodeId(
                 root_id
@@ -378,7 +304,6 @@ mod accesskit_bridge {
             })
         }
 
-        /// For a host that grafts this tree into its own accessibility tree.
         pub fn with_tree_id(mut self, tree_id: TreeId) -> Self {
             self.tree_id = tree_id;
             self.initialized = false;
@@ -386,25 +311,17 @@ mod accesskit_bridge {
             self
         }
 
-        /// Return the reserved window root ID.
         pub fn root_node(&self) -> NodeId {
             self.root_id
         }
-        /// Return the reserved multiline editor ID.
         pub fn editor_node(&self) -> NodeId {
             self.editor_id
         }
 
-        /// Whether accessibility text replacement is blocked.
         pub fn is_read_only(&self) -> bool {
             self.read_only
         }
 
-        /// Expose a selectable read-only editor and cancel existing preedit.
-        ///
-        /// Call [`Self::update`] to publish the new capabilities. Focus and
-        /// selection actions remain available; replacement actions are consumed
-        /// without changing the document, selection, or undo history.
         pub fn set_read_only(
             &mut self,
             read_only: bool,
@@ -419,13 +336,10 @@ mod accesskit_bridge {
             }
         }
 
-        /// Return a paragraph ID from the most recently published update.
         pub fn paragraph_node(&self, paragraph: usize) -> Option<NodeId> {
             self.paragraphs.get(paragraph).map(|paragraph| paragraph.id)
         }
 
-        /// Current text run IDs and their paragraph-local UTF-8 ranges. A hard
-        /// line break belongs to the last run but is excluded from this range.
         pub fn text_runs(
             &self,
             paragraph: usize,
@@ -436,9 +350,6 @@ mod accesskit_bridge {
                 .flat_map(|paragraph| paragraph.runs.iter().map(|run| (run.id, run.range.clone())))
         }
 
-        /// Build the initial tree or an incremental update. An error leaves the
-        /// adapter's previous tree intact. Transient IME text is available from
-        /// the neutral snapshot; committed document text defines this tree.
         pub fn update(
             &mut self,
             editor: &Editor,
@@ -460,8 +371,6 @@ mod accesskit_bridge {
                         .as_ref()
                         .is_some_and(|node| node.is_read_only() != self.read_only)
                 {
-                    // Selection and labels reuse all paragraph nodes and run
-                    // locations. Only the editor node needs to be republished.
                     let mut node = self.last_editor.clone().expect("initialized editor node");
                     node.set_label(label);
                     set_editable_actions(&mut node, self.read_only);
@@ -473,8 +382,6 @@ mod accesskit_bridge {
                     self.last_editor = Some(node);
                     self.last_selection = Some(selection);
                 }
-                // Focus is carried independently of the nodes. Idle frames
-                // and focus changes require no node clones.
                 return Ok(TreeUpdate {
                     nodes,
                     tree: None,
@@ -489,10 +396,6 @@ mod accesskit_bridge {
             let mut next_id = self.next_id;
             let source = editor.document().paragraphs();
             let mut changed_index = None;
-            // A single changed slot cannot move surviving paragraphs. Stage
-            // just that replacement so ordinary typing and local formatting
-            // retain the paragraph Vec and run lookup table. Wider edits use
-            // occurrence-aware matching below to retain IDs after index shifts.
             let precise_change = self
                 .document_identity
                 .as_ref()
@@ -508,8 +411,6 @@ mod accesskit_bridge {
                         false
                     }
                 } else {
-                    // A host can skip document updates or replace the editor.
-                    // Retain identity matching when its predecessor is unknown.
                     self.paragraphs.iter().zip(source).enumerate().all(
                         |(index, (cached, paragraph))| {
                             (Arc::ptr_eq(&cached.paragraph, paragraph)
@@ -534,9 +435,6 @@ mod accesskit_bridge {
                 (None, replacement)
             } else {
                 let mut cached: HashMap<(usize, bool), Vec<&Arc<CachedParagraph>>> = HashMap::new();
-                // Rich paste can repeat the same shared paragraph allocation.
-                // Each occurrence needs its own IDs and is used at most once.
-                // Reverse insertion preserves document order on pop.
                 for paragraph in self.paragraphs.iter().rev() {
                     cached
                         .entry((
@@ -661,9 +559,6 @@ mod accesskit_bridge {
             })
         }
 
-        /// Map a valid byte position into the current published text runs.
-        ///
-        /// Publish an update after document edits before calling this method.
         pub fn to_text_position(
             &self,
             editor: &Editor,
@@ -674,9 +569,6 @@ mod accesskit_bridge {
             to_text_position(&self.paragraphs, position)
         }
 
-        /// Decode a caret stop from the current published text runs.
-        ///
-        /// Synthetic paragraph separators map to the next paragraph's start.
         pub fn from_text_position(
             &self,
             editor: &Editor,
@@ -686,10 +578,6 @@ mod accesskit_bridge {
             from_text_position(&self.paragraphs, &self.run_locations, position)
         }
 
-        /// Apply actions targeted at this editor; other targets remain unhandled.
-        ///
-        /// The host owns focus changes. Text actions require the latest committed
-        /// document update; read-only replacement actions are consumed unchanged.
         pub fn handle_action(
             &self,
             request: &ActionRequest,
@@ -904,8 +792,6 @@ mod accesskit_bridge {
         position: Position,
     ) -> Result<TextPosition, AccessKitError> {
         if let Some(paragraph) = paragraph {
-            // Prefer the preceding run at a shared style boundary, preserving
-            // the adapter's published selection representation.
             let index = paragraph
                 .runs
                 .partition_point(|run| run.range.end < position.byte);
@@ -1026,8 +912,6 @@ mod accesskit_bridge {
                     .is_empty()
             );
 
-            // Separate documents can share a revision and selection without
-            // sharing text. An idle update must not reuse the old text tree.
             let replacement = Editor::from_text("replacement");
             assert_eq!(
                 replacement.document().revision(),
@@ -1240,7 +1124,6 @@ mod accesskit_bridge {
             let obsolete = adapter
                 .to_text_position(&editor, Position::new(1, 0))
                 .unwrap();
-            // Hosts may redraw only after several unrelated edits.
             for paragraph in [1, 2] {
                 editor
                     .set_selection(Selection::caret(Position::new(paragraph, 0)))
@@ -1462,8 +1345,6 @@ mod accesskit_bridge {
             let position = Position::new(1, 3);
             let published = adapter.to_text_position(&editor, position).unwrap();
 
-            // A cloned content state is valid, but a separate same-revision
-            // document must not decode positions from the previous tree.
             let cloned = Editor::new(editor.document().clone());
             assert_eq!(
                 adapter.from_text_position(&cloned, published).unwrap(),
@@ -1481,8 +1362,6 @@ mod accesskit_bridge {
                 Err(AccessKitError::StaleDocument)
             );
             adapter.update(&editor, "Notes", true).unwrap();
-            // The untouched paragraph retains its node, but its document index
-            // changes when a preceding paragraph is inserted.
             assert_eq!(
                 adapter.from_text_position(&editor, published).unwrap(),
                 Position::new(2, 3)
@@ -1510,7 +1389,6 @@ mod accesskit_bridge {
                 adapter.update(&unsupported, "Notes", true),
                 Err(AccessKitError::CharacterTooLong { .. })
             ));
-            // Failed updates keep the previously published tree usable.
             assert_eq!(
                 adapter.from_text_position(&editor, published).unwrap(),
                 Position::new(2, 3)
@@ -1594,7 +1472,6 @@ mod accesskit_bridge {
                 exhausted.update(&Editor::from_text("a"), "Notes", true),
                 Err(AccessKitError::NodeIdExhausted)
             );
-            // An unsuccessful update does not corrupt the previous ID allocator.
             assert!(
                 adapter
                     .update(&Editor::from_text("ok"), "Notes", true)

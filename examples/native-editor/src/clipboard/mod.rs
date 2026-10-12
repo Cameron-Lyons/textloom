@@ -1,9 +1,3 @@
-//! Native clipboard transport belongs to this host, not the library.
-//!
-//! Native initialization and transfers run in killable children. Every pipe
-//! worker is joined after its child is reaped. One retained owner is replaced
-//! only after a transient publisher's new offer has been verified.
-
 use std::{
     ffi::OsString,
     io::{Read, Write},
@@ -50,7 +44,6 @@ pub struct NativeItem {
 
 impl NativeItem {
     fn from_fragment(fragment: &Fragment) -> Result<Self, String> {
-        // Preflight the documented TLFR size before allocating its output.
         let mut encoded_size = 13usize;
         let mut spans = 0usize;
         if fragment.paragraphs().len() > 1_000_000 {
@@ -84,8 +77,6 @@ impl NativeItem {
         let mut rich = Vec::with_capacity(ENVELOPE_SIZE + payload.len());
         rich.extend_from_slice(ENVELOPE);
         rich.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        // Read-back must distinguish a newly published offer from an older copy
-        // of identical text/styles. This is an identity token, not a secret.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "Clipboard publication clock is unavailable")?
@@ -118,8 +109,6 @@ impl NativeItem {
 
     fn fragment(&self) -> Result<Fragment, String> {
         let payload = &self.envelope()?[ENVELOPE_SIZE..];
-        // GlobalSize on Windows may include allocation padding. The envelope
-        // selects the exact TLFR bytes; its decoder still rejects trailing bytes.
         let fragment =
             Fragment::from_bytes(payload).map_err(|_| "Clipboard fragment payload was rejected")?;
         if fragment.plain_text() != normalize_text(&self.plain) {
@@ -137,9 +126,6 @@ impl NativeItem {
 
 fn native_html(fragment: &Fragment) -> String {
     let html = fragment.to_html();
-    // AppKit's HTML importer defaults to a legacy encoding when public.html
-    // contains UTF-8 bytes without document metadata. Keep this transport
-    // wrapper out of the library's reusable HTML fragment export.
     #[cfg(target_os = "macos")]
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{html}</body></html>"
@@ -163,8 +149,6 @@ fn capture_paste(
         _ => None,
     });
     let plain = pastes.next()?;
-    // Callback-only FIFO matching is ambiguous when earlier events are
-    // suppressed. Multiple paste events retain their original plain fallback.
     if plain.is_empty() || pastes.next().is_some() {
         return None;
     }
@@ -174,8 +158,6 @@ fn capture_paste(
     if normalize_text(plain) != captured_plain {
         return None;
     }
-    // Produce this host's event from one captured native item. A copied-text
-    // cache could not distinguish equal text with different formatting.
     *plain = captured_plain;
     Some((plain.clone(), fragment))
 }
@@ -279,8 +261,6 @@ fn exchange(
             Ok((reply, child))
         }
         failure => {
-            // Terminating the child closes its pipes, releasing blocked reads
-            // and writes before join. Backends never spawn further processes.
             stop_child(child);
             let _ = worker.join();
             match failure {
@@ -367,8 +347,6 @@ impl NativeClipboard {
             .spawn()
             .map_err(|_| "Clipboard publication helper could not start")?;
         let (_, child) = exchange(child, Some(item.clone()), deadline)?;
-        // Linux READY is provisional: read-back establishes that the offer was
-        // actually published, and verifies all representations on every platform.
         let verify_deadline = Instant::now() + OPERATION_TIMEOUT;
         loop {
             if let Ok(Some(captured)) = self.capture_until(verify_deadline)
@@ -418,7 +396,6 @@ impl NativeClipboard {
                 failed |= !output.errors.is_empty() || !output.accessibility_errors.is_empty();
             });
         });
-        // A successful native copy must retire the deferred plain overwrite.
         failed |= output.platform_output.commands.iter().any(|command| {
             matches!(
                 command,

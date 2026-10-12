@@ -3,13 +3,9 @@ use std::collections::VecDeque;
 use crate::document::Delta;
 use crate::{Document, InlineStyle, Selection};
 
-/// Limits apply to retained undo and redo entries together.
-/// The default retains at most 256 entries and an estimated 8 MiB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryLimits {
-    /// Maximum total entries across both history directions; zero disables history.
     pub max_entries: usize,
-    /// Maximum estimated retained bytes; zero disables history.
     pub max_bytes: usize,
 }
 
@@ -36,7 +32,6 @@ struct HistoryEntry {
     bytes: usize,
 }
 
-/// Retained edit chains and their accounting, independent of transient editor state.
 #[derive(Default)]
 pub(super) struct History {
     undo: VecDeque<HistoryEntry>,
@@ -148,7 +143,6 @@ impl History {
         while self.undo.len() + self.redo.len() > self.limits.max_entries
             || self.bytes > self.limits.max_bytes
         {
-            // Dropping oldest undo or farthest redo preserves the applicable chain.
             let entry = self.undo.pop_front().or_else(|| self.redo.pop_front());
             let Some(entry) = entry else {
                 break;

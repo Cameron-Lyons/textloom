@@ -8,17 +8,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::document::normalize_newlines;
 use crate::{Document, Position};
 
-/// Options for explicit document searches.
-///
-/// Case-insensitive search uses Unicode lowercase mappings, including
-/// contextual final sigma. It does not perform Unicode normalization or full
-/// case folding, so `é` differs from `e\u{301}` and `ß` differs from `ss`.
-/// The default searches case-sensitive literal text without requiring whole words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
-    /// Compare literal text when true; compare Unicode lowercase mappings when false.
     pub case_sensitive: bool,
-    /// Require both match endpoints to be Unicode word boundaries.
     pub whole_word: bool,
 }
 
@@ -32,12 +24,6 @@ impl Default for SearchOptions {
 }
 
 impl Document {
-    /// Find nonoverlapping matches in document order, preserving original
-    /// paragraph and UTF-8 byte coordinates. Only complete graphemes match.
-    ///
-    /// Query CRLF and CR are normalized to paragraph breaks. Empty queries
-    /// return no matches. Queries without paragraph breaks search paragraphs
-    /// independently; only cross-paragraph queries flatten the document.
     pub fn find(&self, query: &str, options: SearchOptions) -> Vec<Range<Position>> {
         let mut matches = Vec::new();
         let _ = self.visit_matches(query, options, |range| {
@@ -47,7 +33,6 @@ impl Document {
         matches
     }
 
-    /// Visit matches without retaining every range; a consumer can stop early.
     pub(crate) fn visit_matches(
         &self,
         query: &str,
@@ -61,8 +46,6 @@ impl Document {
         self.visit_normalized_matches(&needle, options, accept)
     }
 
-    /// Local queries start near the selection instead of walking every earlier
-    /// paragraph. Each paragraph preserves the forward nonoverlapping match set.
     pub(crate) fn find_relative(
         &self,
         query: &str,
@@ -76,8 +59,6 @@ impl Document {
         }
         let needle = search_needle(query, options);
         if needle.contains('\n') {
-            // Matching across paragraph breaks must retain the original
-            // document-wide stream and its nonoverlapping candidate order.
             let mut found = None;
             let mut wrapped = None;
             let _ = self.visit_normalized_matches(&needle, options, |range| {
@@ -103,9 +84,6 @@ impl Document {
             return found.or(wrapped);
         }
 
-        // If the first scalar occurs only once, literal candidates cannot
-        // overlap. Starting at the selection or scanning backward therefore
-        // preserves the forward scanner's accepted match set.
         let direct_literal = options.case_sensitive
             && !options.whole_word
             && needle
@@ -201,8 +179,6 @@ impl Document {
             });
             let valid_match = |start| {
                 let range = Position::new(index, start)..Position::new(index, start + needle.len());
-                // Slicing narrows eligible candidates, but grapheme boundaries
-                // still belong to the complete original paragraph.
                 (self.validate_position(range.start).is_ok()
                     && self.validate_position(range.end).is_ok())
                 .then_some(range)
@@ -228,8 +204,6 @@ impl Document {
                 found = Some(range);
                 return ControlFlow::Break(());
             }
-            // Ineligible earlier matches remain accepted by the literal
-            // scanner, preserving the document's nonoverlapping match set.
             ControlFlow::Continue(())
         });
         found
@@ -307,8 +281,6 @@ fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
     }
 }
 
-/// Lowercasing and word indexes stay bounded by one paragraph for local queries.
-/// `needle` has already been normalized and lowercased as requested.
 fn visit_text_matches(
     source: &str,
     needle: &str,
@@ -323,13 +295,9 @@ fn visit_text_matches(
     } else {
         Cow::Owned(source.to_lowercase())
     };
-    // Compare after lowercase expansion: a short source such as İ may become
-    // a longer match. Avoid preprocessing impossible needles per paragraph.
     if needle.len() > searched.len() {
         return ControlFlow::Continue(());
     }
-    // Most paragraphs in a missing or sparse search have no literal candidate.
-    // Prepare Unicode coordinates and word boundaries only after one is found.
     let mut word_boundaries = None;
     let mut lowercase_changes = None;
     let mut original_byte = |byte: usize| -> Option<usize> {
@@ -338,8 +306,6 @@ fn visit_text_matches(
             if !options.case_sensitive && !source.is_ascii() {
                 let mut lower_byte = 0;
                 for (byte, character) in source.char_indices() {
-                    // String lowercase additionally handles contextual final
-                    // sigma, whose UTF-8 length equals its scalar lowercase.
                     let lowered_len = if character.is_ascii() {
                         1
                     } else {
@@ -361,16 +327,12 @@ fn visit_text_matches(
         if let Some((lowered, original)) = lowercase_changes.get(index)
             && byte >= lowered.start
         {
-            // A width-changing scalar may expand into several lowercase
-            // scalars. Only its original outer boundaries are valid.
             return (byte == lowered.start).then_some(original.start);
         }
         let original = index.checked_sub(1).map_or(byte, |index| {
             let (lowered, original) = &lowercase_changes[index];
             byte - lowered.end + original.end
         });
-        // This also rejects partial expansions whose total UTF-8 width
-        // equals the original scalar width, without storing all offsets.
         source.is_char_boundary(original).then_some(original)
     };
     visit_literals(&searched, needle, |bytes| {
@@ -387,8 +349,6 @@ fn visit_text_matches(
                                 .chain([source.len()]),
                         )
                     });
-                    // Cache only the prefix needed by candidates so a nearby
-                    // match does not index an unrelated paragraph suffix.
                     while boundaries.last().is_none_or(|byte| *byte < end) {
                         let Some(byte) = remaining.next() else {
                             break;
@@ -411,9 +371,6 @@ fn visit_text_matches(
     })
 }
 
-/// A rejected candidate may overlap a valid later match, so only accepted
-/// matches advance past the full needle. Retain the literal searcher's needle
-/// preprocessing between accepted candidates.
 fn visit_literals(
     source: &str,
     needle: &str,

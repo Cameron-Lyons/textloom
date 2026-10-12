@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Run from any directory. Nothing is published or tagged by this script.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
@@ -42,14 +41,10 @@ package_target_dir=${CARGO_TARGET_DIR:-target}
 native_example_manifest=examples/native-editor/Cargo.toml
 cargo fmt --all -- --check
 cargo fmt --manifest-path "$native_example_manifest" --package textloom-native-example -- --check
-# Test every feature combination: cfg-dependent behavior can differ from all-features.
 for features in '' egui winit accesskit egui,winit egui,accesskit winit,accesskit egui,winit,accesskit; do
     cargo test --locked --no-default-features --features "$features"
 done
-# Search supplies trusted ranges to batch replacement. Exercise their independent
-# oracles with debug assertions disabled, without repeating the complete suite.
 cargo test --release --locked --all-features --test operations --test search
-# The repository-only host has CLI/report tests that need no display.
 cargo test --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir"
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo clippy --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir" -- -D warnings
@@ -63,11 +58,8 @@ package_args=(--locked --all-features)
 if $allow_dirty; then
     package_args+=(--allow-dirty)
 fi
-# Test the files that users receive, including packaged fixtures and examples.
 cargo package "${package_args[@]}" --target-dir "$package_target_dir"
 package_root="$(cd -- "$package_target_dir" && pwd)/package/textloom-$version"
-# Cargo succeeds with zero tests/targets if an include rule drops their entire
-# directory. Check the inventory before trusting the extracted-package checks.
 required_files=(Cargo.toml Cargo.lock README.md BENCHMARKS.md CHANGELOG.md RELEASING.md LICENSE)
 check_package_file() {
     if [[ ! -f "$package_root/$1" ]]; then
@@ -78,16 +70,12 @@ check_package_file() {
 for path in "${required_files[@]}"; do
     check_package_file "$path"
 done
-# Bare include names match nested basenames too. Keep host and QA artifacts out
-# even if a future manifest edit broadens an include pattern accidentally.
 for path in scripts .github examples/native-editor target; do
     if [[ -e "$package_root/$path" ]]; then
         echo "Repository-only path was included in the package: $path" >&2
         exit 1
     fi
 done
-# Cargo excludes nested packages; the native host is a repository-only example.
-# pipefail also rejects missing/unreadable source directories during discovery.
 find src tests examples benches -type d \( -name target -o -path examples/native-editor \) -prune -o -type f -print0 |
     while IFS= read -r -d '' path; do
         check_package_file "$path"
@@ -95,8 +83,6 @@ find src tests examples benches -type d \( -name target -o -path examples/native
 package_manifest="$package_root/Cargo.toml"
 cargo test --locked --all-features --manifest-path "$package_manifest" --target-dir "$package_target_dir"
 cargo check --locked --all-features --all-targets --manifest-path "$package_manifest" --target-dir "$package_target_dir"
-# Compile the repository's native host against the extracted library without
-# changing the verified crate or Textloom's runtime dependency graph.
 native_package_check_dir=$(mktemp -d "$package_target_dir/native-package-check.XXXXXX")
 trap 'rm -rf -- "$native_package_check_dir"' EXIT
 cp -R examples/native-editor/src "$native_package_check_dir/src"

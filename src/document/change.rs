@@ -1,5 +1,3 @@
-//! Paragraph replacement commits, bounded change notifications, and undo deltas.
-
 use std::{ops::Range, sync::Arc};
 
 use super::{Document, Paragraph};
@@ -7,9 +5,7 @@ use super::{Document, Paragraph};
 #[cfg(any(feature = "egui", feature = "accesskit"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParagraphChange {
-    /// Replaced paragraph range in the preceding document state.
     pub range: Range<usize>,
-    /// Number of paragraphs inserted at `range.start` in the current state.
     pub new_len: usize,
 }
 
@@ -45,8 +41,6 @@ impl Document {
     pub(super) fn change(&mut self, range: Range<usize>, mut after: Vec<Arc<Paragraph>>) -> Delta {
         let mut start = range.start;
         let mut end = range.end;
-        // Preserve existing allocations at unchanged edges, and keep them out of
-        // the undo delta even when a caller supplied a wide range.
         let mut prefix = 0;
         while start < end
             && prefix < after.len()
@@ -98,9 +92,6 @@ impl Document {
         }
     }
 
-    /// Return the latest paragraph replacement only when it follows `identity`.
-    /// Matching the current identity yields an empty replacement; missing an
-    /// intervening edit requires adapters to rebuild or compare their snapshots.
     #[cfg(any(feature = "egui", feature = "accesskit"))]
     pub(crate) fn change_since(&self, identity: &Arc<()>) -> Option<ParagraphChange> {
         if Arc::ptr_eq(identity, &self.identity) {
@@ -115,7 +106,6 @@ impl Document {
     }
 }
 
-/// History stores only the contiguous paragraphs changed by an operation.
 #[derive(Clone, Debug)]
 pub(crate) struct Delta {
     pub start: usize,
@@ -128,7 +118,6 @@ impl Delta {
         self.before.is_empty() && self.after.is_empty()
     }
 
-    /// A conservative estimate; shared text may be counted more than once.
     pub fn retained_bytes(&self) -> usize {
         self.before
             .iter()

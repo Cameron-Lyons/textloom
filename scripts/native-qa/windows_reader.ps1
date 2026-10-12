@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Run only on a disposable hosted Windows GUI runner. Never installs NVDA.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$NativeExecutable,
@@ -183,7 +181,7 @@ public static class TextloomReaderInput {
         return window;
     }
     public static string InputDesktopName() {
-        IntPtr desktop = OpenInputDesktop(0, false, 1); // DESKTOP_READOBJECTS
+        IntPtr desktop = OpenInputDesktop(0, false, 1);
         if (desktop == IntPtr.Zero)
             throw new InvalidOperationException("No usable input desktop.");
         try {
@@ -261,8 +259,6 @@ function Get-ReaderEvents {
         throw "NVDA observation callback failed."
     }
     if (-not (Test-Path -LiteralPath $EventsPath)) { return @() }
-    # NVDA appends while the driver polls. Open with compatible sharing flags;
-    # ReadAllLines uses FileShare.Read and can conflict with an active writer.
     $stream = [IO.FileStream]::new($EventsPath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
         ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
     $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false))
@@ -273,7 +269,6 @@ function Get-ReaderEvents {
         if (-not $lines[$index]) { continue }
         try { $events.Add(($lines[$index] | ConvertFrom-Json)) }
         catch {
-            # An in-progress append can leave only the final line incomplete.
             if ($index -ne $lines.Length - 1) { throw "Reader capture contains malformed JSON." }
         }
     }
@@ -339,7 +334,6 @@ function Assert-ReaderSpeech(
         if ($ExactToken) {
             return @($text -split "\s+") -ccontains (Normalize-Text $Expected[0])
         }
-        # Synthesis can split words into several strings at language boundaries.
         $joined = $text -replace "\s", ""
         foreach ($part in $Expected) {
             $expectedText = (Normalize-Text $part) -replace "\s", ""
@@ -433,8 +427,6 @@ automaticUpdates = disabled
         throw "Reader session or synthesizer does not match the isolated profile."
     }
     $VerifiedReader = if ($ReaderProcess.Id -eq $ReaderId) { $ReaderProcess } else { $runningReader }
-    # Get-Process can observe an existing PID lazily. Retain its process handle
-    # while it is alive so its actual exit status remains available after exit.
     $ReaderHandle = $VerifiedReader.Handle
     $Evidence.reader_launcher_pid = $ReaderProcess.Id
     $Evidence.reader_runtime_handle_retained = $ReaderHandle -ne [IntPtr]::Zero
@@ -452,22 +444,22 @@ automaticUpdates = disabled
     $Evidence.text_role = $baseline.role
     Assert-ReaderSpeech 0 @("Document") "ordinary_focus_announcement"
 
-    Send-Chord @(0x11) 0x24 # Ctrl+Home: native caret movement.
+    Send-Chord @(0x11) 0x24
     Wait-Snapshot { param($snapshot) $snapshot.caret_at_start } `
         "Native Ctrl+Home did not move NVDA's accessible caret." | Out-Null
     $Checks.native_caret_movement = $true
     $barrier = Invoke-ReaderRequest "barrier"
-    Send-Chord @(0x2d) 0x26 # NVDA+Up: read current line.
+    Send-Chord @(0x2d) 0x26
     Assert-ReaderSpeech $barrier.sequence @("TextLoom") "native_reader_line"
 
-    Send-Chord @(0x11) 0x41 # Ctrl+A: native selection, not a direct provider action.
+    Send-Chord @(0x11) 0x41
     Wait-Snapshot {
         param($snapshot)
         -not $snapshot.selection_collapsed -and (Normalize-Text $snapshot.selected_text) -eq $baselineText
     } "Native Ctrl+A did not select the fixture through NVDA's text provider." | Out-Null
     $Checks.native_selection = $true
     $barrier = Invoke-ReaderRequest "barrier"
-    Send-Chord @(0x2d, 0x10) 0x26 # NVDA+Shift+Up: announce current selection.
+    Send-Chord @(0x2d, 0x10) 0x26
     Assert-ReaderSpeech $barrier.sequence @("TextLoom", "café", "日本語") "native_reader_unicode_selection"
 
     Assert-EditorForeground
@@ -479,19 +471,18 @@ automaticUpdates = disabled
     } "Native typing did not replace the selected fixture with one character." | Out-Null
     $Checks.native_selection_replacement = $true
     $barrier = Invoke-ReaderRequest "barrier"
-    # Prevent a second NVDA+Up from being interpreted as the repeat/spelling gesture.
     Start-Sleep -Milliseconds 650
     Send-Chord @(0x2d) 0x26
     Assert-ReaderSpeech $barrier.sequence @("x") "native_reader_replacement" -ExactToken
 
-    Send-Chord @(0x11) 0x5a # Ctrl+Z.
+    Send-Chord @(0x11) 0x5a
     Wait-Snapshot {
         param($snapshot)
         (Normalize-Text $snapshot.text) -eq $baselineText `
             -and (Normalize-Text $snapshot.selected_text) -eq $baselineText
     } "Native undo did not restore the complete fixture and selection." | Out-Null
     $Checks.native_undo_document_and_selection = $true
-    Send-Chord @(0x11, 0x10) 0x5a # Ctrl+Shift+Z.
+    Send-Chord @(0x11, 0x10) 0x5a
     Wait-Snapshot {
         param($snapshot)
         (Normalize-Text $snapshot.text).TrimEnd("`n") -eq "x" -and $snapshot.selection_collapsed
@@ -511,8 +502,6 @@ automaticUpdates = disabled
     $captureErrors = @(Get-ReaderEvents | Where-Object { $_.kind -eq "capture_error" })
     if ($captureErrors.Count) { throw "NVDA capture recorded an error." }
     Assert-EditorForeground
-    # MainWindowHandle may name Winit's visible, unowned thread tool window.
-    # Re-resolve the actual editor from the foreground and verify its identity.
     $Window = [TextloomReaderInput]::VerifiedForegroundEditor([uint32]$NativeProcess.Id)
     $Evidence.close_window = [TextloomReaderInput]::DescribeWindow($Window)
     $Evidence.owned_windows_at_close = [TextloomReaderInput]::OwnedWindows([uint32]$NativeProcess.Id)
@@ -550,8 +539,6 @@ catch {
     $Evidence.failure = $_.Exception.Message
 }
 finally {
-    # Only this probe's explicit PIDs or processes inside its fresh portable
-    # directory are eligible for cleanup. Never use a global NVDA quit command.
     if ($NativeProcess -and -not $NativeProcess.HasExited) {
         [TextloomReaderInput]::ReleaseModifiers([uint32]$NativeProcess.Id)
         if ($Window -ne [IntPtr]::Zero) {

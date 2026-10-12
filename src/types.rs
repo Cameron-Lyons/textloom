@@ -1,116 +1,61 @@
 use std::{fmt, ops::Range};
 
-/// A caret position. `byte` is a UTF-8 offset at an extended grapheme boundary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position {
-    /// Zero-based paragraph index.
     pub paragraph: usize,
-    /// UTF-8 byte offset within that paragraph, including its end.
     pub byte: usize,
 }
 
 impl Position {
-    /// Construct coordinates without validation; the receiving document validates them.
     pub const fn new(paragraph: usize, byte: usize) -> Self {
         Self { paragraph, byte }
     }
 }
 
-/// A directional selection: the anchor stays fixed while the focus moves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
-    /// Fixed endpoint when extending a selection.
     pub anchor: Position,
-    /// Moving endpoint and the location used to determine typing style.
     pub focus: Position,
 }
 
 impl Selection {
-    /// Construct an empty selection at a position without validating it.
     pub const fn caret(position: Position) -> Self {
         Self {
             anchor: position,
             focus: position,
         }
     }
-    /// Construct a directional selection without validating its endpoints.
     pub const fn new(anchor: Position, focus: Position) -> Self {
         Self { anchor, focus }
     }
-    /// Whether both endpoints identify the same position.
     pub fn is_caret(self) -> bool {
         self.anchor == self.focus
     }
-    /// The selected half-open range, with endpoints sorted in document order.
     pub fn range(self) -> Range<Position> {
         self.anchor.min(self.focus)..self.anchor.max(self.focus)
     }
 }
 
-/// Unpremultiplied sRGBA color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Color(
-    /// Red, green, blue, and alpha channels, each in `0..=255`.
-    pub [u8; 4],
-);
+pub struct Color(pub [u8; 4]);
 
-/// Character formatting; the default has no emphasis or explicit foreground color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct InlineStyle {
-    /// Bold emphasis.
     pub bold: bool,
-    /// Italic emphasis.
     pub italic: bool,
-    /// Underline decoration.
     pub underline: bool,
-    /// Strikethrough decoration.
     pub strikethrough: bool,
-    /// Inline code formatting, typically rendered with a monospace font.
     pub code: bool,
-    /// Explicit foreground color, or the renderer's default when absent.
     pub foreground: Option<Color>,
 }
 
-/// Inline formatting shared by selected text, with `None` for mixed attributes.
-///
-/// [`crate::Editor::selection_style`] reports each attribute independently, so
-/// a selection can be uniformly bold while having mixed italic or color values.
-/// At a caret, every field describes the pending typing style.
-///
-/// Foreground uses two optional layers: `None` is mixed, `Some(None)` is the
-/// renderer's default color throughout, and `Some(Some(color))` is one explicit
-/// color throughout.
-///
-/// ```
-/// use textloom::{Color, Editor, StylePatch};
-///
-/// let mut editor = Editor::from_text("ab");
-/// assert_eq!(editor.selection_style().foreground, Some(None));
-/// let color = Color([40, 80, 120, 255]);
-/// editor.apply_style(StylePatch {
-///     foreground: Some(Some(color)),
-///     ..Default::default()
-/// }).unwrap();
-/// assert_eq!(editor.selection_style().foreground, Some(Some(color)));
-/// editor.insert_text("x").unwrap();
-/// editor.select_all();
-/// assert_eq!(editor.selection_style().foreground, None);
-/// assert_eq!(editor.selection_style().bold, Some(false));
-/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectionStyle {
-    /// Shared bold value, or `None` when selected runs disagree.
     pub bold: Option<bool>,
-    /// Shared italic value, or `None` when selected runs disagree.
     pub italic: Option<bool>,
-    /// Shared underline value, or `None` when selected runs disagree.
     pub underline: Option<bool>,
-    /// Shared strikethrough value, or `None` when selected runs disagree.
     pub strikethrough: Option<bool>,
-    /// Shared inline-code value, or `None` when selected runs disagree.
     pub code: Option<bool>,
-    /// Shared color: `None` is mixed, `Some(None)` is uniformly default,
-    /// and `Some(Some(color))` is uniformly explicit.
     pub foreground: Option<Option<Color>>,
 }
 
@@ -149,25 +94,17 @@ impl SelectionStyle {
     }
 }
 
-/// Only supplied attributes change. `Some(None)` clears a foreground color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StylePatch {
-    /// Replace bold emphasis when supplied.
     pub bold: Option<bool>,
-    /// Replace italic emphasis when supplied.
     pub italic: Option<bool>,
-    /// Replace underline decoration when supplied.
     pub underline: Option<bool>,
-    /// Replace strikethrough decoration when supplied.
     pub strikethrough: Option<bool>,
-    /// Replace inline code formatting when supplied.
     pub code: Option<bool>,
-    /// Replace the foreground color; `Some(None)` restores the renderer's default.
     pub foreground: Option<Option<Color>>,
 }
 
 impl StylePatch {
-    /// Update only attributes supplied by this patch.
     pub fn apply(self, style: &mut InlineStyle) {
         if let Some(value) = self.bold {
             style.bold = value;
@@ -190,72 +127,44 @@ impl StylePatch {
     }
 }
 
-/// Semantic block formatting. List markers are presentation, separate from paragraph text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ParagraphKind {
-    /// Ordinary body text.
     #[default]
     Body,
-    /// A heading that continues as body text when split.
     Heading {
-        /// Heading level in `1..=6`; invalid values are rejected by editing and import.
         level: u8,
     },
-    /// A bullet list item that retains its indentation when split.
     Bullet {
-        /// Zero-based indentation level.
         indent: u8,
     },
-    /// An ordered list item whose numbering continues when split.
     Ordered {
-        /// Zero-based indentation level.
         indent: u8,
-        /// This item's displayed ordinal. Continuations saturate at `u32::MAX`.
         start: u32,
     },
 }
 
-/// Logical caret movement, independent of visual wrapping or bidirectional layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Movement {
-    /// Preceding extended grapheme, crossing paragraph breaks when needed.
     GraphemeBackward,
-    /// Following extended grapheme, crossing paragraph breaks when needed.
     GraphemeForward,
-    /// Preceding Unicode word start; at paragraph start, move to the preceding paragraph's end.
     WordBackward,
-    /// Following Unicode word end; at paragraph end, move to the following paragraph's start.
     WordForward,
-    /// Start of the current logical paragraph.
     ParagraphStart,
-    /// End of the current logical paragraph.
     ParagraphEnd,
-    /// Start of the document.
     DocumentStart,
-    /// End of the document.
     DocumentEnd,
-    /// Previous paragraph, retaining the preferred grapheme column.
     ParagraphUp,
-    /// Next paragraph, retaining the preferred grapheme column.
     ParagraphDown,
 }
 
-/// Validation and editing failures. Failed validation preserves document content.
-/// Additional validation errors may be added in future releases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// A coordinate is outside the document or inside an extended grapheme.
     InvalidPosition(Position),
-    /// A forward range has reversed endpoints or invalid paragraph indices.
     InvalidRange,
-    /// Rich text has invalid separators, formatting runs, or paragraph metadata.
     InvalidFragment,
-    /// Preedit selection offsets are reversed, out of bounds, or inside UTF-8 encodings.
     InvalidCompositionSelection,
-    /// Heading level is outside `1..=6`.
     InvalidHeadingLevel(u8),
-    /// Commit or cancel IME preedit before performing this operation.
     CompositionActive,
 }
 

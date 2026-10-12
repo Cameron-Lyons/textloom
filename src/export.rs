@@ -133,9 +133,6 @@ fn inline(output: &mut String, paragraph: &Paragraph) {
                 )
                 .unwrap();
             } else {
-                // Eight-digit hex has differing channel orders in CSS and Qt's
-                // HTML importer. Round up at six decimals so importers that
-                // truncate alpha and those that round both recover its byte.
                 let opacity = (u32::from(alpha) * 1_000_000).div_ceil(255);
                 write!(
                     output,
@@ -170,8 +167,6 @@ fn escape(output: &mut String, text: &str) {
     let mut start = 0;
     for (index, byte) in text.bytes().enumerate() {
         let escaped = match byte {
-            // A literal NULL is a parse error and is discarded in HTML body
-            // text. Use its visible replacement, as for a NULL reference.
             0 => "\u{fffd}",
             b'&' => "&amp;",
             b'<' => "&lt;",

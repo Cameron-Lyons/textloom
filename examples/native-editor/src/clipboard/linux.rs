@@ -1,10 +1,3 @@
-//! Linux clipboard operations run only inside the host's managed helper process.
-//!
-//! The parent supplies a whole-operation deadline, kills and reaps stalled helpers,
-//! and verifies all representations after the provisional `READY` response. The
-//! Wayland data-control transport is optional; ordinary window clipboard protocols
-//! remain owned by eframe. This module never starts a serving thread.
-
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
@@ -32,16 +25,12 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INCR_TRANSFERS: usize = 16;
 const CHUNK_BYTES: usize = 64 * 1024;
 
-/// Publish, acknowledge provisional readiness, and serve until another owner takes
-/// over. Only the parent may interpret native readback as successful publication.
 pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
     validate_item(item)?;
     if use_wayland() {
         let mut options = copy::Options::new();
         options.foreground(true);
         let sources = vec![
-            // wl-clipboard-rs uses the first text/* source for additional plain
-            // aliases. Keep actual plain text before HTML, which also qualifies.
             copy::MimeSource {
                 source: copy::Source::Bytes(item.plain.as_bytes().into()),
                 mime_type: copy::MimeType::Text,
@@ -58,9 +47,6 @@ pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
         match options.prepare_copy_multi(sources) {
             Ok(prepared) => {
                 ready()?;
-                // The library queues publication during preparation and flushes
-                // while serving. Its receiver writes may block; the parent owns
-                // this entire process and can always retire it on replacement.
                 return prepared
                     .serve()
                     .map_err(|_| "Wayland clipboard serving failed".into());
@@ -72,9 +58,6 @@ pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
     publish_x11(item)
 }
 
-/// Capture the native representations from one Wayland offer or one checked X11
-/// selection owner. Missing rich data returns None before reading alternatives;
-/// missing HTML or plain representations are empty.
 pub(super) fn read() -> Result<Option<NativeItem>, String> {
     if use_wayland() {
         match watch::Watcher::new(watch::ClipboardType::Regular, paste::Seat::Unspecified) {
@@ -201,8 +184,6 @@ fn read_pipe(
         if Instant::now() >= deadline {
             return Err("Clipboard transfer timed out".into());
         }
-        // Read one byte beyond the limit to distinguish exact-size EOF from an
-        // oversized stream without allowing an unbounded allocation.
         let count = chunk
             .len()
             .min(limit.saturating_sub(bytes.len()).saturating_add(1));
@@ -438,7 +419,6 @@ fn serve_request(
     } else {
         event.property
     };
-    // Refuse overlapping transfers to the same property rather than mixing them.
     let result = if outgoing
         .iter()
         .any(|transfer| transfer.window == event.requestor && transfer.property == property)
@@ -518,8 +498,6 @@ fn serve_request(
         target: event.target,
         property: if result { property } else { x11rb::NONE },
     };
-    // A requestor may disappear at any point. Its failure must not terminate the
-    // clipboard owner or expose native error strings containing clipboard data.
     if let Ok(cookie) = connection.send_event(false, event.requestor, EventMask::NO_EVENT, reply) {
         let _ = cookie.check();
     }
@@ -608,8 +586,6 @@ fn read_target(
         .flush()
         .map_err(|_| "X11 clipboard flush failed")?;
     loop {
-        // The initial INCR property's NEW_VALUE event may still be queued. Reading
-        // a deleted property yields type NONE; skip it until an actual chunk arrives.
         if let Event::PropertyNotify(event) = next_x11_event(connection, deadline)?
             && event.window == window
             && event.atom == atoms.property

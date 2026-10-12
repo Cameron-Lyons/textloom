@@ -1,5 +1,3 @@
-//! Native input bridge without creating a window. In a windowed host, call
-//! handle_window_event from ApplicationHandler::window_event and sync_ime each frame.
 use textloom::{
     Editor,
     adapter::winit::{ClipboardEvent, CommandModifier, WinitAdapter},
@@ -39,7 +37,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(editor.undo());
     println!("Undo restored: {}", editor.document().plain_text());
 
-    // A read-only viewer still offers selection and clipboard access.
     input.set_read_only(true, &mut editor);
     input.set_modifiers(ModifiersState::CONTROL);
     let copy = input.handle_key(

@@ -225,7 +225,6 @@ fn rich_copy_supersedes_earlier_plain_and_image_commands_with_later_plain_fallba
                 ..Default::default()
             },
             |ui| {
-                // Another host control may have queued an image before document copy.
                 ui.ctx()
                     .copy_image(egui::ColorImage::filled([1, 1], Color32::WHITE));
                 ui.ctx().open_url(open_url.clone());
@@ -828,8 +827,6 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
         &editor.composition_snapshot().unwrap()
     ));
 
-    // The native caret may stop within an unfinished grapheme. Display it
-    // at the complete cluster boundary in the normalized preview document.
     editor.update_composition(text, Some(5..9)).unwrap();
     let moved = cached_preview_frame(&context, &mut cache, &editor, &appearance);
     let preview = cache.preview.as_ref().unwrap();
@@ -983,8 +980,6 @@ fn structural_layout_updates_retain_edges_and_match_a_fresh_cache() {
             0 => {}
             1 => assert!(editor.undo()),
             2 => {
-                // Rich paste can repeat shared paragraphs inside the
-                // changed range as well as shift the retained suffix.
                 let fragment = Fragment::from_document(editor.document());
                 editor.insert_fragment(&fragment).unwrap();
             }
@@ -1082,8 +1077,6 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                     "step={step}, paragraph={index}"
                 );
             }
-            // Borrowed viewport painting and owned navigation must describe
-            // the same relative geometry, including leaves split by edits.
             let actual_view = actual.views_range(index..index + 1).next().unwrap();
             let expected_view = expected.views_range(index..index + 1).next().unwrap();
             assert_eq!(actual_view.rect, expected_view.rect);
@@ -1215,8 +1208,6 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                 editor.delete_backward().unwrap();
             }
             6 => {
-                // Three independent changes without publishing a frame
-                // exercise recovery when the latest notification is missed.
                 for index in [
                     1,
                     editor.document().paragraphs().len() / 2,
@@ -1234,8 +1225,6 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                     .document()
                     .fragment(Position::default()..Position::new(3, end))
                     .unwrap();
-                // Complete source paragraphs are pasted again while their
-                // original shared allocations remain earlier in the document.
                 editor
                     .set_selection(Selection::caret(Position::new(60 + step % 30, 0)))
                     .unwrap();
@@ -2824,7 +2813,6 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
     let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     let galley = &layouts.get(1).unwrap().galley;
     assert!(galley.rows.len() >= 3);
-    // egui can wrap between the space and its zero-width combining mark.
     assert_eq!(galley.rows[0].char_count_excluding_newline().0, 2);
     let mut navigation = None;
     let mut errors = Vec::new();

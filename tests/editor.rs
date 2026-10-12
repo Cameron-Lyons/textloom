@@ -1,5 +1,3 @@
-//! Editor selection, Unicode navigation, formatting, IME, and history contracts.
-
 use std::sync::Arc;
 use textloom::{
     Color, Document, Editor, Error, Fragment, HistoryLimits, InlineStyle, Movement, ParagraphKind,

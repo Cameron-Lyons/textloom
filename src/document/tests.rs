@@ -1277,8 +1277,6 @@ fn unicode_replacements_preserve_text_invariants_and_replay_exactly() {
             );
             positions.push(Position::new(index, paragraph.text().len()));
         }
-        // Give surviving edges different styles, so replay verifies both
-        // content and formatting when replacement changes segmentation.
         for (index, position) in positions.iter().enumerate() {
             if index % 2 == 0
                 && let Some(end) = positions.get(index + 1)

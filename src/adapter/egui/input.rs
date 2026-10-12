@@ -1,4 +1,3 @@
-//! Ordered event handling and host clipboard coordination.
 use super::{
     RichClipboard,
     layout::ParagraphLayouts,
@@ -20,8 +19,6 @@ pub(super) fn copy_selection(
         .as_deref_mut()
         .is_some_and(|clipboard| clipboard.copy(&editor.selected_fragment()));
     if copied {
-        // The transport publishes synchronously; earlier deferred clipboard writes
-        // would otherwise run afterward and replace this newer clipboard item.
         ui.ctx().output_mut(|output| {
             output.commands.retain(|command| {
                 !matches!(
@@ -66,8 +63,6 @@ pub(super) fn handle_event(
         && (matches!(event, Event::Text(_) | Event::Paste(_) | Event::Cut)
             || matches!(event, Event::Key { key, pressed: true, .. } if *key != Key::Escape))
     {
-        // Empty preedit can be followed by either Commit or normal typing.
-        // Keep the replacement for Commit, then cancel it when typing resumes.
         *interrupted |= editor.cancel_composition();
     }
     match event {
@@ -184,7 +179,6 @@ pub(super) fn handle_key(
     errors: &mut Vec<Error>,
     read_only: bool,
 ) -> bool {
-    // Ctrl+Alt may be AltGr, and Command+Control is a host shortcut chord.
     let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
     if command || !matches!(key, Key::ArrowUp | Key::ArrowDown) {
         *navigation = None;
@@ -470,8 +464,6 @@ pub(super) fn surrounding_position(
             };
             return Position::new(paragraph, boundary);
         }
-        // Only visit paragraphs crossed by the requested native scalar count.
-        // Each paragraph separator contributes one scalar, including empty rows.
         remaining -= available;
         if forward {
             if paragraph + 1 == document.paragraphs().len() {

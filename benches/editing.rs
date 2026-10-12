@@ -1,5 +1,3 @@
-//! Standalone benchmarks for localized editing, Unicode navigation, and replacement.
-
 use std::{hint::black_box, time::Instant};
 use textloom::{
     Document, Editor, Fragment, HistoryLimits, Movement, Position, SearchOptions, Selection,
@@ -80,8 +78,6 @@ fn serialization() {
     assert_eq!(Document::from_bytes(&expected_bytes).unwrap(), document);
 }
 
-// Assemble canonical TLFR once so benchmark setup does not repeatedly rebuild
-// the paragraph through thousands of individual style commands.
 fn styled_repetitions(phrase: &str, repetitions: usize) -> Document {
     let text = phrase.repeat(repetitions);
     let mut bytes = Vec::new();
@@ -167,7 +163,6 @@ fn sparse_whole_word_search() {
         ..SearchOptions::default()
     };
     let expected = Position::new(0, 0)..Position::new(0, 5);
-    // Warm validation with an initial query; word segmentation remains per query.
     assert_eq!(
         document.find("match", options).as_slice(),
         std::slice::from_ref(&expected)
@@ -220,8 +215,6 @@ fn short_paragraph_edits() {
 }
 
 fn unicode_navigation() {
-    // This fixed phrase is 46 UTF-8 bytes. The caret is 90% through a
-    // 460000-byte paragraph, where a repeated linear scan is expensive.
     let phrase = "café 👩‍💻 नमस्ते 🇺🇸 ";
     let source = phrase.repeat(10_000);
     let position = Position::new(0, phrase.len() * 9_000);
@@ -238,7 +231,6 @@ fn unicode_navigation() {
     });
 
     let mut editor = Editor::from_text(&source);
-    // Explicit selection warms position validation separately from words.
     editor.set_selection(Selection::caret(position)).unwrap();
     let start = Instant::now();
     grapheme_pair(&mut editor);
@@ -331,9 +323,6 @@ fn long_unicode_edits() {
         assert_eq!(editor.document().plain_text(), source);
     }
 
-    // Force a contextual boundary that exceeds a local cursor's context. The
-    // fallback must preserve regional-indicator pairing without rescanning it
-    // for every subsequent validation.
     let source = "🇺🇸".repeat(10_000);
     let original = Selection::caret(Position::new(0, source.len() / 2));
     let mut editor = Editor::from_text(&source);
@@ -502,7 +491,6 @@ fn batch_replacement() {
     });
 
     let mut editor = Editor::new(styled_repetitions("match café 👩‍💻 ", 10_000));
-    // Warm the source with one replacement and confirm the undo entry fits.
     assert_eq!(
         editor
             .replace_all("match", "replacement", SearchOptions::default())
@@ -633,7 +621,6 @@ fn long_literal_navigation() {
     let repetition = 45_000;
     let start = phrase.len() * repetition + "café ".len();
     let end = start + "match".len();
-    // Warm position validation before timing navigation.
     editor
         .set_selection(Selection::caret(Position::new(0, start)))
         .unwrap();
@@ -686,8 +673,6 @@ fn sparse_replacement() {
         let paragraph = "untouched café 👩‍💻. ".repeat(repeats);
         let source = format!("match\n{}match", format!("{paragraph}\n").repeat(10_000));
         let mut editor = Editor::from_text(&source);
-        // This workload retains a contiguous delta across many unchanged
-        // paragraphs; increase the limit so its undo step remains available.
         editor.set_history_limits(HistoryLimits {
             max_bytes: 64 * 1024 * 1024,
             ..HistoryLimits::default()

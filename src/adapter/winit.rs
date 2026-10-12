@@ -1,11 +1,3 @@
-//! Winit keyboard and IME bridge, independent of the renderer and OS clipboard.
-//!
-//! Call [`WinitAdapter::set_focused`] when the editor gains or loses widget focus,
-//! then pass window events to [`WinitAdapter::handle_window_event`]. Do not pass
-//! those same text events to another editor adapter. The host renders the
-//! document and `Editor::composition()`, performs pointer hit testing, services
-//! clipboard requests, and calls [`WinitAdapter::sync_ime`] with the caret area.
-
 use std::borrow::Cow;
 
 use crate::{Editor, Error, Fragment, Movement, ParagraphKind, StylePatch};
@@ -16,38 +8,25 @@ use winit::{
     window::Window,
 };
 
-/// Clipboard operations are owned by the host, avoiding platform dependencies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardEvent {
-    /// Plain selected text for the host to write to its clipboard.
     Copy(String),
-    /// Enabled through [`WinitAdapter::rich_clipboard`]; encode native data or HTML in the host.
     CopyRich(Fragment),
-    /// The selection has already been removed from the document.
     Cut(String),
-    /// Rich content captured before the selection is removed.
     CutRich(Fragment),
-    /// Read the clipboard, then call [`WinitAdapter::paste`].
     PasteRequest,
 }
 
-/// A host should stop dispatching handled input and redraw after a change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InputOutcome {
-    /// Whether the host should stop dispatching this event to other widgets.
     pub handled: bool,
-    /// Includes changes to the caret, typing style, and preedit text.
     pub changed: bool,
-    /// Clipboard work for the host to service after handling this event.
     pub clipboard: Option<ClipboardEvent>,
 }
 
-/// The command modifier can be overridden for a host's shortcut preferences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandModifier {
-    /// Control-based shortcuts, the default outside macOS.
     Control,
-    /// Super/Command-based shortcuts, the default on macOS.
     Super,
 }
 
@@ -61,11 +40,6 @@ impl Default for CommandModifier {
     }
 }
 
-/// Focus-aware native keyboard and IME routing for a host-rendered editor.
-///
-/// The host owns pointer selection, clipboard transport, rendering, and window
-/// IME configuration. Read-only widgets retain navigation, selection, and copy
-/// support through [`WinitAdapter::set_read_only`].
 #[derive(Debug, Default)]
 pub struct WinitAdapter {
     focused: bool,
@@ -78,34 +52,24 @@ pub struct WinitAdapter {
 }
 
 impl WinitAdapter {
-    /// Create an unfocused adapter using the platform's command modifier.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Override the platform shortcut modifier.
     pub fn command_modifier(mut self, modifier: CommandModifier) -> Self {
         self.command_modifier = modifier;
         self
     }
 
-    /// Request rich clipboard payloads for copy/cut instead of plain strings.
-    /// The host owns MIME types and clipboard transport.
     pub fn rich_clipboard(mut self, enabled: bool) -> Self {
         self.rich_clipboard = enabled;
         self
     }
 
-    /// Whether document-changing keyboard, clipboard, and IME input is blocked.
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
 
-    /// Permit selection, navigation, and copying while preventing edits.
-    ///
-    /// Enabling read-only mode cancels active preedit and disables platform IME
-    /// on the next [`Self::sync_ime`] call. Cut copies without deleting; paste,
-    /// formatting, undo, and redo input is consumed without changing history.
     pub fn set_read_only(&mut self, read_only: bool, editor: &mut Editor) -> InputOutcome {
         let changed = self.read_only != read_only;
         self.read_only = read_only;
@@ -119,28 +83,22 @@ impl WinitAdapter {
         }
     }
 
-    /// Whether both the editor widget and its window have focus.
     pub fn is_focused(&self) -> bool {
         self.focused && !self.window_unfocused
     }
 
-    /// Whether the native IME has announced that it is enabled.
     pub fn ime_enabled(&self) -> bool {
         self.ime_enabled
     }
 
-    /// Return the most recently received modifier state.
     pub fn modifiers(&self) -> ModifiersState {
         self.modifiers
     }
 
-    /// Also useful when the host routes modifier state through its own input API.
     pub fn set_modifiers(&mut self, modifiers: ModifiersState) {
         self.modifiers = modifiers;
     }
 
-    /// Set widget focus, canceling composition, clearing modifiers, and ending
-    /// the current typing undo group on blur.
     pub fn set_focused(&mut self, focused: bool, editor: &mut Editor) -> InputOutcome {
         let was_focused = self.is_focused();
         let changed = self.focused != focused;
@@ -161,8 +119,6 @@ impl WinitAdapter {
         }
     }
 
-    /// Enable platform IME while this widget has focus and keep its candidate
-    /// popup near the caret. Coordinates are logical window coordinates.
     pub fn sync_ime(
         &self,
         window: &Window,
@@ -176,9 +132,6 @@ impl WinitAdapter {
         }
     }
 
-    /// Route window focus, modifier, nonsynthetic keyboard, and IME events.
-    ///
-    /// Other events remain unhandled for the host.
     pub fn handle_window_event(
         &mut self,
         event: &WindowEvent,
@@ -223,8 +176,6 @@ impl WinitAdapter {
         }
     }
 
-    /// Routes a logical key and its produced text. Insertion uses `text` only;
-    /// using both it and `Key::Character` would duplicate dead-key output.
     pub fn handle_key(
         &mut self,
         key: &Key,
@@ -242,16 +193,12 @@ impl WinitAdapter {
         if editor.composition().is_some_and(|composition| {
             !composition.text.is_empty() || matches!(key, Key::Named(NamedKey::Escape))
         }) {
-            // The IME owns navigation and editing while composing.
             return Ok(InputOutcome {
                 handled: true,
                 changed: matches!(key, Key::Named(NamedKey::Escape)) && editor.cancel_composition(),
                 clipboard: None,
             });
         }
-        // Empty preedit can precede either Commit or IME cancellation. Keep
-        // its replacement for Commit, but resume normal editing when a new
-        // key arrives instead. Winit suppresses key events during composition.
         if editor.composition().is_some() {
             editor.cancel_composition();
         }
@@ -422,10 +369,6 @@ impl WinitAdapter {
         Ok(outcome)
     }
 
-    /// Route native preedit and commit events while the editor has focus.
-    ///
-    /// Invalid UTF-8 selection boundaries are rejected without changing preedit.
-    /// Empty reset events without an active composition preserve selected text.
     pub fn handle_ime(&mut self, event: &Ime, editor: &mut Editor) -> Result<InputOutcome, Error> {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
@@ -456,8 +399,6 @@ impl WinitAdapter {
                 {
                     return Err(Error::InvalidCompositionSelection);
                 }
-                // An empty preedit preserves the captured replacement until
-                // Commit. Clearing/canceling here would lose that range.
                 if !text.is_empty() || editor.composition().is_some() {
                     let selection = selection.map(|(start, end)| start..end);
                     preedit_changed = editor.composition().is_none_or(|composition| {
@@ -469,8 +410,6 @@ impl WinitAdapter {
                 }
             }
             Ime::Commit(text) => {
-                // Platform IME setup can emit an empty reset without preedit.
-                // A real composition's empty commit still deletes its replacement.
                 if !text.is_empty() || editor.composition().is_some() {
                     editor.commit_composition(text)?;
                 }
@@ -483,9 +422,6 @@ impl WinitAdapter {
         })
     }
 
-    /// Deliver a host clipboard response. Paste is a single undoable edit.
-    /// Empty input or text consisting only of filtered controls leaves selection,
-    /// composition, and typing history unchanged.
     pub fn paste(&mut self, editor: &mut Editor, text: &str) -> Result<InputOutcome, Error> {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
@@ -514,7 +450,6 @@ impl WinitAdapter {
         })
     }
 
-    /// Deliver a rich host clipboard response as one undoable edit.
     pub fn paste_fragment(
         &mut self,
         editor: &mut Editor,
@@ -540,7 +475,6 @@ impl WinitAdapter {
 
     fn command_pressed(&self) -> bool {
         match self.command_modifier {
-            // Ctrl+Alt is commonly AltGr and must remain available for text.
             CommandModifier::Control => {
                 self.modifiers.control_key()
                     && !self.modifiers.alt_key()

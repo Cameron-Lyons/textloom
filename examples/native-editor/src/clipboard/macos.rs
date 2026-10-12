@@ -1,5 +1,3 @@
-//! Eager, single-item AppKit clipboard transport for the repository example.
-
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardWriting};
@@ -7,8 +5,6 @@ use objc2_foundation::{NSArray, NSData, NSString};
 
 use super::{MAX_NATIVE_BYTES, NativeItem};
 
-// Use the native UTI for our MIME representation. Constructing NSString values
-// also avoids unsafe access to AppKit's extern pasteboard type constants.
 const PLAIN_TYPE: &str = "public.utf8-plain-text";
 const HTML_TYPE: &str = "public.html";
 const RICH_TYPE: &str = "org.textloom.fragment";
@@ -39,8 +35,6 @@ fn bounded_item(board: &NSPasteboard, types: &Types) -> Result<Option<ItemData>,
     let Some(items) = board.pasteboardItems() else {
         return Ok(None);
     };
-    // Multiple items may produce aggregated plain text in the native paste
-    // event. A fragment from only one of them cannot represent that event.
     if items.count() != 1 {
         return Ok(None);
     }
@@ -57,7 +51,6 @@ fn bounded_item(board: &NSPasteboard, types: &Types) -> Result<Option<ItemData>,
         .dataForType(&types.html)
         .ok_or_else(|| "Native clipboard item is missing HTML".to_owned())?;
 
-    // Check native lengths before allocating any Rust payload buffers.
     if [plain.length(), html.length(), rich.length()]
         .into_iter()
         .any(|length| length > MAX_NATIVE_BYTES)
@@ -82,8 +75,6 @@ pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
             rich: NSData::with_bytes(&item.rich),
         };
         let native_item = NSPasteboardItem::new();
-        // Prepare all representations before touching the system clipboard.
-        // Eager data needs no provider process after publication succeeds.
         if !native_item.setData_forType(&data.plain, &types.plain)
             || !native_item.setData_forType(&data.html, &types.html)
             || !native_item.setData_forType(&data.rich, &types.rich)
@@ -140,8 +131,6 @@ pub(super) fn read() -> Result<Option<NativeItem>, String> {
                 rich: captured.rich.to_vec(),
             }))
         });
-        // Guard both successful captures and absent/invalid representations:
-        // a new clipboard owner invalidates the entire attempted snapshot.
         if board.changeCount() != generation {
             return Err("Native clipboard changed during capture".to_owned());
         }

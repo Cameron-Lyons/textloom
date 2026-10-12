@@ -1,5 +1,3 @@
-//! Literal and Unicode lowercase search coordinates and boundary contracts.
-
 use textloom::{Document, Editor, Position, SearchOptions, Selection};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -84,8 +82,6 @@ fn only_complete_graphemes_match() {
     assert_eq!(flags.len(), 1);
     assert_eq!(document.text(flags[0].clone()).unwrap(), "🇺");
     assert_eq!(document.find("👩‍💻", default_options()).len(), 1);
-    // The first literal candidate overlaps two flags. Rejecting it must
-    // still allow the later candidate that covers one complete flag.
     assert_eq!(
         Document::from_text("🇨🇺🇺🇺").find("🇺🇺", default_options()),
         vec![Position::new(0, 8)..Position::new(0, 16)]
@@ -297,8 +293,6 @@ fn longer_lowercase_queries_match_expansions_but_skip_short_paragraphs() {
 
 #[test]
 fn generated_unicode_matches_agree_with_a_grapheme_reference() {
-    // The reference tries every complete original grapheme, rather than using
-    // literal candidates or the implementation's sparse lowercase byte map.
     fn reference(
         document: &Document,
         query: &str,
@@ -429,8 +423,6 @@ fn generated_unicode_matches_agree_with_a_grapheme_reference() {
 
 #[test]
 fn navigation_matches_document_search_at_every_grapheme_and_direction() {
-    // Selected matches, carets inside a match, overlapping rejected candidates,
-    // expanding lowercase mappings, empty paragraphs, and paragraph breaks.
     let mut editor = Editor::from_text("ana banana\n\nİ i CAFÉ\n🇨🇺🇺🇺 ana\nΟΣ\nana\n");
     let positions: Vec<_> = editor
         .document()
@@ -517,8 +509,6 @@ fn local_navigation_keeps_forward_nonoverlap_and_complete_lowercase_context() {
         .set_selection(Selection::caret(Position::new(1, 2)))
         .unwrap();
     let caret = editor.selection();
-    // Restarting the literal scanner at byte 2 would invent a later overlapping
-    // "ana" at 3..6, which is absent from Document::find's accepted match set.
     assert!(!editor.find_next("ana", options, false).unwrap());
     assert_eq!(editor.selection(), caret);
     assert!(editor.find_next("ana", options, true).unwrap());
@@ -529,7 +519,6 @@ fn local_navigation_keeps_forward_nonoverlap_and_complete_lowercase_context() {
     editor
         .set_selection(Selection::caret(Position::new(1, 6)))
         .unwrap();
-    // Searching literals in reverse would likewise prefer the overlapping 3..6.
     assert!(editor.find_previous("ana", options, false).unwrap());
     assert_eq!(
         editor.selection(),
@@ -542,8 +531,6 @@ fn local_navigation_keeps_forward_nonoverlap_and_complete_lowercase_context() {
     editor
         .set_selection(Selection::caret(Position::new(2, 4)))
         .unwrap();
-    // Lowercasing only the prefix through the caret would turn Σ into final ς;
-    // the complete paragraph correctly keeps σ because Α follows it.
     assert!(!editor.find_previous("ος", insensitive, true).unwrap());
     assert!(editor.find_previous("οσ", insensitive, false).unwrap());
     assert_eq!(
