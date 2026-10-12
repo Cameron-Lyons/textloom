@@ -4,6 +4,15 @@ use std::{
 };
 use textloom::{Editor, Position, Selection, adapter::egui::RichTextEditor};
 
+fn scaled(iterations: usize) -> usize {
+    let quick = std::env::var_os("TEXTLOOM_BENCH_QUICK").is_some_and(|value| !value.is_empty());
+    if quick {
+        (iterations / 10).max(2)
+    } else {
+        iterations
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct FrameConfig {
     width: Option<f32>,
@@ -71,7 +80,7 @@ fn main() {
         for _ in 0..3 {
             frame(&context, &mut editor);
         }
-        let iterations = if paragraphs == 100 { 1_000 } else { 100 };
+        let iterations = scaled(if paragraphs == 100 { 1_000 } else { 100 });
         let start = Instant::now();
         for _ in 0..iterations {
             frame(&context, &mut editor);
@@ -180,7 +189,7 @@ fn initialization_and_invalidation_frames() {
 
 fn initial_frames(paragraphs: usize, accessible: bool) -> f64 {
     let source = document_text(paragraphs);
-    let iterations = 20;
+    let iterations = scaled(20);
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
         let mut editor = Editor::from_text(&source);
@@ -207,7 +216,7 @@ fn invalidated_frames(
         let config = configure(&context, index);
         frame_config(&context, &mut editor, Vec::new(), config);
     }
-    let iterations = 20;
+    let iterations = scaled(20);
     let mut elapsed = Duration::ZERO;
     for index in 0..iterations {
         let config = configure(&context, index);
@@ -237,7 +246,7 @@ fn accessibility_frames() {
         for _ in 0..3 {
             frame(&context, &mut editor);
         }
-        let iterations = if paragraphs == 100 { 1_000 } else { 100 };
+        let iterations = scaled(if paragraphs == 100 { 1_000 } else { 100 });
         let start = Instant::now();
         for _ in 0..iterations {
             editor.insert_text(black_box("x")).unwrap();
@@ -268,12 +277,13 @@ fn native_preedit_frames() {
             frame_with_events(&context, &mut editor, vec![event.clone()]);
         }
         assert_eq!(editor.composition().unwrap().selection, Some(byte..byte));
+        let iterations = scaled(100);
         let start = Instant::now();
-        for _ in 0..100 {
+        for _ in 0..iterations {
             frame_with_events(&context, &mut editor, vec![black_box(event.clone())]);
             assert_eq!(editor.composition().unwrap().selection, Some(byte..byte));
         }
-        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / 100.0;
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
         editor.cancel_composition();
         assert_eq!(editor.document().plain_text(), "");
         println!("long Unicode preedit: {elapsed:.2} µs / native cursor at {label} + frame");
@@ -292,7 +302,7 @@ fn long_preedit_frames() {
         frame(&context, &mut editor);
     }
     for mode in ["idle", "identical update", "cursor update", "text update"] {
-        let iterations = if mode == "text update" { 20 } else { 200 };
+        let iterations = scaled(if mode == "text update" { 20 } else { 200 });
         let start = Instant::now();
         for index in 0..iterations {
             match mode {

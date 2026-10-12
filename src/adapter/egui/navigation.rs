@@ -4,10 +4,9 @@ use egui::{
     Galley, Pos2, Rect, Vec2,
     text::{CCursor, CharIndex},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::layout::ParagraphLayouts;
-use crate::{Document, Editor, Error, Paragraph, Position, Selection};
+use crate::{Document, Editor, Error, Link, Paragraph, Position, Selection};
 
 #[derive(Clone)]
 pub(super) struct VerticalNavigation {
@@ -33,16 +32,12 @@ pub(super) fn hit_test(
     let cursor = layout
         .galley
         .cursor_from_pos(point - layout.rect.min.to_vec2());
-    let byte = source
-        .byte_from_scalar(cursor.index.0)
-        .unwrap_or(source.text().len());
-    let before = source.boundary_at_or_before(byte);
-    let after = source.boundary_at_or_after(byte);
-    let byte = if byte - before <= after - byte {
-        before
-    } else {
-        after
-    };
+    let byte = snap_grapheme(
+        source,
+        source
+            .byte_from_scalar(cursor.index.0)
+            .unwrap_or(source.text().len()),
+    );
     let index = CharIndex(source.scalar_index(byte).expect("snapped scalar boundary"));
     let clicked_row = layout.galley.layout_from_cursor(cursor).row;
     let prefer_next_row = [cursor.prefer_next_row, !cursor.prefer_next_row]
@@ -59,6 +54,32 @@ pub(super) fn hit_test(
         })
         .unwrap_or(cursor.prefer_next_row);
     (Position::new(paragraph, byte), prefer_next_row)
+}
+
+pub(super) fn link_at_point(
+    document: &Document,
+    layouts: &ParagraphLayouts,
+    point: Vec2,
+) -> Option<Link> {
+    let paragraph = layouts.paragraph_at_y(point.y);
+    let layout = layouts.get(paragraph)?;
+    let source = document.paragraph(paragraph)?;
+    let local = point - layout.rect.min.to_vec2();
+    let mut scalar = 0;
+    for row in &layout.galley.rows {
+        if row.min_y() <= local.y && local.y < row.max_y() {
+            let x = local.x - row.pos.x;
+            let column = row
+                .glyphs
+                .iter()
+                .position(|glyph| glyph.pos.x <= x && x < glyph.max_x())?;
+            let byte = source.byte_from_scalar(scalar + column)?;
+            let position = Position::new(paragraph, source.boundary_at_or_before(byte));
+            return document.link_at(position).cloned();
+        }
+        scalar += row.char_count_including_newline().0;
+    }
+    None
 }
 
 pub(super) fn pointer_navigation(
@@ -111,30 +132,6 @@ pub(super) fn snap_grapheme(paragraph: &Paragraph, byte: usize) -> usize {
     }
 }
 
-pub(super) fn word_selection(editor: &Editor, position: Position) -> Selection {
-    let Some(paragraph) = editor.document().paragraph(position.paragraph) else {
-        return Selection::caret(position);
-    };
-    let text = paragraph.text();
-    let byte = if position.byte == text.len() {
-        paragraph.boundary_at_or_before(text.len().saturating_sub(1))
-    } else {
-        position.byte
-    };
-    for (start, word) in text.split_word_bound_indices() {
-        if start <= byte && byte < start + word.len() {
-            return Selection::new(
-                Position::new(position.paragraph, snap_grapheme(paragraph, start)),
-                Position::new(
-                    position.paragraph,
-                    snap_grapheme(paragraph, start + word.len()),
-                ),
-            );
-        }
-    }
-    Selection::caret(position)
-}
-
 pub(super) fn document_caret_rect(
     document: &Document,
     layouts: &ParagraphLayouts,
@@ -161,6 +158,27 @@ pub(super) fn document_caret_rect(
         .translate(origin.to_vec2() + layout.rect.min.to_vec2())
 }
 
+pub(super) fn selection_bounds(
+    document: &Document,
+    layouts: &ParagraphLayouts,
+    origin: Pos2,
+    selection: Selection,
+    content_width: f32,
+) -> Option<Rect> {
+    if selection.is_caret() {
+        return None;
+    }
+    let range = selection.range();
+    let start = document_caret_rect(document, layouts, origin, range.start, true);
+    let end = document_caret_rect(document, layouts, origin, range.end, false);
+    let mut bounds = start.union(end);
+    if start.top() != end.top() {
+        bounds.min.x = origin.x;
+        bounds.max.x = bounds.max.x.max(origin.x + content_width);
+    }
+    Some(bounds)
+}
+
 pub(super) fn vertical_position(
     editor: &Editor,
     layouts: &ParagraphLayouts,
@@ -179,62 +197,106 @@ pub(super) fn vertical_position(
         || layout.rect.left() + layout.galley.pos_from_cursor(cursor).center().x,
         |navigation| navigation.preferred_x,
     );
-    let (paragraph, cursor) = if down && row + 1 < layout.galley.rows.len() {
-        (
-            focus.paragraph,
-            layout
-                .galley
-                .cursor_down_one_row(&cursor, Some(preferred_x - layout.rect.left()))
-                .0,
-        )
+    let (paragraph, target, cursor) = if down && row + 1 < layout.galley.rows.len() {
+        let cursor = layout
+            .galley
+            .cursor_down_one_row(&cursor, Some(preferred_x - layout.rect.left()))
+            .0;
+        (focus.paragraph, layout, cursor)
     } else if !down && row > 0 {
-        (
-            focus.paragraph,
-            layout
-                .galley
-                .cursor_up_one_row(&cursor, Some(preferred_x - layout.rect.left()))
-                .0,
-        )
+        let cursor = layout
+            .galley
+            .cursor_up_one_row(&cursor, Some(preferred_x - layout.rect.left()))
+            .0;
+        (focus.paragraph, layout, cursor)
     } else if down && focus.paragraph + 1 < layouts.len() {
         let paragraph = focus.paragraph + 1;
-        let target = &layouts.get(paragraph).unwrap();
-        let row = target.galley.rows.first()?;
-        (
-            paragraph,
-            target.galley.cursor_from_pos(Vec2::new(
-                preferred_x - target.rect.left(),
-                row.rect().center().y,
-            )),
-        )
+        let target = layouts.get(paragraph)?;
+        let y = target.galley.rows.first()?.rect().center().y;
+        let cursor = target
+            .galley
+            .cursor_from_pos(Vec2::new(preferred_x - target.rect.left(), y));
+        (paragraph, target, cursor)
     } else if !down && focus.paragraph > 0 {
         let paragraph = focus.paragraph - 1;
-        let target = &layouts.get(paragraph).unwrap();
-        let row = target.galley.rows.last()?;
-        (
-            paragraph,
-            target.galley.cursor_from_pos(Vec2::new(
-                preferred_x - target.rect.left(),
-                row.rect().center().y,
-            )),
-        )
+        let target = layouts.get(paragraph)?;
+        let y = target.galley.rows.last()?.rect().center().y;
+        let cursor = target
+            .galley
+            .cursor_from_pos(Vec2::new(preferred_x - target.rect.left(), y));
+        (paragraph, target, cursor)
     } else {
-        (
-            focus.paragraph,
-            if down {
-                layout.galley.end()
-            } else {
-                layout.galley.begin()
-            },
-        )
+        let cursor = if down {
+            layout.galley.end()
+        } else {
+            layout.galley.begin()
+        };
+        (focus.paragraph, layout, cursor)
     };
     let source = editor.document().paragraph(paragraph)?;
-    let (byte, prefer_next_row) = snap_vertical_cursor(
-        source,
-        &layouts.get(paragraph).unwrap().galley,
-        cursor,
-        down,
-    )?;
+    let (byte, prefer_next_row) = snap_vertical_cursor(source, &target.galley, cursor, down)?;
     Some((Position::new(paragraph, byte), preferred_x, prefer_next_row))
+}
+
+pub(super) fn page_position(
+    editor: &Editor,
+    layouts: &ParagraphLayouts,
+    navigation: Option<&VerticalNavigation>,
+    down: bool,
+    page: f32,
+) -> Option<(Position, f32, bool)> {
+    let document = editor.document();
+    let focus = editor.selection().focus;
+    let prefer_next_row = navigation.is_none_or(|navigation| navigation.prefer_next_row);
+    let caret = document_caret_rect(document, layouts, Pos2::ZERO, focus, prefer_next_row);
+    let preferred_x = navigation.map_or(caret.center().x, |navigation| navigation.preferred_x);
+    let y = caret.center().y + if down { page } else { -page };
+    if y < 0.0 {
+        return Some((Position::default(), preferred_x, true));
+    }
+    if y > layouts.content_height()? {
+        return Some((document.end(), preferred_x, true));
+    }
+    let paragraph = layouts.paragraph_at_y(y).min(layouts.len().checked_sub(1)?);
+    let target = layouts.get(paragraph)?;
+    let cursor = target.galley.cursor_from_pos(Vec2::new(
+        preferred_x - target.rect.left(),
+        (y - target.rect.top()).clamp(0.0, target.galley.rect.bottom()),
+    ));
+    let source = document.paragraph(paragraph)?;
+    let (byte, prefer_next_row) = snap_vertical_cursor(source, &target.galley, cursor, down)?;
+    Some((Position::new(paragraph, byte), preferred_x, prefer_next_row))
+}
+
+pub(super) fn row_boundary_position(
+    editor: &Editor,
+    layouts: &ParagraphLayouts,
+    prefer_next_row: bool,
+    end: bool,
+) -> Option<(Position, f32, bool)> {
+    let focus = editor.selection().focus;
+    let source = editor.document().paragraph(focus.paragraph)?;
+    let layout = layouts.get(focus.paragraph)?;
+    let cursor = CCursor {
+        index: CharIndex(source.scalar_index(focus.byte)?),
+        prefer_next_row,
+    };
+    let target = if end {
+        layout.galley.cursor_end_of_row(&cursor)
+    } else {
+        layout.galley.cursor_begin_of_row(&cursor)
+    };
+    let (byte, prefer_next_row) = snap_vertical_cursor(source, &layout.galley, target, end)?;
+    let x = layout.rect.left()
+        + layout
+            .galley
+            .pos_from_cursor(CCursor {
+                index: CharIndex(source.scalar_index(byte)?),
+                prefer_next_row,
+            })
+            .center()
+            .x;
+    Some((Position::new(focus.paragraph, byte), x, prefer_next_row))
 }
 
 pub(super) fn snap_vertical_cursor(

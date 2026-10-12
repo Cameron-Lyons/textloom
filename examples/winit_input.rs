@@ -4,24 +4,27 @@ use textloom::{
 };
 use winit::{
     event::{ElementState, Ime},
-    keyboard::{Key, ModifiersState},
+    keyboard::{Key, KeyCode, ModifiersState, PhysicalKey},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut editor = Editor::from_text("Select and edit me");
     let mut input = WinitAdapter::new().command_modifier(CommandModifier::Control);
-    input.set_focused(true, &mut editor);
+    assert!(input.set_focused(true, &mut editor).changed);
     input.set_modifiers(ModifiersState::CONTROL);
-    input.handle_key(
+    let select = input.handle_key(
         &Key::Character("a".into()),
+        PhysicalKey::Code(KeyCode::KeyA),
         ElementState::Pressed,
-        None,
+        Some("a"),
         &mut editor,
     )?;
+    assert!(select.handled && select.changed);
     let copy = input.handle_key(
-        &Key::Character("c".into()),
+        &Key::Character("с".into()),
+        PhysicalKey::Code(KeyCode::KeyC),
         ElementState::Pressed,
-        None,
+        Some("с"),
         &mut editor,
     )?;
     if let Some(ClipboardEvent::Copy(text)) = copy.clipboard {
@@ -29,20 +32,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     input.set_modifiers(ModifiersState::empty());
-    input.handle_ime(&Ime::Enabled, &mut editor)?;
-    input.handle_ime(&Ime::Preedit("日本".into(), Some((0, 6))), &mut editor)?;
+    assert!(input.handle_ime(&Ime::Enabled, &mut editor)?.handled);
+    let preedit = input.handle_ime(&Ime::Preedit("日本".into(), Some((0, 6))), &mut editor)?;
+    assert!(preedit.changed);
     assert_eq!(editor.document().plain_text(), "Select and edit me");
-    input.handle_ime(&Ime::Commit("日本語".into()), &mut editor)?;
+    let commit = input.handle_ime(&Ime::Commit("日本語".into()), &mut editor)?;
+    assert!(commit.changed);
     assert_eq!(editor.document().plain_text(), "日本語");
     assert!(editor.undo());
     println!("Undo restored: {}", editor.document().plain_text());
 
-    input.set_read_only(true, &mut editor);
+    assert!(input.set_read_only(true, &mut editor).changed);
     input.set_modifiers(ModifiersState::CONTROL);
     let copy = input.handle_key(
         &Key::Character("x".into()),
+        PhysicalKey::Code(KeyCode::KeyX),
         ElementState::Pressed,
-        None,
+        Some("x"),
         &mut editor,
     )?;
     assert_eq!(

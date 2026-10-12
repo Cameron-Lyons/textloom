@@ -23,15 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: stable
-      - name: Validate version
+      - name: Validate version and changelog
         shell: bash
-        run: |
-          package_id=$(cargo pkgid --offline)
-          version=${package_id##*[#@]}
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match package version v$version" >&2
-            exit 1
-          fi
+        run: ./scripts/release-version.sh "$GITHUB_REF_NAME"
 
   checks:
     name: Release checks

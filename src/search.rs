@@ -24,26 +24,51 @@ impl Default for SearchOptions {
 }
 
 impl Document {
+    #[must_use]
     pub fn find(&self, query: &str, options: SearchOptions) -> Vec<Range<Position>> {
         let mut matches = Vec::new();
-        let _ = self.visit_matches(query, options, |range| {
-            matches.push(range);
-            ControlFlow::Continue(())
-        });
+        if !query.is_empty() {
+            let needle = search_needle(query, options);
+            let _ = self.visit_normalized_matches(&needle, options, |range| {
+                matches.push(range);
+                ControlFlow::Continue(())
+            });
+        }
         matches
     }
 
-    pub(crate) fn visit_matches(
+    pub(crate) fn is_match(
         &self,
         query: &str,
         options: SearchOptions,
-        accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
-    ) -> ControlFlow<()> {
-        if query.is_empty() {
-            return ControlFlow::Continue(());
+        range: &Range<Position>,
+    ) -> bool {
+        if query.is_empty() || range.is_empty() {
+            return false;
         }
         let needle = search_needle(query, options);
-        self.visit_normalized_matches(&needle, options, accept)
+        if !needle.contains('\n') {
+            return range.start.paragraph == range.end.paragraph
+                && self
+                    .find_paragraph_match(
+                        range.start.paragraph,
+                        &needle,
+                        options,
+                        Some(range.start),
+                        false,
+                        is_direct_literal(&needle, options),
+                    )
+                    .is_some_and(|found| found == *range);
+        }
+        let mut found = false;
+        let _ = self.visit_normalized_matches(&needle, options, |candidate| {
+            if candidate.start < range.start {
+                return ControlFlow::Continue(());
+            }
+            found = candidate == *range;
+            ControlFlow::Break(())
+        });
+        found
     }
 
     pub(crate) fn find_relative(
@@ -84,74 +109,44 @@ impl Document {
             return found.or(wrapped);
         }
 
-        let direct_literal = options.case_sensitive
-            && !options.whole_word
-            && needle
-                .chars()
-                .next()
-                .is_some_and(|first| !needle[first.len_utf8()..].contains(first));
-
+        let direct_literal = is_direct_literal(&needle, options);
         let boundary = if backward {
             selection.start
         } else {
             selection.end
         };
+        let len = self.paragraphs().len();
+        let start = boundary.paragraph;
+        let search = |index: usize, bounded: bool| {
+            self.find_paragraph_match(
+                index,
+                &needle,
+                options,
+                bounded.then_some(boundary),
+                backward,
+                direct_literal,
+            )
+        };
         if backward {
-            for index in (0..=boundary.paragraph).rev() {
-                if let Some(found) = self.find_paragraph_match(
-                    index,
-                    &needle,
-                    options,
-                    (index == boundary.paragraph).then_some(boundary),
-                    true,
-                    direct_literal,
-                ) {
-                    return Some(found);
-                }
-            }
-            if wrap {
-                for index in (boundary.paragraph..self.paragraphs().len()).rev() {
-                    if let Some(found) = self.find_paragraph_match(
-                        index,
-                        &needle,
-                        options,
-                        None,
-                        true,
-                        direct_literal,
-                    ) {
-                        return Some(found);
-                    }
-                }
-            }
+            (0..=start)
+                .rev()
+                .find_map(|index| search(index, index == start))
+                .or_else(|| {
+                    wrap.then(|| (start..len).rev().find_map(|index| search(index, false)))
+                        .flatten()
+                })
         } else {
-            for index in boundary.paragraph..self.paragraphs().len() {
-                if let Some(found) = self.find_paragraph_match(
-                    index,
-                    &needle,
-                    options,
-                    (index == boundary.paragraph).then_some(boundary),
-                    false,
-                    direct_literal,
-                ) {
-                    return Some(found);
-                }
-            }
-            if wrap {
-                for index in 0..=boundary.paragraph {
-                    if let Some(found) = self.find_paragraph_match(
-                        index,
-                        &needle,
-                        options,
-                        None,
-                        false,
-                        direct_literal,
-                    ) {
-                        return Some(found);
-                    }
-                }
-            }
+            (start..len)
+                .find_map(|index| search(index, index == start))
+                .or_else(|| {
+                    wrap.then(|| (0..=start).find_map(|index| search(index, false)))
+                        .flatten()
+                })
         }
-        None
+    }
+
+    fn is_grapheme_range(&self, range: &Range<Position>) -> bool {
+        self.validate_position(range.start).is_ok() && self.validate_position(range.end).is_ok()
     }
 
     fn find_paragraph_match(
@@ -179,9 +174,7 @@ impl Document {
             });
             let valid_match = |start| {
                 let range = Position::new(index, start)..Position::new(index, start + needle.len());
-                (self.validate_position(range.start).is_ok()
-                    && self.validate_position(range.end).is_ok())
-                .then_some(range)
+                self.is_grapheme_range(&range).then_some(range)
             };
             return if backward {
                 text[..edge]
@@ -222,9 +215,7 @@ impl Document {
         }
         visit_text_matches(paragraph.text(), needle, options, |bytes| {
             let range = Position::new(index, bytes.start)..Position::new(index, bytes.end);
-            if self.validate_position(range.start).is_ok()
-                && self.validate_position(range.end).is_ok()
-            {
+            if self.is_grapheme_range(&range) {
                 accept(range).map_continue(|()| true)
             } else {
                 ControlFlow::Continue(false)
@@ -247,7 +238,19 @@ impl Document {
         let source = if let [paragraph] = self.paragraphs() {
             Cow::Borrowed(paragraph.text())
         } else {
-            Cow::Owned(self.plain_text())
+            let mut source = String::with_capacity(
+                self.paragraphs()
+                    .iter()
+                    .map(|paragraph| paragraph.text().len() + 1)
+                    .sum(),
+            );
+            for (index, paragraph) in self.paragraphs().iter().enumerate() {
+                if index != 0 {
+                    source.push('\n');
+                }
+                source.push_str(paragraph.text());
+            }
+            Cow::Owned(source)
         };
         let mut paragraph_starts = Vec::with_capacity(self.paragraphs().len());
         let mut paragraph_start = 0;
@@ -261,9 +264,7 @@ impl Document {
         };
         visit_text_matches(&source, needle, options, |bytes| {
             let range = position(bytes.start)..position(bytes.end);
-            if self.validate_position(range.start).is_ok()
-                && self.validate_position(range.end).is_ok()
-            {
+            if self.is_grapheme_range(&range) {
                 accept(range).map_continue(|()| true)
             } else {
                 ControlFlow::Continue(false)
@@ -277,7 +278,25 @@ fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
     if options.case_sensitive {
         query
     } else {
-        Cow::Owned(query.to_lowercase())
+        Cow::Owned(lowercase(&query))
+    }
+}
+
+fn is_direct_literal(needle: &str, options: SearchOptions) -> bool {
+    options.case_sensitive
+        && !options.whole_word
+        && needle
+            .chars()
+            .next()
+            .is_some_and(|first| !needle[first.len_utf8()..].contains(first))
+}
+
+fn lowercase(text: &str) -> String {
+    let lowered = text.to_lowercase();
+    if lowered.contains('ς') {
+        lowered.replace('ς', "σ")
+    } else {
+        lowered
     }
 }
 
@@ -293,7 +312,7 @@ fn visit_text_matches(
     let searched = if options.case_sensitive {
         Cow::Borrowed(source)
     } else {
-        Cow::Owned(source.to_lowercase())
+        Cow::Owned(lowercase(source))
     };
     if needle.len() > searched.len() {
         return ControlFlow::Continue(());

@@ -1,4 +1,4 @@
-use crate::{Composition, Document, Editor, Error, ParagraphKind, Position, Selection, Span};
+use crate::{Composition, Document, Editor, Error, Link, ParagraphKind, Position, Selection, Span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessiblePosition {
@@ -12,6 +12,7 @@ pub struct AccessibleSelection {
     pub focus: AccessiblePosition,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct AccessibleParagraph<'a> {
     pub index: usize,
@@ -108,21 +109,17 @@ fn accessible_position(document: &Document, position: Position) -> AccessiblePos
 }
 
 fn editor_position(document: &Document, position: AccessiblePosition) -> Result<Position, Error> {
-    let paragraph = document
+    document
         .paragraph(position.paragraph)
-        .ok_or(Error::InvalidPosition(Position::new(
-            position.paragraph,
-            position.grapheme,
-        )))?;
-    let byte = paragraph
-        .byte_from_grapheme(position.grapheme)
-        .ok_or(Error::InvalidPosition(Position::new(
-            position.paragraph,
-            position.grapheme,
-        )))?;
-    Ok(Position::new(position.paragraph, byte))
+        .and_then(|paragraph| paragraph.byte_from_grapheme(position.grapheme))
+        .map(|byte| Position::new(position.paragraph, byte))
+        .ok_or(Error::InvalidGraphemePosition {
+            paragraph: position.paragraph,
+            grapheme: position.grapheme,
+        })
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessibleAction<'a> {
     Focus,
@@ -131,11 +128,14 @@ pub enum AccessibleAction<'a> {
     ReplaceAllText(&'a str),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccessibilityOutcome {
     pub handled: bool,
     pub focus_requested: bool,
     pub changed: bool,
+    pub composition_canceled: bool,
+    pub activated_link: Option<Link>,
 }
 
 pub fn apply_action(
@@ -153,7 +153,7 @@ pub fn apply_action(
             return Ok(AccessibilityOutcome {
                 handled: true,
                 focus_requested: true,
-                changed: false,
+                ..AccessibilityOutcome::default()
             });
         }
         AccessibleAction::SetSelection(selection) => editor.set_selection(selection)?,
@@ -166,10 +166,16 @@ pub fn apply_action(
         AccessibleAction::ReplaceAllText(text) => {
             editor.cancel_composition();
             editor.break_history_group();
-            editor.replace_range(Position::default()..editor.document().end(), text)?;
+            let style = editor.document().style_at(Position::default());
+            editor.replace_range_with_style(
+                Position::default()..editor.document().end(),
+                text,
+                style,
+            )?;
             editor.break_history_group();
         }
     }
+    let composing = editor.composition().is_some();
     Ok(AccessibilityOutcome {
         handled: true,
         focus_requested: false,
@@ -178,28 +184,39 @@ pub fn apply_action(
                 editor.document().revision(),
                 editor.selection(),
                 editor.typing_style(),
-                editor.composition().is_some(),
+                composing,
             ),
+        composition_canceled: before.3 && !composing,
+        activated_link: None,
     })
 }
 
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
     use super::{AccessibilityOutcome, AccessibleAction, apply_action};
-    use crate::{Editor, InlineStyle, Paragraph, ParagraphKind, Position, Selection};
+    use crate::{Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
     use accesskit::{
         Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, Tree,
         TreeId, TreeUpdate,
     };
-    use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
+    use std::{
+        collections::HashMap,
+        fmt,
+        iter::Peekable,
+        ops::Range,
+        sync::{Arc, OnceLock},
+    };
     use unicode_segmentation::UnicodeSegmentation;
+
+    const MAX_RUN_CHARACTERS: usize = u8::MAX as usize;
+    const MAX_CHARACTER_BYTES: usize = u8::MAX as usize;
+    const SOFT_BREAK: &str = "\u{2028}";
 
     #[non_exhaustive]
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum AccessKitError {
         Editor(crate::Error),
         NodeIdExhausted,
-        CharacterTooLong { position: Position, bytes: usize },
         InvalidTextPosition(TextPosition),
         InvalidActionData,
         StaleDocument,
@@ -210,11 +227,6 @@ mod accesskit_bridge {
             match self {
                 Self::Editor(error) => error.fmt(f),
                 Self::NodeIdExhausted => f.write_str("AccessKit node ID space exhausted"),
-                Self::CharacterTooLong { position, bytes } => write!(
-                    f,
-                    "grapheme at {}:{} is {bytes} bytes; AccessKit supports at most 255",
-                    position.paragraph, position.byte
-                ),
                 Self::InvalidTextPosition(position) => {
                     write!(f, "invalid AccessKit text position {position:?}")
                 }
@@ -231,7 +243,7 @@ mod accesskit_bridge {
     impl std::error::Error for AccessKitError {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match self {
-                Self::Editor(error) => Some(error),
+                Self::Editor(error) => std::error::Error::source(error),
                 _ => None,
             }
         }
@@ -247,8 +259,65 @@ mod accesskit_bridge {
         id: NodeId,
         node: Node,
         range: Range<usize>,
-        character_offsets: Vec<usize>,
+        split: bool,
         line_break: bool,
+        soft_break: bool,
+    }
+
+    impl CachedRun {
+        fn lengths(&self) -> &[u8] {
+            let lengths = self.node.character_lengths();
+            &lengths[..lengths.len() - usize::from(self.line_break)]
+        }
+
+        fn text_lengths(&self) -> impl Iterator<Item = usize> + '_ {
+            let lengths = self.lengths();
+            let soft_break = self.soft_break.then(|| lengths.len() - 1);
+            lengths.iter().enumerate().map(move |(index, length)| {
+                if soft_break == Some(index) {
+                    SOFT_BREAK.len()
+                } else {
+                    usize::from(*length)
+                }
+            })
+        }
+
+        fn character_index(&self, byte: usize) -> Option<usize> {
+            let offset = byte.checked_sub(self.range.start)?;
+            let lengths = self.lengths();
+            if lengths.len() == self.range.len() {
+                return (offset <= lengths.len()).then_some(offset);
+            }
+            let mut end = 0;
+            for (index, length) in self.text_lengths().enumerate() {
+                if end >= offset {
+                    return (end == offset).then_some(index);
+                }
+                end += length;
+            }
+            (end == offset).then_some(lengths.len())
+        }
+
+        fn byte(&self, index: usize) -> Option<usize> {
+            let lengths = self.lengths();
+            lengths.get(..index)?;
+            Some(
+                self.range.start
+                    + if lengths.len() == self.range.len() {
+                        index
+                    } else {
+                        self.text_lengths().take(index).sum()
+                    },
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct CachedLink {
+        id: NodeId,
+        node: Node,
+        link: Link,
+        runs: Range<usize>,
     }
 
     #[derive(Debug)]
@@ -257,7 +326,57 @@ mod accesskit_bridge {
         id: NodeId,
         node: Node,
         runs: Vec<CachedRun>,
-        line_break: bool,
+        links: Vec<CachedLink>,
+    }
+
+    impl CachedParagraph {
+        fn line_break(&self) -> bool {
+            self.runs.last().is_some_and(|run| run.line_break)
+        }
+
+        fn push_nodes(&self, nodes: &mut Vec<(NodeId, Node)>) {
+            nodes.push((self.id, self.node.clone()));
+            nodes.extend(self.links.iter().map(|link| (link.id, link.node.clone())));
+            nodes.extend(self.runs.iter().map(|run| (run.id, run.node.clone())));
+        }
+    }
+
+    #[derive(Debug)]
+    struct CachedQuote {
+        id: NodeId,
+        node: Node,
+    }
+
+    struct Staged<'a> {
+        published: &'a [Arc<CachedParagraph>],
+        range: Range<usize>,
+        inserted: &'a [Arc<CachedParagraph>],
+    }
+
+    impl<'a> Staged<'a> {
+        fn len(&self) -> usize {
+            self.published.len() - self.range.len() + self.inserted.len()
+        }
+
+        fn get(&self, index: usize) -> Option<&'a CachedParagraph> {
+            let paragraph = if index < self.range.start {
+                self.published.get(index)
+            } else if let Some(paragraph) = self.inserted.get(index - self.range.start) {
+                Some(paragraph)
+            } else {
+                self.published
+                    .get(index - self.range.start - self.inserted.len() + self.range.end)
+            };
+            paragraph.map(Arc::as_ref)
+        }
+
+        fn iter(&self) -> impl Iterator<Item = &'a Arc<CachedParagraph>> + use<'a> {
+            let published = self.published;
+            published[..self.range.start]
+                .iter()
+                .chain(self.inserted)
+                .chain(&published[self.range.end..])
+        }
     }
 
     #[derive(Debug)]
@@ -267,7 +386,8 @@ mod accesskit_bridge {
         tree_id: TreeId,
         next_id: Option<u64>,
         paragraphs: Vec<Arc<CachedParagraph>>,
-        run_locations: HashMap<NodeId, (usize, usize)>,
+        quotes: Vec<CachedQuote>,
+        run_locations: OnceLock<HashMap<NodeId, (usize, usize)>>,
         last_editor: Option<Node>,
         last_selection: Option<Selection>,
         document_identity: Option<Arc<()>>,
@@ -295,7 +415,8 @@ mod accesskit_bridge {
                 tree_id: TreeId::ROOT,
                 next_id: editor_id.0.checked_add(1),
                 paragraphs: Vec::new(),
-                run_locations: HashMap::new(),
+                quotes: Vec::new(),
+                run_locations: OnceLock::new(),
                 last_editor: None,
                 last_selection: None,
                 document_identity: None,
@@ -306,9 +427,13 @@ mod accesskit_bridge {
 
         pub fn with_tree_id(mut self, tree_id: TreeId) -> Self {
             self.tree_id = tree_id;
+            self.invalidate();
+            self
+        }
+
+        pub fn invalidate(&mut self) {
             self.initialized = false;
             self.last_editor = None;
-            self
         }
 
         pub fn root_node(&self) -> NodeId {
@@ -332,6 +457,7 @@ mod accesskit_bridge {
             let canceled = read_only && editor.cancel_composition();
             AccessibilityOutcome {
                 changed: changed || canceled,
+                composition_canceled: canceled,
                 ..AccessibilityOutcome::default()
             }
         }
@@ -350,6 +476,25 @@ mod accesskit_bridge {
                 .flat_map(|paragraph| paragraph.runs.iter().map(|run| (run.id, run.range.clone())))
         }
 
+        pub fn locate_link(&self, node: NodeId) -> Option<(usize, Range<usize>)> {
+            self.paragraphs
+                .iter()
+                .enumerate()
+                .find_map(|(index, paragraph)| {
+                    let link = paragraph.links.iter().find(|link| link.id == node)?;
+                    let runs = &paragraph.runs[link.runs.clone()];
+                    Some((index, runs[0].range.start..runs[runs.len() - 1].range.end))
+                })
+        }
+
+        pub fn locate_text_run(&self, run: NodeId) -> Option<(usize, Range<usize>)> {
+            let &(paragraph, index) = self.run_locations().get(&run)?;
+            Some((
+                paragraph,
+                self.paragraphs[paragraph].runs[index].range.clone(),
+            ))
+        }
+
         pub fn update(
             &mut self,
             editor: &Editor,
@@ -358,6 +503,11 @@ mod accesskit_bridge {
         ) -> Result<TreeUpdate, AccessKitError> {
             let document_identity = editor.document().content_identity();
             let selection = editor.selection();
+            let focus = if focused {
+                self.editor_id
+            } else {
+                self.root_id
+            };
             let same_document = self
                 .document_identity
                 .as_ref()
@@ -386,163 +536,148 @@ mod accesskit_bridge {
                     nodes,
                     tree: None,
                     tree_id: self.tree_id,
-                    focus: if focused {
-                        self.editor_id
-                    } else {
-                        self.root_id
-                    },
+                    focus,
                 });
             }
-            let mut next_id = self.next_id;
             let source = editor.document().paragraphs();
-            let mut changed_index = None;
-            let precise_change = self
+            let initialized = self.initialized;
+            let mut next_id = self.next_id;
+            let mut nodes = Vec::new();
+            let mut build = |index: usize| {
+                let paragraph = Arc::new(build_paragraph(
+                    Arc::clone(&source[index]),
+                    index + 1 < source.len(),
+                    &mut next_id,
+                )?);
+                if initialized {
+                    paragraph.push_nodes(&mut nodes);
+                }
+                Ok::<_, AccessKitError>(paragraph)
+            };
+            let published = self.paragraphs.len();
+            let change = self
                 .document_identity
                 .as_ref()
-                .and_then(|identity| editor.document().change_since(identity));
-            let local_change = self.paragraphs.len() == source.len()
-                && if same_document {
-                    true
-                } else if let Some(change) = precise_change {
-                    if change.range.len() == 1 && change.new_len == 1 {
-                        changed_index = Some(change.range.start);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    self.paragraphs.iter().zip(source).enumerate().all(
-                        |(index, (cached, paragraph))| {
-                            (Arc::ptr_eq(&cached.paragraph, paragraph)
-                                && cached.line_break == (index + 1 < source.len()))
-                                || changed_index.replace(index).is_none()
-                        },
-                    )
-                };
-            let mut nodes = Vec::new();
-            let (paragraphs, replacement) = if local_change {
-                let replacement = changed_index
-                    .map(|index| {
-                        build_paragraph(
-                            Arc::clone(&source[index]),
-                            index,
-                            index + 1 < source.len(),
-                            &mut next_id,
-                        )
-                        .map(|paragraph| (index, Arc::new(paragraph)))
-                    })
-                    .transpose()?;
-                (None, replacement)
+                .and_then(|identity| editor.document().change_since(identity))
+                .filter(|change| {
+                    change.range.end <= published
+                        && published - change.range.len() + change.new_len == source.len()
+                });
+            let (range, inserted) = if let Some(change) = change {
+                let mut start = change.range.start;
+                if start > 0 && (start < published) != (start < source.len()) {
+                    start -= 1;
+                }
+                let inserted = (start..change.range.start + change.new_len)
+                    .map(&mut build)
+                    .collect::<Result<Vec<_>, _>>()?;
+                (start..change.range.end, inserted)
             } else {
                 let mut cached: HashMap<(usize, bool), Vec<&Arc<CachedParagraph>>> = HashMap::new();
                 for paragraph in self.paragraphs.iter().rev() {
                     cached
                         .entry((
                             Arc::as_ptr(&paragraph.paragraph) as usize,
-                            paragraph.line_break,
+                            paragraph.line_break(),
                         ))
                         .or_default()
                         .push(paragraph);
                 }
-                let mut paragraphs = Vec::with_capacity(source.len());
-                for (index, paragraph) in source.iter().enumerate() {
-                    let line_break = index + 1 < source.len();
-                    let key = (Arc::as_ptr(paragraph) as usize, line_break);
-                    let existing = cached.get_mut(&key).and_then(Vec::pop);
-                    let next = if let Some(existing) = existing {
-                        Arc::clone(existing)
-                    } else {
-                        Arc::new(build_paragraph(
-                            Arc::clone(paragraph),
-                            index,
-                            line_break,
-                            &mut next_id,
-                        )?)
-                    };
-                    if existing.is_none() || !self.initialized {
-                        nodes.push((next.id, next.node.clone()));
-                        nodes.extend(next.runs.iter().map(|run| (run.id, run.node.clone())));
-                    }
-                    paragraphs.push(next);
+                let inserted = source
+                    .iter()
+                    .enumerate()
+                    .map(|(index, paragraph)| {
+                        let key = (Arc::as_ptr(paragraph) as usize, index + 1 < source.len());
+                        match cached.get_mut(&key).and_then(Vec::pop) {
+                            Some(existing) => Ok(Arc::clone(existing)),
+                            None => build(index),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (0..published, inserted)
+            };
+            let staged = Staged {
+                published: &self.paragraphs,
+                range: range.clone(),
+                inserted: &inserted,
+            };
+            if !initialized {
+                for paragraph in staged.iter() {
+                    paragraph.push_nodes(&mut nodes);
                 }
-                (Some(paragraphs), None)
-            };
-            let current = paragraphs.as_deref().unwrap_or(&self.paragraphs);
-            let paragraph_at = |index| {
-                replacement
-                    .as_ref()
-                    .filter(|(changed, _)| *changed == index)
-                    .map(|(_, paragraph)| paragraph)
-                    .or_else(|| current.get(index))
-            };
+            }
+            let quotes = self.stage_quotes(&staged, &mut next_id)?;
+            for (quote, previous) in &quotes {
+                let previous = previous.and_then(|index| self.quotes.get(index));
+                if !initialized || previous.is_none_or(|previous| previous.node != quote.node) {
+                    nodes.push((quote.id, quote.node.clone()));
+                }
+            }
             let mut editor_node = Node::new(Role::MultilineTextInput);
             editor_node.set_label(label);
             editor_node.add_action(Action::Focus);
             editor_node.add_action(Action::SetTextSelection);
             set_editable_actions(&mut editor_node, self.read_only);
-            editor_node.set_children(
-                current
-                    .iter()
-                    .enumerate()
-                    .map(|(index, paragraph)| {
-                        let next = paragraph_at(index).unwrap_or(paragraph);
-                        if local_change && (changed_index == Some(index) || !self.initialized) {
-                            nodes.push((next.id, next.node.clone()));
-                            nodes.extend(next.runs.iter().map(|run| (run.id, run.node.clone())));
-                        }
-                        next.id
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let mut children = Vec::with_capacity(staged.len());
+            let mut containers = quotes.iter().map(|(quote, _)| quote.id);
+            let mut quoting = false;
+            for paragraph in staged.iter() {
+                let quote = paragraph.paragraph.kind() == ParagraphKind::Quote;
+                if !quote {
+                    children.push(paragraph.id);
+                } else if !quoting {
+                    children.push(containers.next().expect("a container per quote"));
+                }
+                quoting = quote;
+            }
+            editor_node.set_children(children);
             editor_node.set_text_selection(TextSelection {
                 anchor: paragraph_text_position(
-                    paragraph_at(selection.anchor.paragraph).map(Arc::as_ref),
+                    staged.get(selection.anchor.paragraph),
                     selection.anchor,
                 )?,
                 focus: paragraph_text_position(
-                    paragraph_at(selection.focus.paragraph).map(Arc::as_ref),
+                    staged.get(selection.focus.paragraph),
                     selection.focus,
                 )?,
             });
             if self.last_editor.as_ref() != Some(&editor_node) {
                 nodes.push((self.editor_id, editor_node.clone()));
             }
-            if !self.initialized {
-                let mut root = Node::new(Role::Window);
+            let tree = (!initialized).then(|| {
+                let mut root = Node::new(if self.tree_id == TreeId::ROOT {
+                    Role::Window
+                } else {
+                    Role::GenericContainer
+                });
                 root.set_children(vec![self.editor_id]);
                 nodes.push((self.root_id, root));
-            }
-            let tree = if !self.initialized {
                 let mut tree = Tree::new(self.root_id);
                 tree.toolkit_name = Some("textloom".into());
                 tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
-                Some(tree)
-            } else {
-                None
-            };
+                tree
+            });
             self.next_id = next_id;
-            if let Some(paragraphs) = paragraphs {
-                self.run_locations = paragraphs
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(paragraph_index, paragraph)| {
-                        paragraph
-                            .runs
-                            .iter()
-                            .enumerate()
-                            .map(move |(run_index, run)| (run.id, (paragraph_index, run_index)))
-                    })
-                    .collect();
-                self.paragraphs = paragraphs;
-            } else if let Some((index, replacement)) = replacement {
-                for run in &self.paragraphs[index].runs {
-                    self.run_locations.remove(&run.id);
+            if range.len() == inserted.len() {
+                if let Some(locations) = self.run_locations.get_mut() {
+                    for paragraph in &self.paragraphs[range.clone()] {
+                        for run in &paragraph.runs {
+                            locations.remove(&run.id);
+                        }
+                    }
+                    for (offset, paragraph) in inserted.iter().enumerate() {
+                        locations.extend(
+                            paragraph.runs.iter().enumerate().map(|(run_index, run)| {
+                                (run.id, (range.start + offset, run_index))
+                            }),
+                        );
+                    }
                 }
-                for (run_index, run) in replacement.runs.iter().enumerate() {
-                    self.run_locations.insert(run.id, (index, run_index));
-                }
-                self.paragraphs[index] = replacement;
+            } else {
+                self.run_locations = OnceLock::new();
             }
+            self.paragraphs.splice(range, inserted);
+            self.quotes = quotes.into_iter().map(|(quote, _)| quote).collect();
             self.last_editor = Some(editor_node);
             self.last_selection = Some(selection);
             self.document_identity = Some(document_identity);
@@ -551,11 +686,7 @@ mod accesskit_bridge {
                 nodes,
                 tree,
                 tree_id: self.tree_id,
-                focus: if focused {
-                    self.editor_id
-                } else {
-                    self.root_id
-                },
+                focus,
             })
         }
 
@@ -575,7 +706,7 @@ mod accesskit_bridge {
             position: TextPosition,
         ) -> Result<Position, AccessKitError> {
             self.validate_document(editor)?;
-            from_text_position(&self.paragraphs, &self.run_locations, position)
+            from_text_position(&self.paragraphs, self.run_locations(), position)
         }
 
         pub fn handle_action(
@@ -583,8 +714,23 @@ mod accesskit_bridge {
             request: &ActionRequest,
             editor: &mut Editor,
         ) -> Result<AccessibilityOutcome, AccessKitError> {
-            if request.target_tree != self.tree_id || request.target_node != self.editor_id {
+            if request.target_tree != self.tree_id {
                 return Ok(AccessibilityOutcome::default());
+            }
+            if request.target_node != self.editor_id {
+                let link = (request.action == Action::Click)
+                    .then(|| {
+                        self.paragraphs
+                            .iter()
+                            .flat_map(|paragraph| &paragraph.links)
+                            .find(|link| link.id == request.target_node)
+                    })
+                    .flatten();
+                return Ok(AccessibilityOutcome {
+                    handled: link.is_some(),
+                    activated_link: link.map(|link| link.link.clone()),
+                    ..AccessibilityOutcome::default()
+                });
             }
             if request.action == Action::Focus {
                 return Ok(apply_action(editor, AccessibleAction::Focus)?);
@@ -606,13 +752,10 @@ mod accesskit_bridge {
                     let Some(ActionData::SetTextSelection(selection)) = &request.data else {
                         return Err(AccessKitError::InvalidActionData);
                     };
+                    let locations = self.run_locations();
                     let selection = Selection::new(
-                        from_text_position(
-                            &self.paragraphs,
-                            &self.run_locations,
-                            selection.anchor,
-                        )?,
-                        from_text_position(&self.paragraphs, &self.run_locations, selection.focus)?,
+                        from_text_position(&self.paragraphs, locations, selection.anchor)?,
+                        from_text_position(&self.paragraphs, locations, selection.focus)?,
                     );
                     Ok(apply_action(
                         editor,
@@ -633,6 +776,85 @@ mod accesskit_bridge {
                 }
                 _ => Ok(AccessibilityOutcome::default()),
             }
+        }
+
+        fn stage_quotes(
+            &self,
+            staged: &Staged<'_>,
+            next_id: &mut Option<u64>,
+        ) -> Result<Vec<(CachedQuote, Option<usize>)>, AccessKitError> {
+            let is_quote =
+                |paragraph: &CachedParagraph| paragraph.paragraph.kind() == ParagraphKind::Quote;
+            let mut published = HashMap::new();
+            let mut containers = 0;
+            let mut quoting = false;
+            for paragraph in &self.paragraphs {
+                let quote = is_quote(paragraph);
+                if quote {
+                    containers += usize::from(!quoting);
+                    published.insert(paragraph.id, containers - 1);
+                }
+                quoting = quote;
+            }
+            let replaced = staged.range.start
+                ..staged
+                    .range
+                    .end
+                    .min(staged.range.start + staged.inserted.len());
+            let previous = |index: usize, paragraph: &CachedParagraph| {
+                let replaced = replaced
+                    .contains(&index)
+                    .then(|| self.paragraphs[index].as_ref());
+                [Some(paragraph), replaced]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|paragraph| published.get(&paragraph.id).copied())
+            };
+            let mut claimed = vec![false; containers];
+            let mut quotes = Vec::new();
+            let mut paragraphs = staged.iter().enumerate().peekable();
+            while let Some((index, paragraph)) = paragraphs.next() {
+                if !is_quote(paragraph) {
+                    continue;
+                }
+                let mut children = vec![paragraph.id];
+                let mut reused = previous(index, paragraph).filter(|old| !claimed[*old]);
+                while let Some((index, paragraph)) =
+                    paragraphs.next_if(|(_, paragraph)| is_quote(paragraph))
+                {
+                    children.push(paragraph.id);
+                    reused =
+                        reused.or_else(|| previous(index, paragraph).filter(|old| !claimed[*old]));
+                }
+                let reused = reused.filter(|old| *old < self.quotes.len());
+                let id = match reused {
+                    Some(old) => {
+                        claimed[old] = true;
+                        self.quotes[old].id
+                    }
+                    None => allocate(next_id)?,
+                };
+                let mut node = Node::new(Role::Blockquote);
+                node.set_children(children);
+                quotes.push((CachedQuote { id, node }, reused));
+            }
+            Ok(quotes)
+        }
+
+        fn run_locations(&self) -> &HashMap<NodeId, (usize, usize)> {
+            self.run_locations.get_or_init(|| {
+                self.paragraphs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(paragraph_index, paragraph)| {
+                        paragraph
+                            .runs
+                            .iter()
+                            .enumerate()
+                            .map(move |(run_index, run)| (run.id, (paragraph_index, run_index)))
+                    })
+                    .collect()
+            })
         }
 
         fn validate_document(&self, editor: &Editor) -> Result<(), AccessKitError> {
@@ -667,13 +889,12 @@ mod accesskit_bridge {
 
     fn build_paragraph(
         paragraph: Arc<Paragraph>,
-        index: usize,
         line_break: bool,
         next_id: &mut Option<u64>,
     ) -> Result<CachedParagraph, AccessKitError> {
         let id = allocate(next_id)?;
         let mut node = Node::new(match paragraph.kind() {
-            ParagraphKind::Body => Role::Paragraph,
+            ParagraphKind::Body | ParagraphKind::Quote => Role::Paragraph,
             ParagraphKind::Heading { .. } => Role::Heading,
             ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. } => Role::ListItem,
         });
@@ -687,58 +908,235 @@ mod accesskit_bridge {
                 node.set_level(usize::from(indent) + 1);
                 node.set_list_style(accesskit::ListStyle::Numeric);
             }
-            ParagraphKind::Body => {}
+            ParagraphKind::Body | ParagraphKind::Quote => {}
         }
-        let ranges: Vec<_> = if paragraph.spans().is_empty() {
-            vec![(0..paragraph.text().len(), InlineStyle::default())]
-        } else {
-            paragraph
-                .spans()
-                .iter()
-                .map(|span| (span.range.clone(), span.style))
-                .collect()
-        };
-        let mut runs = Vec::with_capacity(ranges.len());
-        for (run_index, (range, style)) in ranges.iter().enumerate() {
-            let run_id = allocate(next_id)?;
-            let text = &paragraph.text()[range.clone()];
-            let mut lengths = Vec::new();
-            let mut offsets = vec![range.start];
-            for (byte, grapheme) in text.grapheme_indices(true) {
-                lengths.push(u8::try_from(grapheme.len()).map_err(|_| {
-                    AccessKitError::CharacterTooLong {
-                        position: Position::new(index, range.start + byte),
-                        bytes: grapheme.len(),
-                    }
-                })?);
-                offsets.push(range.start + byte + grapheme.len());
+        let pieces = split_runs(&paragraph, line_break);
+        let ids = pieces
+            .iter()
+            .map(|_| allocate(next_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut links: Vec<CachedLink> = Vec::new();
+        let mut children = Vec::with_capacity(ids.len());
+        for (index, piece) in pieces.iter().enumerate() {
+            let Some(link) = &piece.link else {
+                children.push(ids[index]);
+                continue;
+            };
+            match links.last_mut() {
+                Some(cached) if cached.runs.end == index && cached.link == *link => {
+                    cached.runs.end = index + 1;
+                }
+                _ => {
+                    let id = allocate(next_id)?;
+                    children.push(id);
+                    links.push(CachedLink {
+                        id,
+                        node: Node::new(Role::Link),
+                        link: link.clone(),
+                        runs: index..index + 1,
+                    });
+                }
             }
-            let run_break = line_break && run_index + 1 == ranges.len();
-            let mut value = text.to_owned();
-            if run_break {
-                value.push('\n');
-                lengths.push(1);
-            }
-            let mut run_node = Node::new(Role::TextRun);
-            run_node.set_value(value);
-            run_node.set_character_lengths(lengths);
-            apply_style(&mut run_node, *style);
-            runs.push(CachedRun {
-                id: run_id,
-                node: run_node,
-                range: range.clone(),
-                character_offsets: offsets,
-                line_break: run_break,
-            });
         }
-        node.set_children(runs.iter().map(|run| run.id).collect::<Vec<_>>());
+        for cached in &mut links {
+            let range =
+                pieces[cached.runs.start].range.start..pieces[cached.runs.end - 1].range.end;
+            cached.node.set_url(cached.link.as_str());
+            cached
+                .node
+                .set_label(paragraph.text()[range].replace(SOFT_BREAK, " "));
+            cached.node.add_action(Action::Click);
+            cached.node.set_children(ids[cached.runs.clone()].to_vec());
+        }
+        let text = paragraph.text();
+        let mut words = paragraph.word_starts().into_iter().peekable();
+        let last = pieces.len() - 1;
+        let mut continues_line = false;
+        let runs = pieces
+            .into_iter()
+            .enumerate()
+            .map(|(index, piece)| {
+                let line_break = line_break && index == last;
+                let word_starts = run_word_starts(&mut words, &piece);
+                let mut value = String::with_capacity(piece.range.len() + usize::from(line_break));
+                if piece.soft_break {
+                    value.push_str(&text[piece.range.start..piece.range.end - SOFT_BREAK.len()]);
+                    value.push('\n');
+                } else {
+                    value.push_str(&text[piece.range.clone()]);
+                }
+                let mut lengths = piece.lengths;
+                if line_break {
+                    value.push('\n');
+                    lengths.push(1);
+                }
+                let mut run_node = Node::new(Role::TextRun);
+                run_node.set_value(value);
+                run_node.set_character_lengths(lengths);
+                if !word_starts.is_empty() {
+                    run_node.set_word_starts(word_starts);
+                }
+                if continues_line {
+                    run_node.set_previous_on_line(ids[index - 1]);
+                }
+                continues_line = !piece.soft_break;
+                if continues_line && let Some(next) = ids.get(index + 1) {
+                    run_node.set_next_on_line(*next);
+                }
+                apply_style(&mut run_node, piece.style);
+                CachedRun {
+                    id: ids[index],
+                    node: run_node,
+                    range: piece.range,
+                    split: piece.split,
+                    line_break,
+                    soft_break: piece.soft_break,
+                }
+            })
+            .collect();
+        node.set_children(children);
         Ok(CachedParagraph {
             paragraph,
             id,
             node,
             runs,
-            line_break,
+            links,
         })
+    }
+
+    struct RunPiece {
+        range: Range<usize>,
+        style: InlineStyle,
+        link: Option<Link>,
+        lengths: Vec<u8>,
+        split: bool,
+        soft_break: bool,
+    }
+
+    impl RunPiece {
+        fn new(start: usize, style: InlineStyle, link: Option<&Link>) -> Self {
+            Self {
+                range: start..start,
+                style,
+                link: link.cloned(),
+                lengths: Vec::new(),
+                split: false,
+                soft_break: false,
+            }
+        }
+    }
+
+    fn split_runs(paragraph: &Paragraph, line_break: bool) -> Vec<RunPiece> {
+        let text = paragraph.text();
+        let spans = paragraph.spans();
+        let limit = MAX_RUN_CHARACTERS - usize::from(line_break);
+        let mut runs = Vec::new();
+        if text.is_ascii() {
+            for span in spans {
+                for start in span.range.clone().step_by(limit) {
+                    let end = span.range.end.min(start + limit);
+                    runs.push(RunPiece {
+                        lengths: vec![1; end - start],
+                        range: start..end,
+                        ..RunPiece::new(start, span.style, span.link.as_ref())
+                    });
+                }
+            }
+        } else {
+            let mut span = 0;
+            let mut run_span = None;
+            for (byte, grapheme) in text.grapheme_indices(true) {
+                while spans
+                    .get(span)
+                    .is_some_and(|current| current.range.end <= byte)
+                {
+                    span += 1;
+                }
+                let (style, link) = spans
+                    .get(span)
+                    .map_or((InlineStyle::default(), None), |span| {
+                        (span.style, span.link.as_ref())
+                    });
+                let single = u8::try_from(grapheme.len()).ok();
+                let count = if single.is_some() {
+                    1
+                } else {
+                    character_lengths(grapheme).count()
+                };
+                if run_span != Some(span)
+                    || runs.last().is_none_or(|run: &RunPiece| {
+                        run.lengths.len() + count > limit || run.soft_break
+                    })
+                {
+                    runs.push(RunPiece::new(byte, style, link));
+                    run_span = Some(span);
+                }
+                if grapheme == SOFT_BREAK {
+                    let run = runs.last_mut().expect("a run was created");
+                    run.lengths.push(1);
+                    run.range.end = byte + grapheme.len();
+                    run.soft_break = true;
+                    continue;
+                }
+                if let Some(length) = single {
+                    let run = runs.last_mut().expect("a run was created");
+                    run.lengths.push(length);
+                    run.range.end = byte + grapheme.len();
+                    continue;
+                }
+                let mut end = byte;
+                for length in character_lengths(grapheme) {
+                    if runs.last().is_some_and(|run| run.lengths.len() == limit) {
+                        runs.push(RunPiece::new(end, style, link));
+                    }
+                    let run = runs.last_mut().expect("a run was created");
+                    run.lengths.push(length);
+                    end += usize::from(length);
+                    run.range.end = end;
+                    run.split = true;
+                }
+            }
+        }
+        if runs.last().is_none_or(|run| run.soft_break) {
+            let style = spans
+                .last()
+                .map_or_else(InlineStyle::default, |span| span.style);
+            runs.push(RunPiece::new(text.len(), style, None));
+        }
+        runs
+    }
+
+    fn character_lengths(grapheme: &str) -> impl Iterator<Item = u8> + '_ {
+        let mut rest = grapheme;
+        std::iter::from_fn(move || {
+            let end = rest.floor_char_boundary(MAX_CHARACTER_BYTES);
+            let length = u8::try_from(end).ok().filter(|length| *length > 0)?;
+            rest = &rest[end..];
+            Some(length)
+        })
+    }
+
+    fn run_word_starts(
+        words: &mut Peekable<impl Iterator<Item = usize>>,
+        run: &RunPiece,
+    ) -> Vec<u8> {
+        let mut starts = Vec::new();
+        let mut index = 0;
+        let mut end = run.range.start;
+        while let Some(word) = words.next_if(|word| *word < run.range.end) {
+            while let Some(length) = run.lengths.get(index)
+                && end + usize::from(*length) <= word
+            {
+                end += usize::from(*length);
+                index += 1;
+            }
+            if let Ok(start) = u8::try_from(index)
+                && starts.last() != Some(&start)
+            {
+                starts.push(start);
+            }
+        }
+        starts
     }
 
     fn apply_style(node: &mut Node, style: InlineStyle) {
@@ -759,6 +1157,14 @@ mod accesskit_bridge {
             });
         if let Some(color) = color {
             node.set_foreground_color(color);
+        }
+        if let Some(crate::Color([red, green, blue, alpha])) = style.background {
+            node.set_background_color(accesskit::Color {
+                red,
+                green,
+                blue,
+                alpha,
+            });
         }
         let decoration = accesskit::TextDecoration {
             style: accesskit::TextDecorationStyle::Solid,
@@ -791,22 +1197,21 @@ mod accesskit_bridge {
         paragraph: Option<&CachedParagraph>,
         position: Position,
     ) -> Result<TextPosition, AccessKitError> {
-        if let Some(paragraph) = paragraph {
-            let index = paragraph
-                .runs
-                .partition_point(|run| run.range.end < position.byte);
-            if let Some(run) = paragraph.runs.get(index)
-                && let Ok(character_index) = run.character_offsets.binary_search(&position.byte)
-            {
-                return Ok(TextPosition {
+        paragraph
+            .and_then(|paragraph| {
+                let index = paragraph
+                    .runs
+                    .partition_point(|run| run.range.start <= position.byte)
+                    .checked_sub(1)?;
+                let run = &paragraph.runs[index];
+                Some(TextPosition {
                     node: run.id,
-                    character_index,
-                });
-            }
-        }
-        Err(AccessKitError::Editor(crate::Error::InvalidPosition(
-            position,
-        )))
+                    character_index: run.character_index(position.byte)?,
+                })
+            })
+            .ok_or(AccessKitError::Editor(crate::Error::InvalidPosition(
+                position,
+            )))
     }
 
     fn from_text_position(
@@ -815,11 +1220,17 @@ mod accesskit_bridge {
         position: TextPosition,
     ) -> Result<Position, AccessKitError> {
         if let Some(&(index, run_index)) = run_locations.get(&position.node) {
-            let run = &paragraphs[index].runs[run_index];
-            if let Some(byte) = run.character_offsets.get(position.character_index) {
-                return Ok(Position::new(index, *byte));
+            let paragraph = &paragraphs[index];
+            let run = &paragraph.runs[run_index];
+            if let Some(byte) = run.byte(position.character_index) {
+                let byte = if run.split {
+                    paragraph.paragraph.boundary_at_or_before(byte)
+                } else {
+                    byte
+                };
+                return Ok(Position::new(index, byte));
             }
-            if run.line_break && position.character_index == run.character_offsets.len() {
+            if run.line_break && position.character_index == run.lengths().len() + 1 {
                 return Ok(Position::new(index + 1, 0));
             }
         }
@@ -840,6 +1251,115 @@ mod accesskit_bridge {
                 data,
                 target_tree: TreeId::ROOT,
                 target_node: adapter.editor_node(),
+            }
+        }
+
+        fn assert_positions_roundtrip(adapter: &AccessKitAdapter, editor: &Editor) {
+            for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
+                for grapheme in 0..=paragraph.grapheme_count() {
+                    let position =
+                        Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap());
+                    let published = adapter.to_text_position(editor, position).unwrap();
+                    assert_eq!(
+                        adapter.from_text_position(editor, published).unwrap(),
+                        position
+                    );
+                }
+            }
+        }
+
+        fn quote_groups(adapter: &AccessKitAdapter) -> Vec<Vec<usize>> {
+            adapter
+                .quotes
+                .iter()
+                .map(|quote| {
+                    quote
+                        .node
+                        .children()
+                        .iter()
+                        .map(|id| {
+                            adapter
+                                .paragraphs
+                                .iter()
+                                .position(|paragraph| paragraph.id == *id)
+                                .unwrap()
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+
+        fn assert_matches_fresh_tree(adapter: &AccessKitAdapter, editor: &Editor) {
+            let mut fresh = AccessKitAdapter::default();
+            fresh.update(editor, "Notes", true).unwrap();
+            assert_eq!(quote_groups(adapter), quote_groups(&fresh));
+            assert_eq!(
+                adapter.last_editor.as_ref().unwrap().children().len(),
+                fresh.last_editor.as_ref().unwrap().children().len()
+            );
+            assert_eq!(adapter.paragraphs.len(), fresh.paragraphs.len());
+            for (cached, expected) in adapter.paragraphs.iter().zip(&fresh.paragraphs) {
+                assert_eq!(cached.node.role(), expected.node.role());
+                assert_eq!(cached.runs.len(), expected.runs.len());
+                for (run, expected) in cached.runs.iter().zip(&expected.runs) {
+                    assert_eq!(run.range, expected.range);
+                    assert_eq!(run.line_break, expected.line_break);
+                    assert_eq!(run.soft_break, expected.soft_break);
+                    assert_eq!(run.node.value(), expected.node.value());
+                    assert_eq!(
+                        run.node.character_lengths(),
+                        expected.node.character_lengths()
+                    );
+                    assert_eq!(run.node.word_starts(), expected.node.word_starts());
+                }
+            }
+        }
+
+        fn assert_runs_form_lines(adapter: &AccessKitAdapter) {
+            for paragraph in &adapter.paragraphs {
+                let text = paragraph.paragraph.text();
+                let mut end = 0;
+                for (index, run) in paragraph.runs.iter().enumerate() {
+                    assert_eq!(run.range.start, end);
+                    end = run.range.end;
+                    assert!(run.node.character_lengths().len() <= MAX_RUN_CHARACTERS);
+                    let bytes: usize = run.text_lengths().sum();
+                    assert_eq!(bytes, run.range.len());
+                    let value = run.node.value().unwrap();
+                    let value = value
+                        .strip_suffix('\n')
+                        .filter(|_| run.line_break)
+                        .unwrap_or(value);
+                    assert_eq!(value, text[run.range.clone()].replace(SOFT_BREAK, "\n"));
+                    assert_eq!(
+                        run.soft_break,
+                        text[run.range.clone()].ends_with(SOFT_BREAK)
+                    );
+                    let starts = run.node.word_starts();
+                    assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+                    assert!(
+                        starts
+                            .iter()
+                            .all(|start| usize::from(*start) < run.lengths().len())
+                    );
+                    let previous = index
+                        .checked_sub(1)
+                        .map(|previous| &paragraph.runs[previous]);
+                    assert_eq!(
+                        run.node.previous_on_line(),
+                        previous.filter(|run| !run.soft_break).map(|run| run.id)
+                    );
+                    assert_eq!(
+                        run.node.next_on_line(),
+                        paragraph
+                            .runs
+                            .get(index + 1)
+                            .filter(|_| !run.soft_break)
+                            .map(|next| next.id)
+                    );
+                }
+                assert_eq!(end, text.len());
+                assert!(!paragraph.runs.last().unwrap().soft_break);
             }
         }
 
@@ -1024,10 +1544,12 @@ mod accesskit_bridge {
             adapter.update(&editor, "Notes", true).unwrap();
             let paragraph_id = adapter.paragraph_node(0);
             editor.update_composition("candidate", None).unwrap();
-            assert!(adapter.set_read_only(true, &mut editor).changed);
+            let outcome = adapter.set_read_only(true, &mut editor);
+            assert!(outcome.changed && outcome.composition_canceled);
             assert!(adapter.is_read_only());
             assert!(editor.composition().is_none());
-            assert!(!adapter.set_read_only(true, &mut editor).changed);
+            let outcome = adapter.set_read_only(true, &mut editor);
+            assert!(!outcome.changed && !outcome.composition_canceled);
             let update = adapter.update(&editor, "Notes", true).unwrap();
             assert_eq!(update.nodes.len(), 1);
             let (id, node) = &update.nodes[0];
@@ -1085,11 +1607,22 @@ mod accesskit_bridge {
                 .unwrap();
             let mut adapter = AccessKitAdapter::default();
             let tree = adapter.update(&editor, "Notes", true).unwrap();
-            assert_eq!(adapter.text_runs(0).count(), 3);
+            let runs: Vec<_> = adapter.text_runs(0).collect();
+            assert_eq!(runs.len(), 3);
+            assert_runs_form_lines(&adapter);
             assert!(
                 tree.nodes
                     .iter()
                     .any(|(_, node)| node.font_weight() == Some(700.0))
+            );
+            assert_eq!(
+                adapter
+                    .to_text_position(&editor, Position::new(0, 1))
+                    .unwrap(),
+                TextPosition {
+                    node: runs[1].0,
+                    character_index: 0
+                }
             );
             for byte in 0..=3 {
                 let position = Position::new(0, byte);
@@ -1103,6 +1636,60 @@ mod accesskit_bridge {
             editor.insert_text("q").unwrap();
             adapter.update(&editor, "Notes", true).unwrap();
             assert_eq!(adapter.paragraph_node(1), Some(unchanged_id));
+        }
+
+        #[test]
+        fn filled_runs_publish_their_background_and_split_where_the_fill_changes() {
+            let mut editor = Editor::from_text("no fill yellow red");
+            for (range, fill) in [(8..14, crate::Color::YELLOW), (15..18, crate::Color::RED)] {
+                editor
+                    .set_selection(Selection::new(
+                        Position::new(0, range.start),
+                        Position::new(0, range.end),
+                    ))
+                    .unwrap();
+                editor
+                    .apply_style(crate::StylePatch {
+                        background: Some(Some(fill)),
+                        ..crate::StylePatch::default()
+                    })
+                    .unwrap();
+            }
+            let mut adapter = AccessKitAdapter::default();
+            let tree = adapter.update(&editor, "Notes", true).unwrap();
+            let runs: Vec<_> = adapter.text_runs(0).collect();
+            assert_eq!(
+                runs.iter()
+                    .map(|(_, range)| range.clone())
+                    .collect::<Vec<_>>(),
+                [0..8, 8..14, 14..15, 15..18]
+            );
+            let opaque = |red, green, blue| accesskit::Color {
+                red,
+                green,
+                blue,
+                alpha: 255,
+            };
+            let backgrounds: Vec<_> = runs
+                .iter()
+                .map(|(id, _)| {
+                    tree.nodes
+                        .iter()
+                        .find(|(node, _)| node == id)
+                        .unwrap()
+                        .1
+                        .background_color()
+                })
+                .collect();
+            assert_eq!(
+                backgrounds,
+                [
+                    None,
+                    Some(opaque(255, 255, 0)),
+                    None,
+                    Some(opaque(255, 0, 0))
+                ]
+            );
         }
 
         #[test]
@@ -1200,7 +1787,7 @@ mod accesskit_bridge {
                                 &editor,
                                 TextPosition {
                                     node: run.id,
-                                    character_index: run.character_offsets.len(),
+                                    character_index: run.lengths().len() + 1,
                                 }
                             )
                             .unwrap(),
@@ -1211,67 +1798,56 @@ mod accesskit_bridge {
         }
 
         #[test]
-        fn failed_local_updates_keep_the_published_tree_and_id_allocator() {
+        fn failed_updates_keep_the_published_tree_and_id_allocator() {
             let mut editor = Editor::from_text("first\nmiddle\nlast");
             let published_editor = Editor::new(editor.document().clone());
             let mut adapter = AccessKitAdapter::default();
             adapter.update(&editor, "Notes", true).unwrap();
             let before = adapter.paragraphs.clone();
             let storage = adapter.paragraphs.as_ptr();
-            let locations = adapter.run_locations.clone();
             let position = Position::new(1, 2);
             let published = adapter.to_text_position(&editor, position).unwrap();
-            editor
-                .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 6)))
-                .unwrap();
-            editor
-                .insert_text(&format!("x{}", "\u{301}".repeat(200)))
-                .unwrap();
+            assert_eq!(
+                adapter.from_text_position(&editor, published).unwrap(),
+                position
+            );
+            let locations = adapter.run_locations.get().cloned();
+            assert!(locations.is_some());
             let next_id = adapter.next_id;
-            assert!(matches!(
-                adapter.update(&editor, "Failed", false),
-                Err(AccessKitError::CharacterTooLong {
-                    position: Position {
-                        paragraph: 1,
-                        byte: 0
-                    },
-                    bytes: 401,
-                })
-            ));
-            assert_eq!(adapter.next_id, next_id);
-            assert_eq!(adapter.paragraphs.as_ptr(), storage);
-            assert_eq!(adapter.run_locations, locations);
-            for (previous, current) in before.iter().zip(&adapter.paragraphs) {
-                assert!(Arc::ptr_eq(previous, current));
+            editor
+                .set_selection(Selection::caret(Position::new(1, 3)))
+                .unwrap();
+            for structural in [false, true] {
+                if structural {
+                    editor.insert_paragraph().unwrap();
+                } else {
+                    editor.insert_text("supported").unwrap();
+                }
+                adapter.next_id = Some(u64::MAX);
+                assert_eq!(
+                    adapter.update(&editor, "Failed", false),
+                    Err(AccessKitError::NodeIdExhausted)
+                );
+                assert_eq!(adapter.next_id, Some(u64::MAX));
+                assert_eq!(adapter.paragraphs.as_ptr(), storage);
+                for (previous, current) in before.iter().zip(&adapter.paragraphs) {
+                    assert!(Arc::ptr_eq(previous, current));
+                }
+                assert_eq!(adapter.run_locations.get(), locations.as_ref());
+                assert_eq!(adapter.last_editor.as_ref().unwrap().label(), Some("Notes"));
+                assert_eq!(
+                    adapter
+                        .from_text_position(&published_editor, published)
+                        .unwrap(),
+                    position
+                );
+                assert_eq!(
+                    adapter.from_text_position(&editor, published),
+                    Err(AccessKitError::StaleDocument)
+                );
+                assert!(editor.undo());
             }
-            assert_eq!(adapter.last_editor.as_ref().unwrap().label(), Some("Notes"));
-            assert_eq!(
-                adapter
-                    .from_text_position(&published_editor, published)
-                    .unwrap(),
-                position
-            );
-            assert_eq!(
-                adapter.from_text_position(&editor, published),
-                Err(AccessKitError::StaleDocument)
-            );
-
-            assert!(editor.undo());
-            editor.insert_text("supported").unwrap();
-            adapter.next_id = Some(u64::MAX);
-            assert_eq!(
-                adapter.update(&editor, "Failed", false),
-                Err(AccessKitError::NodeIdExhausted)
-            );
-            assert_eq!(adapter.next_id, Some(u64::MAX));
-            assert_eq!(adapter.paragraphs.as_ptr(), storage);
-            assert_eq!(adapter.run_locations, locations);
-            assert_eq!(
-                adapter
-                    .from_text_position(&published_editor, published)
-                    .unwrap(),
-                position
-            );
+            adapter.next_id = next_id;
             assert!(
                 adapter
                     .update(&published_editor, "Notes", true)
@@ -1335,6 +1911,30 @@ mod accesskit_bridge {
                     .nodes
                     .is_empty()
             );
+
+            adapter.invalidate();
+            let reactivated = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(reactivated, initial);
+            assert_eq!(adapter.next_id, next_id);
+            assert!(
+                adapter
+                    .update(&editor, "Notes", true)
+                    .unwrap()
+                    .nodes
+                    .is_empty()
+            );
+
+            let subtree = TreeId(accesskit::Uuid::from_u128(1));
+            let mut grafted = AccessKitAdapter::default().with_tree_id(subtree);
+            let update = grafted.update(&editor, "Notes", true).unwrap();
+            assert_eq!(update.tree_id, subtree);
+            let (_, root) = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == grafted.root_node())
+                .unwrap();
+            assert_eq!(root.role(), Role::GenericContainer);
+            assert_eq!(root.children(), &[grafted.editor_node()]);
         }
 
         #[test]
@@ -1382,16 +1982,6 @@ mod accesskit_bridge {
             assert_eq!(
                 adapter.from_text_position(&editor, invalid),
                 Err(AccessKitError::InvalidTextPosition(invalid))
-            );
-
-            let unsupported = Editor::from_text(&format!("x{}", "\u{301}".repeat(200)));
-            assert!(matches!(
-                adapter.update(&unsupported, "Notes", true),
-                Err(AccessKitError::CharacterTooLong { .. })
-            ));
-            assert_eq!(
-                adapter.from_text_position(&editor, published).unwrap(),
-                Position::new(2, 3)
             );
             assert!(
                 adapter
@@ -1456,27 +2046,338 @@ mod accesskit_bridge {
         }
 
         #[test]
-        fn pathological_clusters_and_node_ids_return_errors_without_panics() {
-            let editor = Editor::from_text(&format!("x{}", "\u{0301}".repeat(200)));
-            let mut adapter = AccessKitAdapter::default();
-            assert!(matches!(
-                adapter.update(&editor, "Notes", true),
-                Err(AccessKitError::CharacterTooLong { bytes: 401, .. })
-            ));
+        fn exhausted_node_ids_return_errors_without_panics() {
             assert!(matches!(
                 AccessKitAdapter::new(NodeId(u64::MAX)),
                 Err(AccessKitError::NodeIdExhausted)
             ));
             let mut exhausted = AccessKitAdapter::new(NodeId(u64::MAX - 1)).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    exhausted.update(&Editor::from_text("a"), "Notes", true),
+                    Err(AccessKitError::NodeIdExhausted)
+                );
+                assert!(exhausted.paragraphs.is_empty() && !exhausted.initialized);
+            }
+        }
+
+        #[test]
+        fn oversized_graphemes_publish_as_several_characters() {
+            let mut editor = Editor::from_text("first\nmiddle\nlast");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            editor
+                .set_selection(Selection::caret(Position::new(1, 3)))
+                .unwrap();
+            editor
+                .insert_text(&format!("x{}", "\u{301}".repeat(200)))
+                .unwrap();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let (run, _) = adapter.text_runs(1).next().unwrap();
+            let (_, node) = update.nodes.iter().find(|(id, _)| *id == run).unwrap();
+            assert_eq!(node.character_lengths(), &[1, 1, 1, 255, 146, 1, 1, 1, 1]);
+            assert_runs_form_lines(&adapter);
+            assert_positions_roundtrip(&adapter, &editor);
+            let character = |character_index| TextPosition {
+                node: run,
+                character_index,
+            };
             assert_eq!(
-                exhausted.update(&Editor::from_text("a"), "Notes", true),
-                Err(AccessKitError::NodeIdExhausted)
+                adapter.from_text_position(&editor, character(4)).unwrap(),
+                Position::new(1, 3)
             );
-            assert!(
-                adapter
-                    .update(&Editor::from_text("ok"), "Notes", true)
-                    .is_ok()
+            assert_eq!(
+                adapter.from_text_position(&editor, character(5)).unwrap(),
+                Position::new(1, 404)
             );
+            editor
+                .set_selection(Selection::caret(Position::new(0, 2)))
+                .unwrap();
+            assert_eq!(
+                adapter.update(&editor, "Notes", true).unwrap().nodes.len(),
+                1
+            );
+
+            let editor = Editor::from_text(&format!("a{}b", "\u{301}".repeat(40_000)));
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_runs_form_lines(&adapter);
+            assert_positions_roundtrip(&adapter, &editor);
+            let runs: Vec<_> = adapter.text_runs(0).collect();
+            assert_eq!(runs.len(), 2);
+            let inside = TextPosition {
+                node: runs[1].0,
+                character_index: 0,
+            };
+            assert!(runs[1].1.start > 0);
+            assert_eq!(
+                adapter.from_text_position(&editor, inside).unwrap(),
+                Position::new(0, 0)
+            );
+        }
+
+        #[test]
+        fn soft_line_breaks_end_published_lines_and_roundtrip_positions() {
+            let mut editor = Editor::from_text("ab\u{2028}cd\u{2028}\nx\u{2028}\u{2028}é");
+            editor
+                .set_selection(Selection::new(Position::new(1, 1), Position::new(1, 4)))
+                .unwrap();
+            editor
+                .apply_style(crate::StylePatch {
+                    bold: Some(true),
+                    ..crate::StylePatch::default()
+                })
+                .unwrap();
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_runs_form_lines(&adapter);
+            assert_positions_roundtrip(&adapter, &editor);
+            let values = |adapter: &AccessKitAdapter, paragraph: usize| {
+                adapter.paragraphs[paragraph]
+                    .runs
+                    .iter()
+                    .map(|run| run.node.value().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values(&adapter, 0), ["ab\n", "cd\n", "\n"]);
+            let runs: Vec<_> = adapter.text_runs(0).collect();
+            let ranges: Vec<_> = runs.iter().map(|(_, range)| range.clone()).collect();
+            assert_eq!(ranges, [0..5, 5..10, 10..10]);
+            assert_eq!(values(&adapter, 1), ["x", "\n", "\n", "é"]);
+            assert_eq!(
+                adapter.paragraphs[1].runs[0].node.next_on_line(),
+                Some(adapter.paragraphs[1].runs[1].id)
+            );
+
+            let encode = |byte| {
+                let position = adapter
+                    .to_text_position(&editor, Position::new(0, byte))
+                    .unwrap();
+                (position.node, position.character_index)
+            };
+            assert_eq!(encode(2), (runs[0].0, 2));
+            assert_eq!(encode(5), (runs[1].0, 0));
+            assert_eq!(encode(10), (runs[2].0, 0));
+            let decode = |node, character_index| {
+                adapter.from_text_position(
+                    &editor,
+                    TextPosition {
+                        node,
+                        character_index,
+                    },
+                )
+            };
+            assert_eq!(decode(runs[0].0, 3), Ok(Position::new(0, 5)));
+            assert_eq!(decode(runs[2].0, 1), Ok(Position::new(1, 0)));
+            assert!(decode(runs[0].0, 4).is_err());
+
+            for edit in 0..4 {
+                match edit {
+                    0 => {
+                        editor
+                            .set_selection(Selection::caret(Position::new(0, 7)))
+                            .unwrap();
+                        editor.insert_line_break().unwrap();
+                    }
+                    1 => editor.insert_text("e").unwrap(),
+                    2 => editor.delete_backward().unwrap(),
+                    _ => editor.delete_backward().unwrap(),
+                }
+                adapter.update(&editor, "Notes", true).unwrap();
+                assert_matches_fresh_tree(&adapter, &editor);
+                assert_runs_form_lines(&adapter);
+                assert_positions_roundtrip(&adapter, &editor);
+            }
+            assert_eq!(values(&adapter, 0), ["ab\n", "cd\n", "\n"]);
+        }
+
+        #[test]
+        fn long_paragraphs_split_into_linked_runs_with_word_starts() {
+            let ascii = "ab ".repeat(200);
+            let unicode = "é ".repeat(300);
+            let editor = Editor::from_text(&format!("{ascii}\n{unicode}"));
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_runs_form_lines(&adapter);
+            assert_positions_roundtrip(&adapter, &editor);
+            let ranges: Vec<_> = adapter.text_runs(0).map(|(_, range)| range).collect();
+            assert_eq!(ranges, [0..254, 254..508, 508..600]);
+            let counts: Vec<_> = adapter.paragraphs[1]
+                .runs
+                .iter()
+                .map(|run| run.lengths().len())
+                .collect();
+            assert_eq!(counts, [255, 255, 90]);
+            let starts = adapter.paragraphs[0].runs[1].node.word_starts();
+            assert_eq!(starts.first(), Some(&1));
+            assert_eq!(starts.last(), Some(&253));
+            assert_eq!(starts.len(), 85);
+        }
+
+        #[test]
+        fn quote_containers_publish_only_when_their_paragraphs_change() {
+            let roles = |update: &TreeUpdate| -> Vec<Role> {
+                update.nodes.iter().map(|(_, node)| node.role()).collect()
+            };
+            let mut editor = Editor::from_text("a\nb\nc\nd");
+            editor
+                .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 1)))
+                .unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+            let mut adapter = AccessKitAdapter::default();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let quote = adapter.quotes[0].id;
+            let editor_node = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == adapter.editor_node())
+                .unwrap();
+            assert_eq!(
+                editor_node.1.children(),
+                [
+                    adapter.paragraph_node(0).unwrap(),
+                    quote,
+                    adapter.paragraph_node(3).unwrap()
+                ]
+            );
+            let (_, container) = update.nodes.iter().find(|(id, _)| *id == quote).unwrap();
+            assert_eq!(container.role(), Role::Blockquote);
+            assert_eq!(quote_groups(&adapter), [vec![1, 2]]);
+            assert_eq!(adapter.paragraphs[1].node.role(), Role::Paragraph);
+
+            editor
+                .set_selection(Selection::caret(Position::new(3, 1)))
+                .unwrap();
+            editor.insert_text("x").unwrap();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(
+                roles(&update),
+                [Role::Paragraph, Role::TextRun, Role::MultilineTextInput]
+            );
+            editor
+                .set_selection(Selection::caret(Position::new(2, 1)))
+                .unwrap();
+            editor.insert_text("x").unwrap();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(
+                roles(&update),
+                [
+                    Role::Paragraph,
+                    Role::TextRun,
+                    Role::Blockquote,
+                    Role::MultilineTextInput
+                ]
+            );
+            assert_eq!(adapter.quotes[0].id, quote);
+            assert_matches_fresh_tree(&adapter, &editor);
+            editor.select_all();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(roles(&update), [Role::MultilineTextInput]);
+
+            editor
+                .set_selection(Selection::caret(Position::new(3, 0)))
+                .unwrap();
+            editor.insert_paragraph().unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(quote_groups(&adapter), [vec![1, 2], vec![4]]);
+            assert_eq!(adapter.quotes[0].id, quote);
+            assert_ne!(adapter.quotes[1].id, quote);
+            editor
+                .set_selection(Selection::caret(Position::new(3, 0)))
+                .unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(quote_groups(&adapter), [vec![1, 2, 3, 4]]);
+            assert_eq!(adapter.quotes[0].id, quote);
+            assert_matches_fresh_tree(&adapter, &editor);
+            assert_positions_roundtrip(&adapter, &editor);
+            while editor.undo() {
+                adapter.update(&editor, "Notes", true).unwrap();
+                assert_matches_fresh_tree(&adapter, &editor);
+            }
+            assert!(adapter.quotes.is_empty());
+        }
+
+        #[test]
+        fn structural_edits_rebuild_only_inserted_paragraphs() {
+            let mut editor = Editor::from_text("zero\none\ntwo\nthree");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let ids: Vec<_> = (0..4)
+                .map(|index| adapter.paragraph_node(index).unwrap())
+                .collect();
+            assert!(adapter.run_locations.get().is_none());
+            assert_positions_roundtrip(&adapter, &editor);
+            editor
+                .set_selection(Selection::caret(Position::new(2, 1)))
+                .unwrap();
+            editor.insert_text("w").unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert!(adapter.run_locations.get().is_some());
+            assert_positions_roundtrip(&adapter, &editor);
+
+            editor
+                .set_selection(Selection::caret(Position::new(1, 1)))
+                .unwrap();
+            editor.insert_paragraph().unwrap();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(update.nodes.len(), 5);
+            assert_eq!(adapter.paragraph_node(0), Some(ids[0]));
+            assert_eq!(adapter.paragraph_node(4), Some(ids[3]));
+            assert!(adapter.run_locations.get().is_none());
+            assert_matches_fresh_tree(&adapter, &editor);
+            assert_positions_roundtrip(&adapter, &editor);
+
+            editor
+                .set_selection(Selection::caret(editor.document().end()))
+                .unwrap();
+            editor.insert_paragraph().unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_ne!(adapter.paragraph_node(4), Some(ids[3]));
+            assert_matches_fresh_tree(&adapter, &editor);
+            editor.delete_backward().unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_matches_fresh_tree(&adapter, &editor);
+
+            while editor.undo() {
+                adapter.update(&editor, "Notes", true).unwrap();
+                assert_matches_fresh_tree(&adapter, &editor);
+                assert_positions_roundtrip(&adapter, &editor);
+            }
+            assert_eq!(adapter.paragraph_node(0), Some(ids[0]));
+            while editor.redo() {
+                adapter.update(&editor, "Notes", true).unwrap();
+                assert_matches_fresh_tree(&adapter, &editor);
+                assert_positions_roundtrip(&adapter, &editor);
+            }
+            assert_runs_form_lines(&adapter);
+        }
+
+        #[test]
+        fn text_runs_can_be_located_for_host_scrolling() {
+            let mut editor = Editor::from_text("first\nsecond");
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let (run, range) = adapter.text_runs(1).next().unwrap();
+            assert_eq!(adapter.locate_text_run(run), Some((1, range)));
+            editor.insert_paragraph().unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(adapter.locate_text_run(run), Some((2, 0..6)));
+            assert_eq!(adapter.locate_text_run(adapter.editor_node()), None);
+        }
+
+        #[test]
+        fn editor_errors_appear_once_in_error_chains() {
+            let error = AccessKitError::from(crate::Error::InvalidRange);
+            assert_eq!(error.to_string(), crate::Error::InvalidRange.to_string());
+            assert!(std::error::Error::source(&error).is_none());
+        }
+
+        #[test]
+        fn adapters_can_move_between_threads() {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<AccessKitAdapter>();
         }
     }
 }
@@ -1524,6 +2425,107 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_grapheme_positions_report_grapheme_coordinates() {
+        let editor = Editor::from_text("h\u{e9}llo");
+        let snapshot = AccessibilitySnapshot::new(&editor, "Notes", true);
+        let caret = |paragraph, grapheme| {
+            let position = AccessiblePosition {
+                paragraph,
+                grapheme,
+            };
+            AccessibleSelection {
+                anchor: position,
+                focus: position,
+            }
+        };
+        assert_eq!(
+            snapshot.selection_from_graphemes(caret(0, 6)),
+            Err(Error::InvalidGraphemePosition {
+                paragraph: 0,
+                grapheme: 6
+            })
+        );
+        assert_eq!(
+            snapshot.selection_from_graphemes(caret(1, 0)),
+            Err(Error::InvalidGraphemePosition {
+                paragraph: 1,
+                grapheme: 0
+            })
+        );
+        assert_eq!(
+            snapshot.selection_from_graphemes(caret(0, 5)),
+            Ok(Selection::caret(Position::new(0, 6)))
+        );
+    }
+
+    #[test]
+    fn outcomes_report_canceled_composition() {
+        let mut editor = Editor::from_text("Hello");
+        editor.update_composition("にほん", None).unwrap();
+        let outcome = apply_action(
+            &mut editor,
+            AccessibleAction::SetSelection(Selection::caret(Position::new(0, 1))),
+        )
+        .unwrap();
+        assert!(outcome.changed && outcome.composition_canceled);
+        let outcome = apply_action(
+            &mut editor,
+            AccessibleAction::SetSelection(Selection::caret(Position::new(0, 2))),
+        )
+        .unwrap();
+        assert!(outcome.changed && !outcome.composition_canceled);
+
+        editor.update_composition("か", None).unwrap();
+        let outcome = apply_action(&mut editor, AccessibleAction::Focus).unwrap();
+        assert!(outcome.focus_requested && !outcome.composition_canceled);
+        assert!(editor.composition().is_some());
+        let outcome =
+            apply_action(&mut editor, AccessibleAction::ReplaceSelectedText("x")).unwrap();
+        assert!(outcome.composition_canceled);
+        assert_eq!(editor.document().plain_text(), "Hexllo");
+    }
+
+    #[test]
+    fn replacing_all_text_uses_the_document_start_style() {
+        let mut editor = Editor::from_text("Title\nbody bold");
+        editor
+            .set_paragraph_kind(ParagraphKind::Heading { level: 1 })
+            .unwrap();
+        editor
+            .set_selection(Selection::new(Position::new(1, 5), Position::new(1, 9)))
+            .unwrap();
+        editor
+            .apply_style(crate::StylePatch {
+                bold: Some(true),
+                ..crate::StylePatch::default()
+            })
+            .unwrap();
+        let selection = Selection::caret(Position::new(1, 9));
+        editor.set_selection(selection).unwrap();
+        let typing_style = editor.typing_style();
+        assert!(typing_style.bold);
+        apply_action(
+            &mut editor,
+            AccessibleAction::ReplaceAllText("brand new\ncontent"),
+        )
+        .unwrap();
+        let paragraphs = editor.document().paragraphs();
+        assert_eq!(paragraphs[0].kind(), ParagraphKind::Heading { level: 1 });
+        assert_eq!(paragraphs[1].kind(), ParagraphKind::Body);
+        assert!(
+            paragraphs
+                .iter()
+                .flat_map(|paragraph| paragraph.spans())
+                .all(|span| !span.style.bold)
+        );
+        assert!(!editor.typing_style().bold);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "Title\nbody bold");
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.typing_style(), typing_style);
     }
 
     #[test]

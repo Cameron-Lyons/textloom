@@ -101,7 +101,7 @@ fn styled_clipboard_editor() -> Editor {
     editor
         .set_paragraph_kind(ParagraphKind::Ordered {
             indent: 1,
-            start: 4,
+            start: Some(4),
         })
         .unwrap();
     editor
@@ -572,6 +572,14 @@ fn rich_clipboard_preserves_accessibility_selection_replacement_and_keyboard_und
     assert!(context.input(|input| input.events.is_empty()));
 }
 
+fn input_options(read_only: bool) -> InputOptions {
+    InputOptions {
+        read_only,
+        page_height: 100.0,
+        heading_shortcuts: true,
+    }
+}
+
 fn key(key: Key, modifiers: Modifiers) -> Event {
     Event::Key {
         key,
@@ -688,6 +696,7 @@ fn appearance() -> Appearance {
         color: Color32::WHITE,
         strong_color: Color32::WHITE,
         code_background: Color32::BLACK,
+        link_color: Color32::LIGHT_BLUE,
         width: 400.0,
     }
 }
@@ -1192,7 +1201,7 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                 editor
                     .set_paragraph_kind(ParagraphKind::Ordered {
                         indent: 1,
-                        start: u32::MAX - 1,
+                        start: Some(u32::MAX - 1),
                     })
                     .unwrap();
             }
@@ -1482,7 +1491,6 @@ fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
     let appearance = appearance();
     let mut previous = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     for change_hinting in [true, false] {
-        let probe = cache.layout.font_probe.clone().unwrap();
         context.global_style_mut(|style| {
             let options = &mut style.visuals.text_options;
             if change_hinting {
@@ -1492,10 +1500,6 @@ fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
             }
         });
         let refreshed = cached_layout_frame(&context, &mut cache, &editor, &appearance);
-        assert!(!Arc::ptr_eq(
-            &probe,
-            cache.layout.font_probe.as_ref().unwrap()
-        ));
         for (old, new) in previous.iter().zip(refreshed.iter()) {
             assert!(!Arc::ptr_eq(&old.galley, &new.galley));
             assert_eq!(old.galley.job.text, new.galley.job.text);
@@ -1950,7 +1954,12 @@ fn tab_and_shift_tab_indent_lists_while_body_tab_keeps_host_focus_navigation() {
         true,
     );
     assert_eq!(editor.document().plain_text(), "first\nsecond");
-    assert!(!selection_contains_list(&editor));
+    assert!(context.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Key { key: Key::Tab, .. }))
+    }));
 }
 
 #[test]
@@ -2259,6 +2268,7 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
                     color: Color32::WHITE,
                     strong_color: Color32::WHITE,
                     code_background: Color32::BLACK,
+                    link_color: Color32::LIGHT_BLUE,
                     width: 400.0,
                 };
                 let job = paragraph_job(
@@ -2325,13 +2335,15 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
     let color = Color32::from_rgb(4, 5, 6);
     let rectangles = |selection| {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            paint_document_selection(
+            paint_document(
+                ui.painter(),
                 editor.document(),
-                selection,
                 &layouts,
                 origin,
-                ui.painter(),
-                color,
+                &[],
+                Some((selection, color)),
+                Color32::WHITE,
+                Color32::GRAY,
             );
         });
         output.textures_delta.clear();
@@ -2548,7 +2560,7 @@ fn ordered_list_reserves_space_for_long_numbers() {
     editor
         .set_paragraph_kind(ParagraphKind::Ordered {
             indent: 0,
-            start: 1_000_000,
+            start: Some(1_000_000),
         })
         .expect("valid list");
     context
@@ -2559,6 +2571,7 @@ fn ordered_list_reserves_space_for_long_numbers() {
                 color: Color32::WHITE,
                 strong_color: Color32::WHITE,
                 code_background: Color32::BLACK,
+                link_color: Color32::LIGHT_BLUE,
                 width: 400.0,
             };
             let mut cache = Cache::default();
@@ -2625,6 +2638,10 @@ fn empty_paste_preserves_selection_and_typing_history() {
 
 #[test]
 fn double_click_at_paragraph_end_selects_the_trailing_word() {
+    let word_selection = |editor: &Editor, position: Position| {
+        let range = editor.document().word_range_at(position).unwrap();
+        Selection::new(range.start, range.end)
+    };
     for (text, expected) in [
         ("hello café", "café"),
         ("hello 👩🏽‍💻", "👩🏽‍💻"),
@@ -2768,11 +2785,12 @@ fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() 
         assert!(handle_key(
             &mut editor,
             key,
+            None,
             Modifiers::NONE,
             &layouts,
             &mut navigation,
             &mut errors,
-            false,
+            &input_options(false),
         ));
         assert_eq!(editor.selection().focus.byte, expected_byte);
         let navigation = navigation.as_ref().unwrap();
@@ -2827,11 +2845,12 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
         assert!(handle_key(
             &mut editor,
             key,
+            None,
             Modifiers::NONE,
             &layouts,
             &mut navigation,
             &mut errors,
-            false,
+            &input_options(false),
         ));
         let focus = editor.selection().focus;
         editor.document().validate_position(focus).unwrap();
@@ -2889,11 +2908,12 @@ fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
         assert!(handle_key(
             &mut editor,
             key,
+            None,
             Modifiers::NONE,
             &layouts,
             &mut navigation,
             &mut errors,
-            false,
+            &input_options(false),
         ));
         let focus = editor.selection().focus;
         editor.document().validate_position(focus).unwrap();
@@ -3523,4 +3543,2409 @@ fn accessibility_and_keyboard_input_follow_their_batch_order() {
     assert_eq!(editor.document().plain_text(), "original typed");
     assert_eq!(editor.selection().focus, editor.document().end());
     assert!(context.input(|input| input.events.is_empty()));
+}
+
+const WIDGET_ID: &str = "widget editor";
+
+fn widget_frame(
+    context: &egui::Context,
+    editor: &mut Editor,
+    events: Vec<Event>,
+    time: Option<f64>,
+    focus: bool,
+    configure: fn(RichTextEditor<'_>) -> RichTextEditor<'_>,
+) -> (egui::FullOutput, RichTextEditorOutput) {
+    let id = Id::new(WIDGET_ID);
+    let mut widget = None;
+    let mut output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+            events,
+            time,
+            ..Default::default()
+        },
+        |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                if focus {
+                    ui.memory_mut(|memory| {
+                        if !memory.has_focus(id) {
+                            memory.request_focus(id);
+                        }
+                    });
+                }
+                let output = configure(RichTextEditor::new(editor).id(id)).show(ui);
+                assert!(output.errors.is_empty(), "{:?}", output.errors);
+                assert!(output.accessibility_errors.is_empty());
+                widget = Some(output);
+                let _ = ui.button("next");
+            });
+        },
+    );
+    output.textures_delta.clear();
+    (output, widget.expect("widget shown"))
+}
+
+fn unchanged(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+    widget
+}
+
+fn widget_cache(context: &egui::Context) -> Cache {
+    context
+        .data(|data| data.get_temp::<Cache>(Id::new(WIDGET_ID)))
+        .expect("cached widget")
+}
+
+fn primary(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
+    Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers,
+    }
+}
+
+fn caret_segments(output: &egui::FullOutput) -> usize {
+    output
+        .shapes
+        .iter()
+        .filter(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::LineSegment { points, .. }
+                if points[0].x == points[1].x)
+        })
+        .count()
+}
+
+fn caret_point(context: &egui::Context, rect: Rect, editor: &Editor, position: Position) -> Pos2 {
+    let cache = widget_cache(context);
+    let (document, layouts) = cache
+        .preview
+        .as_ref()
+        .map_or((editor.document(), &cache.layout.layouts), |preview| {
+            (&preview.document, &preview.render_cache.layouts)
+        });
+    document_caret_rect(
+        document,
+        layouts,
+        rect.min + Vec2::splat(PADDING),
+        position,
+        true,
+    )
+    .center()
+        + Vec2::new(1.0, 0.0)
+}
+
+#[test]
+fn ime_area_stays_next_to_the_caret_and_its_preedit_in_long_documents() {
+    let context = egui::Context::default();
+    let text = (0..200)
+        .map(|index| format!("paragraph {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut editor = Editor::from_text(&text);
+    editor
+        .set_selection(Selection::caret(Position::new(150, 3)))
+        .unwrap();
+    let id = Id::new("ime area");
+    let run = |editor: &mut Editor, events| {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical().animated(false).show(ui, |ui| {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                        RichTextEditor::new(editor).id(id).show(ui);
+                    });
+                });
+            },
+        );
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .ime
+            .expect("focused editable IME output")
+    };
+    for _ in 0..3 {
+        run(&mut editor, Vec::new());
+    }
+    let ime = run(&mut editor, Vec::new());
+    assert_eq!(ime.rect, ime.cursor_rect, "{ime:?}");
+    assert!(ime.rect.height() < 40.0, "{ime:?}");
+    assert!(
+        ime.rect.top() >= 0.0 && ime.rect.bottom() <= 400.0,
+        "{ime:?}"
+    );
+
+    let ime = run(
+        &mut editor,
+        vec![Event::Ime(ImeEvent::Preedit {
+            text: "にほん".into(),
+            active_range_chars: Some(3..3),
+        })],
+    );
+    let ime = if ime.rect == ime.cursor_rect {
+        run(&mut editor, Vec::new())
+    } else {
+        ime
+    };
+    assert!(ime.rect.contains_rect(ime.cursor_rect), "{ime:?}");
+    assert_eq!(ime.rect.right(), ime.cursor_rect.right());
+    assert!(
+        ime.rect.width() > 20.0,
+        "the area covers the preedit: {ime:?}"
+    );
+    assert_eq!(ime.rect.height(), ime.cursor_rect.height());
+}
+
+#[test]
+fn first_preedit_shares_untouched_galleys_with_the_committed_layout() {
+    for (preedit, shifted) in [("あ", 0), ("x\ny", 1)] {
+        let context = egui::Context::default();
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text("first\nOLD\nlast\ntail");
+        let appearance = appearance();
+        let committed = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        editor
+            .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 3)))
+            .unwrap();
+        editor.update_composition(preedit, None).unwrap();
+        let preview = cached_preview_frame(&context, &mut cache, &editor, &appearance);
+        assert_eq!(preview.len(), 4 + shifted);
+        for (source, displayed) in [(0, 0), (2, 2 + shifted), (3, 3 + shifted)] {
+            assert!(
+                Arc::ptr_eq(
+                    &committed.get(source).unwrap().galley,
+                    &preview.get(displayed).unwrap().galley
+                ),
+                "{preedit:?}: paragraph {source} was shaped again"
+            );
+        }
+    }
+}
+
+#[test]
+fn pointer_press_places_the_caret_and_a_drag_extends_from_the_press_point() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abcdefghijklmnopqrstuvwxyz");
+    let (_, widget) = widget_frame(&context, &mut editor, vec![], Some(0.0), false, unchanged);
+    let press = caret_point(&context, widget.response.rect, &editor, Position::new(0, 6));
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::PointerMoved(press),
+            primary(press, true, Modifiers::NONE),
+        ],
+        Some(0.1),
+        false,
+        unchanged,
+    );
+    assert_eq!(editor.selection(), Selection::caret(Position::new(0, 6)));
+    assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+    let release = press + Vec2::new(2.0, 0.0);
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::PointerMoved(release),
+            primary(release, false, Modifiers::NONE),
+        ],
+        Some(0.15),
+        false,
+        unchanged,
+    );
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(Position::new(0, 6)),
+        "release jitter keeps the pressed caret"
+    );
+
+    editor
+        .set_selection(Selection::caret(Position::default()))
+        .unwrap();
+    let end = caret_point(
+        &context,
+        widget.response.rect,
+        &editor,
+        Position::new(0, 13),
+    );
+    for (index, events) in [
+        vec![primary(press, true, Modifiers::NONE)],
+        vec![Event::PointerMoved(press + Vec2::new(12.0, 0.0))],
+        vec![Event::PointerMoved(end)],
+        vec![primary(end, false, Modifiers::NONE)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        widget_frame(
+            &context,
+            &mut editor,
+            events,
+            Some(2.0 + index as f64 * 0.05),
+            false,
+            unchanged,
+        );
+    }
+    assert_eq!(
+        editor.selection(),
+        Selection::new(Position::new(0, 6), Position::new(0, 13))
+    );
+
+    let selection = editor.selection();
+    let secondary = |pos, pressed| Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    for (index, events) in [
+        vec![Event::PointerMoved(press), secondary(press, true)],
+        vec![Event::PointerMoved(press + Vec2::new(40.0, 0.0))],
+        vec![secondary(press + Vec2::new(40.0, 0.0), false)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        widget_frame(
+            &context,
+            &mut editor,
+            events,
+            Some(4.0 + index as f64 * 0.05),
+            false,
+            unchanged,
+        );
+    }
+    assert_eq!(
+        editor.selection(),
+        selection,
+        "secondary drags do not select"
+    );
+}
+
+#[test]
+fn space_and_enter_are_text_input_not_clicks_or_ime_interruptions() {
+    for (key, text) in [(Key::Space, Some(" ")), (Key::Enter, None)] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("hello");
+        widget_frame(&context, &mut editor, vec![], None, true, unchanged);
+        widget_frame(&context, &mut editor, vec![], None, true, unchanged);
+        let mut events = vec![self::key(key, Modifiers::NONE)];
+        events.extend(text.map(|text| Event::Text(text.into())));
+        let (output, widget) = widget_frame(&context, &mut editor, events, None, true, unchanged);
+        assert!(!widget.response.clicked(), "{key:?}");
+        assert!(
+            !output
+                .platform_output
+                .ime
+                .unwrap()
+                .should_interrupt_composition
+        );
+        assert!(
+            !output
+                .platform_output
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::output::OutputEvent::Clicked(_)))
+        );
+        assert_ne!(editor.document().plain_text(), "hello");
+    }
+}
+
+#[test]
+fn home_and_end_follow_wrapped_visual_rows_and_their_affinity() {
+    fn narrow(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+        widget.desired_width(140.0)
+    }
+    let context = egui::Context::default();
+    let text = "first second third fourth fifth sixth seventh eighth ninth tenth eleventh";
+    let mut editor = Editor::from_text(text);
+    widget_frame(&context, &mut editor, vec![], None, true, narrow);
+    let cache = widget_cache(&context);
+    let galley = cache.layout.layouts.get(0).unwrap().galley.clone();
+    assert!(galley.rows.len() >= 3, "{}", galley.rows.len());
+    let starts: Vec<usize> = galley
+        .rows
+        .iter()
+        .scan(0, |start, row| {
+            let row_start = *start;
+            *start += row.char_count_including_newline().0;
+            Some(row_start)
+        })
+        .collect();
+    let row_of = |context: &egui::Context, editor: &Editor| {
+        let cache = widget_cache(context);
+        let navigation = cache.interaction.navigation.expect("visual affinity");
+        assert_eq!(navigation.selection, editor.selection());
+        galley
+            .layout_from_cursor(CCursor {
+                index: CharIndex(editor.selection().focus.byte),
+                prefer_next_row: navigation.prefer_next_row,
+            })
+            .row
+    };
+    let last = starts.len() - 1;
+    let press = |editor: &mut Editor, key, modifiers| {
+        widget_frame(
+            &context,
+            editor,
+            vec![self::key(key, modifiers)],
+            None,
+            true,
+            narrow,
+        );
+    };
+    editor
+        .set_selection(Selection::caret(Position::new(0, starts[last] + 2)))
+        .unwrap();
+    press(&mut editor, Key::Home, Modifiers::NONE);
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(Position::new(0, starts[last]))
+    );
+    assert_eq!(row_of(&context, &editor), last);
+    press(&mut editor, Key::End, Modifiers::NONE);
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(Position::new(0, text.len()))
+    );
+
+    editor
+        .set_selection(Selection::caret(Position::new(0, starts[1] + 2)))
+        .unwrap();
+    press(&mut editor, Key::End, Modifiers::NONE);
+    assert_eq!(editor.selection().focus, Position::new(0, starts[2]));
+    assert_eq!(row_of(&context, &editor), 1);
+    press(&mut editor, Key::Home, Modifiers::NONE);
+    assert_eq!(editor.selection().focus, Position::new(0, starts[1]));
+    assert_eq!(row_of(&context, &editor), 1);
+    press(&mut editor, Key::End, Modifiers::SHIFT);
+    assert_eq!(
+        editor.selection(),
+        Selection::new(Position::new(0, starts[1]), Position::new(0, starts[2]))
+    );
+    let mac_command = Modifiers::MAC_CMD | Modifiers::COMMAND;
+    press(&mut editor, Key::ArrowLeft, mac_command);
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(Position::new(0, starts[1]))
+    );
+    press(&mut editor, Key::ArrowRight, mac_command);
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(Position::new(0, starts[2]))
+    );
+    press(&mut editor, Key::End, Modifiers::COMMAND);
+    assert_eq!(editor.selection().focus, editor.document().end());
+    press(&mut editor, Key::Home, Modifiers::COMMAND);
+    assert_eq!(editor.selection().focus, Position::default());
+}
+
+#[test]
+fn page_down_and_up_move_about_one_viewport_and_keep_the_column() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text(&"line\n".repeat(100));
+    editor
+        .set_selection(Selection::caret(Position::new(0, 2)))
+        .unwrap();
+    scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+    scrolling_frame(
+        &context,
+        &mut editor,
+        vec![key(Key::PageDown, Modifiers::NONE)],
+        true,
+        0.0,
+    );
+    let first = editor.selection().focus;
+    assert!((3..=6).contains(&first.paragraph), "{first:?}");
+    assert_eq!(first.byte, 2);
+    let (_, offset, _, _) = scrolling_frame(
+        &context,
+        &mut editor,
+        vec![key(Key::PageDown, Modifiers::SHIFT)],
+        true,
+        0.0,
+    );
+    assert!(offset.y > 0.0);
+    let second = editor.selection();
+    assert_eq!(second.anchor, first);
+    assert!(second.focus.paragraph > first.paragraph + 2);
+    assert_eq!(second.focus.byte, 2);
+    for _ in 0..3 {
+        scrolling_frame(
+            &context,
+            &mut editor,
+            vec![key(Key::PageUp, Modifiers::NONE)],
+            true,
+            0.0,
+        );
+    }
+    assert_eq!(editor.selection(), Selection::caret(Position::default()));
+    scrolling_frame(
+        &context,
+        &mut editor,
+        vec![key(Key::PageDown, Modifiers::COMMAND)],
+        true,
+        0.0,
+    );
+    assert_eq!(editor.selection(), Selection::caret(Position::default()));
+    assert!(
+        context.input(|input| matches!(
+            input.events.as_slice(),
+            [Event::Key {
+                key: Key::PageDown,
+                modifiers: Modifiers::COMMAND,
+                ..
+            }]
+        )),
+        "Ctrl/Cmd+PageDown is left to the host"
+    );
+}
+
+#[test]
+fn selection_is_spliced_between_code_backgrounds_and_glyphs() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("plain code");
+    editor
+        .set_selection(Selection::new(Position::new(0, 6), Position::new(0, 10)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            code: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    editor.select_all();
+    let (output, _) = widget_frame(&context, &mut editor, vec![], None, true, unchanged);
+    let visuals = context.global_style().visuals.clone();
+    let selection = visuals.selection.bg_fill;
+    let galley = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == "plain code" => {
+                Some(text.galley.clone())
+            }
+            _ => None,
+        })
+        .expect("painted paragraph");
+    let row = &galley.rows[0];
+    let mesh = &row.visuals.mesh;
+    let first_use = |color| {
+        let vertex = mesh
+            .vertices
+            .iter()
+            .position(|vertex| vertex.color == color)
+            .expect("colored quad") as u32;
+        mesh.indices
+            .iter()
+            .position(|&index| index == vertex)
+            .unwrap()
+    };
+    assert!(first_use(visuals.code_bg_color) < first_use(selection));
+    assert!(first_use(selection) < row.visuals.glyph_index_start);
+    assert!(
+        mesh.indices[row.visuals.glyph_index_start..]
+            .iter()
+            .all(|&index| mesh.vertices[index as usize].color != selection)
+    );
+    let cache = widget_cache(&context);
+    let cached = &cache.layout.layouts.get(0).unwrap().galley;
+    assert!(!Arc::ptr_eq(cached, &galley));
+    assert!(
+        cached.rows[0]
+            .visuals
+            .mesh
+            .vertices
+            .iter()
+            .all(|vertex| vertex.color != selection)
+    );
+    assert!(!output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == selection)
+    }));
+}
+
+#[test]
+fn fills_paint_behind_glyphs_replace_code_backgrounds_and_keep_selection_visible() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("plain fill code");
+    let blue = crate::Color([0, 112, 192, 128]);
+    for (range, patch) in [
+        (
+            6..10,
+            StylePatch {
+                background: Some(Some(crate::Color::YELLOW)),
+                ..Default::default()
+            },
+        ),
+        (
+            11..15,
+            StylePatch {
+                code: Some(true),
+                background: Some(Some(blue)),
+                ..Default::default()
+            },
+        ),
+    ] {
+        editor
+            .set_selection(Selection::new(
+                Position::new(0, range.start),
+                Position::new(0, range.end),
+            ))
+            .unwrap();
+        editor.apply_style(patch).unwrap();
+    }
+    editor
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 8)))
+        .unwrap();
+    let (output, _) = widget_frame(&context, &mut editor, vec![], None, true, unchanged);
+    let visuals = context.global_style().visuals.clone();
+    let selection = visuals.selection.bg_fill;
+    let yellow = Color32::from_rgb(255, 255, 0);
+    let translucent = Color32::from_rgba_unmultiplied(0, 112, 192, 128);
+    let galley = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == "plain fill code" => {
+                Some(text.galley.clone())
+            }
+            _ => None,
+        })
+        .expect("painted paragraph");
+    let backgrounds: Vec<_> = galley
+        .job
+        .sections
+        .iter()
+        .map(|section| (section.format.background, section.format.expand_bg))
+        .collect();
+    assert_eq!(
+        backgrounds,
+        [
+            (Color32::TRANSPARENT, 1.0),
+            (yellow, 0.0),
+            (Color32::TRANSPARENT, 1.0),
+            (translucent, 0.0),
+        ]
+    );
+    let row = &galley.rows[0];
+    let mesh = &row.visuals.mesh;
+    let first_use = |color| {
+        let vertex = mesh
+            .vertices
+            .iter()
+            .position(|vertex| vertex.color == color)
+            .expect("colored quad") as u32;
+        mesh.indices
+            .iter()
+            .position(|&index| index == vertex)
+            .unwrap()
+    };
+    assert!(first_use(yellow) < first_use(selection));
+    assert!(first_use(translucent) < first_use(selection));
+    assert!(first_use(selection) < row.visuals.glyph_index_start);
+    assert!(
+        mesh.vertices
+            .iter()
+            .all(|vertex| vertex.color != visuals.code_bg_color)
+    );
+}
+
+#[test]
+fn host_highlight_ranges_paint_visible_matches_and_skip_stale_ranges() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("find me\nand find you");
+    let found = editor
+        .document()
+        .find("find", crate::SearchOptions::default());
+    assert_eq!(found.len(), 2);
+    let ranges = [
+        found[0].clone(),
+        Position::new(0, 5)..Position::new(0, 60),
+        Position::new(0, 50)..Position::new(1, 3),
+        Position::new(1, 0)..Position::new(9, 0),
+        found[1].clone(),
+        Position::new(7, 0)..Position::new(9, 0),
+    ];
+    let color = Color32::from_rgb(250, 200, 10);
+    let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+        let output = RichTextEditor::new(&mut editor)
+            .highlight_ranges(&ranges, color)
+            .show(ui);
+        assert!(output.errors.is_empty());
+    });
+    output.textures_delta.clear();
+    let highlighted = output
+        .shapes
+        .iter()
+        .filter(
+            |shape| matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == color),
+        )
+        .count();
+    assert_eq!(highlighted, 2);
+}
+
+#[test]
+fn output_reports_caret_and_selection_geometry_even_when_unfocused() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text(&format!("{}end", "line\n".repeat(60)));
+    let mut offset = Vec2::ZERO;
+    let mut geometry = (Rect::NOTHING, None, Rect::NOTHING);
+    let mut run = |editor: &mut Editor, scroll: bool| {
+        context
+            .run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let area = egui::ScrollArea::vertical()
+                            .animated(false)
+                            .max_height(100.0)
+                            .show(ui, |ui| {
+                                let output = RichTextEditor::new(editor)
+                                    .id(Id::new("unfocused"))
+                                    .show(ui);
+                                if scroll {
+                                    ui.scroll_to_rect(output.caret_rect, None);
+                                }
+                                (
+                                    output.caret_rect,
+                                    output.selection_rect,
+                                    output.response.rect,
+                                )
+                            });
+                        offset = area.state.offset;
+                        geometry = area.inner;
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        (offset, geometry)
+    };
+    let (_, (caret, selection, rect)) = run(&mut editor, false);
+    assert_eq!(selection, None);
+    assert!(rect.contains_rect(caret));
+    assert_eq!(caret.left(), rect.left() + PADDING);
+    editor
+        .set_selection(Selection::new(Position::new(1, 1), editor.document().end()))
+        .unwrap();
+    let (offset, (caret, selection, rect)) = run(&mut editor, false);
+    assert_eq!(
+        offset.y, 0.0,
+        "an unfocused editor does not scroll by itself"
+    );
+    let selection = selection.expect("selected text bounds");
+    assert!(selection.contains_rect(caret));
+    assert_eq!(selection.left(), rect.left() + PADDING);
+    assert!(selection.top() > rect.top() + PADDING && caret.bottom() <= rect.bottom());
+    run(&mut editor, true);
+    let (offset, _) = run(&mut editor, true);
+    assert!(
+        offset.y > 100.0,
+        "hosts can reveal the selection: {offset:?}"
+    );
+}
+
+#[test]
+fn pointer_and_blur_commit_preedit_text_while_escape_cancels_it() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc def");
+    let (_, widget) = widget_frame(&context, &mut editor, vec![], Some(0.0), true, unchanged);
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![Event::Ime(ImeEvent::Preedit {
+            text: "にほんご".into(),
+            active_range_chars: Some(4..4),
+        })],
+        Some(0.1),
+        true,
+        unchanged,
+    );
+    let target = Position::new(0, "にほんごa".len());
+    let point = caret_point(&context, widget.response.rect, &editor, target);
+    let (output, _) = widget_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::PointerMoved(point),
+            primary(point, true, Modifiers::NONE),
+        ],
+        Some(0.2),
+        true,
+        unchanged,
+    );
+    assert!(
+        output
+            .platform_output
+            .ime
+            .unwrap()
+            .should_interrupt_composition
+    );
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![primary(point, false, Modifiers::NONE)],
+        Some(0.25),
+        true,
+        unchanged,
+    );
+    assert_eq!(editor.document().plain_text(), "にほんごabc def");
+    assert!(editor.composition().is_none());
+    assert_eq!(editor.selection(), Selection::caret(target));
+    assert_eq!(editor.undo_len(), 1);
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "abc def");
+
+    editor.update_composition("", None).unwrap();
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![primary(point, true, Modifiers::NONE)],
+        Some(2.0),
+        true,
+        unchanged,
+    );
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![primary(point, false, Modifiers::NONE)],
+        Some(2.05),
+        true,
+        unchanged,
+    );
+    assert_eq!(editor.document().plain_text(), "abc def");
+    assert!(editor.composition().is_none());
+
+    editor.update_composition("候補", None).unwrap();
+    widget_frame(&context, &mut editor, vec![], Some(3.0), true, unchanged);
+    context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+    widget_frame(&context, &mut editor, vec![], Some(3.1), false, unchanged);
+    assert!(editor.composition().is_none());
+    assert!(editor.document().plain_text().contains("候補"));
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "abc def");
+
+    editor.update_composition("候補", None).unwrap();
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Escape, Modifiers::NONE)],
+        Some(4.0),
+        true,
+        unchanged,
+    );
+    assert!(editor.composition().is_none());
+    assert_eq!(editor.document().plain_text(), "abc def");
+}
+
+fn composing_frame(context: &egui::Context, editor: &mut Editor, preedit: &str) -> Rect {
+    let (_, widget) = widget_frame(context, editor, vec![], Some(0.0), true, unchanged);
+    widget_frame(
+        context,
+        editor,
+        vec![Event::Ime(ImeEvent::Preedit {
+            text: preedit.into(),
+            active_range_chars: None,
+        })],
+        Some(0.1),
+        true,
+        unchanged,
+    );
+    widget.response.rect
+}
+
+fn candidate_commit(text: &str) -> [Event; 2] {
+    [
+        Event::Ime(ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        }),
+        Event::Ime(ImeEvent::Commit(text.into())),
+    ]
+}
+
+#[test]
+fn ime_events_queued_before_a_click_apply_before_the_click_commits() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc def");
+    let rect = composing_frame(&context, &mut editor, "ni");
+    let point = caret_point(&context, rect, &editor, Position::new(0, "nia".len()));
+    let mut events = candidate_commit("你").to_vec();
+    events.extend([
+        Event::PointerMoved(point),
+        primary(point, true, Modifiers::NONE),
+    ]);
+    let (output, _) = widget_frame(&context, &mut editor, events, Some(0.2), true, unchanged);
+    assert_eq!(editor.document().plain_text(), "你abc def");
+    assert!(editor.composition().is_none());
+    assert_eq!(editor.undo_len(), 1);
+    assert!(
+        !output
+            .platform_output
+            .ime
+            .unwrap()
+            .should_interrupt_composition
+    );
+    assert!(context.input(|input| {
+        !input
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Ime(_)))
+    }));
+
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    let rect = composing_frame(&context, &mut editor, "n");
+    let point = caret_point(&context, rect, &editor, Position::new(0, "na".len()));
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Ime(ImeEvent::Preedit {
+                text: "ni".into(),
+                active_range_chars: None,
+            }),
+            Event::PointerMoved(point),
+            primary(point, true, Modifiers::NONE),
+            Event::Text("x".into()),
+        ],
+        Some(0.2),
+        true,
+        unchanged,
+    );
+    let text = editor.document().plain_text();
+    assert!(text.starts_with("ni") && text.contains('x'), "{text}");
+    assert_eq!(text.len(), "niabcx".len());
+}
+
+#[test]
+fn ime_events_queued_with_a_focus_change_apply_before_blur_commits() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    composing_frame(&context, &mut editor, "ni");
+    context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+    widget_frame(
+        &context,
+        &mut editor,
+        candidate_commit("你").to_vec(),
+        Some(0.2),
+        false,
+        unchanged,
+    );
+    assert_eq!(editor.document().plain_text(), "你abc");
+    assert!(editor.composition().is_none());
+    assert!(context.input(|input| input.events.is_empty()));
+
+    let mut other = Editor::from_text("abc");
+    widget_frame(
+        &context,
+        &mut other,
+        candidate_commit("你").to_vec(),
+        Some(0.3),
+        false,
+        unchanged,
+    );
+    assert_eq!(other.document().plain_text(), "abc");
+    assert_eq!(context.input(|input| input.events.len()), 2);
+}
+
+#[test]
+fn an_input_method_echoing_a_click_commit_is_inserted_once() {
+    let click_commit = |context: &egui::Context, editor: &mut Editor| {
+        let rect = composing_frame(context, editor, "한");
+        let point = caret_point(context, rect, editor, Position::new(0, "한ab".len()));
+        let (output, _) = widget_frame(
+            context,
+            editor,
+            vec![
+                Event::PointerMoved(point),
+                primary(point, true, Modifiers::NONE),
+            ],
+            Some(0.2),
+            true,
+            unchanged,
+        );
+        assert!(
+            output
+                .platform_output
+                .ime
+                .unwrap()
+                .should_interrupt_composition
+        );
+        widget_frame(
+            context,
+            editor,
+            vec![primary(point, false, Modifiers::NONE)],
+            Some(0.25),
+            true,
+            unchanged,
+        );
+        assert_eq!(editor.document().plain_text(), "한abc");
+    };
+    let commit = |text: &str| Event::Ime(ImeEvent::Commit(text.into()));
+
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    click_commit(&context, &mut editor);
+    let mut echo = candidate_commit("한").to_vec();
+    #[allow(deprecated)]
+    echo.push(Event::Ime(ImeEvent::Disabled));
+    widget_frame(&context, &mut editor, echo, Some(0.3), true, unchanged);
+    assert_eq!(editor.document().plain_text(), "한abc");
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![commit("한")],
+        Some(0.35),
+        true,
+        unchanged,
+    );
+    assert_eq!(editor.document().plain_text(), "한ab한c");
+
+    for (events, time) in [
+        (vec![Event::Text("x".into()), commit("한")], 0.3),
+        (vec![commit("하")], 0.3),
+        (vec![commit("한")], 1.0),
+    ] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("abc");
+        click_commit(&context, &mut editor);
+        let typed = events.len() == 2;
+        widget_frame(&context, &mut editor, events, Some(time), true, unchanged);
+        let text = editor.document().plain_text();
+        assert_eq!(
+            text.chars().count(),
+            "한abc".chars().count() + 1 + usize::from(typed),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn ime_commits_merge_like_typing_until_a_line_break() {
+    let context = egui::Context::default();
+    let mut editor = Editor::default();
+    frame(&context, &mut editor, vec![], true);
+    for text in ["a", "b", "c"] {
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::Ime(ImeEvent::Commit(text.into()))],
+            true,
+        );
+    }
+    frame(&context, &mut editor, vec![Event::Text("d".into())], true);
+    assert_eq!(editor.document().plain_text(), "abcd");
+    assert_eq!(editor.undo_len(), 1);
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Ime(ImeEvent::Preedit {
+                text: "に".into(),
+                active_range_chars: None,
+            }),
+            Event::Ime(ImeEvent::Commit("日".into())),
+            Event::Ime(ImeEvent::Commit("x\ny".into())),
+        ],
+        true,
+    );
+    assert_eq!(editor.document().plain_text(), "abcd日x\ny");
+    assert_eq!(editor.undo_len(), 2);
+}
+
+#[test]
+fn ime_line_break_text_is_ignored_like_egui_text_edit() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    editor
+        .set_selection(Selection::caret(Position::new(0, 3)))
+        .unwrap();
+    for text in ["\n", "\r", "\r\n"] {
+        frame(
+            &context,
+            &mut editor,
+            vec![
+                Event::Ime(ImeEvent::Commit(text.into())),
+                Event::Ime(ImeEvent::Preedit {
+                    text: text.into(),
+                    active_range_chars: None,
+                }),
+            ],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), "abc");
+        assert!(editor.composition().is_none());
+        assert!(context.input(|input| input.events.is_empty()));
+    }
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Enter, Modifiers::NONE)],
+        true,
+    );
+    assert_eq!(editor.document().plain_text(), "abc\n");
+}
+
+#[test]
+fn empty_preedit_keeps_the_source_caret_visible() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("hello");
+    frame(&context, &mut editor, vec![], true);
+    let normal = frame(&context, &mut editor, vec![], true);
+    assert_eq!(caret_segments(&normal), 1);
+    let hidden = frame(
+        &context,
+        &mut editor,
+        vec![Event::Ime(ImeEvent::Preedit {
+            text: "a".into(),
+            active_range_chars: None,
+        })],
+        true,
+    );
+    assert_eq!(caret_segments(&hidden), 0);
+    let empty = frame(
+        &context,
+        &mut editor,
+        vec![Event::Ime(ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        })],
+        true,
+    );
+    assert!(editor.composition().is_some());
+    assert_eq!(caret_segments(&empty), 1);
+}
+
+#[test]
+fn pasted_typed_and_committed_text_drop_control_characters() {
+    let context = egui::Context::default();
+    let mut editor = Editor::default();
+    let mut clipboard = TestClipboard::default();
+    clipboard_frame(
+        &context,
+        &mut editor,
+        vec![Event::Paste("a\u{1b}[31mb\u{7}".into())],
+        true,
+        false,
+        true,
+        Some(&mut clipboard),
+    );
+    assert_eq!(editor.document().plain_text(), "a[31mb");
+    assert_eq!(
+        clipboard.calls,
+        vec![ClipboardCall::Paste("a\u{1b}[31mb\u{7}".into())],
+        "the transport sees the event's own text"
+    );
+    frame(
+        &context,
+        &mut editor,
+        vec![Event::Paste("\tx\ny\u{0}".into())],
+        true,
+    );
+    assert_eq!(editor.document().plain_text(), "a[31mb\tx\ny");
+    let undo_len = editor.undo_len();
+    let revision = editor.document().revision();
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Text("p".into()),
+            Event::Paste("\u{7}\u{1b}".into()),
+            Event::Text("\u{8}q\t".into()),
+            Event::Ime(ImeEvent::Commit("r\u{0}".into())),
+        ],
+        true,
+    );
+    assert_eq!(editor.document().plain_text(), "a[31mb\tx\nypqr");
+    assert_ne!(editor.document().revision(), revision);
+    assert_eq!(
+        editor.undo_len(),
+        undo_len + 1,
+        "control-only paste keeps typing grouped"
+    );
+
+    editor.update_composition("候", None).unwrap();
+    frame(
+        &context,
+        &mut editor,
+        vec![Event::Ime(ImeEvent::Commit("\u{8}".into()))],
+        true,
+    );
+    assert!(editor.composition().is_none());
+    assert_eq!(editor.document().plain_text(), "a[31mb\tx\nypqr");
+}
+
+#[test]
+fn nonempty_preedit_consumes_cut_paste_and_text() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("source");
+    editor.select_all();
+    frame(&context, &mut editor, vec![], true);
+    editor.update_composition("候", None).unwrap();
+    let composition = editor.composition().cloned();
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Text("x".into()),
+            Event::Paste("y".into()),
+            Event::Cut,
+        ],
+        true,
+    );
+    assert!(context.input(|input| input.events.is_empty()));
+    assert_eq!(editor.composition(), composition.as_ref());
+    assert_eq!(editor.document().plain_text(), "source");
+    assert!(!editor.can_undo());
+}
+
+#[test]
+fn touch_swipes_scroll_until_the_editor_is_focused() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text(&"line of text\n".repeat(80));
+    let id = Id::new("touch");
+    let mut time = 0.0;
+    let mut run = |editor: &mut Editor, events: Vec<Event>| {
+        time += 0.05;
+        let mut offset = Vec2::ZERO;
+        context
+            .run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let area = egui::ScrollArea::vertical().animated(false).show(ui, |ui| {
+                            RichTextEditor::new(editor).id(id).show(ui);
+                        });
+                        offset = area.state.offset;
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        offset
+    };
+    let touch = |phase, pos| Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(1),
+        phase,
+        pos,
+        force: None,
+    };
+    let swipe = |run: &mut dyn FnMut(&mut Editor, Vec<Event>) -> Vec2, editor: &mut Editor| {
+        let mut point = Pos2::new(100.0, 300.0);
+        run(
+            editor,
+            vec![
+                touch(egui::TouchPhase::Start, point),
+                Event::PointerMoved(point),
+                primary(point, true, Modifiers::NONE),
+            ],
+        );
+        for _ in 0..10 {
+            point.y -= 20.0;
+            run(
+                editor,
+                vec![
+                    touch(egui::TouchPhase::Move, point),
+                    Event::PointerMoved(point),
+                ],
+            );
+        }
+        run(
+            editor,
+            vec![
+                touch(egui::TouchPhase::End, point),
+                primary(point, false, Modifiers::NONE),
+                Event::PointerGone,
+            ],
+        );
+        run(editor, Vec::new())
+    };
+    let known = Pos2::new(100.0, 300.0);
+    run(
+        &mut editor,
+        vec![
+            touch(egui::TouchPhase::Start, known),
+            touch(egui::TouchPhase::End, known),
+        ],
+    );
+    run(&mut editor, Vec::new());
+    let offset = swipe(&mut run, &mut editor);
+    assert!(offset.y > 0.0, "{offset:?}");
+    assert_eq!(editor.selection(), Selection::caret(Position::default()));
+    assert!(!context.memory(|memory| memory.has_focus(id)));
+
+    let tap = Pos2::new(100.0, 200.0);
+    run(
+        &mut editor,
+        vec![
+            touch(egui::TouchPhase::Start, tap),
+            Event::PointerMoved(tap),
+            primary(tap, true, Modifiers::NONE),
+        ],
+    );
+    run(
+        &mut editor,
+        vec![
+            touch(egui::TouchPhase::End, tap),
+            primary(tap, false, Modifiers::NONE),
+            Event::PointerGone,
+        ],
+    );
+    assert!(context.memory(|memory| memory.has_focus(id)));
+    assert!(editor.selection().is_caret());
+    assert_ne!(editor.selection(), Selection::caret(Position::default()));
+    run(&mut editor, Vec::new());
+    swipe(&mut run, &mut editor);
+    assert!(
+        !editor.selection().is_caret(),
+        "a focused editor drag-selects"
+    );
+}
+
+#[test]
+fn tab_after_a_list_shortcut_in_the_previous_frame_indents_the_new_item() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("item");
+    widget_frame(&context, &mut editor, vec![], None, true, unchanged);
+    widget_frame(&context, &mut editor, vec![], None, false, unchanged);
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Num8, Modifiers::COMMAND | Modifiers::SHIFT)],
+        None,
+        false,
+        unchanged,
+    );
+    assert_eq!(
+        editor.document().paragraphs()[0].kind(),
+        ParagraphKind::Bullet { indent: 0 }
+    );
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Tab, Modifiers::NONE)],
+        None,
+        false,
+        unchanged,
+    );
+    assert_eq!(
+        editor.document().paragraphs()[0].kind(),
+        ParagraphKind::Bullet { indent: 1 }
+    );
+    assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+}
+
+#[test]
+fn min_rows_reserves_shaped_body_rows_and_paragraph_gaps() {
+    fn four(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+        widget.min_rows(4)
+    }
+    let context = egui::Context::default();
+    let mut empty = Editor::default();
+    let (_, widget) = widget_frame(&context, &mut empty, vec![], None, false, four);
+    let body = egui::TextStyle::Body.resolve(&context.global_style());
+    let row = context.fonts_mut(|fonts| fonts.row_height(&body));
+    let reserved = widget.response.rect.height() - PADDING * 2.0;
+    assert!(reserved >= 4.0 * row, "{reserved} < {}", 4.0 * row);
+    let mut lines = Editor::from_text("1\n2\n3\n4");
+    let (_, widget) = widget_frame(&context, &mut lines, vec![], None, false, four);
+    let content = widget.response.rect.height() - PADDING * 2.0;
+    assert!((content - reserved).abs() < 1.0, "{content} vs {reserved}");
+}
+
+#[test]
+fn forget_state_releases_the_cached_layout() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("cached");
+    let (_, widget) = widget_frame(&context, &mut editor, vec![], None, false, unchanged);
+    assert_eq!(widget.response.id, Id::new(WIDGET_ID));
+    assert!(
+        context
+            .data(|data| data.get_temp::<Cache>(widget.response.id))
+            .is_some()
+    );
+    RichTextEditor::forget_state(&context, widget.response.id);
+    assert!(
+        context
+            .data(|data| data.get_temp::<Cache>(widget.response.id))
+            .is_none()
+    );
+}
+
+#[test]
+fn caret_blinks_with_egui_text_cursor_visuals_and_restarts_on_input() {
+    let context = egui::Context::default();
+    context.global_style_mut(|style| {
+        style.visuals.text_cursor.blink = true;
+        style.visuals.text_cursor.on_duration = 0.5;
+        style.visuals.text_cursor.off_duration = 0.5;
+    });
+    let mut editor = Editor::from_text("blink");
+    let run = |editor: &mut Editor, events, time| {
+        let (output, _) = widget_frame(&context, editor, events, Some(time), true, unchanged);
+        caret_segments(&output)
+    };
+    assert_eq!(run(&mut editor, vec![], 10.0), 1);
+    assert_eq!(run(&mut editor, vec![], 10.3), 1);
+    assert_eq!(run(&mut editor, vec![], 10.7), 0);
+    assert_eq!(
+        run(
+            &mut editor,
+            vec![key(Key::ArrowRight, Modifiers::NONE)],
+            10.8
+        ),
+        1
+    );
+    assert_eq!(run(&mut editor, vec![], 11.2), 1);
+    context.global_style_mut(|style| style.visuals.text_cursor.blink = false);
+    assert_eq!(run(&mut editor, vec![], 11.6), 1);
+}
+
+#[test]
+fn disabled_heading_shortcuts_reach_the_host() {
+    fn no_headings(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+        widget.heading_shortcuts(false)
+    }
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("title");
+    editor
+        .set_paragraph_kind(ParagraphKind::Heading { level: 2 })
+        .unwrap();
+    editor.select_all();
+    context.set_zoom_factor(1.5);
+    widget_frame(&context, &mut editor, vec![], None, true, no_headings);
+    let headings = vec![
+        key(Key::Num1, Modifiers::COMMAND),
+        key(Key::Num6, Modifiers::COMMAND),
+    ];
+    widget_frame(
+        &context,
+        &mut editor,
+        [
+            vec![key(Key::Num0, Modifiers::COMMAND)],
+            headings.clone(),
+            vec![key(Key::B, Modifiers::COMMAND)],
+        ]
+        .concat(),
+        None,
+        true,
+        no_headings,
+    );
+    assert_eq!(context.input(|input| input.events.clone()), headings);
+    assert_eq!(
+        editor.document().paragraphs()[0].kind(),
+        ParagraphKind::Heading { level: 2 }
+    );
+    widget_frame(&context, &mut editor, vec![], None, true, no_headings);
+    assert_eq!(
+        context.zoom_factor(),
+        1.0,
+        "egui's zoom reset receives Cmd+0"
+    );
+    assert_eq!(editor.selection_style().bold, Some(true));
+}
+
+#[test]
+fn shortcuts_follow_shift_layout_and_read_only_policies() {
+    let command = Modifiers::COMMAND | Modifiers::CTRL;
+    let shift = command | Modifiers::SHIFT;
+    let host = [
+        key(Key::Enter, command),
+        key(Key::Num7, command),
+        key(Key::Num8, command),
+        key(Key::A, shift),
+        key(Key::B, shift),
+        key(Key::Num1, shift),
+        key(Key::CloseBracket, shift),
+        key(Key::Y, shift),
+    ];
+    for read_only in [false, true] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("item");
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        editor.clear_history();
+        frame_options(&context, &mut editor, host.to_vec(), true, read_only);
+        assert_eq!(
+            context.input(|input| input.events.clone()),
+            host.to_vec(),
+            "read_only={read_only}"
+        );
+        assert_eq!(editor.document().plain_text(), "item");
+        assert!(!editor.can_undo());
+
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::CloseBracket, command)],
+            true,
+            read_only,
+        );
+        let indent = u8::from(!read_only);
+        assert_eq!(
+            editor.document().paragraphs()[0].kind(),
+            ParagraphKind::Bullet { indent }
+        );
+        frame_options(
+            &context,
+            &mut editor,
+            vec![key(Key::OpenBracket, command)],
+            true,
+            read_only,
+        );
+        assert_eq!(
+            editor.document().paragraphs()[0].kind(),
+            ParagraphKind::Bullet { indent: 0 }
+        );
+        assert!(context.input(|input| input.events.is_empty()));
+    }
+
+    let physical = |key: Key, physical: Key, modifiers| Event::Key {
+        key,
+        physical_key: Some(physical),
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("title");
+    frame(
+        &context,
+        &mut editor,
+        vec![physical(Key::Quote, Key::Num4, command)],
+        true,
+    );
+    assert_eq!(
+        editor.document().paragraphs()[0].kind(),
+        ParagraphKind::Heading { level: 4 }
+    );
+    frame(
+        &context,
+        &mut editor,
+        vec![physical(Key::Slash, Key::Num7, shift)],
+        true,
+    );
+    assert_eq!(
+        editor.document().paragraphs()[0].kind(),
+        ParagraphKind::Ordered {
+            indent: 0,
+            start: Some(1)
+        }
+    );
+    let semicolon = physical(Key::Semicolon, Key::Z, command);
+    frame(&context, &mut editor, vec![semicolon.clone()], true);
+    assert!(editor.can_undo());
+    assert_eq!(context.input(|input| input.events.clone()), vec![semicolon]);
+    frame(
+        &context,
+        &mut editor,
+        vec![physical(Key::Z, Key::Slash, command)],
+        true,
+    );
+    assert_eq!(
+        editor.document().paragraphs()[0].kind(),
+        ParagraphKind::Heading { level: 4 }
+    );
+}
+
+#[cfg(feature = "winit")]
+#[test]
+fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
+    use crate::adapter::winit::{CommandModifier, WinitAdapter};
+    use winit::{
+        event::ElementState,
+        keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey},
+    };
+    type LayoutKey = (KeyCode, Key, char, char);
+    let layouts: [(&str, &[LayoutKey]); 4] = [
+        (
+            "US",
+            &[
+                (KeyCode::KeyB, Key::B, 'b', 'B'),
+                (KeyCode::KeyZ, Key::Z, 'z', 'Z'),
+                (KeyCode::Digit1, Key::Num1, '1', '!'),
+                (KeyCode::Digit7, Key::Num7, '7', '&'),
+                (KeyCode::Digit8, Key::Num8, '8', '*'),
+                (KeyCode::Digit0, Key::Num0, '0', ')'),
+                (KeyCode::BracketLeft, Key::OpenBracket, '[', '{'),
+                (KeyCode::BracketRight, Key::CloseBracket, ']', '}'),
+            ],
+        ),
+        (
+            "AZERTY",
+            &[
+                (KeyCode::KeyQ, Key::Q, 'a', 'A'),
+                (KeyCode::KeyW, Key::W, 'z', 'Z'),
+                (KeyCode::Digit1, Key::Num1, '&', '1'),
+                (KeyCode::Digit2, Key::Num2, 'é', '2'),
+                (KeyCode::Digit3, Key::Num3, '"', '3'),
+                (KeyCode::Digit4, Key::Num4, '\'', '4'),
+                (KeyCode::Digit6, Key::Num6, '-', '6'),
+                (KeyCode::Digit7, Key::Num7, 'è', '7'),
+                (KeyCode::Digit8, Key::Num8, '_', '8'),
+                (KeyCode::BracketLeft, Key::OpenBracket, '\0', '\0'),
+                (KeyCode::BracketRight, Key::CloseBracket, '$', '£'),
+            ],
+        ),
+        (
+            "German",
+            &[
+                (KeyCode::KeyY, Key::Y, 'z', 'Z'),
+                (KeyCode::Digit6, Key::Num6, '6', '&'),
+                (KeyCode::Digit7, Key::Num7, '7', '/'),
+                (KeyCode::Digit8, Key::Num8, '8', '('),
+                (KeyCode::BracketLeft, Key::OpenBracket, 'ü', 'Ü'),
+                (KeyCode::BracketRight, Key::CloseBracket, '+', '*'),
+            ],
+        ),
+        (
+            "Russian",
+            &[
+                (KeyCode::KeyB, Key::B, 'и', 'И'),
+                (KeyCode::KeyZ, Key::Z, 'я', 'Я'),
+                (KeyCode::Digit7, Key::Num7, '7', '?'),
+                (KeyCode::BracketLeft, Key::OpenBracket, 'х', 'Х'),
+                (KeyCode::BracketRight, Key::CloseBracket, 'ъ', 'Ъ'),
+            ],
+        ),
+    ];
+    let start = || {
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        editor.select_all();
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        editor
+            .set_selection(Selection::caret(Position::new(1, 1)))
+            .unwrap();
+        editor.insert_text("x").unwrap();
+        editor
+            .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 2)))
+            .unwrap();
+        editor
+    };
+    for (layout, keys) in layouts {
+        for &(code, position, plain, shifted) in keys {
+            for shift in [false, true] {
+                let character = if shift { shifted } else { plain };
+                let name = (character != '\0').then(|| character.to_string());
+                let mut winit_editor = start();
+                let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Control);
+                let _ = adapter.set_focused(true, &mut winit_editor);
+                adapter.set_modifiers(if shift {
+                    ModifiersState::CONTROL | ModifiersState::SHIFT
+                } else {
+                    ModifiersState::CONTROL
+                });
+                let logical = name.as_ref().map_or(WinitKey::Dead(None), |name| {
+                    WinitKey::Character(name.into())
+                });
+                let outcome = adapter
+                    .handle_key(
+                        &logical,
+                        PhysicalKey::Code(code),
+                        ElementState::Pressed,
+                        None,
+                        &mut winit_editor,
+                    )
+                    .unwrap();
+
+                let key = name.as_deref().and_then(Key::from_name).unwrap_or(position);
+                let mut egui_editor = start();
+                let handled = handle_key(
+                    &mut egui_editor,
+                    key,
+                    Some(position),
+                    Modifiers {
+                        ctrl: true,
+                        command: true,
+                        shift,
+                        ..Modifiers::NONE
+                    },
+                    &ParagraphLayouts::default(),
+                    &mut None,
+                    &mut Vec::new(),
+                    &input_options(false),
+                );
+                let chord = format!("{layout} {character:?} shift={shift}");
+                if !matches!(key, Key::C | Key::X | Key::V) {
+                    assert_eq!(handled, outcome.handled, "{chord}");
+                }
+                assert_eq!(
+                    egui_editor.document().to_bytes(),
+                    winit_editor.document().to_bytes(),
+                    "{chord}"
+                );
+                assert_eq!(egui_editor.selection(), winit_editor.selection(), "{chord}");
+                assert_eq!(
+                    egui_editor.typing_style(),
+                    winit_editor.typing_style(),
+                    "{chord}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hint_uses_the_first_paragraph_indent_font_and_wrap_width() {
+    let context = egui::Context::default();
+    let shapes = |editor: &mut Editor| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            RichTextEditor::new(editor)
+                .hint_text("Write something")
+                .show(ui);
+        });
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::epaint::Shape::Text(text) => Some((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                    text.galley.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut editor = Editor::default();
+    editor
+        .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+        .unwrap();
+    let painted = shapes(&mut editor);
+    let marker = painted.iter().find(|(text, ..)| text == "•").unwrap().1;
+    let hint = painted
+        .iter()
+        .find(|(text, ..)| text == "Write something")
+        .unwrap()
+        .1;
+    assert!(
+        hint.left() >= marker.right(),
+        "{hint:?} overlaps {marker:?}"
+    );
+
+    let mut editor = Editor::default();
+    editor
+        .set_paragraph_kind(ParagraphKind::Heading { level: 1 })
+        .unwrap();
+    let painted = shapes(&mut editor);
+    let row = |text: &str| {
+        painted
+            .iter()
+            .find(|(painted, ..)| painted == text)
+            .unwrap()
+            .2
+            .rows[0]
+            .rect()
+            .height()
+    };
+    assert_eq!(row("Write something"), row(""));
+}
+
+#[test]
+fn double_and_triple_clicks_select_the_word_and_paragraph_on_release() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("first second third\nnext");
+    let (_, widget) = widget_frame(&context, &mut editor, vec![], Some(0.0), false, unchanged);
+    let point = caret_point(&context, widget.response.rect, &editor, Position::new(0, 8));
+    let mut time = 0.1;
+    let mut click = |editor: &mut Editor| {
+        for pressed in [true, false] {
+            widget_frame(
+                &context,
+                editor,
+                vec![
+                    Event::PointerMoved(point),
+                    primary(point, pressed, Modifiers::NONE),
+                ],
+                Some(time),
+                false,
+                unchanged,
+            );
+            time += 0.05;
+        }
+        editor.selected_text()
+    };
+    assert_eq!(click(&mut editor), "");
+    assert_eq!(editor.selection(), Selection::caret(Position::new(0, 8)));
+    assert_eq!(click(&mut editor), "second");
+    assert_eq!(click(&mut editor), "first second third");
+}
+
+#[test]
+fn shift_enter_starts_a_new_row_inside_the_paragraph() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut editor = Editor::from_text("");
+    frame(&context, &mut editor, vec![], true);
+    let output = frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Text("ab".into()),
+            key(Key::Enter, Modifiers::SHIFT),
+            Event::Text("cd".into()),
+        ],
+        true,
+    );
+    assert!(output.platform_output.events.iter().any(|event| {
+        matches!(event, egui::output::OutputEvent::TextSelectionChanged(info)
+                if info.current_text_value.as_deref() == Some("ab\ncd")
+                && info.text_selection == Some(CharIndex(5)..CharIndex(5)))
+    }));
+    assert_eq!(editor.document().paragraphs().len(), 1);
+    assert_eq!(
+        editor.document().paragraph(0).unwrap().text(),
+        "ab\u{2028}cd"
+    );
+    assert_eq!(editor.selection(), Selection::caret(Position::new(0, 7)));
+    assert_eq!(editor.undo_len(), 1);
+    for (key_press, expected) in [
+        (key(Key::Home, Modifiers::NONE), 5),
+        (key(Key::ArrowUp, Modifiers::NONE), 0),
+        (key(Key::End, Modifiers::NONE), 2),
+        (key(Key::ArrowRight, Modifiers::NONE), 5),
+        (key(Key::ArrowLeft, Modifiers::NONE), 2),
+        (key(Key::Home, Modifiers::NONE), 0),
+        (key(Key::ArrowDown, Modifiers::NONE), 5),
+        (key(Key::End, Modifiers::SHIFT), 7),
+    ] {
+        frame(&context, &mut editor, vec![key_press.clone()], true);
+        assert_eq!(
+            editor.selection().focus,
+            Position::new(0, expected),
+            "{key_press:?}"
+        );
+    }
+    assert_eq!(editor.selected_text(), "cd");
+
+    frame_options(
+        &context,
+        &mut editor,
+        vec![key(Key::Enter, Modifiers::SHIFT)],
+        true,
+        true,
+    );
+    assert_eq!(
+        editor.document().paragraph(0).unwrap().text(),
+        "ab\u{2028}cd"
+    );
+    assert!(context.input(|input| input.events.is_empty()));
+}
+
+#[test]
+fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
+    let context = egui::Context::default();
+    let editor = Editor::from_text("ab\u{2028}cd\u{2028}\u{2028}e\nnext");
+    let mut cache = Cache::default();
+    let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance());
+    let layout = layouts.get(0).unwrap();
+    let galley = &layout.galley;
+    assert_eq!(galley.job.text, "ab\ncd\n\ne");
+    assert_eq!(galley.end().index.0, 8);
+    assert_eq!(galley.rows.len(), 4);
+    assert!(galley.rows[..3].iter().all(|row| row.ends_with_newline));
+    let caret = |byte, prefer_next_row| {
+        document_caret_rect(
+            editor.document(),
+            &layouts,
+            Pos2::ZERO,
+            Position::new(0, byte),
+            prefer_next_row,
+        )
+    };
+    let row_top = |row: usize| layout.rect.top() + galley.rows[row].min_y();
+    for prefer_next_row in [false, true] {
+        let before = caret(2, prefer_next_row);
+        assert_eq!(before.top(), row_top(0));
+        assert_eq!(
+            before.left(),
+            layout.rect.left() + galley.rows[0].rect().right()
+        );
+        assert_eq!(caret(5, prefer_next_row).top(), row_top(1));
+        assert_eq!(caret(10, prefer_next_row).top(), row_top(2));
+        assert_eq!(caret(13, prefer_next_row).top(), row_top(3));
+    }
+    let point = |row: usize, x: f32| {
+        let row = &galley.rows[row];
+        layout.rect.min.to_vec2() + Vec2::new(x, row.rect().center().y)
+    };
+    let past = galley.rows[0].rect().right() + 20.0;
+    assert_eq!(
+        hit_test(&editor, &layouts, point(0, past)),
+        (Position::new(0, 2), false)
+    );
+    assert_eq!(
+        hit_test(&editor, &layouts, point(2, past)).0,
+        Position::new(0, 10)
+    );
+    assert_eq!(
+        hit_test(&editor, &layouts, point(1, 0.0)).0,
+        Position::new(0, 5)
+    );
+}
+
+#[test]
+fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
+    let context = egui::Context::default();
+    let editor = Editor::from_text("ab\u{2028}cd\u{2028}\u{2028}e");
+    let mut cache = Cache::default();
+    let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance());
+    let rows = &layouts.get(0).unwrap().galley.rows;
+    let origin = Pos2::new(10.0, 10.0);
+    let color = Color32::from_rgb(4, 5, 6);
+    let range = |start, end| Position::new(0, start)..Position::new(0, end);
+    let rectangles = |selection: Option<Selection>, highlights: &[Range<Position>]| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            paint_document(
+                ui.painter(),
+                editor.document(),
+                &layouts,
+                origin,
+                &[(highlights, color)],
+                selection.map(|selection| (selection, color)),
+                Color32::WHITE,
+                Color32::GRAY,
+            );
+        });
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::epaint::Shape::Rect(rectangle) if rectangle.fill == color => {
+                    Some(rectangle.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let all = rectangles(
+        Some(Selection::new(Position::default(), editor.document().end())),
+        &[],
+    );
+    assert_eq!(all.len(), 4);
+    for (index, (rect, row)) in all.iter().zip(rows).enumerate() {
+        let extension = if index < 3 { 5.0 } else { 0.0 };
+        assert_eq!(rect.top(), origin.y + row.rect().top());
+        assert_eq!(rect.right(), origin.x + row.rect().right() + extension);
+    }
+    assert_eq!(rectangles(None, &[range(0, 14)]), all);
+    let second = rectangles(
+        Some(Selection::new(Position::new(0, 5), Position::new(0, 7))),
+        &[],
+    );
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].right(), origin.x + rows[1].rect().right());
+    let only = rectangles(None, &[range(2, 5)]);
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0].left(), origin.x + rows[0].rect().right());
+    assert_eq!(only[0].width(), 5.0);
+}
+
+#[test]
+fn ime_preview_lays_out_soft_line_breaks_in_its_preedit() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("a\u{2028}b");
+    editor
+        .set_selection(Selection::caret(Position::new(0, 4)))
+        .unwrap();
+    editor.update_composition("x\u{2028}y", Some(4..4)).unwrap();
+    let mut cache = Cache::default();
+    let layouts = cached_preview_frame(&context, &mut cache, &editor, &appearance());
+    let layout = layouts.get(0).unwrap();
+    assert_eq!(layout.galley.job.text, "a\nx\nyb");
+    assert_eq!(layout.galley.rows.len(), 3);
+    let preview = cache.preview.as_ref().unwrap();
+    assert_eq!(preview.document.paragraphs().len(), 1);
+    assert_eq!(preview.caret, Position::new(0, 8));
+    let caret = document_caret_rect(&preview.document, &layouts, Pos2::ZERO, preview.caret, true);
+    assert_eq!(
+        caret.top(),
+        layout.rect.top() + layout.galley.rows[2].min_y()
+    );
+    assert_eq!(editor.document().paragraph(0).unwrap().text(), "a\u{2028}b");
+}
+
+fn link_frame(
+    context: &egui::Context,
+    editor: &mut Editor,
+    events: Vec<Event>,
+    time: f64,
+    modifiers: Modifiers,
+    read_only: bool,
+) -> (egui::FullOutput, RichTextEditorOutput) {
+    let id = Id::new(WIDGET_ID);
+    let mut widget = None;
+    let mut events = events;
+    if context.input(|input| input.modifiers) != modifiers {
+        events.insert(0, Event::ModifiersChanged(modifiers));
+    }
+    let mut output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+            events,
+            time: Some(time),
+            ..Default::default()
+        },
+        |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let output = RichTextEditor::new(editor)
+                    .id(id)
+                    .read_only(read_only)
+                    .show(ui);
+                assert!(output.errors.is_empty(), "{:?}", output.errors);
+                widget = Some(output);
+            });
+        },
+    );
+    output.textures_delta.clear();
+    (output, widget.expect("widget shown"))
+}
+
+fn linked_widget_editor() -> (Editor, Link) {
+    let link = Link::new("https://example.com/docs").unwrap();
+    let mut editor = Editor::from_text("Visit example now");
+    editor
+        .set_selection(Selection::new(Position::new(0, 6), Position::new(0, 13)))
+        .unwrap();
+    editor.set_link(Some(link.clone())).unwrap();
+    editor.set_selection(Selection::default()).unwrap();
+    (editor, link)
+}
+
+#[test]
+fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
+    let context = egui::Context::default();
+    let (mut editor, link) = linked_widget_editor();
+    let (_, widget) = link_frame(&context, &mut editor, vec![], 0.0, Modifiers::NONE, false);
+    let rect = widget.response.rect;
+    let on_link = caret_point(&context, rect, &editor, Position::new(0, 8));
+    let off_link = caret_point(&context, rect, &editor, Position::new(0, 2));
+
+    let mut tooltip = false;
+    for (index, modifiers, cursor) in [
+        (0, Modifiers::NONE, egui::CursorIcon::Text),
+        (1, Modifiers::COMMAND, egui::CursorIcon::PointingHand),
+        (2, Modifiers::COMMAND, egui::CursorIcon::PointingHand),
+    ] {
+        let events = if index == 0 {
+            vec![Event::PointerMoved(on_link)]
+        } else {
+            Vec::new()
+        };
+        let (output, widget) = link_frame(
+            &context,
+            &mut editor,
+            events,
+            1.0 + f64::from(index),
+            modifiers,
+            false,
+        );
+        assert_eq!(output.platform_output.cursor_icon, cursor, "{index}");
+        assert_eq!(widget.clicked_link, None);
+        tooltip |= output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                if text.galley.job.text == link.as_str())
+        });
+    }
+    assert!(tooltip, "hovering a link shows its target");
+    let (output, _) = link_frame(
+        &context,
+        &mut editor,
+        vec![Event::PointerMoved(off_link)],
+        4.0,
+        Modifiers::COMMAND,
+        false,
+    );
+    assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Text);
+
+    let selection = editor.selection();
+    let (_, pressed) = link_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::PointerMoved(on_link),
+            primary(on_link, true, Modifiers::COMMAND),
+        ],
+        5.0,
+        Modifiers::COMMAND,
+        false,
+    );
+    assert_eq!(pressed.clicked_link, None);
+    assert_eq!(editor.selection(), selection);
+    let (_, released) = link_frame(
+        &context,
+        &mut editor,
+        vec![primary(on_link, false, Modifiers::COMMAND)],
+        5.05,
+        Modifiers::COMMAND,
+        false,
+    );
+    assert_eq!(released.clicked_link, Some(link.clone()));
+    assert_eq!(editor.selection(), selection);
+    assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+
+    for (time, point, modifiers, caret) in [
+        (7.0, on_link, Modifiers::NONE, 8),
+        (9.0, off_link, Modifiers::COMMAND, 2),
+    ] {
+        for (offset, pressed) in [(0.0, true), (0.05, false)] {
+            let (_, widget) = link_frame(
+                &context,
+                &mut editor,
+                vec![
+                    Event::PointerMoved(point),
+                    primary(point, pressed, modifiers),
+                ],
+                time + offset,
+                modifiers,
+                false,
+            );
+            assert_eq!(widget.clicked_link, None);
+        }
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, caret))
+        );
+    }
+
+    let end = caret_point(&context, rect, &editor, Position::new(0, 17));
+    for (index, events) in [
+        vec![
+            Event::PointerMoved(on_link),
+            primary(on_link, true, Modifiers::COMMAND),
+        ],
+        vec![Event::PointerMoved(on_link + Vec2::new(12.0, 0.0))],
+        vec![Event::PointerMoved(end)],
+        vec![primary(end, false, Modifiers::COMMAND)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, widget) = link_frame(
+            &context,
+            &mut editor,
+            events,
+            11.0 + index as f64 * 0.05,
+            Modifiers::COMMAND,
+            false,
+        );
+        assert_eq!(widget.clicked_link, None);
+    }
+    assert_eq!(
+        editor.selection(),
+        Selection::new(Position::new(0, 8), Position::new(0, 17))
+    );
+}
+
+#[test]
+fn read_only_clicks_and_accessibility_clicks_follow_links() {
+    use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+    let context = egui::Context::default();
+    let (mut editor, link) = linked_widget_editor();
+    let (_, widget) = link_frame(&context, &mut editor, vec![], 0.0, Modifiers::NONE, true);
+    let on_link = caret_point(
+        &context,
+        widget.response.rect,
+        &editor,
+        Position::new(0, 10),
+    );
+    let (output, _) = link_frame(
+        &context,
+        &mut editor,
+        vec![Event::PointerMoved(on_link)],
+        1.0,
+        Modifiers::NONE,
+        true,
+    );
+    assert_eq!(
+        output.platform_output.cursor_icon,
+        egui::CursorIcon::PointingHand
+    );
+    let selection = editor.selection();
+    let mut clicked = Vec::new();
+    for (time, pressed) in [(2.0, true), (2.05, false)] {
+        let (_, widget) = link_frame(
+            &context,
+            &mut editor,
+            vec![primary(on_link, pressed, Modifiers::NONE)],
+            time,
+            Modifiers::NONE,
+            true,
+        );
+        clicked.push(widget.clicked_link);
+    }
+    assert_eq!(clicked, [None, Some(link.clone())]);
+    assert_eq!(editor.selection(), selection);
+
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    for read_only in [false, true] {
+        let (mut output, _) = link_frame(
+            &context,
+            &mut editor,
+            vec![],
+            3.0,
+            Modifiers::NONE,
+            read_only,
+        );
+        let update = output.platform_output.accesskit_update.take().unwrap();
+        let (node_id, _) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Link)
+            .expect("link node");
+        let request = ActionRequest {
+            action: Action::Click,
+            target_node: *node_id,
+            target_tree: TreeId::ROOT,
+            data: None,
+        };
+        let revision = editor.document().revision();
+        let (_, widget) = link_frame(
+            &context,
+            &mut editor,
+            vec![Event::AccessKitActionRequest(request)],
+            3.1,
+            Modifiers::NONE,
+            read_only,
+        );
+        assert_eq!(widget.clicked_link, Some(link.clone()));
+        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(editor.selection(), selection);
+        assert!(context.input(|input| input.events.is_empty()));
+    }
+}
+
+#[test]
+fn clicks_pressed_and_released_in_one_frame_follow_links_and_place_the_caret() {
+    for (modifiers, read_only, byte, follows) in [
+        (Modifiers::COMMAND, false, 8, true),
+        (Modifiers::NONE, true, 8, true),
+        (Modifiers::NONE, false, 8, false),
+        (Modifiers::COMMAND, false, 2, false),
+    ] {
+        let context = egui::Context::default();
+        let (mut editor, link) = linked_widget_editor();
+        let (_, widget) = link_frame(&context, &mut editor, vec![], 0.0, modifiers, read_only);
+        let point = caret_point(
+            &context,
+            widget.response.rect,
+            &editor,
+            Position::new(0, byte),
+        );
+        let (_, widget) = link_frame(
+            &context,
+            &mut editor,
+            vec![
+                Event::PointerMoved(point),
+                primary(point, true, modifiers),
+                primary(point, false, modifiers),
+            ],
+            1.0,
+            modifiers,
+            read_only,
+        );
+        let case = format!("{modifiers:?} read_only={read_only} byte={byte}");
+        if follows {
+            assert_eq!(widget.clicked_link, Some(link), "{case}");
+            assert_eq!(editor.selection(), Selection::default(), "{case}");
+        } else {
+            assert_eq!(widget.clicked_link, None, "{case}");
+            assert_eq!(
+                editor.selection(),
+                Selection::caret(Position::new(0, byte)),
+                "{case}"
+            );
+        }
+        let (_, next) = link_frame(&context, &mut editor, vec![], 1.1, modifiers, read_only);
+        assert_eq!(next.clicked_link, None, "{case}");
+    }
+
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc def");
+    let rect = composing_frame(&context, &mut editor, "ni");
+    let point = caret_point(&context, rect, &editor, Position::new(0, "niabc ".len()));
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::PointerMoved(point),
+            primary(point, true, Modifiers::NONE),
+            primary(point, false, Modifiers::NONE),
+        ],
+        Some(0.2),
+        true,
+        unchanged,
+    );
+    assert_eq!(editor.document().plain_text(), "niabc def");
+    assert!(editor.composition().is_none());
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(Position::new(0, "niabc ".len()))
+    );
+}
+
+#[test]
+fn quote_bars_paint_beside_quotes_whose_indent_pointer_and_caret_follow() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("intro\none\ntwo words\nbody\nthree");
+    for paragraphs in [1..3, 4..5] {
+        editor
+            .set_selection(Selection::new(
+                Position::new(paragraphs.start, 0),
+                Position::new(paragraphs.end - 1, 1),
+            ))
+            .unwrap();
+        editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+    }
+    let (output, widget) = widget_frame(&context, &mut editor, vec![], Some(0.0), true, unchanged);
+    let origin = widget.response.rect.min + Vec2::splat(PADDING);
+    let layouts = widget_cache(&context).layout.layouts;
+    let rect = |index| layouts.get(index).unwrap().rect.translate(origin.to_vec2());
+    let quote_color = context.global_style().visuals.weak_text_color();
+    let bars: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::epaint::Shape::Rect(shape)
+                if shape.fill == quote_color && shape.rect.width() < PADDING =>
+            {
+                Some(shape.rect)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bars.len(), 2, "{bars:?}");
+    assert_eq!(bars[0].top(), rect(1).top());
+    assert_eq!(bars[0].bottom(), rect(2).bottom());
+    assert_eq!(bars[1].y_range(), rect(4).y_range());
+    for bar in &bars {
+        assert!(bar.left() > origin.x && bar.right() < rect(1).left());
+    }
+    assert!(rect(1).left() > rect(0).left());
+    assert_eq!(rect(3).left(), rect(0).left());
+
+    let mut time = 0.1;
+    let mut click = |editor: &mut Editor, point: Pos2| {
+        let mut caret = Rect::NOTHING;
+        for pressed in [true, false] {
+            let (_, widget) = widget_frame(
+                &context,
+                editor,
+                vec![
+                    Event::PointerMoved(point),
+                    primary(point, pressed, Modifiers::NONE),
+                ],
+                Some(time),
+                true,
+                unchanged,
+            );
+            caret = widget.caret_rect;
+            time += 1.0;
+        }
+        caret
+    };
+    let caret = click(&mut editor, Pos2::new(origin.x + 1.0, rect(2).center().y));
+    assert_eq!(editor.selection(), Selection::caret(Position::new(2, 0)));
+    assert_eq!(caret.left(), rect(2).left());
+    let point = caret_point(&context, widget.response.rect, &editor, Position::new(2, 4));
+    let caret = click(&mut editor, point);
+    assert_eq!(editor.selection(), Selection::caret(Position::new(2, 4)));
+    assert!(caret.left() > rect(2).left());
+
+    let text_left = rect(1).left();
+    editor
+        .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 3)))
+        .unwrap();
+    let selection_color = context.global_style().visuals.selection.bg_fill;
+    let (output, _) = widget_frame(&context, &mut editor, vec![], Some(time), true, unchanged);
+    let selected: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::epaint::Shape::Rect(shape) if shape.fill == selection_color => Some(shape.rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert!(selected.iter().all(|selected| selected.left() == text_left));
+}
+
+#[test]
+fn enter_and_backspace_leave_quotes_in_the_widget() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("quoted");
+    editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+    editor
+        .set_selection(Selection::caret(editor.document().end()))
+        .unwrap();
+    frame(&context, &mut editor, vec![], true);
+    let kinds = |editor: &Editor| -> Vec<_> {
+        editor
+            .document()
+            .paragraphs()
+            .iter()
+            .map(|paragraph| paragraph.kind())
+            .collect()
+    };
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Enter, Modifiers::NONE)],
+        true,
+    );
+    assert_eq!(kinds(&editor), [ParagraphKind::Quote; 2]);
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Enter, Modifiers::NONE)],
+        true,
+    );
+    assert_eq!(kinds(&editor), [ParagraphKind::Quote, ParagraphKind::Body]);
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Text("x".into()),
+            key(Key::ArrowLeft, Modifiers::NONE),
+        ],
+        true,
+    );
+    editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Backspace, Modifiers::NONE)],
+        true,
+    );
+    assert_eq!(kinds(&editor), [ParagraphKind::Quote, ParagraphKind::Body]);
+    assert_eq!(editor.document().plain_text(), "quoted\nx");
+    editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+    frame(&context, &mut editor, vec![], true);
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::Tab, Modifiers::NONE)],
+        true,
+    );
+    assert_eq!(kinds(&editor), [ParagraphKind::Quote; 2]);
+    assert_eq!(editor.document().plain_text(), "quoted\nx");
 }

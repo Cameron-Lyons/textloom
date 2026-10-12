@@ -12,6 +12,12 @@ cargo bench --locked --bench editing
 cargo bench --locked --features egui --bench rendering
 ```
 
+Setting `TEXTLOOM_BENCH_QUICK=1` divides every timed loop's iteration count by
+10, keeping at least two iterations, so smoke runs finish quickly;
+`scripts/check-release.sh` and CI use it. Recorded results come from full runs
+without it. Sections below are tied to the runs they describe; later changes are
+summarized in [Changes since the recorded runs](#changes-since-the-recorded-runs).
+
 ## egui frames
 
 The same `benches/rendering.rs` harness was run against baseline commit
@@ -726,3 +732,56 @@ allocations/content identity, and undo/redo. Editor checks preserve directional
 selections and redo through unchanged commands, and update typing style when
 only paragraph breaks are selected. Automated release checks cover all feature
 combinations and the extracted Cargo package.
+
+## Changes since the recorded runs
+
+A later improvement pass changed several measured paths after the October 9
+runs above, whose numbers were not re-recorded. The workloads below were
+measured during that pass, outside the controlled alternating
+baseline/current comparisons used above; the machine, run counts, and
+background load were not recorded with them. Treat them as magnitudes, not
+comparable medians. The two idle-frame rows correspond to the rendering
+harness's idle workloads, where other harness rows stayed roughly unchanged;
+the remaining rows used workloads that the harnesses do not include.
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| 10,000 paragraphs, idle frame | 7.6 µs | 11.0 µs |
+| Idle frame with a long preedit | 6.7 µs | 20 µs |
+| Mixed-style typing in a 460 KB Unicode paragraph, per keystroke | about 5.5 ms | about 20 µs |
+| Enter + undo at the end of a huge paragraph | 5.1 ms | 0.3 µs |
+| `Paragraph::scalar_count()`, 2.4 MB of CJK text | 2.4 ms | 0.14 ms |
+| Retained history per Enter, 10,000-item list | 2.0 MB | 0.64 MB |
+| Direct AccessKit update after Enter, 100,000 paragraphs | 26.5 ms | 0.27 ms |
+| Egui accessibility geometry, 40,000 characters | 68.5 ms | 3.5 ms |
+| Egui accessibility after Enter at the top, 2,000 paragraphs | 34 ms | 0.78 ms |
+| Egui relayout after Enter in a 10,000-item list | 4.2 ms | 2.9 ms |
+| Egui pass for another viewport or a hidden frame, 2,000 paragraphs | up to about 294 ms | no relayout |
+
+Idle frames became slower because each frame now requests the visible galleys
+again, so a font-atlas rebuild cannot leave stale texture coordinates; idle
+validation therefore grows with the visible paragraphs instead of taking
+constant time. In
+exchange, other viewports' passes and frames that hide the widget no longer
+relay out the document. Direct AccessKit structural edits rebuild only the
+replaced paragraphs, and egui accessibility keeps paragraph node IDs across
+structural edits and reuses runs of renumbered list items. Span normalization
+checks run boundaries locally instead of segmenting a long mixed-style
+paragraph, Enter at a paragraph end keeps the existing paragraph, scalar
+counting no longer builds an index, and history charges each change's larger
+side once.
+
+One trade-off was noted without a harness row: long non-ASCII paragraphs now pay
+Unicode word segmentation for accessibility word starts, about twice the
+previous per-keystroke accessibility cost at 10–200 KB; ASCII paragraphs skip it.
+
+A subsequent feature pass added computed list numbering, fill colors, soft line
+breaks, hyperlinks, and block quotes without re-running the harnesses. Ordered
+items now store only optional explicit starts, so list edits no longer rewrite
+the following items: displayed numbers are computed in one pass after a change
+to paragraph kinds or count, then cached, and egui rebuilds only markers whose
+number changed. The two 10,000-item list rows above predate this model. With
+links supported, typing measured during that pass took about 4–5 µs per
+keystroke in a paragraph with 1,000 style runs and 76–95 µs with 20,000 runs,
+the magnitude measured before links were added; these figures carry the same
+caveats as the table above.

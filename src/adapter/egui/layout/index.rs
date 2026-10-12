@@ -25,10 +25,8 @@ impl Entry {
                 galley: cache.galley.clone(),
                 rect,
                 marker: cache.marker.clone(),
-                marker_position: egui::Pos2::new(
-                    cache.indent - cache.marker.as_ref().map_or(0.0, |m| m.size().x) - 8.0,
-                    0.0,
-                ),
+                marker_position: egui::Pos2::new(cache.marker_x, 0.0),
+                quote_bar: cache.quote_bar,
             },
             height: f64::from(cache.galley.size().y + PARAGRAPH_GAP),
             chars: cache.chars + 1,
@@ -40,6 +38,7 @@ impl Entry {
         let offset = egui::vec2(0.0, y as f32);
         layout.rect = layout.rect.translate(offset);
         layout.marker_position += offset;
+        layout.quote_bar = layout.quote_bar.map(|bar| bar.translate(offset));
         layout
     }
 
@@ -50,6 +49,7 @@ impl Entry {
             rect: self.layout.rect.translate(offset),
             marker: self.layout.marker.as_ref(),
             marker_position: self.layout.marker_position + offset,
+            quote_bar: self.layout.quote_bar.map(|bar| bar.translate(offset)),
         }
     }
 }
@@ -67,12 +67,12 @@ struct Node {
     lists: usize,
     depth: u16,
     tail_height: f64,
-    tail_top: f32,
     tail_bottom: f32,
 }
 
 fn leaf(entries: Vec<Entry>) -> Arc<Node> {
     debug_assert!(!entries.is_empty() && entries.len() <= LEAF_CAPACITY);
+    debug_assert!(entries.iter().all(|entry| entry.layout.rect.top() == 0.0));
     let tail = entries.last().expect("nonempty layout leaf");
     Arc::new(Node {
         len: entries.len(),
@@ -84,7 +84,6 @@ fn leaf(entries: Vec<Entry>) -> Arc<Node> {
             .count(),
         depth: 1,
         tail_height: tail.height,
-        tail_top: tail.layout.rect.top(),
         tail_bottom: tail.layout.rect.bottom(),
         children: Children::Leaf(entries.into_boxed_slice()),
     })
@@ -98,7 +97,6 @@ fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
         lists: left.lists + right.lists,
         depth: left.depth.max(right.depth) + 1,
         tail_height: right.tail_height,
-        tail_top: right.tail_top,
         tail_bottom: right.tail_bottom,
         children: Children::Branch(left, right),
     })
@@ -358,13 +356,7 @@ impl ParagraphLayouts {
             match &node.children {
                 Children::Branch(left, right) => {
                     let last_y = (offset + left.height - left.tail_height) as f32;
-                    let edge = last_y
-                        + if bottom {
-                            left.tail_bottom
-                        } else {
-                            left.tail_top
-                        }
-                        + extra;
+                    let edge = last_y + if bottom { left.tail_bottom } else { 0.0 } + extra;
                     if before(edge) {
                         index += left.len;
                         offset += left.height;
@@ -379,7 +371,7 @@ impl ParagraphLayouts {
                             + if bottom {
                                 entry.layout.rect.bottom()
                             } else {
-                                entry.layout.rect.top()
+                                0.0
                             }
                             + extra;
                         if !before(edge) {
@@ -448,17 +440,10 @@ impl ParagraphLayouts {
         self.prefix(range.end, true) > self.prefix(range.start, true)
     }
 
-    pub(super) fn rebuild(&mut self, paragraphs: &[ParagraphCache], environment_changed: bool) {
-        let environment = if environment_changed {
-            Arc::new(())
-        } else {
-            self.version
-                .as_ref()
-                .map_or_else(|| Arc::new(()), |version| version.environment.clone())
-        };
+    pub(super) fn rebuild(&mut self, paragraphs: &[ParagraphCache]) {
         self.version = Some(Arc::new(LayoutVersion {
             root: build(paragraphs.iter().map(Entry::from_cache)),
-            environment,
+            environment: Arc::new(()),
         }));
     }
 
@@ -494,10 +479,12 @@ impl ParagraphLayouts {
         self.publish_root(concat(concat(before, replacement), after));
     }
 
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = ParagraphLayout> + '_ {
         self.iter_range(0..self.len())
     }
 
+    #[cfg(test)]
     pub(crate) fn iter_range(
         &self,
         range: Range<usize>,
@@ -550,14 +537,16 @@ impl ParagraphLayouts {
 
     #[cfg(test)]
     pub(crate) fn from_test_layouts(layouts: Vec<ParagraphLayout>) -> Self {
-        let mut y = 0.0;
         let entries: Vec<_> = layouts
             .into_iter()
             .map(|mut layout| {
                 let height = f64::from(layout.galley.size().y + PARAGRAPH_GAP);
-                layout.rect = layout.rect.translate(egui::vec2(0.0, -(y as f32)));
-                layout.marker_position.y -= y as f32;
-                y += height;
+                let top = layout.rect.top();
+                layout.rect = layout.rect.translate(egui::vec2(0.0, -top));
+                layout.marker_position.y -= top;
+                layout.quote_bar = layout
+                    .quote_bar
+                    .map(|bar| bar.translate(egui::vec2(0.0, -top)));
                 Entry {
                     chars: layout.galley.end().index.0 + 1,
                     layout,

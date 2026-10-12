@@ -10,7 +10,7 @@ use std::{
 
 use eframe::egui;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use textloom::{Fragment, ParagraphKind};
+use textloom::{DecodeLimits, Fragment, ParagraphKind};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -25,10 +25,31 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
+pub const SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+));
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+mod platform {
+    use super::NativeItem;
+
+    const UNSUPPORTED: &str = "Native rich clipboard is not supported on this platform";
+
+    pub(super) fn publish(_item: &NativeItem, _owner: usize) -> Result<(), String> {
+        Err(UNSUPPORTED.into())
+    }
+
+    pub(super) fn read() -> Result<Option<NativeItem>, String> {
+        Err(UNSUPPORTED.into())
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub const MIME: &str = "application/x-textloom-fragment";
-pub const MAX_NATIVE_BYTES: usize = 64 * 1024 * 1024 + 32;
-const MAX_TLFR_BYTES: usize = 64 * 1024 * 1024;
+const TLFR_LIMITS: DecodeLimits = DecodeLimits::DEFAULT;
+pub const MAX_NATIVE_BYTES: usize = TLFR_LIMITS.max_bytes + ENVELOPE_SIZE;
 const ENVELOPE: &[u8; 8] = b"TLCL\x01\0\0\0";
 const ENVELOPE_SIZE: usize = 32;
 static PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -42,27 +63,36 @@ pub struct NativeItem {
     pub rich: Vec<u8>,
 }
 
+fn encoded_size(fragment: &Fragment) -> (usize, usize) {
+    let mut size = 13usize;
+    let mut spans = 0usize;
+    for paragraph in fragment.paragraphs() {
+        let kind = match paragraph.kind() {
+            ParagraphKind::Body | ParagraphKind::Quote => 1,
+            ParagraphKind::Heading { .. }
+            | ParagraphKind::Bullet { .. }
+            | ParagraphKind::Ordered { start: None, .. } => 2,
+            _ => 6,
+        };
+        size = size.saturating_add(kind + 16 + paragraph.text().len());
+        spans = spans.saturating_add(paragraph.spans().len());
+        for span in paragraph.spans() {
+            let colors = usize::from(span.style.foreground.is_some())
+                + usize::from(span.style.background.is_some());
+            let link = span.link.as_ref().map_or(0, |link| 8 + link.as_str().len());
+            size = size.saturating_add(9 + colors * 4).saturating_add(link);
+        }
+    }
+    (size, spans)
+}
+
 impl NativeItem {
     fn from_fragment(fragment: &Fragment) -> Result<Self, String> {
-        let mut encoded_size = 13usize;
-        let mut spans = 0usize;
-        if fragment.paragraphs().len() > 1_000_000 {
+        if fragment.paragraphs().len() > TLFR_LIMITS.max_paragraphs {
             return Err("Clipboard fragment exceeds the paragraph limit".into());
         }
-        for paragraph in fragment.paragraphs() {
-            let kind = match paragraph.kind() {
-                ParagraphKind::Body => 1,
-                ParagraphKind::Heading { .. } | ParagraphKind::Bullet { .. } => 2,
-                ParagraphKind::Ordered { .. } => 6,
-            };
-            encoded_size = encoded_size.saturating_add(kind + 16 + paragraph.text().len());
-            spans = spans.saturating_add(paragraph.spans().len());
-            for span in paragraph.spans() {
-                encoded_size = encoded_size
-                    .saturating_add(9 + usize::from(span.style.foreground.is_some()) * 4);
-            }
-        }
-        if encoded_size > MAX_TLFR_BYTES || spans > 1_000_000 {
+        let (encoded_size, spans) = encoded_size(fragment);
+        if encoded_size > TLFR_LIMITS.max_bytes || spans > TLFR_LIMITS.max_spans {
             return Err("Clipboard fragment exceeds the native transport limit".into());
         }
         let plain = fragment.plain_text();
@@ -100,7 +130,7 @@ impl NativeItem {
             .ok_or("Clipboard fragment envelope was truncated")?;
         let length = usize::try_from(u64::from_le_bytes(length_bytes))
             .ok()
-            .filter(|length| *length <= MAX_TLFR_BYTES)
+            .filter(|length| *length <= TLFR_LIMITS.max_bytes)
             .ok_or("Clipboard fragment exceeds the native transport limit")?;
         self.rich
             .get(..ENVELOPE_SIZE + length)
@@ -109,8 +139,8 @@ impl NativeItem {
 
     fn fragment(&self) -> Result<Fragment, String> {
         let payload = &self.envelope()?[ENVELOPE_SIZE..];
-        let fragment =
-            Fragment::from_bytes(payload).map_err(|_| "Clipboard fragment payload was rejected")?;
+        let fragment = Fragment::from_bytes_with_limits(payload, TLFR_LIMITS)
+            .map_err(|_| "Clipboard fragment payload was rejected")?;
         if fragment.plain_text() != normalize_text(&self.plain) {
             return Err("Clipboard representations do not describe the same text".into());
         }
@@ -316,6 +346,8 @@ impl NativeClipboard {
         if let Some(backend) = self.backend {
             command.env("TEXTLOOM_CLIPBOARD_BACKEND", backend);
         }
+        #[cfg(target_os = "linux")]
+        command.env(linux::PARENT_VARIABLE, std::process::id().to_string());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -421,13 +453,14 @@ impl NativeClipboard {
                 bold: Some(true),
                 italic: Some(true),
                 foreground: Some(Some(textloom::Color([42, 100, 200, 255]))),
+                background: Some(Some(textloom::Color::YELLOW)),
                 ..Default::default()
             })
             .map_err(|_| "Clipboard fixture formatting failed")?;
         editor
             .set_paragraph_kind(ParagraphKind::Ordered {
                 indent: 1,
-                start: 4,
+                start: Some(4),
             })
             .map_err(|_| "Clipboard fixture paragraph formatting failed")?;
         let fragment = editor.selected_fragment();
@@ -503,6 +536,8 @@ pub fn helper(arguments: &[OsString]) -> Option<Result<(), String>> {
         return None;
     }
     Some((|| {
+        #[cfg(target_os = "linux")]
+        linux::exit_with_parent()?;
         if operation == "--native-clipboard-copy" {
             let owner = arguments
                 .get(1)
@@ -546,6 +581,65 @@ mod tests {
 
     fn item() -> NativeItem {
         NativeItem::from_fragment(&Fragment::from_text("café 日本語👩🏽‍💻\nsecond")).unwrap()
+    }
+
+    #[test]
+    fn size_preflight_matches_the_encoding_of_every_paragraph_kind() {
+        let mut editor = textloom::Editor::from_text("body\nheading\nbullet\nitem\nnext\nquote\n");
+        for (paragraph, kind) in [
+            (1, ParagraphKind::Heading { level: 2 }),
+            (5, ParagraphKind::Quote),
+            (2, ParagraphKind::Bullet { indent: 1 }),
+            (
+                3,
+                ParagraphKind::Ordered {
+                    indent: 0,
+                    start: Some(7),
+                },
+            ),
+            (
+                4,
+                ParagraphKind::Ordered {
+                    indent: 0,
+                    start: None,
+                },
+            ),
+        ] {
+            editor
+                .set_selection(textloom::Selection::caret(textloom::Position::new(
+                    paragraph, 0,
+                )))
+                .unwrap();
+            editor.set_paragraph_kind(kind).unwrap();
+        }
+        editor
+            .set_selection(textloom::Selection::new(
+                textloom::Position::new(0, 0),
+                textloom::Position::new(3, 2),
+            ))
+            .unwrap();
+        editor
+            .apply_style(textloom::StylePatch {
+                foreground: Some(Some(textloom::Color([1, 2, 3, 4]))),
+                ..Default::default()
+            })
+            .unwrap();
+        editor
+            .set_selection(textloom::Selection::new(
+                textloom::Position::new(1, 2),
+                textloom::Position::new(2, 3),
+            ))
+            .unwrap();
+        editor
+            .set_link(Some(textloom::Link::new("https://example.com/é").unwrap()))
+            .unwrap();
+        let fragment = Fragment::from_document(editor.document());
+        let spans = fragment
+            .paragraphs()
+            .iter()
+            .map(|paragraph| paragraph.spans().len())
+            .sum();
+        assert_eq!(encoded_size(&fragment), (fragment.to_bytes().len(), spans));
     }
 
     #[test]

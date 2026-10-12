@@ -1,24 +1,33 @@
 use std::{
+    fmt,
     ops::Range,
     sync::{Arc, OnceLock},
 };
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
-use crate::{Error, InlineStyle, ParagraphKind, StylePatch};
+use crate::{Error, InlineStyle, Link, ParagraphKind, StylePatch};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub range: Range<usize>,
     pub style: InlineStyle,
+    pub link: Option<Link>,
 }
 
-#[derive(Clone, Debug)]
+impl Span {
+    fn continues(&self, style: InlineStyle, link: Option<&Link>) -> bool {
+        self.style == style && self.link.as_ref() == link
+    }
+}
+
+#[derive(Clone)]
 pub struct Paragraph {
     pub(super) text: Arc<str>,
     pub(super) spans: Arc<[Span]>,
     pub(super) kind: ParagraphKind,
     pub(super) ascii: bool,
+    pub(super) linked: bool,
     pub(super) indices: OnceLock<Arc<TextIndices>>,
 }
 
@@ -37,7 +46,21 @@ impl PartialEq for Paragraph {
 
 impl Eq for Paragraph {}
 
+impl fmt::Debug for Paragraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Paragraph")
+            .field("text", &&*self.text)
+            .field("spans", &&*self.spans)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
 impl Paragraph {
+    pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
+        Self::from_parts(text, spans, kind)
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -161,23 +184,16 @@ impl Paragraph {
     }
 
     fn grapheme_context(&self, byte: usize) -> (&str, usize) {
-        const CONTEXT_BYTES: usize = 64;
-        let mut start = byte.saturating_sub(CONTEXT_BYTES);
-        let mut end = byte.saturating_add(CONTEXT_BYTES).min(self.text.len());
-        while !self.text.is_char_boundary(start) {
-            start += 1;
-        }
-        while !self.text.is_char_boundary(end) {
-            end -= 1;
-        }
-        (&self.text[start..end], start)
+        grapheme_context(&self.text, byte)
     }
 
     pub fn scalar_count(&self) -> usize {
         if self.ascii {
             self.text.len()
+        } else if let Some(scalars) = self.indices.get().and_then(|indices| indices.scalars.get()) {
+            scalars.len() - 1
         } else {
-            self.scalar_boundaries().len() - 1
+            self.text.chars().count()
         }
     }
 
@@ -246,6 +262,13 @@ impl Paragraph {
         self.indices.get()?.graphemes.get().map(Box::as_ref)
     }
 
+    #[cfg(all(test, feature = "egui"))]
+    pub(crate) fn has_scalar_index(&self) -> bool {
+        self.indices
+            .get()
+            .is_some_and(|indices| indices.scalars.get().is_some())
+    }
+
     fn scalar_boundaries(&self) -> &[usize] {
         self.text_indices().scalars.get_or_init(|| {
             self.text
@@ -257,12 +280,20 @@ impl Paragraph {
     }
 
     pub(super) fn word_ranges(&self) -> &[Range<usize>] {
-        self.text_indices().words.get_or_init(|| {
-            self.text
-                .unicode_word_indices()
-                .map(|(byte, word)| byte..byte + word.len())
-                .collect()
-        })
+        self.text_indices()
+            .words
+            .get_or_init(|| word_stops(&self.text).into())
+    }
+
+    #[cfg(any(feature = "egui", feature = "accesskit"))]
+    pub(crate) fn word_starts(&self) -> Vec<usize> {
+        match self.indices.get().and_then(|indices| indices.words.get()) {
+            Some(words) => words.iter().map(|word| word.start).collect(),
+            None => word_stops(&self.text)
+                .into_iter()
+                .map(|word| word.start)
+                .collect(),
+        }
     }
 
     pub(super) fn with_kind(&self, kind: ParagraphKind) -> Self {
@@ -271,11 +302,32 @@ impl Paragraph {
             spans: Arc::clone(&self.spans),
             kind,
             ascii: self.ascii,
-            indices: self.indices.clone(),
+            linked: self.linked,
+            indices: self.shared_indices(),
         }
     }
 
+    fn shared_indices(&self) -> OnceLock<Arc<TextIndices>> {
+        if !self.ascii {
+            self.text_indices();
+        }
+        self.indices.clone()
+    }
+
     pub(super) fn with_style(&self, range: Range<usize>, patch: StylePatch) -> Option<Self> {
+        self.with_runs(range, patch, None)
+    }
+
+    pub(super) fn with_link(&self, range: Range<usize>, link: Option<&Link>) -> Option<Self> {
+        self.with_runs(range, StylePatch::default(), Some(link))
+    }
+
+    fn with_runs(
+        &self,
+        range: Range<usize>,
+        patch: StylePatch,
+        link: Option<Option<&Link>>,
+    ) -> Option<Self> {
         if range.is_empty() {
             return None;
         }
@@ -285,32 +337,60 @@ impl Paragraph {
         let last = self
             .spans
             .partition_point(|span| span.range.start < range.end);
+        fn patched<'a>(
+            span: &'a Span,
+            patch: StylePatch,
+            link: Option<Option<&'a Link>>,
+        ) -> (InlineStyle, Option<&'a Link>) {
+            let mut style = span.style;
+            patch.apply(&mut style);
+            (style, link.unwrap_or(span.link.as_ref()))
+        }
+        let patched = |span| patched(span, patch, link);
         let first = first
             + self.spans[first..last].iter().position(|span| {
-                let mut style = span.style;
-                patch.apply(&mut style);
-                style != span.style
+                let (style, link) = patched(span);
+                !span.continues(style, link)
             })?;
         let mut spans = Vec::with_capacity(self.spans.len() + 2);
         spans.extend_from_slice(&self.spans[..first]);
         for span in &self.spans[first..last] {
             let overlap = span.range.start.max(range.start)..span.range.end.min(range.end);
-            push_span(&mut spans, span.range.start..overlap.start, span.style);
-            let mut style = span.style;
-            patch.apply(&mut style);
-            push_span(&mut spans, overlap.clone(), style);
-            push_span(&mut spans, overlap.end..span.range.end, span.style);
+            let (style, link) = patched(span);
+            push_span(
+                &mut spans,
+                span.range.start..overlap.start,
+                span.style,
+                span.link.as_ref(),
+            );
+            push_span(&mut spans, overlap.clone(), style, link);
+            push_span(
+                &mut spans,
+                overlap.end..span.range.end,
+                span.style,
+                span.link.as_ref(),
+            );
         }
         if let Some(span) = self.spans.get(last) {
-            push_span(&mut spans, span.range.clone(), span.style);
+            push_span(
+                &mut spans,
+                span.range.clone(),
+                span.style,
+                span.link.as_ref(),
+            );
             spans.extend_from_slice(&self.spans[last + 1..]);
         }
+        let linked = match link {
+            None => self.linked,
+            Some(_) => has_links(&spans),
+        };
         Some(Self {
             text: Arc::clone(&self.text),
             spans: spans.into(),
             kind: self.kind,
             ascii: self.ascii,
-            indices: self.indices.clone(),
+            linked,
+            indices: self.shared_indices(),
         })
     }
 
@@ -322,6 +402,7 @@ impl Paragraph {
             vec![Span {
                 range: 0..text.len(),
                 style: InlineStyle::default(),
+                link: None,
             }]
         };
         Self {
@@ -329,7 +410,8 @@ impl Paragraph {
             spans: spans.into(),
             kind: ParagraphKind::Body,
             ascii,
-            indices: new_text_indices(ascii),
+            linked: false,
+            indices: OnceLock::new(),
         }
     }
 
@@ -338,10 +420,11 @@ impl Paragraph {
         let spans = normalize_spans(&text, raw_spans, ascii);
         Self {
             text: text.into(),
+            linked: has_links(&spans),
             spans: spans.into(),
             kind,
             ascii,
-            indices: new_text_indices(ascii),
+            indices: OnceLock::new(),
         }
     }
 
@@ -350,10 +433,12 @@ impl Paragraph {
         mut spans: Vec<Span>,
         kind: ParagraphKind,
     ) -> Result<Self, Error> {
-        if text.as_bytes().contains(&b'\r')
-            || text.as_bytes().contains(&b'\n')
-            || matches!(kind, ParagraphKind::Heading { level } if !(1..=6).contains(&level))
+        if let ParagraphKind::Heading { level } = kind
+            && !(1..=6).contains(&level)
         {
+            return Err(Error::InvalidHeadingLevel(level));
+        }
+        if text.contains(['\r', '\n', '\u{2029}']) {
             return Err(Error::InvalidFragment);
         }
         let ascii = text.is_ascii();
@@ -375,7 +460,7 @@ impl Paragraph {
             return Err(Error::InvalidFragment);
         }
         spans.dedup_by(|next, previous| {
-            if next.style == previous.style {
+            if previous.continues(next.style, next.link.as_ref()) {
                 previous.range.end = next.range.end;
                 true
             } else {
@@ -384,10 +469,11 @@ impl Paragraph {
         });
         Ok(Self {
             text: Arc::from(text),
+            linked: has_links(&spans),
             spans: spans.into(),
             kind,
             ascii,
-            indices: new_text_indices(ascii),
+            indices: OnceLock::new(),
         })
     }
 
@@ -396,6 +482,28 @@ impl Paragraph {
         self.spans
             .get(index)
             .map_or_else(InlineStyle::default, |span| span.style)
+    }
+
+    pub(super) fn link_for_byte(&self, byte: usize) -> Option<&Link> {
+        let index = self.spans.partition_point(|span| span.range.end <= byte);
+        self.spans.get(index)?.link.as_ref()
+    }
+
+    pub(super) fn link_range(&self, byte: usize) -> Option<Range<usize>> {
+        let index = self.spans.partition_point(|span| span.range.end <= byte);
+        let link = self.spans.get(index)?.link.as_ref()?;
+        let start = self.spans[..index]
+            .iter()
+            .rev()
+            .take_while(|span| span.link.as_ref() == Some(link))
+            .last()
+            .map_or(self.spans[index].range.start, |span| span.range.start);
+        let end = self.spans[index + 1..]
+            .iter()
+            .take_while(|span| span.link.as_ref() == Some(link))
+            .last()
+            .map_or(self.spans[index].range.end, |span| span.range.end);
+        Some(start..end)
     }
 }
 
@@ -410,32 +518,63 @@ pub(super) fn append_slice(
     let first = paragraph
         .spans
         .partition_point(|span| span.range.end <= range.start);
-    for span in &paragraph.spans[first..] {
-        if span.range.start >= range.end {
-            break;
-        }
-        let start = span.range.start.max(range.start) - range.start + offset;
-        let end = span.range.end.min(range.end) - range.start + offset;
-        push_span(spans, start..end, span.style);
+    let last = paragraph
+        .spans
+        .partition_point(|span| span.range.start < range.end);
+    if first >= last {
+        return;
     }
+    let clip = |span: &Span| {
+        span.range.start.max(range.start) - range.start + offset
+            ..span.range.end.min(range.end) - range.start + offset
+    };
+    let head = &paragraph.spans[first];
+    push_span(spans, clip(head), head.style, head.link.as_ref());
+    spans.extend(paragraph.spans[first + 1..last].iter().map(|span| Span {
+        range: clip(span),
+        style: span.style,
+        link: span.link.clone(),
+    }));
 }
 
-pub(super) fn push_span(spans: &mut Vec<Span>, range: Range<usize>, style: InlineStyle) {
+#[inline]
+pub(super) fn push_span(
+    spans: &mut Vec<Span>,
+    range: Range<usize>,
+    style: InlineStyle,
+    link: Option<&Link>,
+) {
     if range.is_empty() {
         return;
     }
     if let Some(last) = spans.last_mut()
         && last.range.end == range.start
-        && last.style == style
+        && last.continues(style, link)
     {
         last.range.end = range.end;
         return;
     }
-    spans.push(Span { range, style });
+    spans.push(Span {
+        range,
+        style,
+        link: link.cloned(),
+    });
+}
+
+fn has_links(spans: &[Span]) -> bool {
+    spans.iter().any(|span| span.link.is_some())
 }
 
 fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
     if ascii || raw.len() <= 1 {
+        return raw;
+    }
+    if raw[..raw.len() - 1].iter().all(|span| {
+        let (chunk, start) = grapheme_context(text, span.range.end);
+        GraphemeCursor::new(span.range.end, text.len(), true)
+            .is_boundary(chunk, start)
+            .unwrap_or(false)
+    }) {
         return raw;
     }
     let mut result = Vec::with_capacity(raw.len());
@@ -444,18 +583,49 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
         while raw.get(index).is_some_and(|span| span.range.end <= start) {
             index += 1;
         }
-        let style = raw
+        let (style, link) = raw
             .get(index)
-            .map_or_else(InlineStyle::default, |span| span.style);
-        push_span(&mut result, start..start + grapheme.len(), style);
+            .map_or((InlineStyle::default(), None), |span| {
+                (span.style, span.link.as_ref())
+            });
+        push_span(&mut result, start..start + grapheme.len(), style, link);
     }
     result
 }
 
-fn new_text_indices(ascii: bool) -> OnceLock<Arc<TextIndices>> {
-    if ascii {
-        OnceLock::new()
-    } else {
-        OnceLock::from(Arc::new(TextIndices::default()))
+fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
+    const CONTEXT_BYTES: usize = 64;
+    let mut start = byte.saturating_sub(CONTEXT_BYTES);
+    let mut end = byte.saturating_add(CONTEXT_BYTES).min(text.len());
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[start..end], start)
+}
+
+fn word_stops(text: &str) -> Vec<Range<usize>> {
+    let mut words = text
+        .unicode_word_indices()
+        .map(|(start, _)| start)
+        .peekable();
+    let mut stops: Vec<Range<usize>> = Vec::new();
+    let mut symbols = false;
+    for (start, segment) in text.split_word_bound_indices() {
+        let range = start..start + segment.len();
+        if words.next_if_eq(&start).is_some() {
+            stops.push(range);
+            symbols = false;
+        } else if segment.chars().all(char::is_whitespace) {
+            symbols = false;
+        } else if symbols && let Some(run) = stops.last_mut() {
+            run.end = range.end;
+        } else {
+            stops.push(range);
+            symbols = true;
+        }
+    }
+    stops
 }

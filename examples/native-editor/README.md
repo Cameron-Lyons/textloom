@@ -12,16 +12,44 @@ cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-di
 ```
 
 The toolbar demonstrates uniform/mixed selection styles, inline formatting,
-headings, lists, indentation, undo/redo, and read-only/disabled modes. Find supports case
-and whole-word options; replace-all is one undo step. Capture/restore keeps a
-native rich snapshot in memory. Restoring clears editing history.
-Use `--read-only` to start with editing disabled while retaining selection and copy.
+fill and font colors, links, headings, block quotes, lists, indentation,
+undo/redo, and read-only/disabled modes. Find supports case
+and whole-word options; replace-all is one undo step.
+
+- **Fill Color** and **Font Color** are Excel-style split buttons: the swatch
+  button applies the last color chosen, initially Yellow and Red, and the arrow
+  opens a menu with **No Fill** or **Automatic** and Excel's ten standard colors.
+- **Link** and Ctrl/Command+K open a URL field prefilled with the selected link.
+  Applying it links the selection, or edits the link at the caret; with the
+  caret outside a link it inserts the URL as linked text. An empty URL removes
+  the link, and an invalid URL reports an error. **Remove link** removes the
+  selected link or the link at the caret. Editing or removing a selection inside
+  one link applies to the whole link in one undo step.
+- Ctrl/Command+click on a link, or a click in read-only mode, opens it in the
+  system browser or mail client. Only `http`, `https`, and `mailto` targets
+  open; others show a status message.
+- The paragraph-kind choice includes **Quote**. **Numbered list** extends a
+  list ending right before the selection or starts one at 1, as
+  Ctrl/Command+Shift+7 does. When the caret is in a numbered item, the toolbar
+  shows its number (**Item N.**) and offers **Restart at 1** and **Continue
+  numbering**, which continues the list before it, even across body text. Each
+  is one undo step.
+- Enter starts a new paragraph, continuing a list or quote; Shift+Enter starts a
+  new line within the paragraph.
+
+Capture/restore keeps a native rich snapshot in memory. Restoring clears
+editing history. Use `--read-only` to start with editing disabled while
+retaining selection and copy.
 Use `--disabled` to start with the document widget disabled, including focus,
 selection, and clipboard interaction. The independent **Enabled** and **Read only**
 checkboxes let you change these modes during an IME session. Formatting,
 undo/redo, replacement, and snapshot restoration controls follow the document's
-editing mode. **Document**, **Find**, and **Replace** labels are associated with
-their widgets for native accessibility.
+editing mode. Toolbar, find, and replace commands first end an active IME
+composition, committing its visible preedit as clicking outside the document
+does; an empty preedit is canceled. Choosing a list type keeps the item's
+nesting level, and choosing the current paragraph type keeps list numbering.
+**Document**, **Find**, and **Replace** labels are associated with their widgets
+for native accessibility.
 
 The host provides the system's plain-text clipboard and native IME caret area.
 It adapts egui-winit 0.36.2's cursor-area output to the composing caret rectangle,
@@ -33,7 +61,8 @@ backports for current AT-SPI activation and the application's desktop parent.
 See [the source and removal notes](vendor/accesskit_unix/BACKPORT.md). These
 host dependencies do not change the library's optional AccessKit 0.24 API.
 Plain clipboard behavior remains the default. Add `--rich-clipboard` to enable
-the example's native rich backend on Linux (Wayland/X11), macOS, or Windows:
+the example's native rich backend on Linux (Wayland/X11), macOS, or Windows;
+other platforms build the host but reject the flag:
 
 ```sh
 cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target -- \
@@ -60,7 +89,8 @@ backend exports HTML for other applications; it does not import arbitrary HTML.
 The host retains one verified clipboard owner helper, reaps replaced or timed-out
 helpers, joins pipe workers, and retires its owner on close. Linux serves clipboard
 requests from that owner process; preserving its item after closing the host
-depends on a clipboard manager. macOS and Windows publish eager native data.
+depends on a clipboard manager. Linux helpers also exit when the host process
+dies, including when it is killed or aborts. macOS and Windows publish eager native data.
 All platform wrappers and their dependencies stay in this example's separate
 workspace, and its Rust code continues to forbid unsafe code.
 
@@ -86,7 +116,7 @@ preedit/candidate windows or screen readers.
 `--clipboard-self-test` requires `--rich-clipboard` and **writes a deterministic
 fixture to the system clipboard**. Use it only in an isolated test session. It
 verifies rich/HTML/plain publication and read-back, then widget rich insertion and one-step
-undo/redo. It can be combined with `--smoke-test` and `--qa-report`; successful
+undo/redo. The fixture is a formatted, colored, and Yellow-filled numbered list. It can be combined with `--smoke-test` and `--qa-report`; successful
 completion prints `Native rich clipboard roundtrip and undo/redo passed`.
 Renderer CI requests rich clipboard in all three modes and this self-test in
 editable mode. Isolated widget fixtures passed on Linux X11/Wayland, macOS, and
@@ -101,9 +131,11 @@ UTF-8 so TextEdit decodes Unicode correctly. See the
 desktop signoff remains required.
 
 For native QA, pass `--qa-report PATH` and close the window normally after testing.
-The host writes a JSON report only on graceful exit. Existing paths are protected
-from overwrite; a report write failure or smoke-test failure returns a nonzero
-exit status. Choose a new file for each run and an existing parent directory.
+The host creates PATH before opening its window and exits with status 2 if the
+file already exists or cannot be created, so an unusable path cannot discard a
+session. It writes the JSON report only on graceful exit; after an abnormal exit
+the file stays empty, which report validation rejects. A report write failure or
+smoke-test failure returns a nonzero exit status. Choose a new file for each run.
 Without this flag, the host records no report and writes no document file.
 
 The report contains OS/architecture, egui/native display scale, font-supply flags,

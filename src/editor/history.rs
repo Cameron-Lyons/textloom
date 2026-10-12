@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::document::Delta;
 use crate::{Document, InlineStyle, Selection};
@@ -24,21 +27,70 @@ pub(super) struct EditState {
     pub(super) style: InlineStyle,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Group {
+    #[default]
+    None,
+    Typing,
+    DeleteBackward,
+    DeleteForward,
+}
+
+#[derive(Clone)]
 struct HistoryEntry {
-    delta: Delta,
+    deltas: Vec<Delta>,
     before: EditState,
     after: EditState,
-    typing: bool,
+    group: Group,
     bytes: usize,
 }
 
-#[derive(Default)]
+impl HistoryEntry {
+    fn new(deltas: Vec<Delta>, before: EditState, after: EditState, group: Group) -> Self {
+        Self {
+            bytes: retained_bytes(&deltas),
+            deltas,
+            before,
+            after,
+            group,
+        }
+    }
+
+    fn can_extend(&self, delta: &Delta) -> bool {
+        matches!(self.deltas.as_slice(), [previous] if extends(previous, delta))
+    }
+}
+
+fn extends(previous: &Delta, delta: &Delta) -> bool {
+    previous.start == delta.start
+        && previous.after.len() == 1
+        && delta.before.len() == 1
+        && delta.after.len() == 1
+}
+
+#[derive(Clone)]
+struct Transaction {
+    token: u64,
+    depth: usize,
+    deltas: Vec<Delta>,
+    before: EditState,
+    marks: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TransactionLevel {
+    token: u64,
+    depth: usize,
+}
+
+#[derive(Clone, Default)]
 pub(super) struct History {
     undo: VecDeque<HistoryEntry>,
     redo: VecDeque<HistoryEntry>,
     bytes: usize,
     limits: HistoryLimits,
-    coalesce_typing: bool,
+    group: Group,
+    transaction: Option<Transaction>,
 }
 
 impl History {
@@ -58,6 +110,10 @@ impl History {
         self.redo.len()
     }
 
+    pub(super) fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
     pub(super) fn set_limits(&mut self, limits: HistoryLimits) {
         self.limits = limits;
         self.break_group();
@@ -72,20 +128,30 @@ impl History {
     }
 
     pub(super) fn break_group(&mut self) {
-        self.coalesce_typing = false;
+        self.group = Group::None;
     }
 
     pub(super) fn undo(&mut self, document: &mut Document) -> Option<EditState> {
+        if self.in_transaction() {
+            return None;
+        }
         let entry = self.undo.pop_back()?;
-        document.replay(&entry.delta, false);
+        for delta in entry.deltas.iter().rev() {
+            document.replay(delta, false);
+        }
         let state = entry.before;
         self.redo.push_back(entry);
         Some(state)
     }
 
     pub(super) fn redo(&mut self, document: &mut Document) -> Option<EditState> {
+        if self.in_transaction() {
+            return None;
+        }
         let entry = self.redo.pop_back()?;
-        document.replay(&entry.delta, true);
+        for delta in &entry.deltas {
+            document.replay(delta, true);
+        }
         let state = entry.after;
         self.undo.push_back(entry);
         Some(state)
@@ -96,47 +162,153 @@ impl History {
         delta: Delta,
         before: EditState,
         after: EditState,
-        typing: bool,
+        group: Group,
     ) {
-        for entry in self.redo.drain(..) {
-            self.bytes = self.bytes.saturating_sub(entry.bytes);
-        }
-        if self.limits.max_entries == 0 || self.limits.max_bytes == 0 {
-            self.coalesce_typing = false;
+        if let Some(transaction) = &mut self.transaction {
+            let floor = transaction.marks.last().copied().unwrap_or(0);
+            let pending = transaction.deltas.len();
+            match transaction.deltas.last_mut() {
+                Some(previous) if pending > floor && extends(previous, &delta) => {
+                    previous.after = delta.after;
+                }
+                _ => transaction.deltas.push(delta),
+            }
             return;
         }
-        let entry = HistoryEntry {
-            bytes: delta.retained_bytes(),
-            delta,
-            before,
-            after,
-            typing,
-        };
-        let merge = self.coalesce_typing
-            && typing
+        self.discard_redo();
+        if self.is_disabled() {
+            self.break_group();
+            return;
+        }
+        let merge = group != Group::None
+            && self.group == group
             && self.undo.back().is_some_and(|previous| {
-                previous.typing
+                previous.group == group
                     && previous.after.selection == before.selection
                     && previous.after.style == before.style
-                    && previous.delta.start == entry.delta.start
-                    && previous.delta.before.len() == 1
-                    && previous.delta.after.len() == 1
-                    && entry.delta.before.len() == 1
-                    && entry.delta.after.len() == 1
+                    && previous.can_extend(&delta)
             });
         if merge {
             let previous = self.undo.back_mut().expect("checked entry");
             self.bytes = self.bytes.saturating_sub(previous.bytes);
-            previous.delta.after = entry.delta.after;
+            previous.deltas[0].after = delta.after;
             previous.after = after;
-            previous.bytes = previous.delta.retained_bytes();
+            previous.bytes = retained_bytes(&previous.deltas);
             self.bytes = self.bytes.saturating_add(previous.bytes);
         } else {
-            self.bytes = self.bytes.saturating_add(entry.bytes);
-            self.undo.push_back(entry);
+            self.push(HistoryEntry::new(vec![delta], before, after, group));
         }
-        self.coalesce_typing = typing;
+        self.group = group;
         self.enforce_limits();
+    }
+
+    pub(super) fn begin_transaction(&mut self, before: EditState) -> TransactionLevel {
+        static TOKENS: AtomicU64 = AtomicU64::new(0);
+        self.break_group();
+        if let Some(transaction) = &mut self.transaction {
+            transaction.marks.push(transaction.deltas.len());
+            transaction.depth += 1;
+            TransactionLevel {
+                token: transaction.token,
+                depth: transaction.depth,
+            }
+        } else {
+            let token = TOKENS.fetch_add(1, Ordering::Relaxed);
+            self.transaction = Some(Transaction {
+                token,
+                depth: 1,
+                deltas: Vec::new(),
+                before,
+                marks: Vec::new(),
+            });
+            TransactionLevel { token, depth: 1 }
+        }
+    }
+
+    fn transaction_at(&mut self, level: TransactionLevel) -> Option<&mut Transaction> {
+        self.transaction.as_mut().filter(|transaction| {
+            transaction.token == level.token && transaction.depth == level.depth
+        })
+    }
+
+    pub(super) fn commit_transaction(&mut self, level: TransactionLevel, after: EditState) {
+        let Some(transaction) = self.transaction_at(level) else {
+            return;
+        };
+        transaction.depth -= 1;
+        if transaction.depth != 0 {
+            transaction.marks.pop();
+            return;
+        }
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        self.break_group();
+        if transaction.deltas.is_empty() {
+            return;
+        }
+        self.discard_redo();
+        if self.is_disabled() {
+            return;
+        }
+        self.push(HistoryEntry::new(
+            transaction.deltas,
+            transaction.before,
+            after,
+            Group::None,
+        ));
+        self.enforce_limits();
+    }
+
+    pub(super) fn rollback_transaction(
+        &mut self,
+        level: TransactionLevel,
+        document: &mut Document,
+    ) -> bool {
+        let Some(transaction) = self.transaction_at(level) else {
+            return false;
+        };
+        let mark = transaction
+            .marks
+            .pop()
+            .unwrap_or(0)
+            .min(transaction.deltas.len());
+        for delta in transaction.deltas.drain(mark..).rev() {
+            document.replay(&delta, false);
+        }
+        transaction.depth -= 1;
+        if transaction.depth == 0 {
+            self.transaction = None;
+        }
+        self.break_group();
+        true
+    }
+
+    pub(super) fn close_transactions(&mut self, after: EditState) {
+        if let Some(transaction) = &mut self.transaction {
+            transaction.depth = 1;
+            transaction.marks.clear();
+            let level = TransactionLevel {
+                token: transaction.token,
+                depth: 1,
+            };
+            self.commit_transaction(level, after);
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.limits.max_entries == 0 || self.limits.max_bytes == 0
+    }
+
+    fn push(&mut self, entry: HistoryEntry) {
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        self.undo.push_back(entry);
+    }
+
+    fn discard_redo(&mut self) {
+        for entry in self.redo.drain(..) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
     }
 
     fn enforce_limits(&mut self) {
@@ -150,4 +322,11 @@ impl History {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
         }
     }
+}
+
+fn retained_bytes(deltas: &[Delta]) -> usize {
+    deltas
+        .iter()
+        .map(Delta::retained_bytes)
+        .fold(0, usize::saturating_add)
 }

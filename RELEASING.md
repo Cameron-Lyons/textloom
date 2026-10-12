@@ -20,6 +20,14 @@ evidence. A local complete release check and publication dry run previously
 passed on clean `f05a518`, without upload; repeat publication checks on the final
 clean commit.
 
+A later improvement pass changed editing behavior, both input adapters,
+accessibility publication, and CI. A feature pass then added computed list
+numbering, fill colors, soft line breaks, hyperlinks, and block quotes, with
+native host controls for each, and moved the native format to TLFR version 2;
+see `CHANGELOG.md`. The evidence below predates both. Repeat the automated and
+native checks on the publication commit, including the pending checks listed
+after the QA table.
+
 All nine Linux X11/macOS/Windows renderer mode reports independently validated
 21 frames, graceful exit, zero errors, clipboard request/completion flags, equal
 TLFR round trips, and disabled focus suppression. Editable widget clipboard
@@ -152,10 +160,11 @@ Windows backends. They publish plain text, native HTML, and a length-framed TLFR
 payload with a per-publication generation token. Linux/Windows register
 `application/x-textloom-fragment`; macOS maps the rich format to
 `org.textloom.fragment`. Windows HTML uses CF_HTML. The token distinguishes a
-new offer during copy verification and does not alter TLFR v1 or establish trust.
+new offer during copy verification and does not alter the TLFR format or establish trust.
 Native access runs in helper processes with hard deadlines and bounded transfers;
-native lengths are checked before Rust payload allocation. TLFR retains its
-64 MiB limit, with a 32-byte transport envelope allowance. Copy verifies all
+native lengths are checked before Rust payload allocation. TLFR retains the
+library's default 64 MiB limit (`DecodeLimits::DEFAULT`), with a 32-byte
+transport envelope allowance. Copy verifies all
 representations through read-back before suppressing the plain fallback.
 
 Paste captures one native item and validates its rich data and plain alternative.
@@ -233,45 +242,120 @@ signoff remain pending.
 | Rich clipboard MIME transport | Widget fixtures passed on all platforms; Linux Qt and macOS TextEdit interoperability passed; Windows external applications and full manual signoff pending |
 | macOS and Windows native host checks | Hosted macOS native editing/focus/guard checks and Windows NVDA interaction passed; physical keyboards, IMEs, VoiceOver, scale changes, and full manual signoff pending |
 
+Checks added by the later improvement and feature passes have no recorded
+results yet. The egui widget now commits the visible preedit on click, drag, or
+focus loss, where the Fcitx sessions above observed cancellation. No windowed
+host in this repository uses the winit adapter, so its row needs a host-supplied
+winit harness. The `NATIVE_QA.md` protocol gives steps for the feature rows.
+
+| Check | Result |
+| --- | --- |
+| Winit adapter: macOS typing at launch without switching apps; IME candidate window at the caret on the first composition; Russian layout Ctrl+C/Ctrl+V; Linux Ctrl+Alt+T reaching the host; Windows Shift+Delete, Ctrl+Insert, Shift+Insert, and AltGr through Ctrl+Alt | Pending |
+| Egui click, drag, and focus loss during composition commit the preedit exactly once, without a double commit, on macOS, Windows, and IBus/Fcitx 5 under Wayland and X11 | Pending |
+| Egui IME candidate placement in long scrolled documents | Pending |
+| Egui touch scrolling: swipes scroll until the editor has focus | Pending |
+| AZERTY digit-row shortcuts (Ctrl/Command+0–6, Shift+7/8) | Pending |
+| Egui touchpad tap-to-click places the caret, commits a preedit, and activates links | Pending |
+| Fill Color and Font Color: apply, No Fill/Automatic, undo/redo; selections and found matches stay visible over fills; fill survives external rich copy | Pending |
+| Soft line breaks: Shift+Enter in a list item and a heading; caret, selection, Home/End, and Up/Down across the break; screen-reader line reading; external plain copy shows a line break; HTML paste into Word/TextEdit shows the break | Pending |
+| Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Pending |
+| Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Pending |
+| Numbering controls: Numbered list and Ctrl/Command+Shift+7 extend or start lists; markers and the "Item N." label continue past body text and restart after headings; Restart at 1 and Continue numbering change only the focused item in one undo step; copied items keep their numbers in Word/TextEdit | Pending |
+
 ## Compatibility contract
 
 Textloom 1.x follows semantic versioning for the documented public API and feature
 names. Existing default builds remain independent of GUI libraries. Optional
 adapters expose types from egui 0.36, winit 0.30, and AccessKit 0.24; an upstream
 upgrade that breaks those exposed types requires a Textloom major release.
-Error enums are non-exhaustive: callers must retain a fallback match arm.
+Error enums (`Error`, `FragmentError`, `AccessKitError`, egui
+`AccessibilityError`), `ParagraphKind`, `Movement`, `InlineAttribute`,
+`AccessibleAction`, and winit `ClipboardEvent` are non-exhaustive: callers must
+retain a fallback match arm. `Composition`, `DecodeLimits`, `AccessibleParagraph`,
+`AccessibilityOutcome`, `RichTextEditorOutput`, and winit `InputOutcome` are
+non-exhaustive structs that may gain fields. `InlineStyle`,
+`StylePatch`, `SelectionStyle`, `SearchOptions`, `HistoryLimits`, `Position`,
+`Selection`, `Color`, and `Span` stay exhaustive; adding a field to them requires
+a major release. `Editor`, `Document`, `Paragraph`, and `Fragment` must remain
+`Send + Sync`, which `src/lib.rs` checks at compile time.
 Exact error messages, private implementation details, cache layouts, and benchmark
 timings are not API guarantees.
 
 Rust 1.95 is the minimum supported compiler for 1.0. The locked dependency graph
-is tested on that compiler. Any future minimum-version increase must be announced
+is tested on that compiler, and a CI job also compiles the lowest direct
+dependency versions that `Cargo.toml` permits (AccessKit 0.24.1, as egui 0.36
+requires). Any future minimum-version increase must be announced
 in a minor or major release, never a patch release. Review dependency updates
-against the minimum compiler and all eight feature combinations.
+against the minimum compiler, all eight feature combinations, and the cargo-deny
+policy in `deny.toml`. Development-only dependencies, such as
+`accesskit_consumer` for loading published accessibility trees in tests, are
+outside the library's dependency contract.
 
-TLFR format version 1 is independent of the crate version. Its signature, fixed
-integer widths, tag meanings, style bits, and decoded semantics are stable.
-Future readers must continue to accept valid v1 snapshots within the documented
-64 MiB, one-million-paragraph, and one-million-span decoding limits. In-memory
-documents can exceed these limits; their encoded snapshots will not be accepted
-by the bounded decoder. The format stores document content, not selection, undo
-history, or an active composition.
+TLFR format versions are independent of the crate version. Textloom 1.x writes
+version 2 and reads versions 1 and 2. The signature, version byte, fixed integer
+widths, tag meanings, style bits, and decoded semantics of both versions are
+stable. Future readers must continue to accept valid v1 and v2 snapshots within
+the documented default decoding limits (`DecodeLimits::DEFAULT`: 64 MiB, one
+million paragraphs, and one million spans). In-memory documents can exceed these
+limits; the default decoder rejects their encoded snapshots, and
+`Fragment::from_bytes_with_limits` or `Document::from_bytes_with_limits` reads
+larger trusted snapshots. The format stores document content, not selection,
+undo history, or an active composition. The canonical v2 encoding rules and the
+v1 reading rules follow.
+
+Version 2 keeps v1's signature, little-endian `u64` lengths, canonical span
+rules, limits, and trailing-data rejection, and changes only these rows:
+
+- Paragraph kind tags 0 (body), 1 (heading + `u8` level), and 2 (bullet + `u8`
+  indent) are shared. Tag 3, v1's ordered item (`u8` indent + `u32` displayed
+  ordinal), is v1-only. Version 2 adds tag 4 (ordered item continuing its list,
+  `u8` indent), tag 5 (ordered item with an explicit start, `u8` indent + `u32`
+  start), and tag 6 (block quote, no payload).
+- Style bits 0–5 (bold, italic, underline, strikethrough, code, foreground
+  present + 4 RGBA bytes) are shared. Version 2 adds bit 6 (fill present + 4 RGBA
+  bytes after the foreground bytes) and bit 7 (link present + `u64` byte length
+  and UTF-8 target after the fill bytes). Adjacent spans must differ in style or
+  link, and targets must be valid for `Link::new`.
+- Paragraph text is UTF-8 without CR or LF in both versions; version 2 also
+  rejects U+2029 PARAGRAPH SEPARATOR. U+2028 LINE SEPARATOR is a soft line break
+  and was already valid v1 text, so soft breaks need no format change.
+
+A v1 payload is decoded with v1 rules only: tags 4–6 and style bits 6–7 are
+rejected inside it. Tag 3 is read into the computed-numbering model: an item
+becomes `start: None` when its stored ordinal equals the number it would show by
+continuation (`Document::list_number`) and `start: Some(ordinal)` otherwise, so
+every decoded item shows its stored ordinal. U+2029 in v1 text is read as a
+U+2028 soft line break. Re-encoding a v1 snapshot writes version 2, which
+Textloom 0.1 and other v1-only readers reject. Because v1 reading and the
+display of v2 kinds both depend on the numbering rule of
+`Document::list_number`, that rule is part of the format contract.
 
 Grapheme boundaries are part of the format contract. Textloom pins
 unicode-segmentation 1.13.3 (Unicode 17.0) so dependency resolution cannot silently
 change valid span boundaries. Audit any future segmentation update for old-file
 compatibility; introduce a format migration if old boundaries become invalid.
-The independent v1 fixtures in `tests/fixtures/` must keep decoding and encoding
-to the same bytes. Keep malformed-input regression tests when changing the codec.
+The fixtures in `tests/fixtures/` were assembled from the documented layouts
+independently of the encoder. `native-v1.tlfr` must keep decoding to the same
+content, with the same displayed numbers, and re-encode as its version 2
+equivalent; `native-v2.tlfr` must decode and re-encode to identical bytes. Quote,
+fill, and link rows are covered by layout and rejection tests. Keep
+malformed-input regression tests when changing the codec.
 
 ## Prepare and verify
 
 1. Update `Cargo.toml`, dependency examples in `README.md`, and `CHANGELOG.md`.
+   Replace `Unreleased.` in the version's changelog entry with the release date;
+   the entry must not mention "unreleased" anywhere else.
+   `scripts/release-version.sh` enforces this for `scripts/check-release.sh --tag`
+   and the tag workflow, so both fail until the date is recorded.
    Refresh the package entry in `Cargo.lock` with `cargo check --offline`.
-2. Run `./scripts/check-release.sh --allow-dirty --tag v1.0.0` while reviewing
-   pending changes. This requires a matching changelog entry and checks formatting,
-   every feature combination, doctests, Clippy, documentation, benchmarks, and
-   headless examples. It also checks formatting and strict Clippy for the native
-   host and its CLI/report/clipboard regression tests without opening a window.
+2. Run `./scripts/check-release.sh --allow-dirty` while reviewing pending changes,
+   adding `--tag v1.0.0` once the changelog entry is dated. This requires a
+   matching changelog entry and checks formatting, every feature combination,
+   doctests, Clippy, documentation, benchmark smoke runs with
+   `TEXTLOOM_BENCH_QUICK=1`, and headless examples. It also checks formatting
+   and strict Clippy for the native host and its CLI/report/clipboard regression
+   tests without opening a window.
    It then runs all-feature tests and compiles
    every target from the extracted Cargo package. An explicit inventory check
    requires every packaged source, test, fixture, headless example, benchmark,
@@ -288,8 +372,10 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
 4. Commit the release changes, then run `./scripts/check-release.sh --tag v1.0.0`
    on the clean checkout. Run `cargo +1.95.0 test --locked --all-features` and
    `cargo +1.95.0 check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target`.
-   Confirm the MSRV feature checks and macOS/Windows jobs pass on that commit;
-   they compile and test the standalone native host as well as the library targets.
+   Confirm the MSRV feature checks, minimal dependency versions, dependency
+   policy, and macOS/Windows jobs pass on that commit; the MSRV and native jobs
+   compile and test the standalone native host as well as the library targets,
+   and macOS/Windows run strict Clippy on both.
    Confirm required Linux X11, macOS, and Windows Mesa renderer smoke checks pass
    in editable, read-only, and disabled modes with rich clipboard enabled, plus
    editable-mode clipboard fixture read-back and undo/redo. Validate the fresh
@@ -298,17 +384,31 @@ to the same bytes. Keep malformed-input regression tests when changing the codec
    remains required independently. Confirm the hosted macOS TextEdit and Windows
    NVDA interaction jobs also pass, with strict interaction report validation and
    owned-process cleanup. They do not certify audible speech or physical input.
-5. Exercise a native host on Linux, macOS, and Windows. Check focus loss during
-   composition, Japanese/Chinese IME replacement and candidate placement,
-   physical-keyboard dead keys and AltGr, platform shortcuts, plain/rich clipboard
+5. Exercise a native host on Linux, macOS, and Windows. Check clicks and focus
+   loss during composition (one commit of the visible preedit), Japanese/Chinese
+   IME replacement and candidate placement in long scrolled documents,
+   physical-keyboard dead keys and AltGr, platform and AZERTY digit-row shortcuts,
+   touch scrolling and touchpad taps, plain/rich clipboard
    transport and external-application HTML/plain interoperability,
    read-only/disabled widgets, high DPI, and screen-reader selection/replacement.
+   Check fill and font colors, soft line breaks, link editing and activation,
+   block quotes, and list numbering controls, including their screen-reader
+   presentation and HTML paste into Word or TextEdit.
+   Exercise the winit adapter rows in a host-supplied winit harness.
    Headless tests validate routing and semantics; hosts supply these platform
    services. Record the host/platform results in the release notes. Any failed
    host behavior claimed by this release is a release blocker. Use the native
    signoff protocol in `examples/native-editor/NATIVE_QA.md` and record unavailable
    checks explicitly. Test desktops are currently unavailable, so these human
    gates remain open and the candidate remains unreleased.
+
+Re-apply `.github/branch-protection.json` to `main` whenever its required checks
+change, as they did with the "Dependency policy (bans licenses sources)" job:
+
+```sh
+gh api --method PUT repos/Cameron-Lyons/textloom/branches/main/protection \
+  --input .github/branch-protection.json
+```
 
 ## Publish
 

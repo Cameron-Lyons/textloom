@@ -119,13 +119,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     caret_at_end=caret.compareEndPoints(entire, "startToEnd") == 0)
 
     def _poll(self):
-        if not self._request.exists():
+        try:
+            size = self._request.stat().st_size
+            text = None if size > 1024 else self._request.read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError):
             return
         request_id = None
         try:
-            if self._request.stat().st_size > 1024:
+            if text is None:
                 raise ValueError("request exceeds limit")
-            request = json.loads(self._request.read_text(encoding="utf-8"))
+            request = json.loads(text)
             request_id = request["id"]
             if type(request_id) is not int or request_id <= self._last_request:
                 return

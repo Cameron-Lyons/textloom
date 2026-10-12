@@ -282,7 +282,16 @@ function Invoke-ReaderRequest([string]$Operation) {
     [IO.File]::WriteAllText($temporary,
         (@{id = $id; operation = $Operation} | ConvertTo-Json -Compress),
         [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $temporary -Destination $RequestPath -Force
+    $replaceUntil = [DateTime]::UtcNow.AddSeconds(5)
+    while ($true) {
+        try {
+            [IO.File]::Move($temporary, $RequestPath, $true)
+            break
+        } catch [IO.IOException], [UnauthorizedAccessException] {
+            if ([DateTime]::UtcNow -ge $replaceUntil) { throw }
+            Start-Sleep -Milliseconds 20
+        }
+    }
     return Wait-Condition {
         $found = @(Get-ReaderEvents | Where-Object {
             $_.PSObject.Properties.Name -contains "request_id" -and $_.request_id -eq $id

@@ -37,16 +37,15 @@ impl Cache {
                     || preview.composition.text == composition.text
                         && preview.composition.replacement == composition.replacement)
         }) {
+            let previous = self.preview.take();
             let mut document = editor.document().clone();
             let range = composition.replacement.range();
             let mut preedit_style = style;
             preedit_style.underline = true;
             document.replace(range, &composition.text, preedit_style)?;
             let (caret, selection) = preedit_selection(&document, &composition);
-            let render_cache = self
-                .preview
-                .take()
-                .map_or_else(LayoutCache::default, |preview| preview.render_cache);
+            let render_cache =
+                previous.map_or_else(|| self.layout.clone(), |preview| preview.render_cache);
             self.preview = Some(Box::new(CompositionPreview {
                 composition: Arc::clone(&composition),
                 style,
