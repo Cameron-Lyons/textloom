@@ -19,8 +19,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-qa-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: native-qa-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,6 +40,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native host
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
@@ -68,6 +71,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native host
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target

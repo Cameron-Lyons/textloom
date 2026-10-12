@@ -7,7 +7,7 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 First stable release of the native Rust rich-text editing library.
 
 - Internal document/Unicode, history/IME, and egui layout/input/navigation/painting
-  responsibilities are separated without changing the public API or TLFR v1.
+  responsibilities are separated as a refactor without behavior changes.
   Precise paragraph-change notifications and a persistent layout index make
   ordinary local layout updates proportional to the affected range and tree
   paths. Accessibility preparation uses layout generations and localized run
@@ -46,8 +46,9 @@ First stable release of the native Rust rich-text editing library.
   native typing/history/focus and guarded modes, and Windows NVDA generated
   speech, accessible selection, native replacement/history and graceful close.
   Release package verification requires these probes. macOS clipboard HTML
-  explicitly declares UTF-8 so TextEdit preserves Unicode; library HTML fragments
-  and the TLFR format remain unchanged. Physical desktop signoffs remain required.
+  explicitly declares UTF-8 so TextEdit preserves Unicode; this host-side fix
+  leaves library HTML fragments and TLFR untouched. Physical desktop signoffs
+  remain required.
 - HTML export uses six-digit opaque colors and `rgba()` for translucent colors,
   preserving channel order and all 256 alpha values in Qt's HTML importer as well
   as CSS consumers. Native Qt clipboard checks preserve Unicode text, emphasis,
@@ -145,11 +146,13 @@ First stable release of the native Rust rich-text editing library.
   buffer and is shared by import, insertion, and search queries.
 - Release verification checks the complete package inventory before testing
   the extracted crate, catching omitted test, example, and benchmark directories.
-- Renderer-independent documents, inline styles, headings, lists, directional
-  selections, Unicode grapheme/word editing, and transient IME composition.
+- Renderer-independent documents, inline styles, fill colors, hyperlinks,
+  headings, lists, block quotes, soft line breaks, directional selections,
+  Unicode grapheme/word editing, and transient IME composition.
 - Bounded undo/redo with grouped typing, rich clipboard fragments, literal
   search, grouped replace-all, and list indentation.
-- Versioned TLFR v1 persistence with bounded decoding and escaped semantic HTML.
+- Versioned TLFR persistence, written as version 2 and reading version 1, with
+  bounded decoding and escaped semantic HTML.
 - Optional egui widget, winit input bridge, and AccessKit accessibility adapters.
 - Shared immutable paragraphs, lazy Unicode indexes, and cached egui layouts.
 - Documented public API, non-exhaustive error enums, explicit API/file-format
@@ -196,7 +199,300 @@ First stable release of the native Rust rich-text editing library.
   preventing duplicated RTL/prepend glyphs and invalid cursor offsets while
   preserving paragraph text and formatting.
 
-Migration from 0.1: update the dependency to `textloom = "1.0"` and add a fallback
-arm to exhaustive matches on error enums. Read accessibility snapshot state using
-its accessor methods. The TLFR v1 encoding remains unchanged. Unicode
-segmentation is pinned to preserve persisted span-boundary semantics.
+### Added
+
+- `Editor::transaction()` records several commands as one undo step, merges
+  successive edits to one paragraph, rolls back on error or panic, nests, and
+  keeps an editor that the closure replaced. `Editor::mark_saved()` and `is_modified()` track
+  unsaved changes by content, so undoing back to the saved text reads as
+  unmodified.
+- `Editor::replace_selected_match()` implements a Replace button with the
+  per-match style of `replace_all()`. `select_word_at()`, `select_paragraph()`,
+  and `Document::word_range_at()` implement double and triple click;
+  `delete_to_paragraph_start()`, `selected_paragraphs()`,
+  `selection_paragraph_kind()`, and `toggle_style(InlineAttribute)` serve
+  adapters and toolbars.
+- `Paragraph::new()` validates host-built rich paragraphs, and
+  `Document::from_paragraphs()` assembles them. `Fragment::from(&Document)`,
+  `Document::from(Fragment)`, `StylePatch::from(InlineStyle)`, and
+  `StylePatch::from(SelectionStyle)` (a format painter) convert between types.
+- `DecodeLimits`, `Fragment::from_bytes_with_limits()`, and
+  `Document::from_bytes_with_limits()` reopen trusted snapshots beyond the
+  unchanged default limits of 64 MiB and one million paragraphs and spans.
+- `Error::InvalidGraphemePosition`, which
+  `AccessibilitySnapshot::selection_from_graphemes()` returns instead of
+  `InvalidPosition`.
+- `AccessKitAdapter::invalidate()` republishes the complete tree when a platform
+  adapter requests an initial tree or an update is discarded. `locate_text_run()`
+  maps a run to its paragraph text for `ScrollIntoView` requests, and
+  `AccessibilityOutcome::composition_canceled` reports discarded preedit.
+- Egui: `RichTextEditorOutput::caret_rect` and `selection_rect`, computed while
+  unfocused; `.highlight_ranges()` for search matches; `.heading_shortcuts()`;
+  `RichTextEditor::forget_state()`; PageUp/PageDown; Ctrl/Command+] and [ list
+  indentation; and a caret blink that follows egui's `text_cursor` visuals.
+- Winit: `WinitAdapter::host_vertical_navigation()`, the Shift+Delete,
+  Ctrl+Insert, and Shift+Insert clipboard aliases in Control mode, and dedicated
+  Cut, Copy, Paste, Undo, and Redo keys.
+- `Editor` implements `Clone` and `Debug`, `Selection` implements `Hash`, and
+  the egui widget and its output implement `Debug`. `Editor`, `Document`,
+  `Paragraph`, and `Fragment` are `Send + Sync`, checked at compile time.
+  docs.rs pages label feature-gated items.
+- Computed list numbering: `Document::list_number()` returns the number an
+  ordered item displays, computed from paragraph kinds and cached until kinds or
+  the paragraph count change. `Editor::apply_numbered_list(indent)` implements a
+  Numbered List command as one undo step: it extends a list ending right before
+  the selection or starts one at 1, and does nothing when every selected
+  paragraph is already numbered at that level.
+- Fill colors: `InlineStyle::background`, `StylePatch::background`, and
+  `SelectionStyle::background` work like Excel's Fill Color, with `None` as
+  "No Fill". `Color::STANDARD` and the `Color::DARK_RED` through
+  `Color::PURPLE` constants provide Excel's ten standard colors for font and
+  fill pickers. `clear_formatting()` removes fills, and
+  `StylePatch::from(SelectionStyle)` copies them. HTML exports the fill as
+  `background-color` on the color span; egui paints it behind the glyphs,
+  replacing inline code's background, with selections and highlights visible
+  over it; both accessibility bridges publish it as run background color.
+- Soft line breaks: U+2028 LINE SEPARATOR is a line break within a paragraph.
+  `Editor::insert_line_break()` and Shift+Enter in both adapters insert one in
+  the typing style, keeping the paragraph kind and the typing undo step. HTML
+  exports `<br>`, plus a placeholder `<br>` after a final soft break. Egui caret
+  placement, hit testing, Home/End, Up/Down, IME preview, and selection painting
+  follow its rows, and both accessibility bridges end a published line at each
+  soft break. `Document::word_range_at()` treats it like a paragraph end.
+- Hyperlinks: `Link` validates a target (`Link::MAX_LEN`, `Error::InvalidLink`,
+  `FragmentError::InvalidLink`), and `Span::link` carries it. `Editor::set_link()`
+  links, edits, or removes links as one undo step, `insert_link()` inserts linked
+  text, `selected_link()` prefills a link field, and `Document::link_at()` and
+  `link_range_at()` serve click handling. Typing extends a link only strictly
+  inside it, rich paste and replacements keep links, and `clear_formatting()`
+  preserves them. HTML shares one `<a href>` per link and exports `javascript:`,
+  `vbscript:`, and `data:` targets as plain text. Egui underlines links in the
+  hyperlink color unless explicitly colored, shows the target on hover with a
+  pointing hand while a click would activate it, and reports Ctrl/Command+click,
+  or a read-only click, in `RichTextEditorOutput::clicked_link` without opening
+  it. Both accessibility bridges publish `Link` nodes whose `Click` action is
+  reported through `AccessibilityOutcome::activated_link` or `clicked_link`;
+  `AccessKitAdapter::locate_link()` maps a link node to its text.
+- Block quotes: `ParagraphKind::Quote`. Enter continues a quote; Enter on an
+  empty quote paragraph and Backspace at a quote paragraph's start turn it into
+  body text as one undo step, and indentation commands and Tab leave quotes
+  alone. HTML groups consecutive quote paragraphs into one `<blockquote>` with a
+  `<p>` each. Egui indents them with a gutter bar that continues across
+  consecutive quotes, and both accessibility bridges group them under one
+  `Blockquote` node.
+- TLFR version 2 adds paragraph kind tags 4 and 5 (ordered items that continue
+  or restart their list) and 6 (block quote), and style bits 6 (fill) and 7
+  (link). The decoder still reads version 1.
+- Native host: Excel-style **Fill Color** and **Font Color** split buttons
+  apply the last color chosen, initially Yellow and Red, and their menus offer
+  "No Fill" or "Automatic" and the ten standard colors. **Link** and
+  Ctrl/Command+K open a URL field prefilled from the selected link; applying it
+  links the selection or edits the link at the caret, a caret elsewhere inserts
+  the URL as linked text, and an empty URL unlinks. Editing or removing part of
+  one link applies to the whole link. **Remove link** unlinks.
+  Ctrl/Command+click, or a click in read-only mode, opens only http, https, and
+  mailto targets. The paragraph-kind choice adds **Quote**, and a focused
+  numbered item shows **Item N.** with **Restart at 1** and **Continue
+  numbering**, each one undo step. The clipboard self-test fixture includes a
+  Yellow fill.
+
+### Changed
+
+Library behavior changes relative to 0.1 come first, then host and CI changes.
+
+- Lists number like a word processor's. `ParagraphKind::Ordered` stores an
+  optional explicit start instead of its displayed number: `Some(n)` restarts
+  at `n`, and `None` continues the nearest earlier ordered item at the same
+  indent unless a heading or a shallower list item lies between them, showing
+  1 otherwise. Body text, quotes, and same-level bullets interrupt a list
+  without ending it, and deeper items are skipped. Edits never rewrite other
+  paragraphs to renumber them, so converting an item to another kind and back
+  restores its list exactly, and a heading placed mid-list restarts the
+  following items at 1. When a deletion removes an item with an explicit start,
+  the item that continued its list inherits that start. Indent and outdent keep
+  starts, and `replace_all()` numbers lists exactly as step-by-step replacement
+  does. Applying `Ordered { start, .. }` gives `start` to the first selected
+  item and continues the rest.
+- Ctrl/Command+Shift+7 uses `apply_numbered_list(0)`: it extends a list ending
+  right before the selection and does nothing on items already numbered at
+  level zero, instead of always restarting at 1.
+- Enter on an empty list item outdents it one level instead of always leaving
+  the list. Backspace at the start of an item outdents it, turning level zero
+  into body text; a second Backspace joins paragraphs.
+- Splitting a heading before its end keeps both parts headings. Typing over a
+  selection that starts at a paragraph start and crosses a paragraph break takes
+  the kind of the paragraph containing the selection end.
+- Rich paste keeps the kinds and explicit starts of complete pasted
+  paragraphs, so pasted continuations continue the destination list; surviving
+  destination text keeps its kind. A fragment without a paragraph break adopts
+  its source kind only when it fills an empty line or whole selected
+  paragraphs. Empty fragments change nothing. An ordered item that begins a list
+  and is the fragment's first item at its level is captured with start 1, so a
+  copied list stays a new list. HTML of a captured range keeps the numbers its
+  items showed, for example `<ol start="3">` for the third to fifth items,
+  without changing its TLFR bytes. Fragment equality compares, and `Debug`
+  shows, only paragraphs.
+- Import and insertion treat U+2029 PARAGRAPH SEPARATOR as a paragraph break
+  like LF, CRLF, and CR; `Paragraph::new()` and TLFR version 2 reject it in
+  paragraph text. U+2028 is a soft line break: plain-text export,
+  `Document::text()`, `selected_text()`, and `Fragment::plain_text()` write it
+  as LF instead of verbatim. A search query's LF, CRLF, CR, or U+2029 matches
+  only paragraph breaks, and its U+2028 matches only soft breaks.
+- `to_bytes()` writes TLFR version 2. Version 1 snapshots still decode: a
+  legacy ordered item becomes an explicit start only when its stored ordinal
+  differs from the number it would show by continuation, so every item shows
+  its stored ordinal, and U+2029 in version 1 text becomes a soft line break.
+- Word movement and deletion stop at Unicode words and at runs of punctuation,
+  symbols, or emoji; accessibility word starts use the same stops.
+- Consecutive Backspace or Delete within a paragraph coalesce into one undo step,
+  like typing; a deleted paragraph break is its own step. Typing over a
+  selection continues as one step, and IME commits without paragraph breaks
+  join adjacent typing instead of always forming their own step.
+- Typing over a selection uses the style of its first selected grapheme in
+  either direction; forward selections previously used the last. Moves that
+  leave the selection unchanged keep a pending caret style.
+- Case-insensitive search treats final sigma `ς` as `σ`.
+- HTML export places the color `<span>` directly around `<u>` and `<s>`, inside
+  any `<code>`, so decoration lines take the text color.
+- `history_bytes()` charges the larger side of each change once, without counting
+  text and runs both sides share, so formatting multi-megabyte documents stays
+  undoable. `Debug` output of paragraphs and documents omits internal caches.
+- Accessibility full-value replacement uses the style at the document start
+  instead of the caret's typing style. The direct AccessKit adapter publishes
+  graphemes longer than 255 bytes as several AccessKit characters instead of
+  failing, and `AccessKitError::Editor` no longer repeats its message in error
+  chains.
+- Egui: a press places the caret and a primary-button drag extends from the
+  press point; double and triple clicks select on release. Home/End and macOS
+  Command+Left/Right use the visual row, and Ctrl/Command+Home/End move to the
+  document start or end. Clicking, dragging, or moving focus away during IME
+  composition commits the preedit after applying IME events queued earlier in
+  the frame, and ignores one immediate repeat of that commit; Escape, read-only
+  mode, and disabling cancel it. Touch swipes scroll until the editor has focus. `min_rows(n)` fits `n`
+  single-row paragraphs. List geometry scales with the font, and ordered markers
+  reserve three digits: at 16 pt, level-zero ordered text moves from 32 to
+  39 pt. Bold spans always use the strong text color, and missing bold or
+  monospace families fall back instead of panicking.
+- Both adapters: shortcuts without Shift ignore chords with Shift held, which
+  reach the host. Latin logical keys select shortcuts, other layouts use the
+  physical US key, and the digit row uses its physical digit. Typed text drops
+  control characters; paste and IME commits keep only line breaks and tabs among
+  them. Egui read-only mode consumes only the chords editable mode handles.
+- Winit: Ctrl+Alt chords type text only on Windows (AltGr). Modifiers survive
+  widget blur. `sync_ime` sends only changes, allows IME after focus gain or
+  `Ime::Disabled`, releases it once after blur or read-only mode, and
+  interrupts preedits the editor dropped.
+- The `egui` feature no longer enables `egui/default_fonts`; eframe enables it by
+  default. The minimum AccessKit version is 0.24.1.
+- Native host: toolbar and search commands commit an active preedit instead of
+  failing with `CompositionActive`. The paragraph-kind choice keeps indentation
+  and numbering and shows the kind of a paragraph that commands change; its
+  "Numbered list" uses `apply_numbered_list()`, as Ctrl/Command+Shift+7 does.
+  The rich clipboard preflights the exact TLFR version 2 size.
+  `--qa-report` claims its path at startup and exits with status 2 if the file
+  exists or cannot be created. Linux clipboard helpers exit when the host dies.
+  The host builds on other Unix targets, which reject `--rich-clipboard`, and
+  uses the public `DecodeLimits::DEFAULT`.
+- CI adds cargo-deny checks, with bans, licenses, and sources as a required
+  check, and a build with minimal direct dependency versions. macOS and Windows
+  run strict Clippy, only pull requests cancel superseded runs, and benchmark
+  smoke runs use `TEXTLOOM_BENCH_QUICK=1`. `scripts/release-version.sh` gives
+  local and tag release checks one version gate, which also requires this entry
+  to record its release date.
+
+### Fixed
+
+- Egui: IME candidate windows follow the caret through a caret-local IME area.
+  Drags anchor at the press point. Space and Enter no longer act as clicks that
+  refocus or interrupt IME. Bare IME commits group like typing, and IME text
+  consisting of one line break no longer duplicates Enter. The caret stays
+  visible during an empty preedit, selection is visible over inline code, the
+  Tab focus filter no longer goes stale, read-only mode no longer swallows host
+  shortcuts, and hint text uses the first paragraph's layout. A click whose
+  press and release arrive in the same frame, such as a touchpad tap, places
+  the caret, commits a preedit, and activates links instead of being ignored.
+- Egui accessibility: oversized graphemes no longer fail every frame. Runs
+  publish word starts and stay within 255 characters including the synthetic
+  line break, so AccessKit word navigation no longer wraps to the run start.
+  List items publish their position and set size, following the numbering
+  rule: headings close every set, shallower items close deeper sets, body text,
+  quotes, and the other list kind at the same level interrupt a set without
+  closing it, and an explicit start begins a new set. At wrapped-row seams the
+  published caret follows the painted caret's affinity.
+- Winit: typing works at macOS startup despite winit 0.30's spurious
+  `Focused(false)` (winit #4371). `sync_ime` sends the caret area without
+  waiting for `Ime::Enabled`, so candidate windows follow the caret from the
+  first composition. Shortcuts work on non-Latin, AZERTY, and German layouts.
+
+### Performance
+
+Timings were measured informally during development; see `BENCHMARKS.md`.
+
+- Mixed-style typing in a 460 KB Unicode paragraph dropped from about 5.5 ms to
+  20 µs per keystroke. Enter at a paragraph end reuses the paragraph: Enter and
+  undo in a huge paragraph dropped from 5.1 ms to 0.3 µs. `scalar_count()`
+  builds no index (2.4 MB of CJK text: 2.4 to 0.14 ms), index storage is
+  allocated lazily, and history per Enter in a 10,000-item list fell from 2.0 MB
+  to 0.64 MB.
+- Direct AccessKit structural edits rebuild only replaced paragraphs (Enter at
+  100,000 paragraphs: 26.5 to 0.27 ms), with lazy position lookups, no
+  per-grapheme offset tables, and no segmentation for ASCII paragraphs. Long
+  non-ASCII paragraphs now pay word segmentation for word starts, about twice
+  the previous per-keystroke cost at 10–200 KB.
+- Egui no longer relays out the document on other viewports' passes or hidden
+  frames, which took up to about 294 ms at 2,000 paragraphs. Accessibility
+  geometry is linear (40,000 characters: 68.5 to 3.5 ms), node IDs stay stable
+  across structural edits (Enter at the top of 2,000 paragraphs: 34 to
+  0.78 ms), and renumbered list items reuse shaped text and accessibility runs
+  (Enter in a 10,000-item list: 4.2 to 2.9 ms of relayout). Layout builds no
+  scalar indexes, and the first preedit no longer reshapes the whole document.
+  Idle frames request visible galleys again so font-atlas changes cannot leave
+  stale texture coordinates: 10,000-paragraph idle frames rose from 7.6 to
+  11.0 µs, and long-preedit idle frames from 6.7 to 20 µs.
+- List edits no longer rewrite following items to renumber them. Displayed
+  numbers are computed in one pass after a change to paragraph kinds or count
+  and cached, and egui rebuilds only markers whose number changed, reusing the
+  shaped text. With links supported, typing in heavily formatted paragraphs
+  still takes about 4–5 µs per keystroke with 1,000 style runs and 76–95 µs
+  with 20,000.
+
+### Migration from 0.1
+
+Update the dependency to `textloom = "1.0"`.
+
+- Add a fallback arm when matching the error enums, `ParagraphKind`, `Movement`,
+  `InlineAttribute`, `AccessibleAction`, or winit `ClipboardEvent`.
+  `Composition`, `DecodeLimits`, `AccessibleParagraph`, `AccessibilityOutcome`,
+  `RichTextEditorOutput`, and winit `InputOutcome` cannot be built with struct
+  literals. Read accessibility snapshot state using its accessor methods.
+- `AccessKitError::CharacterTooLong` is removed because oversized graphemes are
+  published instead.
+- Pass the physical key to `WinitAdapter::handle_key`: `event.physical_key`, or
+  `PhysicalKey::Unidentified(NativeKeyCode::Unidentified)` when unknown.
+  `handle_window_event` does this automatically.
+- `WinitAdapter::sync_ime` takes `&mut self` and the editor:
+  `sync_ime(&window, &editor, position, size)`. Call it every frame while the
+  editor is focused and at least once after it blurs.
+- `InputOutcome` is `#[must_use]`, as are the egui widget's builder methods.
+  During a nonempty preedit, winit `paste` and `paste_fragment` return a handled,
+  unchanged outcome instead of `Err(CompositionActive)`.
+- Egui applications that do not use eframe and rely on egui's bundled fonts
+  enable `egui/default_fonts` themselves.
+- `ParagraphKind::Ordered { indent, start }` takes `start: Option<u32>`:
+  `Some(n)` restarts at `n` and `None` continues the list, instead of storing
+  the displayed number. Read displayed numbers with `Document::list_number()`,
+  and start a new list with `Editor::apply_numbered_list()` or `Some(1)`.
+  `ParagraphKind` also gained `Quote`.
+- Add `background` to `InlineStyle` and `StylePatch` struct literals, or use
+  `..Default::default()`, and `link` to `Span` literals and patterns.
+  `AccessibilityOutcome` no longer implements `Copy` because it can carry the
+  activated `Link`. `Error` and `FragmentError` gained `InvalidLink`.
+- `to_bytes()` writes TLFR version 2, which Textloom 0.1 cannot decode; 1.0
+  still reads version 1 snapshots, turning U+2029 in their text into soft line
+  breaks. Imported U+2029 starts a new paragraph, and plain-text export writes
+  U+2028 soft line breaks as LF.
+- Review the behavior changes above, notably list numbering and
+  Enter/Backspace, undo grouping, typing style over selections, and HTML
+  element order.
+
+Unicode segmentation is pinned to preserve persisted span-boundary semantics.

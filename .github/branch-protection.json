@@ -4,6 +4,7 @@
     "checks": [
       { "context": "Quality", "app_id": 15368 },
       { "context": "MSRV and feature combinations", "app_id": 15368 },
+      { "context": "Dependency policy (bans licenses sources)", "app_id": 15368 },
       { "context": "Native (macos-latest)", "app_id": 15368 },
       { "context": "Native (windows-latest)", "app_id": 15368 },
       { "context": "Native rendering (Linux X11)", "app_id": 15368 },

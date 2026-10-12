@@ -1,4 +1,4 @@
-use textloom::{Document, Editor, Position, SearchOptions, Selection};
+use textloom::{Document, Editor, Error, Position, SearchOptions, Selection, StylePatch};
 use unicode_segmentation::UnicodeSegmentation;
 
 fn default_options() -> SearchOptions {
@@ -230,20 +230,21 @@ fn overlapping_retries_preserve_earlier_and_later_matches() {
 }
 
 #[test]
-fn paragraph_local_options_preserve_case_context_and_word_boundaries() {
+fn paragraph_local_options_fold_final_sigma_and_respect_word_boundaries() {
     let document = Document::from_text("ΟΣ\nΟΣΑ\nİ\ni\ncat's\ncat\n你好\n\u{0600}word\nword");
     let insensitive = SearchOptions {
         case_sensitive: false,
         whole_word: false,
     };
-    assert_eq!(
-        document.find("ος", insensitive),
-        vec![Position::new(0, 0)..Position::new(0, 4)]
-    );
-    assert_eq!(
-        document.find("οσ", insensitive),
-        vec![Position::new(1, 0)..Position::new(1, 4)]
-    );
+    for query in ["ος", "οσ", "ΟΣ"] {
+        assert_eq!(
+            document.find(query, insensitive),
+            vec![
+                Position::new(0, 0)..Position::new(0, 4),
+                Position::new(1, 0)..Position::new(1, 4)
+            ]
+        );
+    }
     assert_eq!(
         document.find("i", insensitive),
         vec![Position::new(3, 0)..Position::new(3, 1)]
@@ -303,7 +304,7 @@ fn generated_unicode_matches_agree_with_a_grapheme_reference() {
         let needle = if options.case_sensitive {
             needle
         } else {
-            needle.to_lowercase()
+            needle.to_lowercase().replace('ς', "σ")
         };
         if needle.is_empty() {
             return Vec::new();
@@ -311,7 +312,7 @@ fn generated_unicode_matches_agree_with_a_grapheme_reference() {
         let searched = if options.case_sensitive {
             source.clone()
         } else {
-            source.to_lowercase()
+            source.to_lowercase().replace('ς', "σ")
         };
         let coordinates: Vec<_> = source
             .grapheme_indices(true)
@@ -502,7 +503,7 @@ fn navigation_matches_document_search_at_every_grapheme_and_direction() {
 }
 
 #[test]
-fn local_navigation_keeps_forward_nonoverlap_and_complete_lowercase_context() {
+fn local_navigation_keeps_forward_nonoverlap_and_folds_final_sigma() {
     let options = SearchOptions::default();
     let mut editor = Editor::from_text("ana\nbanana\nΟΣΑ");
     editor
@@ -531,12 +532,16 @@ fn local_navigation_keeps_forward_nonoverlap_and_complete_lowercase_context() {
     editor
         .set_selection(Selection::caret(Position::new(2, 4)))
         .unwrap();
-    assert!(!editor.find_previous("ος", insensitive, true).unwrap());
-    assert!(editor.find_previous("οσ", insensitive, false).unwrap());
-    assert_eq!(
-        editor.selection(),
-        Selection::new(Position::new(2, 0), Position::new(2, 4))
-    );
+    for query in ["ος", "οσ", "ΟΣ"] {
+        editor
+            .set_selection(Selection::caret(Position::new(2, 4)))
+            .unwrap();
+        assert!(editor.find_previous(query, insensitive, false).unwrap());
+        assert_eq!(
+            editor.selection(),
+            Selection::new(Position::new(2, 0), Position::new(2, 4))
+        );
+    }
 }
 
 #[test]
@@ -687,4 +692,202 @@ fn navigation_matches_global_results_for_sparse_paragraphs_and_crossing_selectio
     }
     assert_eq!(editor.document().revision(), 0);
     assert_eq!(editor.undo_len(), 0);
+}
+
+#[test]
+fn case_insensitive_search_finds_case_sensitive_sigma_matches_in_any_context() {
+    let insensitive = SearchOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+    for (text, query) in [
+        ("ΟΣΑ", "ΟΣ"),
+        ("ΟΣ", "Σ"),
+        ("ΑΣ.Α", "ΑΣ"),
+        ("λόγος", "σ"),
+        ("ΟΣΑ", "ς"),
+        ("ΟΣ ΟΣΑ λόγος", "οσ"),
+    ] {
+        let document = Document::from_text(text);
+        let sensitive = document.find(query, default_options());
+        let matches = document.find(query, insensitive);
+        assert!(!matches.is_empty(), "{text:?} {query:?}");
+        assert!(
+            sensitive.iter().all(|found| matches
+                .iter()
+                .any(|candidate| candidate.start < found.end && found.start < candidate.end)),
+            "{text:?} {query:?} {sensitive:?} {matches:?}"
+        );
+    }
+    let mut editor = Editor::from_text("ΟΣΑ");
+    assert!(editor.find_next("ΟΣ", insensitive, true).unwrap());
+    assert_eq!(editor.selected_text(), "ΟΣ");
+    assert_eq!(editor.replace_all("οσ", "x", insensitive).unwrap(), 1);
+    assert_eq!(editor.document().plain_text(), "xΑ");
+}
+
+#[test]
+fn replacing_the_selected_match_matches_replace_all_formatting_in_one_step() {
+    let mut editor = Editor::from_text("xx foo yy foo");
+    editor
+        .set_selection(Selection::new(Position::new(0, 3), Position::new(0, 4)))
+        .unwrap();
+    editor
+        .apply_style(StylePatch {
+            bold: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut all = Editor::new(editor.document().clone());
+    all.replace_all("foo", "bar", default_options()).unwrap();
+    caret(&mut editor, 0, 0);
+    assert!(editor.find_next("foo", default_options(), true).unwrap());
+    let selection = editor.selection();
+    let steps = editor.undo_len();
+    assert!(
+        editor
+            .replace_selected_match("foo", "bar", default_options())
+            .unwrap()
+    );
+    assert_eq!(editor.selection(), Selection::caret(Position::new(0, 6)));
+    assert!(
+        !editor
+            .replace_selected_match("foo", "bar", default_options())
+            .unwrap()
+    );
+    assert!(editor.find_next("foo", default_options(), true).unwrap());
+    assert!(
+        editor
+            .replace_selected_match("foo", "bar", default_options())
+            .unwrap()
+    );
+    assert_eq!(editor.document().paragraphs(), all.document().paragraphs());
+    assert_eq!(editor.undo_len(), steps + 2);
+    assert!(editor.undo());
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "xx foo yy foo");
+    assert_eq!(editor.selection(), selection);
+}
+
+#[test]
+fn only_selections_in_the_match_stream_are_replaced() {
+    let insensitive = SearchOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+    let whole_word = SearchOptions {
+        case_sensitive: true,
+        whole_word: true,
+    };
+    let mut editor = Editor::from_text("banana Foo cat category\nend");
+    let select = |editor: &mut Editor, start: (usize, usize), end: (usize, usize)| {
+        editor
+            .set_selection(Selection::new(
+                Position::new(start.0, start.1),
+                Position::new(end.0, end.1),
+            ))
+            .unwrap();
+    };
+    for (start, end, query, options, expected) in [
+        ((0, 3), (0, 6), "ana", default_options(), false),
+        ((0, 1), (0, 4), "ana", default_options(), true),
+        ((0, 7), (0, 10), "foo", default_options(), false),
+        ((0, 7), (0, 10), "foo", insensitive, true),
+        ((0, 15), (0, 18), "cat", whole_word, false),
+        ((0, 11), (0, 14), "cat", whole_word, true),
+        ((0, 22), (1, 2), "y\nen", default_options(), true),
+        ((0, 22), (1, 1), "y\nen", default_options(), false),
+        ((0, 3), (0, 3), "", default_options(), false),
+    ] {
+        let mut copy = editor.clone();
+        select(&mut copy, start, end);
+        let selection = copy.selection();
+        let content = copy.document().paragraphs().to_vec();
+        assert_eq!(
+            copy.replace_selected_match(query, "_", options).unwrap(),
+            expected,
+            "{query:?} {start:?}..{end:?}"
+        );
+        if !expected {
+            assert_eq!(copy.selection(), selection);
+            assert_eq!(copy.document().paragraphs(), content);
+        }
+    }
+    select(&mut editor, (0, 22), (1, 2));
+    assert!(
+        editor
+            .replace_selected_match("y\nen", "y!\nEN", default_options())
+            .unwrap()
+    );
+    assert_eq!(
+        editor.document().plain_text(),
+        "banana Foo cat category!\nENd"
+    );
+    assert_eq!(editor.undo_len(), 1);
+    editor.update_composition("x", None).unwrap();
+    assert_eq!(
+        editor.replace_selected_match("x", "y", default_options()),
+        Err(Error::CompositionActive)
+    );
+}
+
+fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
+    editor
+        .set_selection(Selection::caret(Position::new(paragraph, byte)))
+        .unwrap();
+}
+
+#[test]
+fn line_feed_queries_match_paragraph_breaks_but_not_soft_line_breaks() {
+    let document = Document::from_text("ab\u{2028}cd\nef");
+    let find = |query| document.find(query, default_options());
+    let range = |start: (usize, usize), end: (usize, usize)| {
+        Position::new(start.0, start.1)..Position::new(end.0, end.1)
+    };
+    assert_eq!(find("\n"), [range((0, 7), (1, 0))]);
+    assert_eq!(find("d\ne"), [range((0, 6), (1, 1))]);
+    assert!(find("b\nc").is_empty());
+    assert_eq!(find("\u{2028}"), [range((0, 2), (0, 5))]);
+    assert_eq!(find("b\u{2028}cd\ne"), [range((0, 1), (1, 1))]);
+    assert_eq!(find("f"), [range((1, 1), (1, 2))]);
+    assert_eq!(find("d\u{2029}e"), [range((0, 6), (1, 1))]);
+    let words = SearchOptions {
+        case_sensitive: false,
+        whole_word: true,
+    };
+    assert_eq!(document.find("CD", words), [range((0, 5), (0, 7))]);
+    assert_eq!(
+        document.find("AB\u{2028}CD", words),
+        [range((0, 0), (0, 7))]
+    );
+    assert!(document.find("B\u{2028}C", words).is_empty());
+
+    let mut editor = Editor::new(document.clone());
+    assert!(
+        editor
+            .find_next("b\u{2028}cd\ne", default_options(), true)
+            .unwrap()
+    );
+    assert_eq!(
+        editor.selection(),
+        Selection::new(Position::new(0, 1), Position::new(1, 1))
+    );
+    assert!(
+        editor
+            .replace_selected_match("b\u{2028}cd\ne", "X", default_options())
+            .unwrap()
+    );
+    assert_eq!(editor.document().plain_text(), "aXf");
+    assert!(editor.undo());
+    assert_eq!(
+        editor.replace_all("\u{2028}", " ", default_options()),
+        Ok(1)
+    );
+    assert_eq!(editor.document().plain_text(), "ab cd\nef");
+    assert_eq!(
+        editor.replace_all(" ", "\u{2028}", default_options()),
+        Ok(1)
+    );
+    assert_eq!(editor.document().paragraphs().len(), 2);
+    assert_eq!(editor.document().paragraphs()[0].text(), "ab\u{2028}cd");
 }

@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +33,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Complete release checks
         run: ./scripts/check-release.sh
@@ -52,19 +55,63 @@ jobs:
           toolchain: '1.95.0'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests and doctests for every feature combination
         run: |
           for features in '' egui winit accesskit egui,winit egui,accesskit winit,accesskit egui,winit,accesskit; do
             cargo test --locked --no-default-features --features "$features"
           done
-      - name: All targets compile
-        run: |
-          cargo check --locked --all-features --all-targets
-      - name: Native host example compiles
-        run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
-      - name: Native host CLI and report tests
+      - name: Benchmarks compile
+        run: cargo build --locked --all-features --benches
+      - name: Native host compiles, CLI and report tests
         run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+
+  minimal-versions:
+    name: Minimal dependency versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: '1.95.0'
+      - name: Resolve the lowest direct dependency versions
+        run: cargo +nightly update -Z direct-minimal-versions
+      - name: All targets compile
+        run: cargo +1.95.0 check --locked --all-features --all-targets
+
+  dependencies:
+    name: Dependency policy (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [advisories, bans licenses sources]
+    continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Library
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          command: check ${{ matrix.checks }}
+          rust-version: '1.95.0'
+      - name: Native host
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          manifest-path: examples/native-editor/Cargo.toml
+          command: check ${{ matrix.checks }}
+          rust-version: '1.95.0'
 
   native:
     name: Native (${{ matrix.os }})
@@ -81,13 +128,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: stable
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: All targets compile
-        run: cargo check --locked --all-features --all-targets
-      - name: Native host example compiles
-        run: cargo check --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: All targets compile without Clippy warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Native host compiles without Clippy warnings
+        run: cargo clippy --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target -- -D warnings
       - name: Native host CLI and report tests
         run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
       - name: Tests and doctests
@@ -143,6 +194,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install virtual display and software renderer
         run: |
@@ -199,6 +253,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          workspaces: |
+            . -> target
+            examples/native-editor -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native renderer
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target

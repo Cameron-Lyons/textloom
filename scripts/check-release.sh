@@ -25,16 +25,7 @@ if ! $allow_dirty && [[ -n "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
-package_id=$(cargo pkgid --offline)
-version=${package_id##*[#@]}
-if [[ -n "$release_tag" && "$release_tag" != "v$version" ]]; then
-    echo "Release tag $release_tag does not match package version v$version" >&2
-    exit 1
-fi
-if ! grep -Fxq "## $version" CHANGELOG.md; then
-    echo "CHANGELOG.md has no release entry for $version" >&2
-    exit 1
-fi
+version=$(./scripts/release-version.sh ${release_tag:+"$release_tag"})
 
 export CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-always}
 package_target_dir=${CARGO_TARGET_DIR:-target}
@@ -49,7 +40,7 @@ cargo test --locked --manifest-path "$native_example_manifest" --all-targets --t
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo clippy --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir" -- -D warnings
 RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --locked --all-features --no-deps
-cargo bench --locked --all-features --bench editing --bench rendering
+TEXTLOOM_BENCH_QUICK=1 cargo bench --locked --all-features --bench editing --bench rendering
 cargo run --locked --example rich_text
 cargo run --locked --example egui_editor --features egui
 cargo run --locked --example winit_input --features winit

@@ -81,7 +81,7 @@ fn serialization() {
 fn styled_repetitions(phrase: &str, repetitions: usize) -> Document {
     let text = phrase.repeat(repetitions);
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"TLFR\x01");
+    bytes.extend_from_slice(b"TLFR\x02");
     bytes.extend_from_slice(&1u64.to_le_bytes());
     bytes.push(0);
     bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
@@ -201,15 +201,16 @@ fn short_paragraph_edits() {
         editor
             .set_selection(Selection::caret(Position::new(paragraphs / 2, 5)))
             .unwrap();
+        let iterations = scaled(2_000);
         let start = Instant::now();
-        for _ in 0..2_000 {
+        for _ in 0..iterations {
             editor.insert_text(black_box("x")).unwrap();
             editor.break_history_group();
             assert!(editor.undo());
         }
         println!(
             "{paragraphs:>6} paragraphs: {:.2} µs / insert + undo",
-            start.elapsed().as_secs_f64() * 1_000_000.0 / 2_000.0
+            start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
         );
     }
 }
@@ -704,7 +705,17 @@ fn sparse_replacement() {
     }
 }
 
+fn scaled(iterations: usize) -> usize {
+    let quick = std::env::var_os("TEXTLOOM_BENCH_QUICK").is_some_and(|value| !value.is_empty());
+    if quick {
+        (iterations / 10).max(2)
+    } else {
+        iterations
+    }
+}
+
 fn measure(label: &str, iterations: usize, mut operation: impl FnMut()) {
+    let iterations = scaled(iterations);
     let start = Instant::now();
     for _ in 0..iterations {
         operation();

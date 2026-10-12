@@ -1,15 +1,14 @@
-use crate::{Document, Editor, Error, Fragment, Position, Selection};
+use crate::{Document, Editor, Error, Fragment, Link, Position, Selection};
 #[cfg(test)]
 use crate::{ParagraphKind, StylePatch};
-#[cfg(test)]
-use egui::{Color32, ImeEvent, Key, Modifiers, Stroke, text::CCursor};
 use egui::{
-    Event, FontFamily, FontId, Id, Pos2, Rect, Response, Sense, TextStyle, Ui, Vec2, Widget,
-    text::CharIndex,
+    Color32, Event, FontFamily, FontId, Galley, Id, ImeEvent, Pos2, Rect, Response, Sense,
+    TextFormat, TextStyle, Ui, Vec2, Widget,
+    text::{CharIndex, LayoutJob},
 };
 #[cfg(test)]
-use std::ops::Range;
-use std::sync::Arc;
+use egui::{Key, Modifiers, Stroke, text::CCursor};
+use std::{ops::Range, sync::Arc};
 #[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -19,20 +18,22 @@ mod input;
 mod layout;
 mod navigation;
 mod paint;
+use super::clean_text;
 pub use accessibility::AccessibilityError;
 use composition::CompositionPreview;
-use input::{handle_event, selected_paragraphs};
+use input::{InputOptions, handle_event};
 #[cfg(test)]
-use input::{handle_key, selection_contains_list, surrounding_position};
+use input::{handle_key, surrounding_position};
 #[cfg(test)]
 use layout::paragraph_job;
-use layout::{Appearance, LayoutCache, ParagraphLayout, ParagraphLayouts};
+use layout::{Appearance, LayoutCache, ParagraphLayouts};
 use navigation::{
-    VerticalNavigation, document_caret_rect, hit_test, pointer_navigation, word_selection,
+    VerticalNavigation, document_caret_rect, hit_test, link_at_point, pointer_navigation,
+    selection_bounds,
 };
 #[cfg(test)]
 use navigation::{preedit_byte_range, snap_grapheme};
-use paint::paint_document_selection;
+use paint::{BackgroundRanges, paint_document};
 
 pub trait RichClipboard {
     fn copy(&mut self, _fragment: &Fragment) -> bool {
@@ -54,13 +55,39 @@ pub struct RichTextEditor<'a> {
     bold_family: Option<FontFamily>,
     hint: String,
     read_only: bool,
+    heading_shortcuts: bool,
+    highlights: Vec<BackgroundRanges<'a>>,
     rich_clipboard: Option<&'a mut dyn RichClipboard>,
 }
 
+impl std::fmt::Debug for RichTextEditor<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RichTextEditor")
+            .field("id", &self.id)
+            .field("salt", &self.salt)
+            .field("desired_width", &self.desired_width)
+            .field("min_rows", &self.min_rows)
+            .field("font", &self.font)
+            .field("bold_family", &self.bold_family)
+            .field("hint", &self.hint)
+            .field("read_only", &self.read_only)
+            .field("heading_shortcuts", &self.heading_shortcuts)
+            .field("highlights", &self.highlights)
+            .field("rich_clipboard", &self.rich_clipboard.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct RichTextEditorOutput {
     pub response: Response,
     pub errors: Vec<Error>,
     pub accessibility_errors: Vec<AccessibilityError>,
+    pub caret_rect: Rect,
+    pub selection_rect: Option<Rect>,
+    pub clicked_link: Option<Link>,
 }
 
 impl<'a> RichTextEditor<'a> {
@@ -75,53 +102,80 @@ impl<'a> RichTextEditor<'a> {
             bold_family: None,
             hint: String::new(),
             read_only: false,
+            heading_shortcuts: true,
+            highlights: Vec::new(),
             rich_clipboard: None,
         }
     }
 
+    #[must_use]
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
         self
     }
 
+    #[must_use]
     pub fn id_salt(mut self, salt: impl egui::AsIdSalt) -> Self {
         self.salt = Some(egui::IdSalt::new(salt));
         self
     }
 
+    #[must_use]
     pub fn desired_width(mut self, width: f32) -> Self {
         self.desired_width = Some(width.max(32.0));
         self
     }
 
+    #[must_use]
     pub fn min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
         self
     }
 
+    #[must_use]
     pub fn font(mut self, font: FontId) -> Self {
         self.font = Some(font);
         self
     }
 
+    #[must_use]
     pub fn bold_font_family(mut self, family: FontFamily) -> Self {
         self.bold_family = Some(family);
         self
     }
 
+    #[must_use]
     pub fn hint_text(mut self, hint: impl Into<String>) -> Self {
         self.hint = hint.into();
         self
     }
 
+    #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
     }
 
+    #[must_use]
+    pub fn heading_shortcuts(mut self, enabled: bool) -> Self {
+        self.heading_shortcuts = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn highlight_ranges(mut self, ranges: &'a [Range<Position>], color: Color32) -> Self {
+        self.highlights.push((ranges, color));
+        self
+    }
+
+    #[must_use]
     pub fn rich_clipboard(mut self, clipboard: &'a mut dyn RichClipboard) -> Self {
         self.rich_clipboard = Some(clipboard);
         self
+    }
+
+    pub fn forget_state(ctx: &egui::Context, id: Id) {
+        ctx.data_mut(|data| data.remove::<Cache>(id));
     }
 
     pub fn show(mut self, ui: &mut Ui) -> RichTextEditorOutput {
@@ -148,11 +202,13 @@ impl<'a> RichTextEditor<'a> {
             color: ui.visuals().text_color(),
             strong_color: ui.visuals().strong_text_color(),
             code_background: ui.visuals().code_bg_color,
+            link_color: ui.visuals().hyperlink_color,
             width: width - PADDING * 2.0,
         };
         let old_revision = self.editor.document().revision();
         let old_selection = self.editor.selection();
         let old_composition = self.editor.composition_snapshot();
+        let was_focused = cache.interaction.focused;
         let publish_text = ui
             .ctx()
             .accesskit_node_builder(id, |node| {
@@ -176,86 +232,183 @@ impl<'a> RichTextEditor<'a> {
                 None
             }
         };
+        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+        let rows = self.min_rows as f32;
+        let hint = self.hint_galley(ui, initial_preview.as_ref().unwrap_or(&layouts));
         let height = initial_preview
             .as_ref()
             .unwrap_or(&layouts)
             .content_height()
-            .unwrap_or(font.size);
+            .unwrap_or(row_height)
+            .max(hint.as_ref().map_or(0.0, |(_, galley)| galley.size().y));
         let (_, rect) = ui.allocate_space(Vec2::new(
             width,
-            height.max(font.size * self.min_rows as f32) + PADDING * 2.0,
+            height.max(row_height * rows + PARAGRAPH_GAP * (rows - 1.0)) + PADDING * 2.0,
         ));
-        let mut response = ui.interact(rect, id, Sense::click_and_drag());
+        let drag_to_select =
+            !ui.input(|input| input.has_touch_screen()) || ui.memory(|memory| memory.has_focus(id));
+        let sense = if drag_to_select {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
+        let mut response = ui.interact(rect, id, sense);
+        response
+            .flags
+            .remove(egui::response::Flags::FAKE_PRIMARY_CLICKED);
         cache.observe_focus(self.editor, ui.is_enabled() && response.has_focus());
         let origin = rect.min + Vec2::splat(PADDING);
+        let mut pointer_interaction = false;
 
+        let now = ui.input(|input| input.time);
+        let mut clicked_link = None;
         if ui.is_enabled() {
-            if response.clicked() || response.drag_started() {
+            let options = InputOptions {
+                read_only: self.read_only,
+                page_height: (ui.clip_rect().height() - row_height).max(row_height),
+                heading_shortcuts: self.heading_shortcuts,
+            };
+            let pressed = drag_to_select
+                && (response.is_pointer_button_down_on() || response.clicked())
+                && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+            let clicked = response.clicked()
+                && (!drag_to_select || response.double_clicked() || response.triple_clicked());
+            let pointer = response.interact_pointer_pos();
+            let dragged = drag_to_select
+                && !pressed
+                && response.dragged_by(egui::PointerButton::Primary)
+                && pointer.is_some();
+            if !was_focused
+                || cache
+                    .interaction
+                    .commit_echo
+                    .as_ref()
+                    .is_some_and(|echo| now - echo.time > COMMIT_ECHO_SECONDS)
+            {
+                cache.interaction.commit_echo = None;
+            }
+            let ends_composition = ((pressed || clicked) && pointer.is_some())
+                || dragged
+                || !(pressed || clicked || response.has_focus());
+            let follows_links = self.read_only || ui.input(|input| input.modifiers.command);
+            let previous_press = cache.interaction.link_press.take();
+            let applied = if was_focused && ends_composition && self.editor.composition().is_some()
+            {
+                apply_queued_ime(
+                    self.editor,
+                    ui,
+                    &mut cache,
+                    &appearance,
+                    &mut layouts,
+                    &mut errors,
+                    &mut interrupted,
+                    &options,
+                )
+            } else {
+                Vec::new()
+            };
+            if pressed || clicked {
+                pointer_interaction = true;
                 cache.interaction.navigation = None;
-                response.request_focus();
-                if let Some(pointer) = response.interact_pointer_pos() {
-                    interrupted |= self.editor.cancel_composition();
-                    let (position, prefer_next_row) =
-                        hit_test(self.editor, &layouts, pointer - origin);
-                    let shift = ui.input(|input| input.modifiers.shift);
-                    let selection = if response.triple_clicked() {
-                        let end = self
-                            .editor
-                            .document()
-                            .paragraph(position.paragraph)
-                            .map_or(0, |p| p.text().len());
-                        Selection::new(
-                            Position::new(position.paragraph, 0),
-                            Position::new(position.paragraph, end),
-                        )
-                    } else if response.double_clicked() {
-                        word_selection(self.editor, position)
-                    } else if shift {
-                        Selection::new(self.editor.selection().anchor, position)
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                if let Some(pointer) = pointer {
+                    if let Some(committed) = finish_composition(self.editor, &mut errors) {
+                        interrupted = true;
+                        layouts = cache.layout(ui, self.editor, &appearance);
+                        cache.interaction.commit_echo = CommitEcho::new(committed, now);
+                    }
+                    let single = !response.double_clicked() && !response.triple_clicked();
+                    let link = (follows_links && single)
+                        .then(|| link_at_point(self.editor.document(), &layouts, pointer - origin))
+                        .flatten();
+                    if let Some(link) = link {
+                        if pressed {
+                            let (anchor, _) = hit_test(self.editor, &layouts, pointer - origin);
+                            cache.interaction.link_press = Some(LinkPress { link, anchor });
+                        } else {
+                            clicked_link = Some(link);
+                        }
                     } else {
-                        Selection::caret(position)
-                    };
-                    record(self.editor.set_selection(selection), &mut errors);
-                    cache.interaction.navigation =
-                        pointer_navigation(self.editor, &layouts, position, prefer_next_row);
+                        let (position, prefer_next_row) =
+                            hit_test(self.editor, &layouts, pointer - origin);
+                        let shift = ui.input(|input| input.modifiers.shift);
+                        let result = if response.triple_clicked() {
+                            self.editor.select_paragraph(position.paragraph)
+                        } else if response.double_clicked() {
+                            self.editor.select_word_at(position)
+                        } else {
+                            let anchor = if shift {
+                                self.editor.selection().anchor
+                            } else {
+                                position
+                            };
+                            self.editor.set_selection(Selection::new(anchor, position))
+                        };
+                        record(result, &mut errors);
+                        cache.interaction.navigation =
+                            pointer_navigation(self.editor, &layouts, position, prefer_next_row);
+                    }
                 }
             }
-            if response.dragged()
-                && let Some(pointer) = response.interact_pointer_pos()
+            let mut link_press = if pressed {
+                cache.interaction.link_press.take()
+            } else {
+                previous_press
+            };
+            if response.clicked()
+                && !response.double_clicked()
+                && !response.triple_clicked()
+                && let Some(press) = link_press.take()
+                && let Some(pointer) = pointer
+                && link_at_point(self.editor.document(), &layouts, pointer - origin).as_ref()
+                    == Some(&press.link)
             {
+                clicked_link = Some(press.link);
+            }
+            if dragged && let Some(pointer) = pointer {
+                pointer_interaction = true;
                 cache.interaction.navigation = None;
-                interrupted |= self.editor.cancel_composition();
+                if let Some(committed) = finish_composition(self.editor, &mut errors) {
+                    interrupted = true;
+                    layouts = cache.layout(ui, self.editor, &appearance);
+                    cache.interaction.commit_echo = CommitEcho::new(committed, now);
+                }
                 let (position, prefer_next_row) = hit_test(self.editor, &layouts, pointer - origin);
+                let anchor = link_press
+                    .take()
+                    .map_or(self.editor.selection().anchor, |press| press.anchor);
                 record(
-                    self.editor
-                        .set_selection(Selection::new(self.editor.selection().anchor, position)),
+                    self.editor.set_selection(Selection::new(anchor, position)),
                     &mut errors,
                 );
                 cache.interaction.navigation =
                     pointer_navigation(self.editor, &layouts, position, prefer_next_row);
             }
+            if response.is_pointer_button_down_on() {
+                cache.interaction.link_press = link_press;
+            }
 
             cache.observe_focus(self.editor, response.has_focus());
             if response.has_focus() {
                 cache.validate_navigation(self.editor.selection());
-                ui.memory_mut(|memory| {
-                    memory.set_focus_lock_filter(
-                        id,
-                        egui::EventFilter {
-                            tab: !self.read_only && cache.selection_contains_list(self.editor),
-                            horizontal_arrows: true,
-                            vertical_arrows: true,
-                            escape: true,
-                        },
-                    )
-                });
+                self.set_focus_filter(ui, id, &cache);
             }
+            let published = cache.accessibility.clone();
+            let link_click = |request: &egui::accesskit::ActionRequest| {
+                (request.action == egui::accesskit::Action::Click
+                    && request.target_tree == egui::accesskit::TreeId::ROOT)
+                    .then(|| published.as_ref()?.link(request.target_node).cloned())
+                    .flatten()
+            };
             let process_events = response.has_focus()
                 || ui.input(|input| {
                     input.events.iter().any(|event| {
                         matches!(event, Event::AccessKitActionRequest(request)
-                            if request.target_node == id.accesskit_id()
+                            if (request.target_node == id.accesskit_id()
                                 && request.target_tree == egui::accesskit::TreeId::ROOT)
+                                || link_click(request).is_some())
                     })
                 });
             let events = if process_events {
@@ -265,8 +418,18 @@ impl<'a> RichTextEditor<'a> {
             };
             let mut consumed = Vec::new();
             for (index, event) in events.iter().enumerate() {
+                if applied.binary_search(&index).is_ok() {
+                    continue;
+                }
                 let revision = self.editor.document().revision();
-                let handled = if let Event::AccessKitActionRequest(request) = event
+                let link = match event {
+                    Event::AccessKitActionRequest(request) => link_click(request),
+                    _ => None,
+                };
+                let handled = if let Some(link) = link {
+                    clicked_link = Some(link);
+                    true
+                } else if let Event::AccessKitActionRequest(request) = event
                     && request.target_node == id.accesskit_id()
                     && request.target_tree == egui::accesskit::TreeId::ROOT
                 {
@@ -280,17 +443,18 @@ impl<'a> RichTextEditor<'a> {
                         &mut accessibility_errors,
                     )
                 } else if response.has_focus() {
-                    handle_event(
-                        self.editor,
-                        ui,
-                        event,
-                        &layouts,
-                        &mut cache.interaction.navigation,
-                        &mut errors,
-                        &mut interrupted,
-                        self.read_only,
-                        &mut self.rich_clipboard,
-                    )
+                    is_commit_echo(&mut cache.interaction.commit_echo, event, self.editor)
+                        || handle_event(
+                            self.editor,
+                            ui,
+                            event,
+                            &layouts,
+                            &mut cache.interaction.navigation,
+                            &mut errors,
+                            &mut interrupted,
+                            &options,
+                            &mut self.rich_clipboard,
+                        )
                 } else {
                     false
                 };
@@ -302,6 +466,8 @@ impl<'a> RichTextEditor<'a> {
                 }
                 cache.validate_navigation(self.editor.selection());
             }
+            consumed.extend(applied);
+            consumed.sort_unstable();
             if !consumed.is_empty() {
                 ui.input_mut(|input| {
                     let mut consumed = consumed.into_iter().peekable();
@@ -316,8 +482,10 @@ impl<'a> RichTextEditor<'a> {
                     });
                 });
             }
-            if !response.has_focus() {
-                interrupted |= self.editor.cancel_composition();
+            if response.has_focus() {
+                self.set_focus_filter(ui, id, &cache);
+            } else {
+                interrupted |= finish_composition(self.editor, &mut errors).is_some();
             }
         }
 
@@ -372,78 +540,68 @@ impl<'a> RichTextEditor<'a> {
             .with_clip_rect(ui.clip_rect().intersect(rect.shrink(1.0)));
         let visible = ui.is_rect_visible(rect);
         if visible {
-            if let Some(selection) = display_selection {
-                paint_document_selection(
-                    display_document,
-                    selection,
-                    display_layouts,
-                    origin,
-                    &painter,
-                    ui.visuals().selection.bg_fill,
-                );
-            }
-            let top = painter.clip_rect().top() - origin.y;
-            let bottom = painter.clip_rect().bottom() - origin.y;
-            let first_visible = display_layouts.first_bottom_at_least(top);
-            let last_visible = display_layouts.first_top_after(bottom).max(first_visible);
-            for paragraph in display_layouts.views_range(first_visible..last_visible) {
-                let text_origin = origin + paragraph.rect.min.to_vec2();
-                if !painter
-                    .clip_rect()
-                    .intersects(paragraph.rect.translate(origin.to_vec2()))
-                {
-                    continue;
-                }
-                if let Some(marker) = paragraph.marker {
-                    painter.galley(
-                        origin + paragraph.marker_position.to_vec2(),
-                        marker.clone(),
-                        appearance.color,
-                    );
-                }
-                painter.galley(text_origin, paragraph.galley.clone(), appearance.color);
-            }
-            if self.editor.document().paragraphs().len() == 1
-                && self.editor.document().paragraphs()[0].text().is_empty()
-                && self.editor.composition().is_none()
-                && !self.hint.is_empty()
-            {
-                painter.text(
-                    origin,
-                    egui::Align2::LEFT_TOP,
-                    &self.hint,
-                    font.clone(),
-                    ui.visuals().weak_text_color(),
-                );
-            }
-        }
-        if response.has_focus() {
-            let caret_position =
-                preview.map_or(self.editor.selection().focus, |preview| preview.caret);
-            let prefer_next_row = preview.is_some()
-                || cache
-                    .interaction
-                    .navigation
-                    .as_ref()
-                    .is_none_or(|navigation| navigation.prefer_next_row);
-            let local_caret = document_caret_rect(
+            let highlights = if preview.is_some() {
+                &[][..]
+            } else {
+                &self.highlights[..]
+            };
+            paint_document(
+                &painter,
                 display_document,
                 display_layouts,
-                Pos2::ZERO,
-                caret_position,
-                prefer_next_row,
+                origin,
+                highlights,
+                display_selection.map(|selection| (selection, ui.visuals().selection.bg_fill)),
+                appearance.color,
+                ui.visuals().weak_text_color(),
             );
-            let caret = local_caret.translate(origin.to_vec2());
-            let show_caret = self
-                .editor
-                .composition()
-                .map_or(self.editor.selection().is_caret(), |composition| {
-                    composition.selection.is_some()
-                });
+            if let Some((position, galley)) = self.hint_galley(ui, display_layouts) {
+                let color = ui.visuals().weak_text_color();
+                painter.galley(origin + position.to_vec2(), galley, color);
+            }
+        }
+        let caret_position = preview.map_or(self.editor.selection().focus, |preview| preview.caret);
+        let prefer_next_row = preview.is_some()
+            || cache
+                .interaction
+                .navigation
+                .as_ref()
+                .is_none_or(|navigation| navigation.prefer_next_row);
+        let local_caret = document_caret_rect(
+            display_document,
+            display_layouts,
+            Pos2::ZERO,
+            caret_position,
+            prefer_next_row,
+        );
+        let caret = local_caret.translate(origin.to_vec2());
+        let selection_rect = display_selection.and_then(|selection| {
+            selection_bounds(
+                display_document,
+                display_layouts,
+                origin,
+                selection,
+                appearance.width,
+            )
+        });
+        if pointer_interaction
+            || !was_focused
+            || composition_changed
+            || old_selection != self.editor.selection()
+            || old_revision != self.editor.document().revision()
+        {
+            cache.interaction.last_interaction = now;
+        }
+        if response.has_focus() {
+            let show_caret = preview.map_or(self.editor.selection().is_caret(), |preview| {
+                preview.selection.is_some()
+            });
             if visible && show_caret {
-                painter.line_segment(
-                    [caret.left_top(), caret.left_bottom()],
-                    ui.visuals().text_cursor.stroke,
+                egui::text_selection::visuals::paint_text_cursor(
+                    ui,
+                    &painter,
+                    caret,
+                    now - cache.interaction.last_interaction,
                 );
             }
             if cache.interaction.caret_rect != Some(local_caret)
@@ -466,10 +624,23 @@ impl<'a> RichTextEditor<'a> {
                 .layer_transform_to_global(ui.layer_id())
                 .unwrap_or_default();
             if !self.read_only && ui.is_enabled() {
+                let mut ime_area = caret;
+                if let Some(preview) = preview {
+                    let start = document_caret_rect(
+                        display_document,
+                        display_layouts,
+                        origin,
+                        preview.composition.replacement.range().start,
+                        true,
+                    );
+                    if start.top() == caret.top() {
+                        ime_area = ime_area.union(start);
+                    }
+                }
                 ui.output_mut(|output| {
                     output.ime = Some(egui::output::IMEOutput {
                         purpose: egui::IMEPurpose::Normal,
-                        rect: transform * rect,
+                        rect: transform * ime_area.intersect(rect),
                         cursor_rect: transform * caret,
                         should_interrupt_composition: interrupted,
                     })
@@ -479,8 +650,21 @@ impl<'a> RichTextEditor<'a> {
             cache.interaction.scroll_to_caret = false;
         }
 
+        let hovered_link = response
+            .hover_pos()
+            .filter(|_| preview.is_none() && ui.is_enabled())
+            .and_then(|pointer| link_at_point(self.editor.document(), &layouts, pointer - origin));
         if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            let follows_links = self.read_only || ui.input(|input| input.modifiers.command);
+            ui.ctx()
+                .set_cursor_icon(if hovered_link.is_some() && follows_links {
+                    egui::CursorIcon::PointingHand
+                } else {
+                    egui::CursorIcon::Text
+                });
+        }
+        if let Some(link) = hovered_link {
+            response = response.on_hover_text_at_pointer(link.as_str());
         }
         let range = self.editor.selection().range();
         let char_start = cache.char_offset(self.editor.document(), range.start);
@@ -525,7 +709,17 @@ impl<'a> RichTextEditor<'a> {
                 accessibility_errors.push(error);
             }
             if let Some(snapshot) = &cache.accessibility {
-                snapshot.publish(ui, id, self.editor, &layouts, origin, self.read_only);
+                let navigation = cache.interaction.navigation.as_ref();
+                let next_row = navigation.is_none_or(|nav| nav.prefer_next_row);
+                snapshot.publish(
+                    ui,
+                    id,
+                    self.editor,
+                    &layouts,
+                    origin,
+                    self.read_only,
+                    next_row,
+                );
             }
         } else {
             cache.accessibility = None;
@@ -535,7 +729,44 @@ impl<'a> RichTextEditor<'a> {
             response,
             errors,
             accessibility_errors,
+            caret_rect: caret,
+            selection_rect,
+            clicked_link,
         }
+    }
+
+    fn hint_galley(&self, ui: &Ui, layouts: &ParagraphLayouts) -> Option<(Pos2, Arc<Galley>)> {
+        let paragraphs = self.editor.document().paragraphs();
+        if self.hint.is_empty()
+            || paragraphs.len() != 1
+            || !paragraphs[0].text().is_empty()
+            || self.editor.composition().is_some()
+        {
+            return None;
+        }
+        let layout = layouts.get(0)?;
+        let font = layout.galley.job.sections.first()?.format.font_id.clone();
+        let mut job = LayoutJob::single_section(
+            self.hint.clone(),
+            TextFormat::simple(font, ui.visuals().weak_text_color()),
+        );
+        job.wrap.max_width = layout.galley.job.wrap.max_width;
+        Some((layout.rect.min, ui.fonts_mut(|fonts| fonts.layout_job(job))))
+    }
+
+    fn set_focus_filter(&self, ui: &Ui, id: Id, cache: &Cache) {
+        let tab = !self.read_only && cache.selection_contains_list(self.editor);
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    tab,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            );
+        });
     }
 }
 
@@ -563,6 +794,15 @@ struct InteractionState {
     caret_rect: Option<Rect>,
     scroll_to_caret: bool,
     focused: bool,
+    last_interaction: f64,
+    commit_echo: Option<CommitEcho>,
+    link_press: Option<LinkPress>,
+}
+
+#[derive(Clone)]
+struct LinkPress {
+    link: Link,
+    anchor: Position,
 }
 
 impl Cache {
@@ -612,13 +852,121 @@ impl Cache {
     fn selection_contains_list(&self, editor: &Editor) -> bool {
         self.layout
             .layouts
-            .contains_list(selected_paragraphs(editor))
+            .contains_list(editor.selected_paragraphs())
     }
 }
 
 fn record(result: Result<(), Error>, errors: &mut Vec<Error>) {
     if let Err(error) = result {
         errors.push(error);
+    }
+}
+
+fn finish_composition(editor: &mut Editor, errors: &mut Vec<Error>) -> Option<String> {
+    let composition = editor.composition()?;
+    let text = clean_text(&composition.text, true).into_owned();
+    if text.is_empty() {
+        editor.cancel_composition();
+        return Some(text);
+    }
+    Some(match editor.commit_composition(&text) {
+        Ok(()) => text,
+        Err(error) => {
+            errors.push(error);
+            String::new()
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_queued_ime(
+    editor: &mut Editor,
+    ui: &Ui,
+    cache: &mut Cache,
+    appearance: &Appearance,
+    layouts: &mut ParagraphLayouts,
+    errors: &mut Vec<Error>,
+    interrupted: &mut bool,
+    options: &InputOptions,
+) -> Vec<usize> {
+    let queued: Vec<_> = ui.input(|input| {
+        let press = input.events.iter().position(|event| {
+            matches!(
+                event,
+                Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
+        input.events[..press.unwrap_or(input.events.len())]
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, Event::Ime(_)))
+            .map(|(index, event)| (index, event.clone()))
+            .collect()
+    });
+    let mut applied = Vec::new();
+    for (index, event) in queued {
+        let revision = editor.document().revision();
+        if handle_event(
+            editor,
+            ui,
+            &event,
+            layouts,
+            &mut cache.interaction.navigation,
+            errors,
+            interrupted,
+            options,
+            &mut None,
+        ) {
+            applied.push(index);
+        }
+        if revision != editor.document().revision() {
+            *layouts = cache.layout(ui, editor, appearance);
+        }
+    }
+    applied
+}
+
+const COMMIT_ECHO_SECONDS: f64 = 0.5;
+
+#[derive(Clone)]
+struct CommitEcho {
+    text: String,
+    time: f64,
+}
+
+impl CommitEcho {
+    fn new(text: String, time: f64) -> Option<Self> {
+        (!text.is_empty()).then_some(Self { text, time })
+    }
+}
+
+fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor) -> bool {
+    let Some(pending) = echo else {
+        return false;
+    };
+    match event {
+        Event::Ime(ImeEvent::Commit(text))
+            if editor.composition().is_none() && clean_text(text, true) == pending.text =>
+        {
+            *echo = None;
+            true
+        }
+        Event::Ime(ImeEvent::Preedit { text, .. }) if text.is_empty() => false,
+        #[allow(deprecated)]
+        Event::Ime(ImeEvent::Enabled | ImeEvent::Disabled) => false,
+        Event::Ime(_)
+        | Event::Text(_)
+        | Event::Paste(_)
+        | Event::Cut
+        | Event::Key { pressed: true, .. } => {
+            *echo = None;
+            false
+        }
+        _ => false,
     }
 }
 

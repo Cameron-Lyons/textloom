@@ -98,6 +98,23 @@ pub(super) fn read() -> Result<Option<NativeItem>, String> {
     read_x11()
 }
 
+pub(super) const PARENT_VARIABLE: &str = "TEXTLOOM_CLIPBOARD_PARENT";
+
+pub(super) fn exit_with_parent() -> Result<(), String> {
+    use rustix::process::{Pid, Signal, getppid, set_parent_process_death_signal};
+
+    set_parent_process_death_signal(Some(Signal::TERM))
+        .map_err(|_| "Clipboard helper could not follow its host")?;
+    let host = std::env::var(PARENT_VARIABLE)
+        .ok()
+        .and_then(|pid| pid.parse().ok())
+        .and_then(Pid::from_raw);
+    if host.is_none() || getppid() != host {
+        return Err("Clipboard helper host is not running".into());
+    }
+    Ok(())
+}
+
 fn use_wayland() -> bool {
     match std::env::var("TEXTLOOM_CLIPBOARD_BACKEND").as_deref() {
         Ok("x11") => false,

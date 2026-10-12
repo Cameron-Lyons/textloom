@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     fmt::Write as _,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -10,7 +10,7 @@ use std::{
 use eframe::egui;
 use textloom::{Composition, Editor, InlineStyle, Selection};
 
-pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--rich-clipboard] [--clipboard-self-test] [--font PATH] [--bold-font PATH] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--rich-clipboard enables the example's native rich clipboard transport.\n--clipboard-self-test runs a deterministic rich clipboard fixture check.\n                      Requires --rich-clipboard and writes the system clipboard;\n                      use only in an isolated test session.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH must not already exist; reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
+pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--rich-clipboard] [--clipboard-self-test] [--font PATH] [--bold-font PATH] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--rich-clipboard enables the example's native rich clipboard transport.\n--clipboard-self-test runs a deterministic rich clipboard fixture check.\n                      Requires --rich-clipboard and writes the system clipboard;\n                      use only in an isolated test session.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH is created at startup and must not already exist;\n            reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -69,6 +69,9 @@ impl Options {
         if options.clipboard_self_test && !options.rich_clipboard {
             return Err("--clipboard-self-test requires --rich-clipboard".to_owned());
         }
+        if options.rich_clipboard && !crate::clipboard::SUPPORTED {
+            return Err("--rich-clipboard is not supported on this platform".to_owned());
+        }
         Ok(options)
     }
 }
@@ -117,8 +120,23 @@ pub struct FocusState {
     pub widget_focus_retained: bool,
 }
 
-pub struct Session {
+pub struct ReportFile {
     path: PathBuf,
+    file: Option<File>,
+}
+
+impl ReportFile {
+    pub fn create(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            file: Some(file),
+        })
+    }
+}
+
+pub struct Session {
+    report_file: ReportFile,
     started_unix_seconds: u64,
     smoke_test: bool,
     rich_clipboard_requested: bool,
@@ -156,9 +174,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(options: &Options, editor: &Editor) -> Option<Self> {
-        Some(Self {
-            path: options.qa_report.clone()?,
+    pub fn new(options: &Options, report_file: ReportFile, editor: &Editor) -> Self {
+        Self {
+            report_file,
             started_unix_seconds: unix_seconds(),
             smoke_test: options.smoke_test,
             rich_clipboard_requested: options.rich_clipboard,
@@ -193,7 +211,7 @@ impl Session {
             minimum_pixels_per_point: None,
             maximum_pixels_per_point: None,
             native_pixels_per_point: None,
-        })
+        }
     }
 
     pub fn begin_frame(&mut self, context: &egui::Context) {
@@ -366,15 +384,19 @@ impl Session {
         )
     }
 
-    pub fn write_report(&self, editor: &Editor) -> io::Result<&Path> {
+    pub fn write_report(&mut self, editor: &Editor) -> io::Result<&Path> {
+        let mut file = self.report_file.file.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AlreadyExists, "QA report already written")
+        })?;
         let report = self.report(editor, option_env!("TEXTLOOM_QA_REVISION"));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.path)?;
         file.write_all(report.as_bytes())?;
         file.sync_all()?;
-        Ok(&self.path)
+        Ok(&self.report_file.path)
+    }
+
+    #[cfg(test)]
+    pub fn host_command_errors(&self) -> u64 {
+        self.host_command_errors
     }
 }
 
@@ -428,6 +450,22 @@ mod tests {
         Options::parse(arguments.iter().map(OsString::from))
     }
 
+    fn unwritten_session(arguments: &[&str], editor: &Editor) -> Session {
+        let report_file = ReportFile {
+            path: "unused.json".into(),
+            file: None,
+        };
+        Session::new(&options(arguments).unwrap(), report_file, editor)
+    }
+
+    fn temporary_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("textloom-{name}-{}-{unique}", std::process::id()))
+    }
+
     #[test]
     fn options_distinguish_disabled_read_only_and_report() {
         let parsed = options(&[
@@ -479,17 +517,15 @@ mod tests {
     #[test]
     fn clipboard_fixture_report_distinguishes_unrun_passed_and_sticky_failure() {
         let editor = Editor::from_text("PRIVATE_FIXTURE_TEXT");
-        let mut session = Session::new(
-            &options(&[
+        let mut session = unwritten_session(
+            &[
                 "--qa-report",
                 "unused.json",
                 "--rich-clipboard",
                 "--clipboard-self-test",
-            ])
-            .unwrap(),
+            ],
             &editor,
-        )
-        .unwrap();
+        );
         let report = session.report(&editor, None);
         assert!(report.contains("\"rich_clipboard_requested\": true"));
         assert!(report.contains("\"clipboard_self_test_requested\": true"));
@@ -509,8 +545,7 @@ mod tests {
         assert!(report.contains("\"manual_signoff\": \"not_recorded\""));
         assert!(!report.contains("PRIVATE"));
 
-        let mut unrequested =
-            Session::new(&options(&["--qa-report", "unused.json"]).unwrap(), &editor).unwrap();
+        let mut unrequested = unwritten_session(&["--qa-report", "unused.json"], &editor);
         unrequested.clipboard_self_test_result(true);
         let report = unrequested.report(&editor, None);
         assert!(report.contains("\"rich_clipboard_requested\": false"));
@@ -523,8 +558,7 @@ mod tests {
     fn report_escapes_metadata_and_omits_document_and_preedit_text() {
         let mut editor = Editor::from_text("PRIVATE_DOCUMENT_秘密");
         editor.update_composition("PRIVATE_PREEDIT", None).unwrap();
-        let session =
-            Session::new(&options(&["--qa-report", "unused.json"]).unwrap(), &editor).unwrap();
+        let session = unwritten_session(&["--qa-report", "unused.json"], &editor);
         let report = session.report(&editor, Some("rev\"\n\\\u{0}"));
         assert!(report.contains("\"source_revision\": \"rev\\\"\\n\\\\\\u0000\""));
         assert!(report.contains("\"tlfr_round_trip_equal\": true"));
@@ -538,8 +572,7 @@ mod tests {
     #[test]
     fn counters_observe_host_events_and_editor_transitions_without_text() {
         let mut editor = Editor::from_text("ab");
-        let mut session =
-            Session::new(&options(&["--qa-report", "unused.json"]).unwrap(), &editor).unwrap();
+        let mut session = unwritten_session(&["--qa-report", "unused.json"], &editor);
         session.input.observe(&[
             egui::Event::Text("secret".into()),
             egui::Event::Paste("secret".into()),
@@ -573,8 +606,7 @@ mod tests {
     #[test]
     fn focus_diagnostics_distinguish_native_blur_from_widget_focus_loss() {
         let editor = Editor::from_text("secret");
-        let mut session =
-            Session::new(&options(&["--qa-report", "unused.json"]).unwrap(), &editor).unwrap();
+        let mut session = unwritten_session(&["--qa-report", "unused.json"], &editor);
         session.input.observe(&[
             egui::Event::WindowFocused(true),
             egui::Event::WindowFocused(false),
@@ -612,29 +644,56 @@ mod tests {
     }
 
     #[test]
-    fn report_never_overwrites_existing_evidence() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("textloom-qa-{}-{unique}.json", std::process::id()));
+    fn report_path_is_claimed_at_startup_and_never_overwrites_evidence() {
+        let path = temporary_path("qa.json");
         let editor = Editor::from_text("secret");
-        let session = Session::new(
-            &Options {
-                qa_report: Some(path.clone()),
-                ..Options::default()
-            },
-            &editor,
-        )
-        .unwrap();
+        let options = Options {
+            qa_report: Some(path.clone()),
+            ..Options::default()
+        };
+        let mut session = Session::new(&options, ReportFile::create(&path).unwrap(), &editor);
+        assert_eq!(
+            ReportFile::create(&path).err().unwrap().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
         assert_eq!(session.write_report(&editor).unwrap(), path);
         let initial = std::fs::read(&path).unwrap();
+        assert!(initial.starts_with(b"{"));
         assert_eq!(
             session.write_report(&editor).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(&path).unwrap(), initial);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unusable_report_paths_fail_at_startup() {
+        let existing = temporary_path("existing.json");
+        std::fs::write(&existing, b"{}").unwrap();
+        assert_eq!(
+            ReportFile::create(&existing).err().unwrap().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"{}");
+        std::fs::remove_file(existing).unwrap();
+        let missing_parent = temporary_path("missing").join("report.json");
+        assert_eq!(
+            ReportFile::create(&missing_parent).err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn rich_clipboard_is_rejected_where_the_host_has_no_backend() {
+        assert_eq!(
+            options(&["--rich-clipboard"]).is_ok(),
+            cfg!(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "windows"
+            ))
+        );
     }
 }

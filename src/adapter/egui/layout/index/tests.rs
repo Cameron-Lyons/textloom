@@ -32,12 +32,20 @@ impl Fixture {
             egui::Pos2::ZERO,
             egui::vec2(20.0 + (id % 17) as f32, 12.0 + (id % 11) as f32 * 0.125),
         );
+        let marker = id.is_multiple_of(4).then(|| self.galley.clone());
+        let indent = (id % 5) as f32 * 3.0;
+        let quote_bar = (id % 4 == 1).then(|| {
+            egui::Rect::from_min_size(egui::pos2(1.0, 0.0), egui::vec2(2.0, galley.rect.height()))
+        });
         ParagraphCache {
             paragraph: self.paragraph.clone(),
+            number: None,
+            quote_bar,
             galley: Arc::new(galley),
-            marker: id.is_multiple_of(4).then(|| self.galley.clone()),
+            marker_x: indent - marker.as_ref().map_or(0.0, |marker| marker.size().x) - 8.0,
+            marker,
             chars: id + 1,
-            indent: (id % 5) as f32 * 3.0,
+            indent,
         }
     }
 
@@ -80,19 +88,13 @@ fn assert_tree(node: &Node) -> (usize, f64, usize, usize, u16) {
     );
     let expected_tail = match &node.children {
         Children::Leaf(entries) => {
+            assert!(entries.iter().all(|entry| entry.layout.rect.top() == 0.0));
             let tail = entries.last().unwrap();
-            (
-                tail.height,
-                tail.layout.rect.top(),
-                tail.layout.rect.bottom(),
-            )
+            (tail.height, tail.layout.rect.bottom())
         }
-        Children::Branch(_, right) => (right.tail_height, right.tail_top, right.tail_bottom),
+        Children::Branch(_, right) => (right.tail_height, right.tail_bottom),
     };
-    assert_eq!(
-        (node.tail_height, node.tail_top, node.tail_bottom),
-        expected_tail
-    );
+    assert_eq!((node.tail_height, node.tail_bottom), expected_tail);
     expected
 }
 
@@ -119,6 +121,7 @@ fn assert_layout_sequence(actual: &[ParagraphLayout], expected: &[ParagraphLayou
     for (actual, expected) in actual.iter().zip(expected) {
         assert_eq!(actual.rect, expected.rect);
         assert_eq!(actual.marker_position, expected.marker_position);
+        assert_eq!(actual.quote_bar, expected.quote_bar);
         assert!(Arc::ptr_eq(&actual.galley, &expected.galley));
         match (&actual.marker, &expected.marker) {
             (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
@@ -167,12 +170,12 @@ fn assert_layouts(layouts: &ParagraphLayouts, expected: &[ParagraphCache]) {
             layout.rect,
             egui::Rect::from_min_size(egui::pos2(cache.indent, y as f32), cache.galley.size())
         );
+        assert_eq!(layout.marker_position, egui::pos2(cache.marker_x, y as f32));
         assert_eq!(
-            layout.marker_position,
-            egui::pos2(
-                cache.indent - cache.marker.as_ref().map_or(0.0, |marker| marker.size().x) - 8.0,
-                y as f32,
-            )
+            layout.quote_bar,
+            cache
+                .quote_bar
+                .map(|bar| bar.translate(egui::vec2(0.0, y as f32)))
         );
         match (&layout.marker, &cache.marker) {
             (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
@@ -199,6 +202,7 @@ fn assert_layouts(layouts: &ParagraphLayouts, expected: &[ParagraphCache]) {
     for (actual, expected) in iterated.iter().zip(&flat) {
         assert_eq!(actual.rect, expected.rect);
         assert_eq!(actual.marker_position, expected.marker_position);
+        assert_eq!(actual.quote_bar, expected.quote_bar);
         assert!(Arc::ptr_eq(&actual.galley, &expected.galley));
     }
     for point in [
@@ -246,7 +250,7 @@ fn placeholder_defaults_allocate_no_generation_and_initialized_empty_versions_ar
     assert!(layouts.version.is_none());
     assert!(placeholder.matches(&layouts));
 
-    layouts.rebuild(&[], false);
+    layouts.rebuild(&[]);
     let initialized = layouts.identity();
     let environment = layouts.environment_identity();
     assert!(layouts.version.is_some());
@@ -256,14 +260,14 @@ fn placeholder_defaults_allocate_no_generation_and_initialized_empty_versions_ar
     layouts.replace(0..0, &[]);
     assert!(initialized.matches(&layouts));
 
+    assert!(Arc::ptr_eq(&environment, &layouts.environment_identity()));
+
     let retained_empty = layouts.clone();
-    layouts.rebuild(&[], false);
+    layouts.rebuild(&[]);
     assert!(!initialized.matches(&layouts));
     assert!(initialized.matches(&retained_empty));
-    assert!(Arc::ptr_eq(&environment, &layouts.environment_identity()));
-    assert_layouts(&layouts, &[]);
-    layouts.rebuild(&[], true);
     assert!(!Arc::ptr_eq(&environment, &layouts.environment_identity()));
+    assert_layouts(&layouts, &[]);
 
     let fixture = Fixture::new();
     let appended = fixture.caches(0, 2);
@@ -280,7 +284,7 @@ fn placeholder_defaults_allocate_no_generation_and_initialized_empty_versions_ar
 fn weak_generation_tokens_do_not_retain_geometry_or_environment_after_replacement() {
     let fixture = Fixture::new();
     let mut layouts = ParagraphLayouts::default();
-    layouts.rebuild(&fixture.caches(0, 4), true);
+    layouts.rebuild(&fixture.caches(0, 4));
     let identity = layouts.identity();
     let root = Arc::downgrade(layouts.root().unwrap());
     let environment = Arc::downgrade(&layouts.environment_identity());
@@ -302,7 +306,7 @@ fn retained_geometry_snapshots_keep_their_generation_until_the_snapshot_is_dropp
     let fixture = Fixture::new();
     let original = fixture.caches(0, 4);
     let mut layouts = ParagraphLayouts::default();
-    layouts.rebuild(&original, true);
+    layouts.rebuild(&original);
     let identity = layouts.identity();
     let root = Arc::downgrade(layouts.root().unwrap());
     let retained = layouts.clone();
@@ -329,7 +333,7 @@ fn y_partitions_match_rectangle_predicates_at_every_edge_and_gap_midpoint() {
                 Arc::make_mut(&mut first.galley).rect.max.y = 16_777_216.0;
             }
             let mut layouts = ParagraphLayouts::default();
-            layouts.rebuild(&caches, false);
+            layouts.rebuild(&caches);
             let mut y = 0.0_f64;
             let flat: Vec<_> = caches
                 .iter()
@@ -341,12 +345,10 @@ fn y_partitions_match_rectangle_predicates_at_every_edge_and_gap_midpoint() {
                             cache.galley.size(),
                         ),
                         marker: cache.marker.clone(),
-                        marker_position: egui::pos2(
-                            cache.indent
-                                - cache.marker.as_ref().map_or(0.0, |marker| marker.size().x)
-                                - 8.0,
-                            y as f32,
-                        ),
+                        marker_position: egui::pos2(cache.marker_x, y as f32),
+                        quote_bar: cache
+                            .quote_bar
+                            .map(|bar| bar.translate(egui::vec2(0.0, y as f32))),
                     };
                     y += f64::from(cache.galley.size().y + PARAGRAPH_GAP);
                     layout
@@ -375,7 +377,7 @@ fn range_iteration_matches_flat_slices_across_leaf_boundaries_and_edits() {
     let fixture = Fixture::new();
     let mut caches = fixture.caches(0, 257);
     let mut layouts = ParagraphLayouts::default();
-    layouts.rebuild(&caches, false);
+    layouts.rebuild(&caches);
     for replacement in [0, 1, 7, 33, 65] {
         let inserted = fixture.caches(1000 + replacement * 100, replacement);
         layouts.replace(31..65, &inserted);
@@ -453,7 +455,7 @@ fn repeated_replacements_match_flat_geometry_prefixes_and_retained_snapshots() {
     let fixture = Fixture::new();
     let mut expected = fixture.caches(0, 257);
     let mut layouts = ParagraphLayouts::default();
-    layouts.rebuild(&expected, false);
+    layouts.rebuild(&expected);
     let mut snapshots = Vec::new();
     let mut seed = 0xdea1_cafe_babe_1234_u64;
     let mut next_id = expected.len();
@@ -515,7 +517,7 @@ fn local_changes_share_unchanged_tree_leaves_and_preserve_old_snapshot_geometry(
     let fixture = Fixture::new();
     let original = fixture.caches(0, 2048);
     let mut layouts = ParagraphLayouts::default();
-    layouts.rebuild(&original, true);
+    layouts.rebuild(&original);
     let snapshot = layouts.clone();
     assert!(Arc::ptr_eq(
         layouts.root().unwrap(),
@@ -532,12 +534,9 @@ fn local_changes_share_unchanged_tree_leaves_and_preserve_old_snapshot_geometry(
     assert_layouts(&snapshot, &original);
     let environment = layouts.environment_identity();
     let identity = layouts.identity();
-    layouts.rebuild(&expected, false);
-    assert!(Arc::ptr_eq(&layouts.environment_identity(), &environment));
-    assert!(!layouts.identity().ptr_eq(&identity));
-    assert_layouts(&layouts, &expected);
-    layouts.rebuild(&expected, true);
+    layouts.rebuild(&expected);
     assert!(!Arc::ptr_eq(&layouts.environment_identity(), &environment));
+    assert!(!layouts.identity().ptr_eq(&identity));
     assert_layouts(&layouts, &expected);
 }
 
@@ -547,7 +546,7 @@ fn equal_count_updates_share_every_untouched_leaf_across_tree_seams() {
     let original = fixture.caches(0, 2048);
     for range in [0..1, 31..32, 31..34, 1023..1026, 2047..2048, 0..2048] {
         let mut layouts = ParagraphLayouts::default();
-        layouts.rebuild(&original, false);
+        layouts.rebuild(&original);
         let snapshot = layouts.clone();
         let before = leaf_addresses(snapshot.root().unwrap());
         let replacement = fixture.caches(3000, range.len());
@@ -564,7 +563,7 @@ fn equal_count_updates_share_every_untouched_leaf_across_tree_seams() {
         assert_layouts(&snapshot, &original);
     }
     let mut layouts = ParagraphLayouts::default();
-    layouts.rebuild(&original, false);
+    layouts.rebuild(&original);
     let snapshot = layouts.clone();
     layouts.replace(32..32, &[]);
     assert!(Arc::ptr_eq(

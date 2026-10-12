@@ -1,14 +1,16 @@
-use std::borrow::Cow;
-
-use crate::{Editor, Error, Fragment, Movement, ParagraphKind, StylePatch};
+use super::{Shortcut, clean_text, shortcut_key_name};
+use crate::{Editor, Error, Fragment, Movement, ParagraphKind};
 use winit::{
     dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, Ime, WindowEvent},
-    keyboard::{Key, ModifiersState, NamedKey},
+    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::Window,
 };
 
+const CTRL_ALT_IS_ALTGR: bool = cfg!(windows);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ClipboardEvent {
     Copy(String),
     CopyRich(Fragment),
@@ -18,6 +20,8 @@ pub enum ClipboardEvent {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[must_use = "service clipboard requests and redraw after changes"]
 pub struct InputOutcome {
     pub handled: bool,
     pub changed: bool,
@@ -49,6 +53,25 @@ pub struct WinitAdapter {
     command_modifier: CommandModifier,
     rich_clipboard: bool,
     read_only: bool,
+    host_vertical_navigation: bool,
+    ime: ImeSync,
+}
+
+type ImeArea = (LogicalPosition<f64>, LogicalSize<f64>);
+
+#[derive(Debug, Default)]
+struct ImeSync {
+    allowed: bool,
+    stale: bool,
+    area: Option<ImeArea>,
+    preedit: bool,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ImeRequests {
+    interrupt: bool,
+    allowed: Option<bool>,
+    area: Option<ImeArea>,
 }
 
 impl WinitAdapter {
@@ -63,6 +86,11 @@ impl WinitAdapter {
 
     pub fn rich_clipboard(mut self, enabled: bool) -> Self {
         self.rich_clipboard = enabled;
+        self
+    }
+
+    pub fn host_vertical_navigation(mut self, enabled: bool) -> Self {
+        self.host_vertical_navigation = enabled;
         self
     }
 
@@ -103,31 +131,30 @@ impl WinitAdapter {
         let was_focused = self.is_focused();
         let changed = self.focused != focused;
         self.focused = focused;
-        if was_focused && !self.is_focused() {
-            editor.break_history_group();
-        }
-        let composition_changed = if !focused {
-            self.ime_enabled = false;
-            self.modifiers = ModifiersState::empty();
-            editor.cancel_composition()
-        } else {
-            false
-        };
+        let canceled = self.focus_changed(was_focused, editor);
         InputOutcome {
-            changed: changed || composition_changed,
+            changed: changed || canceled,
             ..InputOutcome::default()
         }
     }
 
     pub fn sync_ime(
-        &self,
+        &mut self,
         window: &Window,
+        editor: &Editor,
         position: LogicalPosition<f64>,
         size: LogicalSize<f64>,
     ) {
-        let editable = self.is_focused() && !self.read_only;
-        window.set_ime_allowed(editable);
-        if editable && self.ime_enabled {
+        let window_focused = self.window_unfocused && window.has_focus();
+        let requests = self.plan_ime(editor, window_focused, (position, size));
+        if requests.interrupt {
+            window.set_ime_allowed(false);
+            window.set_ime_allowed(true);
+        }
+        if let Some(allowed) = requests.allowed {
+            window.set_ime_allowed(allowed);
+        }
+        if let Some((position, size)) = requests.area {
             window.set_ime_cursor_area(position, size);
         }
     }
@@ -146,16 +173,10 @@ impl WinitAdapter {
                 let was_focused = self.is_focused();
                 let changed = self.window_unfocused == *focused;
                 self.window_unfocused = !focused;
-                if was_focused && !self.is_focused() {
-                    editor.break_history_group();
-                }
-                let canceled = if !focused {
-                    self.ime_enabled = false;
+                if !focused {
                     self.modifiers = ModifiersState::empty();
-                    editor.cancel_composition()
-                } else {
-                    false
-                };
+                }
+                let canceled = self.focus_changed(was_focused, editor);
                 Ok(InputOutcome {
                     changed: changed || canceled,
                     ..InputOutcome::default()
@@ -165,12 +186,18 @@ impl WinitAdapter {
                 event,
                 is_synthetic: false,
                 ..
-            } => self.handle_key(
-                &event.logical_key,
-                event.state,
-                event.text.as_deref(),
-                editor,
-            ),
+            } => {
+                let regained = event.state == ElementState::Pressed && self.observe_window_focus();
+                let mut outcome = self.handle_key(
+                    &event.logical_key,
+                    event.physical_key,
+                    event.state,
+                    event.text.as_deref(),
+                    editor,
+                )?;
+                outcome.changed |= regained;
+                Ok(outcome)
+            }
             WindowEvent::Ime(event) => self.handle_ime(event, editor),
             _ => Ok(InputOutcome::default()),
         }
@@ -179,6 +206,7 @@ impl WinitAdapter {
     pub fn handle_key(
         &mut self,
         key: &Key,
+        physical_key: PhysicalKey,
         state: ElementState,
         text: Option<&str>,
         editor: &mut Editor,
@@ -190,12 +218,14 @@ impl WinitAdapter {
         if self.read_only {
             editor.cancel_composition();
         }
-        if editor.composition().is_some_and(|composition| {
-            !composition.text.is_empty() || matches!(key, Key::Named(NamedKey::Escape))
-        }) {
+        let escape = matches!(key, Key::Named(NamedKey::Escape));
+        if editor
+            .composition()
+            .is_some_and(|composition| !composition.text.is_empty() || escape)
+        {
             return Ok(InputOutcome {
                 handled: true,
-                changed: matches!(key, Key::Named(NamedKey::Escape)) && editor.cancel_composition(),
+                changed: escape && editor.cancel_composition(),
                 clipboard: None,
             });
         }
@@ -208,98 +238,17 @@ impl WinitAdapter {
         };
         let command = self.command_pressed();
         let shift = self.modifiers.shift_key();
-        if command && let Key::Character(character) = key {
-            let shortcut = character.to_ascii_lowercase();
-            if self.read_only
-                && (matches!(
-                    shortcut.as_str(),
-                    "v" | "z"
-                        | "y"
-                        | "b"
-                        | "i"
-                        | "u"
-                        | "["
-                        | "]"
-                        | "0"
-                        | "1"
-                        | "2"
-                        | "3"
-                        | "4"
-                        | "5"
-                        | "6"
-                ) || shift && matches!(shortcut.as_str(), "7" | "8" | "&" | "*"))
-            {
+        let mut shortcut = None;
+        if command {
+            shortcut = shortcut_key(key, physical_key).and_then(|name| Shortcut::new(name, shift));
+            if shortcut.is_none() && matches!(key, Key::Character(_)) {
+                outcome.handled = false;
                 outcome.changed = before.changed(editor);
                 return Ok(outcome);
             }
-            match shortcut.as_str() {
-                "a" => editor.select_all(),
-                "c" => {
-                    if !editor.selection().is_caret() {
-                        outcome.clipboard = Some(if self.rich_clipboard {
-                            ClipboardEvent::CopyRich(editor.selected_fragment())
-                        } else {
-                            ClipboardEvent::Copy(editor.selected_text())
-                        });
-                    }
-                }
-                "x" => {
-                    if !editor.selection().is_caret() {
-                        let selected = if self.read_only && self.rich_clipboard {
-                            ClipboardEvent::CopyRich(editor.selected_fragment())
-                        } else if self.read_only {
-                            ClipboardEvent::Copy(editor.selected_text())
-                        } else if self.rich_clipboard {
-                            ClipboardEvent::CutRich(editor.selected_fragment())
-                        } else {
-                            ClipboardEvent::Cut(editor.selected_text())
-                        };
-                        if !self.read_only {
-                            editor.insert_text("")?;
-                        }
-                        outcome.clipboard = Some(selected);
-                    }
-                }
-                "v" => outcome.clipboard = Some(ClipboardEvent::PasteRequest),
-                "z" => {
-                    if shift {
-                        editor.redo();
-                    } else {
-                        editor.undo();
-                    }
-                }
-                "y" => {
-                    editor.redo();
-                }
-                "b" => editor.apply_style(StylePatch {
-                    bold: Some(editor.selection_style().bold != Some(true)),
-                    ..StylePatch::default()
-                })?,
-                "i" => editor.apply_style(StylePatch {
-                    italic: Some(editor.selection_style().italic != Some(true)),
-                    ..StylePatch::default()
-                })?,
-                "u" => editor.apply_style(StylePatch {
-                    underline: Some(editor.selection_style().underline != Some(true)),
-                    ..StylePatch::default()
-                })?,
-                "0" => editor.set_paragraph_kind(ParagraphKind::Body)?,
-                "1" | "2" | "3" | "4" | "5" | "6" => {
-                    editor.set_paragraph_kind(ParagraphKind::Heading {
-                        level: shortcut.as_bytes()[0] - b'0',
-                    })?
-                }
-                "7" | "&" if shift => editor.set_paragraph_kind(ParagraphKind::Ordered {
-                    indent: 0,
-                    start: 1,
-                })?,
-                "8" | "*" if shift => {
-                    editor.set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })?
-                }
-                "]" => editor.indent_list()?,
-                "[" => editor.outdent_list()?,
-                _ => outcome.handled = false,
-            }
+        }
+        if let Some(shortcut) = shortcut.or_else(|| self.named_shortcut(key, editor)) {
+            outcome.clipboard = self.run_shortcut(shortcut, editor)?;
             outcome.changed = before.changed(editor);
             return Ok(outcome);
         }
@@ -307,6 +256,7 @@ impl WinitAdapter {
         let word = self.modifiers.alt_key()
             || (self.modifiers.control_key() && !self.modifiers.super_key());
         let super_command = command && self.command_modifier == CommandModifier::Super;
+        let paragraph_vertical = !self.host_vertical_navigation;
         let movement = match key {
             Key::Named(NamedKey::ArrowLeft) if super_command => Some(Movement::ParagraphStart),
             Key::Named(NamedKey::ArrowRight) if super_command => Some(Movement::ParagraphEnd),
@@ -316,8 +266,8 @@ impl WinitAdapter {
             Key::Named(NamedKey::ArrowRight) => Some(Movement::GraphemeForward),
             Key::Named(NamedKey::ArrowUp) if command => Some(Movement::DocumentStart),
             Key::Named(NamedKey::ArrowDown) if command => Some(Movement::DocumentEnd),
-            Key::Named(NamedKey::ArrowUp) => Some(Movement::ParagraphUp),
-            Key::Named(NamedKey::ArrowDown) => Some(Movement::ParagraphDown),
+            Key::Named(NamedKey::ArrowUp) if paragraph_vertical => Some(Movement::ParagraphUp),
+            Key::Named(NamedKey::ArrowDown) if paragraph_vertical => Some(Movement::ParagraphDown),
             Key::Named(NamedKey::Home) if command => Some(Movement::DocumentStart),
             Key::Named(NamedKey::End) if command => Some(Movement::DocumentEnd),
             Key::Named(NamedKey::Home) => Some(Movement::ParagraphStart),
@@ -328,11 +278,16 @@ impl WinitAdapter {
             editor.move_cursor(movement, shift)?;
         } else {
             match key {
-                Key::Named(NamedKey::Enter | NamedKey::Backspace | NamedKey::Delete)
-                    if self.read_only => {}
+                Key::Named(
+                    NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::PageUp | NamedKey::PageDown,
+                ) => outcome.handled = false,
+                Key::Named(NamedKey::Process) => {}
+                Key::Named(NamedKey::Enter) if self.read_only && !command => {}
+                Key::Named(NamedKey::Backspace | NamedKey::Delete) if self.read_only => {}
+                Key::Named(NamedKey::Enter) if shift && !command => editor.insert_line_break()?,
                 Key::Named(NamedKey::Enter) if !command => editor.insert_paragraph()?,
                 Key::Named(NamedKey::Backspace) if super_command => {
-                    super::delete_to_paragraph_start(editor)?
+                    editor.delete_to_paragraph_start()?
                 }
                 Key::Named(NamedKey::Backspace) if word => editor.delete_word_backward()?,
                 Key::Named(NamedKey::Delete) if word => editor.delete_word_forward()?,
@@ -352,7 +307,8 @@ impl WinitAdapter {
                     }
                 }
                 _ if !self.modifiers.super_key()
-                    && (!self.modifiers.control_key() || self.modifiers.alt_key()) =>
+                    && (!self.modifiers.control_key()
+                        || CTRL_ALT_IS_ALTGR && self.modifiers.alt_key()) =>
                 {
                     let produced = text.unwrap_or("");
                     let clean = clean_text(produced, false);
@@ -374,6 +330,7 @@ impl WinitAdapter {
             return Ok(InputOutcome::default());
         }
         if self.read_only {
+            self.ime.preedit = false;
             let changed = editor.cancel_composition() || self.ime_enabled;
             self.ime_enabled = false;
             return Ok(InputOutcome {
@@ -389,6 +346,8 @@ impl WinitAdapter {
             Ime::Enabled => self.ime_enabled = true,
             Ime::Disabled => {
                 self.ime_enabled = false;
+                self.ime.stale = true;
+                self.ime.preedit = false;
                 editor.cancel_composition();
             }
             Ime::Preedit(text, selection) => {
@@ -399,19 +358,33 @@ impl WinitAdapter {
                 {
                     return Err(Error::InvalidCompositionSelection);
                 }
-                if !text.is_empty() || editor.composition().is_some() {
-                    let selection = selection.map(|(start, end)| start..end);
+                let selection = selection.map(|(start, end)| start..end);
+                if text.is_empty() {
+                    self.ime.preedit = false;
+                    if editor
+                        .composition()
+                        .is_some_and(|composition| !composition.text.is_empty())
+                    {
+                        editor.update_composition(text, selection)?;
+                        preedit_changed = true;
+                    }
+                } else if !self.ime.preedit || editor.composition().is_some() {
                     preedit_changed = editor.composition().is_none_or(|composition| {
                         composition.text != *text || composition.selection != selection
                     });
                     if preedit_changed {
                         editor.update_composition(text, selection)?;
                     }
+                    self.ime.preedit = true;
                 }
             }
             Ime::Commit(text) => {
-                if !text.is_empty() || editor.composition().is_some() {
-                    editor.commit_composition(text)?;
+                self.ime.preedit = false;
+                let clean = clean_text(text, true);
+                if clean.is_empty() && !text.is_empty() {
+                    editor.cancel_composition();
+                } else if !clean.is_empty() || editor.composition().is_some() {
+                    editor.commit_composition(&clean)?;
                 }
             }
         }
@@ -426,20 +399,21 @@ impl WinitAdapter {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
         }
+        let blocked = InputOutcome {
+            handled: true,
+            ..InputOutcome::default()
+        };
         if self.read_only {
-            return Ok(InputOutcome {
-                handled: true,
-                ..InputOutcome::default()
-            });
+            return Ok(blocked);
         }
         let clean = clean_text(text, true);
         if clean.is_empty() {
-            return Ok(InputOutcome {
-                handled: true,
-                ..InputOutcome::default()
-            });
+            return Ok(blocked);
         }
         let before = EditorState::capture(editor);
+        if !cancel_empty_composition(editor) {
+            return Ok(blocked);
+        }
         editor.break_history_group();
         editor.insert_text(&clean)?;
         editor.break_history_group();
@@ -458,13 +432,17 @@ impl WinitAdapter {
         if !self.is_focused() {
             return Ok(InputOutcome::default());
         }
+        let blocked = InputOutcome {
+            handled: true,
+            ..InputOutcome::default()
+        };
         if self.read_only {
-            return Ok(InputOutcome {
-                handled: true,
-                ..InputOutcome::default()
-            });
+            return Ok(blocked);
         }
         let before = EditorState::capture(editor);
+        if !cancel_empty_composition(editor) {
+            return Ok(blocked);
+        }
         editor.insert_fragment(fragment)?;
         Ok(InputOutcome {
             handled: true,
@@ -487,31 +465,194 @@ impl WinitAdapter {
             }
         }
     }
+
+    fn focus_changed(&mut self, was_focused: bool, editor: &mut Editor) -> bool {
+        if self.is_focused() {
+            if !was_focused {
+                self.ime.stale = true;
+            }
+            return false;
+        }
+        if was_focused {
+            editor.break_history_group();
+        }
+        self.ime_enabled = false;
+        editor.cancel_composition()
+    }
+
+    fn observe_window_focus(&mut self) -> bool {
+        let regained = self.window_unfocused && self.focused;
+        self.window_unfocused = false;
+        if regained {
+            self.ime.stale = true;
+        }
+        regained
+    }
+
+    fn plan_ime(&mut self, editor: &Editor, window_focused: bool, area: ImeArea) -> ImeRequests {
+        if window_focused {
+            self.observe_window_focus();
+        }
+        let editable = self.is_focused() && !self.read_only;
+        let ime = &mut self.ime;
+        let mut requests = ImeRequests::default();
+        if !editable {
+            if ime.allowed {
+                requests.allowed = Some(false);
+            }
+            *ime = ImeSync::default();
+            return requests;
+        }
+        if ime.preedit && editor.composition().is_none() {
+            requests.interrupt = true;
+            ime.preedit = false;
+        } else if !ime.allowed || ime.stale {
+            requests.allowed = Some(true);
+        }
+        if requests.interrupt || requests.allowed.is_some() {
+            ime.allowed = true;
+            ime.stale = false;
+            ime.area = None;
+        }
+        if ime.area != Some(area) {
+            ime.area = Some(area);
+            requests.area = Some(area);
+        }
+        requests
+    }
+
+    fn named_shortcut(&self, key: &Key, editor: &Editor) -> Option<Shortcut> {
+        let Key::Named(named) = key else {
+            return None;
+        };
+        let pc = self.command_modifier == CommandModifier::Control;
+        let modifiers = self.modifiers;
+        Some(match named {
+            NamedKey::Copy => Shortcut::Copy,
+            NamedKey::Cut => Shortcut::Cut,
+            NamedKey::Paste => Shortcut::Paste,
+            NamedKey::Undo => Shortcut::Undo,
+            NamedKey::Redo => Shortcut::Redo,
+            NamedKey::Insert if pc && modifiers == ModifiersState::CONTROL => Shortcut::Copy,
+            NamedKey::Insert if pc && modifiers == ModifiersState::SHIFT => Shortcut::Paste,
+            NamedKey::Delete
+                if pc && modifiers == ModifiersState::SHIFT && !editor.selection().is_caret() =>
+            {
+                Shortcut::Cut
+            }
+            _ => return None,
+        })
+    }
+
+    fn run_shortcut(
+        &self,
+        shortcut: Shortcut,
+        editor: &mut Editor,
+    ) -> Result<Option<ClipboardEvent>, Error> {
+        if self.read_only && shortcut.edits() {
+            return Ok(None);
+        }
+        match shortcut {
+            Shortcut::Copy => return Ok(self.selection_event(editor, false)),
+            Shortcut::Cut => {
+                let cut = !self.read_only;
+                let event = self.selection_event(editor, cut);
+                if cut && event.is_some() {
+                    editor.insert_text("")?;
+                }
+                return Ok(event);
+            }
+            Shortcut::Paste => return Ok(Some(ClipboardEvent::PasteRequest)),
+            _ => shortcut.apply(editor)?,
+        }
+        Ok(None)
+    }
+
+    fn selection_event(&self, editor: &Editor, cut: bool) -> Option<ClipboardEvent> {
+        if editor.selection().is_caret() {
+            return None;
+        }
+        Some(match (cut, self.rich_clipboard) {
+            (false, false) => ClipboardEvent::Copy(editor.selected_text()),
+            (false, true) => ClipboardEvent::CopyRich(editor.selected_fragment()),
+            (true, false) => ClipboardEvent::Cut(editor.selected_text()),
+            (true, true) => ClipboardEvent::CutRich(editor.selected_fragment()),
+        })
+    }
 }
 
-fn clean_text(text: &str, multiline: bool) -> Cow<'_, str> {
-    let allowed = |character: char| {
-        !character.is_control() || multiline && matches!(character, '\n' | '\r' | '\t')
+fn shortcut_key(key: &Key, physical_key: PhysicalKey) -> Option<char> {
+    let logical = match key {
+        Key::Character(text) => {
+            let mut characters = text.chars();
+            characters.next().filter(|_| characters.next().is_none())
+        }
+        Key::Named(_) => return None,
+        Key::Dead(_) | Key::Unidentified(_) => None,
     };
-    if text.chars().all(allowed) {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(
-            text.chars()
-                .filter(|character| allowed(*character))
-                .collect(),
-        )
+    shortcut_key_name(logical, physical_shortcut_key(physical_key))
+}
+
+fn physical_shortcut_key(physical_key: PhysicalKey) -> Option<char> {
+    let PhysicalKey::Code(code) = physical_key else {
+        return None;
+    };
+    Some(match code {
+        KeyCode::KeyA => 'a',
+        KeyCode::KeyB => 'b',
+        KeyCode::KeyC => 'c',
+        KeyCode::KeyD => 'd',
+        KeyCode::KeyE => 'e',
+        KeyCode::KeyF => 'f',
+        KeyCode::KeyG => 'g',
+        KeyCode::KeyH => 'h',
+        KeyCode::KeyI => 'i',
+        KeyCode::KeyJ => 'j',
+        KeyCode::KeyK => 'k',
+        KeyCode::KeyL => 'l',
+        KeyCode::KeyM => 'm',
+        KeyCode::KeyN => 'n',
+        KeyCode::KeyO => 'o',
+        KeyCode::KeyP => 'p',
+        KeyCode::KeyQ => 'q',
+        KeyCode::KeyR => 'r',
+        KeyCode::KeyS => 's',
+        KeyCode::KeyT => 't',
+        KeyCode::KeyU => 'u',
+        KeyCode::KeyV => 'v',
+        KeyCode::KeyW => 'w',
+        KeyCode::KeyX => 'x',
+        KeyCode::KeyY => 'y',
+        KeyCode::KeyZ => 'z',
+        KeyCode::Digit0 => '0',
+        KeyCode::Digit1 => '1',
+        KeyCode::Digit2 => '2',
+        KeyCode::Digit3 => '3',
+        KeyCode::Digit4 => '4',
+        KeyCode::Digit5 => '5',
+        KeyCode::Digit6 => '6',
+        KeyCode::Digit7 => '7',
+        KeyCode::Digit8 => '8',
+        KeyCode::Digit9 => '9',
+        KeyCode::BracketLeft => '[',
+        KeyCode::BracketRight => ']',
+        _ => return None,
+    })
+}
+
+fn cancel_empty_composition(editor: &mut Editor) -> bool {
+    match editor.composition() {
+        Some(composition) if !composition.text.is_empty() => false,
+        Some(_) => {
+            editor.cancel_composition();
+            true
+        }
+        None => true,
     }
 }
 
 fn selection_contains_list(editor: &Editor) -> bool {
-    let range = editor.selection().range();
-    let end = if range.end.paragraph > range.start.paragraph && range.end.byte == 0 {
-        range.end.paragraph
-    } else {
-        range.end.paragraph + 1
-    };
-    editor.document().paragraphs()[range.start.paragraph..end]
+    editor.document().paragraphs()[editor.selected_paragraphs()]
         .iter()
         .any(|paragraph| {
             matches!(
@@ -547,9 +688,12 @@ impl EditorState {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
-    use crate::{Position, Selection};
+    use crate::{Position, Selection, StylePatch};
+    use std::mem::discriminant;
+    use winit::keyboard::NativeKeyCode;
 
     fn focused(editor: &mut Editor) -> WinitAdapter {
         let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Control);
@@ -563,9 +707,34 @@ mod tests {
         key: Key,
         text: Option<&str>,
     ) -> InputOutcome {
+        let physical = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
         adapter
-            .handle_key(&key, ElementState::Pressed, text, editor)
+            .handle_key(&key, physical, ElementState::Pressed, text, editor)
             .unwrap()
+    }
+
+    fn chord(
+        adapter: &mut WinitAdapter,
+        editor: &mut Editor,
+        modifiers: ModifiersState,
+        logical: &str,
+        physical: KeyCode,
+        text: Option<&str>,
+    ) -> InputOutcome {
+        adapter.set_modifiers(modifiers);
+        adapter
+            .handle_key(
+                &Key::Character(logical.into()),
+                PhysicalKey::Code(physical),
+                ElementState::Pressed,
+                text,
+                editor,
+            )
+            .unwrap()
+    }
+
+    fn area(x: f64) -> ImeArea {
+        (LogicalPosition::new(x, 4.0), LogicalSize::new(1.0, 16.0))
     }
 
     #[test]
@@ -697,14 +866,19 @@ mod tests {
             Key::Character("1".into()),
             Some("1"),
         );
-        adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::ALT);
-        key(
+        let ctrl_alt = chord(
             &mut adapter,
             &mut editor,
-            Key::Character("2".into()),
+            ModifiersState::CONTROL | ModifiersState::ALT,
+            "2",
+            KeyCode::Digit2,
             Some("²"),
         );
-        assert_eq!(editor.document().plain_text(), "1²");
+        assert_eq!(ctrl_alt.handled, CTRL_ALT_IS_ALTGR);
+        assert_eq!(
+            editor.document().plain_text(),
+            if CTRL_ALT_IS_ALTGR { "1²" } else { "1" }
+        );
         assert_eq!(
             editor.document().paragraph(0).unwrap().kind(),
             ParagraphKind::Body
@@ -713,20 +887,29 @@ mod tests {
             ModifiersState::SUPER,
             ModifiersState::CONTROL | ModifiersState::SUPER,
         ] {
-            adapter.set_modifiers(modifiers);
-            let outcome = key(&mut adapter, &mut editor, Key::Character("3".into()), None);
+            let outcome = chord(
+                &mut adapter,
+                &mut editor,
+                modifiers,
+                "3",
+                KeyCode::Digit3,
+                Some("3"),
+            );
             assert!(!outcome.handled && !outcome.changed);
         }
+        let revision = editor.document().revision();
         adapter.set_read_only(true, &mut editor);
-        adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::ALT);
-        let outcome = key(
+        let outcome = chord(
             &mut adapter,
             &mut editor,
-            Key::Character("4".into()),
+            ModifiersState::CONTROL | ModifiersState::ALT,
+            "4",
+            KeyCode::Digit4,
             Some("⁴"),
         );
-        assert!(outcome.handled && !outcome.changed);
-        assert_eq!(editor.document().plain_text(), "1²");
+        assert_eq!(outcome.handled, CTRL_ALT_IS_ALTGR);
+        assert!(!outcome.changed);
+        assert_eq!(editor.document().revision(), revision);
     }
 
     #[test]
@@ -1035,7 +1218,6 @@ mod tests {
             Key::Named(NamedKey::Enter),
             Some("\r"),
         );
-        adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::ALT);
         key(
             &mut adapter,
             &mut editor,
@@ -1043,13 +1225,27 @@ mod tests {
             Some("@"),
         );
         assert_eq!(editor.document().plain_text(), "´e\n@");
+        adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::ALT);
         key(
             &mut adapter,
             &mut editor,
-            Key::Character("x".into()),
-            Some("\u{0}"),
+            Key::Character("€".into()),
+            Some("€"),
         );
-        assert_eq!(editor.document().plain_text(), "´e\n@");
+        let expected = if CTRL_ALT_IS_ALTGR {
+            "´e\n@€"
+        } else {
+            "´e\n@"
+        };
+        assert_eq!(editor.document().plain_text(), expected);
+        let outcome = key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("x".into()),
+            if CTRL_ALT_IS_ALTGR { None } else { Some("x") },
+        );
+        assert!(!outcome.handled);
+        assert_eq!(editor.document().plain_text(), expected);
     }
 
     #[test]
@@ -1218,7 +1414,7 @@ mod tests {
             &mut adapter,
             &mut editor,
             Key::Character("a".into()),
-            Some("\u{1}"),
+            Some("a"),
         );
         let cut = key(&mut adapter, &mut editor, Key::Character("x".into()), None);
         assert_eq!(cut.clipboard, Some(ClipboardEvent::Cut("hello".into())));
@@ -1413,5 +1609,974 @@ mod tests {
         assert!(editor.composition().is_none());
         assert_eq!(editor.document().plain_text(), "original");
         assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn focused_window_input_corrects_a_spurious_startup_blur() {
+        let mut editor = Editor::default();
+        let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+        adapter.set_focused(true, &mut editor);
+        let blur = adapter
+            .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+            .unwrap();
+        assert!(blur.changed && !adapter.is_focused());
+        assert!(adapter.observe_window_focus());
+        assert!(adapter.is_focused());
+        let typed = key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("a".into()),
+            Some("a"),
+        );
+        assert!(typed.handled && typed.changed);
+        assert_eq!(editor.document().plain_text(), "a");
+
+        adapter
+            .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+            .unwrap();
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(1.0)),
+            ImeRequests::default()
+        );
+        assert!(!adapter.is_focused());
+        let requests = adapter.plan_ime(&editor, true, area(1.0));
+        assert!(adapter.is_focused());
+        assert_eq!(requests.allowed, Some(true));
+
+        adapter.set_focused(false, &mut editor);
+        adapter
+            .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+            .unwrap();
+        assert!(!adapter.observe_window_focus());
+        adapter.set_focused(true, &mut editor);
+        assert!(adapter.is_focused());
+    }
+
+    #[test]
+    fn ctrl_alt_letters_stay_with_the_host_outside_windows_altgr() {
+        for command_modifier in [CommandModifier::Control, CommandModifier::Super] {
+            for read_only in [false, true] {
+                let mut editor = Editor::default();
+                let mut adapter = WinitAdapter::new().command_modifier(command_modifier);
+                adapter.set_focused(true, &mut editor);
+                adapter.set_read_only(read_only, &mut editor);
+                for (logical, physical) in [("t", KeyCode::KeyT), ("1", KeyCode::Digit1)] {
+                    let text = (!CTRL_ALT_IS_ALTGR).then_some(logical);
+                    let outcome = chord(
+                        &mut adapter,
+                        &mut editor,
+                        ModifiersState::CONTROL | ModifiersState::ALT,
+                        logical,
+                        physical,
+                        text,
+                    );
+                    assert!(!outcome.handled && !outcome.changed);
+                    assert_eq!(editor.document().plain_text(), "");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_latin_layouts_use_physical_shortcut_keys() {
+        let control = ModifiersState::CONTROL;
+        let shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let mut editor = Editor::from_text("text");
+        editor.select_all();
+        let mut adapter = focused(&mut editor);
+        for logical in ["с", "ψ"] {
+            let copy = chord(
+                &mut adapter,
+                &mut editor,
+                control,
+                logical,
+                KeyCode::KeyC,
+                Some(logical),
+            );
+            assert!(copy.handled);
+            assert_eq!(copy.clipboard, Some(ClipboardEvent::Copy("text".into())));
+        }
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        chord(&mut adapter, &mut editor, control, "ф", KeyCode::KeyA, None);
+        assert_eq!(editor.selected_text(), "text");
+        chord(&mut adapter, &mut editor, control, "и", KeyCode::KeyB, None);
+        assert_eq!(editor.selection_style().bold, Some(true));
+
+        let kind = |editor: &Editor| editor.document().paragraph(0).unwrap().kind();
+        chord(
+            &mut adapter,
+            &mut editor,
+            control,
+            "&",
+            KeyCode::Digit1,
+            None,
+        );
+        assert_eq!(kind(&editor), ParagraphKind::Heading { level: 1 });
+        chord(
+            &mut adapter,
+            &mut editor,
+            control,
+            "é",
+            KeyCode::Digit2,
+            None,
+        );
+        assert_eq!(kind(&editor), ParagraphKind::Heading { level: 2 });
+        chord(&mut adapter, &mut editor, shift, "8", KeyCode::Digit8, None);
+        assert_eq!(kind(&editor), ParagraphKind::Bullet { indent: 0 });
+        chord(&mut adapter, &mut editor, shift, "/", KeyCode::Digit7, None);
+        assert_eq!(
+            kind(&editor),
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: Some(1)
+            }
+        );
+        chord(&mut adapter, &mut editor, shift, "(", KeyCode::Digit8, None);
+        assert_eq!(kind(&editor), ParagraphKind::Bullet { indent: 0 });
+        chord(
+            &mut adapter,
+            &mut editor,
+            control,
+            "ъ",
+            KeyCode::BracketRight,
+            None,
+        );
+        assert_eq!(kind(&editor), ParagraphKind::Bullet { indent: 1 });
+        chord(
+            &mut adapter,
+            &mut editor,
+            control,
+            "х",
+            KeyCode::BracketLeft,
+            None,
+        );
+        assert_eq!(kind(&editor), ParagraphKind::Bullet { indent: 0 });
+        let undo = chord(&mut adapter, &mut editor, control, "я", KeyCode::KeyZ, None);
+        assert!(undo.handled && undo.changed);
+        assert_eq!(kind(&editor), ParagraphKind::Bullet { indent: 1 });
+
+        adapter.set_read_only(true, &mut editor);
+        let paste = chord(&mut adapter, &mut editor, control, "м", KeyCode::KeyV, None);
+        assert!(paste.handled && !paste.changed);
+        assert_eq!(paste.clipboard, None);
+    }
+
+    #[test]
+    fn punctuation_without_an_egui_key_uses_its_physical_key() {
+        let control = ModifiersState::CONTROL;
+        let shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let mut editor = Editor::from_text("text");
+        editor.select_all();
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        let mut adapter = focused(&mut editor);
+        let kind = |editor: &Editor| editor.document().paragraph(0).unwrap().kind();
+        let indent = chord(
+            &mut adapter,
+            &mut editor,
+            control,
+            "$",
+            KeyCode::BracketRight,
+            None,
+        );
+        assert!(indent.handled && indent.changed);
+        assert_eq!(kind(&editor), ParagraphKind::Bullet { indent: 1 });
+        editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            })
+            .unwrap();
+        let star = chord(
+            &mut adapter,
+            &mut editor,
+            shift,
+            "*",
+            KeyCode::BracketRight,
+            None,
+        );
+        assert!(!star.handled && !star.changed);
+        assert!(matches!(kind(&editor), ParagraphKind::Ordered { .. }));
+        adapter.set_modifiers(shift);
+        let unidentified = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+        for (logical, expected) in [
+            ("*", ParagraphKind::Bullet { indent: 0 }),
+            (
+                "&",
+                ParagraphKind::Ordered {
+                    indent: 0,
+                    start: Some(1),
+                },
+            ),
+        ] {
+            let outcome = adapter
+                .handle_key(
+                    &Key::Character(logical.into()),
+                    unidentified,
+                    ElementState::Pressed,
+                    None,
+                    &mut editor,
+                )
+                .unwrap();
+            assert!(outcome.handled && outcome.changed, "{logical}");
+            assert_eq!(kind(&editor), expected);
+        }
+    }
+
+    #[test]
+    fn latin_logical_keys_keep_their_shortcuts_on_remapped_layouts() {
+        let control = ModifiersState::CONTROL;
+        let mut editor = Editor::from_text("text");
+        editor.select_all();
+        let mut adapter = focused(&mut editor);
+        let j = chord(&mut adapter, &mut editor, control, "j", KeyCode::KeyC, None);
+        assert!(!j.handled && j.clipboard.is_none());
+        let copy = chord(&mut adapter, &mut editor, control, "c", KeyCode::KeyI, None);
+        assert_eq!(copy.clipboard, Some(ClipboardEvent::Copy("text".into())));
+        assert_eq!(editor.selection_style().italic, Some(false));
+        editor
+            .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+            .unwrap();
+        let plus = chord(
+            &mut adapter,
+            &mut editor,
+            control,
+            "+",
+            KeyCode::BracketRight,
+            None,
+        );
+        assert!(!plus.handled);
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().kind(),
+            ParagraphKind::Bullet { indent: 0 }
+        );
+    }
+
+    #[test]
+    fn command_shift_chords_without_shift_bindings_reach_the_host() {
+        for read_only in [false, true] {
+            let mut editor = Editor::from_text("text");
+            editor.select_all();
+            let mut adapter = focused(&mut editor);
+            adapter.set_read_only(read_only, &mut editor);
+            let revision = editor.document().revision();
+            let shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+            for (logical, physical) in [
+                ("A", KeyCode::KeyA),
+                ("C", KeyCode::KeyC),
+                ("X", KeyCode::KeyX),
+                ("V", KeyCode::KeyV),
+                ("Y", KeyCode::KeyY),
+                ("B", KeyCode::KeyB),
+                ("I", KeyCode::KeyI),
+                ("U", KeyCode::KeyU),
+                ("!", KeyCode::Digit1),
+                ("}", KeyCode::BracketRight),
+            ] {
+                let outcome = chord(&mut adapter, &mut editor, shift, logical, physical, None);
+                assert!(!outcome.handled && !outcome.changed, "{logical}");
+                assert_eq!(outcome.clipboard, None);
+                assert_eq!(editor.document().revision(), revision);
+                assert_eq!(editor.selected_text(), "text");
+            }
+        }
+    }
+
+    #[test]
+    fn command_shortcuts_run_in_both_modifier_modes() {
+        for (command_modifier, command) in [
+            (CommandModifier::Control, ModifiersState::CONTROL),
+            (CommandModifier::Super, ModifiersState::SUPER),
+        ] {
+            let shift = command | ModifiersState::SHIFT;
+            let mut editor = Editor::from_text("one\ntwo");
+            let mut adapter = WinitAdapter::new().command_modifier(command_modifier);
+            adapter.set_focused(true, &mut editor);
+            let select = chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "a",
+                KeyCode::KeyA,
+                Some("a"),
+            );
+            assert!(select.handled && select.changed);
+            let copy = chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "c",
+                KeyCode::KeyC,
+                Some("c"),
+            );
+            assert_eq!(
+                copy.clipboard,
+                Some(ClipboardEvent::Copy("one\ntwo".into()))
+            );
+
+            for (modifiers, logical, physical, kind) in [
+                (
+                    command,
+                    "1",
+                    KeyCode::Digit1,
+                    ParagraphKind::Heading { level: 1 },
+                ),
+                (command, "0", KeyCode::Digit0, ParagraphKind::Body),
+                (
+                    shift,
+                    "&",
+                    KeyCode::Digit7,
+                    ParagraphKind::Ordered {
+                        indent: 0,
+                        start: Some(1),
+                    },
+                ),
+                (
+                    shift,
+                    "*",
+                    KeyCode::Digit8,
+                    ParagraphKind::Bullet { indent: 0 },
+                ),
+                (
+                    command,
+                    "]",
+                    KeyCode::BracketRight,
+                    ParagraphKind::Bullet { indent: 1 },
+                ),
+                (
+                    command,
+                    "[",
+                    KeyCode::BracketLeft,
+                    ParagraphKind::Bullet { indent: 0 },
+                ),
+            ] {
+                let outcome = chord(
+                    &mut adapter,
+                    &mut editor,
+                    modifiers,
+                    logical,
+                    physical,
+                    None,
+                );
+                assert!(outcome.handled && outcome.changed, "{logical}");
+                let second = editor.document().paragraph(1).unwrap().kind();
+                assert_eq!(editor.document().paragraph(0).unwrap().kind(), kind);
+                assert_eq!(discriminant(&second), discriminant(&kind));
+            }
+            let bold = chord(&mut adapter, &mut editor, command, "b", KeyCode::KeyB, None);
+            assert!(bold.handled && bold.changed);
+            assert_eq!(editor.selection_style().bold, Some(true));
+
+            let cut = chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "x",
+                KeyCode::KeyX,
+                Some("x"),
+            );
+            assert_eq!(cut.clipboard, Some(ClipboardEvent::Cut("one\ntwo".into())));
+            assert_eq!(editor.document().plain_text(), "");
+            chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "z",
+                KeyCode::KeyZ,
+                Some("z"),
+            );
+            assert_eq!(editor.document().plain_text(), "one\ntwo");
+            chord(
+                &mut adapter,
+                &mut editor,
+                shift,
+                "Z",
+                KeyCode::KeyZ,
+                Some("Z"),
+            );
+            assert_eq!(editor.document().plain_text(), "");
+            chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "z",
+                KeyCode::KeyZ,
+                Some("z"),
+            );
+            chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "y",
+                KeyCode::KeyY,
+                Some("y"),
+            );
+            assert_eq!(editor.document().plain_text(), "");
+            let paste = chord(
+                &mut adapter,
+                &mut editor,
+                command,
+                "v",
+                KeyCode::KeyV,
+                Some("v"),
+            );
+            assert_eq!(paste.clipboard, Some(ClipboardEvent::PasteRequest));
+        }
+    }
+
+    #[test]
+    fn navigation_keys_move_and_extend_in_both_modifier_modes() {
+        use Movement::*;
+        let text = "one two\nthree four\nfive";
+        let start = Position::new(1, 6);
+        for command_modifier in [CommandModifier::Control, CommandModifier::Super] {
+            let (command, word) = match command_modifier {
+                CommandModifier::Control => (ModifiersState::CONTROL, ModifiersState::CONTROL),
+                CommandModifier::Super => (ModifiersState::SUPER, ModifiersState::ALT),
+            };
+            let none = ModifiersState::empty();
+            let mut cases = vec![
+                (none, NamedKey::ArrowLeft, GraphemeBackward),
+                (none, NamedKey::ArrowRight, GraphemeForward),
+                (word, NamedKey::ArrowLeft, WordBackward),
+                (word, NamedKey::ArrowRight, WordForward),
+                (none, NamedKey::ArrowUp, ParagraphUp),
+                (none, NamedKey::ArrowDown, ParagraphDown),
+                (none, NamedKey::Home, ParagraphStart),
+                (none, NamedKey::End, ParagraphEnd),
+                (command, NamedKey::ArrowUp, DocumentStart),
+                (command, NamedKey::ArrowDown, DocumentEnd),
+                (command, NamedKey::Home, DocumentStart),
+                (command, NamedKey::End, DocumentEnd),
+            ];
+            if command_modifier == CommandModifier::Super {
+                cases.push((command, NamedKey::ArrowLeft, ParagraphStart));
+                cases.push((command, NamedKey::ArrowRight, ParagraphEnd));
+            }
+            for (modifiers, named, movement) in cases {
+                for extend in [false, true] {
+                    let mut expected = Editor::from_text(text);
+                    expected.set_selection(Selection::caret(start)).unwrap();
+                    expected.move_cursor(movement, extend).unwrap();
+                    let mut editor = Editor::from_text(text);
+                    editor.set_selection(Selection::caret(start)).unwrap();
+                    let mut adapter = WinitAdapter::new().command_modifier(command_modifier);
+                    adapter.set_focused(true, &mut editor);
+                    adapter.set_modifiers(if extend {
+                        modifiers | ModifiersState::SHIFT
+                    } else {
+                        modifiers
+                    });
+                    let outcome = key(&mut adapter, &mut editor, Key::Named(named), None);
+                    assert!(
+                        outcome.handled && outcome.changed,
+                        "{named:?} {modifiers:?}"
+                    );
+                    assert_eq!(editor.selection(), expected.selection(), "{named:?}");
+                    assert_eq!(editor.selection().anchor == start, extend);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_vertical_navigation_leaves_line_and_page_keys_to_the_host() {
+        let caret = Selection::caret(Position::new(0, 1));
+        for host_vertical in [false, true] {
+            let mut editor = Editor::from_text("one\ntwo");
+            editor.set_selection(caret).unwrap();
+            let mut adapter = WinitAdapter::new()
+                .command_modifier(CommandModifier::Control)
+                .host_vertical_navigation(host_vertical);
+            adapter.set_focused(true, &mut editor);
+            for modifiers in [ModifiersState::empty(), ModifiersState::SHIFT] {
+                adapter.set_modifiers(modifiers);
+                for page in [NamedKey::PageDown, NamedKey::PageUp] {
+                    assert!(!key(&mut adapter, &mut editor, Key::Named(page), None).handled);
+                    assert_eq!(editor.selection(), caret);
+                }
+                let down = key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Named(NamedKey::ArrowDown),
+                    None,
+                );
+                assert_eq!(down.handled, !host_vertical);
+                if host_vertical {
+                    assert_eq!(editor.selection(), caret);
+                } else {
+                    assert_eq!(editor.selection().focus, Position::new(1, 1));
+                    editor.set_selection(caret).unwrap();
+                }
+            }
+            adapter.set_modifiers(ModifiersState::CONTROL);
+            let end = key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::ArrowDown),
+                None,
+            );
+            assert!(end.handled);
+            assert_eq!(editor.selection().focus, editor.document().end());
+        }
+    }
+
+    #[test]
+    fn widget_refocus_keeps_held_modifiers_and_window_blur_clears_them() {
+        let mut editor = Editor::from_text("doc");
+        let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+        adapter.set_focused(true, &mut editor);
+        adapter.set_modifiers(ModifiersState::SUPER);
+        adapter.set_focused(false, &mut editor);
+        adapter.set_focused(true, &mut editor);
+        let paste = key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("v".into()),
+            Some("v"),
+        );
+        assert_eq!(paste.clipboard, Some(ClipboardEvent::PasteRequest));
+        assert_eq!(editor.document().plain_text(), "doc");
+        adapter
+            .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+            .unwrap();
+        assert_eq!(adapter.modifiers(), ModifiersState::empty());
+    }
+
+    #[test]
+    fn paste_cancels_empty_preedit_and_is_blocked_by_visible_preedit() {
+        for rich in [false, true] {
+            let paste = |adapter: &mut WinitAdapter, editor: &mut Editor| {
+                if rich {
+                    adapter.paste_fragment(editor, &Fragment::from_text("x"))
+                } else {
+                    adapter.paste(editor, "x")
+                }
+            };
+            let mut editor = Editor::from_text("ab");
+            let replacement = Selection::new(Position::new(0, 0), Position::new(0, 1));
+            editor.set_selection(replacement).unwrap();
+            let mut adapter = focused(&mut editor);
+            adapter
+                .handle_ime(&Ime::Preedit("n".into(), Some((1, 1))), &mut editor)
+                .unwrap();
+            let blocked = paste(&mut adapter, &mut editor).unwrap();
+            assert!(blocked.handled && !blocked.changed);
+            assert_eq!(editor.composition().unwrap().text, "n");
+            assert_eq!(editor.document().plain_text(), "ab");
+
+            adapter
+                .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+                .unwrap();
+            let pasted = paste(&mut adapter, &mut editor).unwrap();
+            assert!(pasted.handled && pasted.changed);
+            assert!(editor.composition().is_none());
+            assert_eq!(editor.document().plain_text(), "xb");
+            assert_eq!(editor.undo_len(), 1);
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "ab");
+            assert_eq!(editor.selection(), replacement);
+        }
+    }
+
+    #[test]
+    fn repeated_empty_preedits_report_no_change() {
+        let mut editor = Editor::from_text("ab");
+        let mut adapter = focused(&mut editor);
+        let ime = |adapter: &mut WinitAdapter, editor: &mut Editor, event| {
+            adapter.handle_ime(&event, editor).unwrap().changed
+        };
+        assert!(ime(
+            &mut adapter,
+            &mut editor,
+            Ime::Preedit("n".into(), Some((1, 1)))
+        ));
+        assert!(ime(
+            &mut adapter,
+            &mut editor,
+            Ime::Preedit(String::new(), None)
+        ));
+        for _ in 0..3 {
+            assert!(!ime(
+                &mut adapter,
+                &mut editor,
+                Ime::Preedit(String::new(), Some((0, 0)))
+            ));
+            assert!(!ime(
+                &mut adapter,
+                &mut editor,
+                Ime::Preedit(String::new(), None)
+            ));
+        }
+        assert!(ime(&mut adapter, &mut editor, Ime::Commit("ん".into())));
+        assert_eq!(editor.document().plain_text(), "んab");
+    }
+
+    #[test]
+    fn ime_commit_filters_control_characters() {
+        let replacement = Selection::new(Position::new(0, 0), Position::new(0, 1));
+        let mut editor = Editor::from_text("ab");
+        editor.set_selection(replacement).unwrap();
+        let mut adapter = focused(&mut editor);
+        adapter
+            .handle_ime(&Ime::Preedit("x".into(), None), &mut editor)
+            .unwrap();
+        let outcome = adapter
+            .handle_ime(&Ime::Commit("\u{8}\u{16}".into()), &mut editor)
+            .unwrap();
+        assert!(outcome.changed);
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "ab");
+        assert_eq!(editor.selection(), replacement);
+        assert!(!editor.can_undo());
+
+        adapter
+            .handle_ime(&Ime::Commit("a\u{8}b\nc".into()), &mut editor)
+            .unwrap();
+        assert_eq!(editor.document().plain_text(), "ab\ncb");
+    }
+
+    #[test]
+    fn sync_ime_sends_only_changes_and_releases_once() {
+        let mut editor = Editor::default();
+        let mut adapter = WinitAdapter::new();
+        let allow = |area| ImeRequests {
+            allowed: Some(true),
+            area: Some(area),
+            ..ImeRequests::default()
+        };
+        let release = ImeRequests {
+            allowed: Some(false),
+            ..ImeRequests::default()
+        };
+        let none = ImeRequests::default();
+        assert_eq!(adapter.plan_ime(&editor, false, area(1.0)), none);
+        adapter.set_focused(true, &mut editor);
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(1.0)),
+            allow(area(1.0))
+        );
+        assert!(!adapter.ime_enabled());
+        assert_eq!(adapter.plan_ime(&editor, false, area(1.0)), none);
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            ImeRequests {
+                area: Some(area(2.0)),
+                ..ImeRequests::default()
+            }
+        );
+        adapter.handle_ime(&Ime::Disabled, &mut editor).unwrap();
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            allow(area(2.0))
+        );
+
+        adapter.set_focused(false, &mut editor);
+        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), release);
+        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), none);
+        adapter.set_focused(true, &mut editor);
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            allow(area(2.0))
+        );
+        adapter.set_focused(false, &mut editor);
+        adapter.set_focused(true, &mut editor);
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            allow(area(2.0))
+        );
+
+        adapter.set_read_only(true, &mut editor);
+        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), release);
+        adapter.set_read_only(false, &mut editor);
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            allow(area(2.0))
+        );
+        adapter
+            .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+            .unwrap();
+        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), release);
+        adapter
+            .handle_window_event(&WindowEvent::Focused(true), &mut editor)
+            .unwrap();
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            allow(area(2.0))
+        );
+    }
+
+    #[test]
+    fn dropped_preedit_is_interrupted_instead_of_restored() {
+        let interrupt = |area| ImeRequests {
+            interrupt: true,
+            area: Some(area),
+            ..ImeRequests::default()
+        };
+        for host_click in [false, true] {
+            let mut editor = Editor::from_text("abc");
+            let mut adapter = focused(&mut editor);
+            adapter.plan_ime(&editor, false, area(1.0));
+            adapter
+                .handle_ime(&Ime::Preedit("ni".into(), Some((2, 2))), &mut editor)
+                .unwrap();
+            if host_click {
+                editor
+                    .set_selection(Selection::caret(Position::new(0, 3)))
+                    .unwrap();
+            } else {
+                let escape = key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Named(NamedKey::Escape),
+                    None,
+                );
+                assert!(escape.handled && escape.changed);
+            }
+            assert!(editor.composition().is_none());
+            let resent = adapter
+                .handle_ime(&Ime::Preedit("nih".into(), Some((3, 3))), &mut editor)
+                .unwrap();
+            assert!(resent.handled && !resent.changed);
+            assert!(editor.composition().is_none());
+            assert_eq!(
+                adapter.plan_ime(&editor, false, area(1.0)),
+                interrupt(area(1.0))
+            );
+            assert_eq!(
+                adapter.plan_ime(&editor, false, area(1.0)),
+                ImeRequests::default()
+            );
+            adapter
+                .handle_ime(&Ime::Preedit("k".into(), None), &mut editor)
+                .unwrap();
+            assert_eq!(editor.composition().unwrap().text, "k");
+            assert_eq!(editor.document().plain_text(), "abc");
+        }
+    }
+
+    #[test]
+    fn pc_clipboard_aliases_and_dedicated_keys_follow_read_only_rules() {
+        let shift = ModifiersState::SHIFT;
+        let control = ModifiersState::CONTROL;
+        let none = ModifiersState::empty();
+        let press = |adapter: &mut WinitAdapter, editor: &mut Editor, modifiers, named| {
+            adapter.set_modifiers(modifiers);
+            key(adapter, editor, Key::Named(named), None)
+        };
+        let mut editor = Editor::from_text("secret");
+        editor.select_all();
+        let mut adapter = focused(&mut editor);
+        let cut = press(&mut adapter, &mut editor, shift, NamedKey::Delete);
+        assert_eq!(cut.clipboard, Some(ClipboardEvent::Cut("secret".into())));
+        assert_eq!(editor.document().plain_text(), "");
+        press(&mut adapter, &mut editor, none, NamedKey::Undo);
+        assert_eq!(editor.document().plain_text(), "secret");
+        press(&mut adapter, &mut editor, none, NamedKey::Redo);
+        assert_eq!(editor.document().plain_text(), "");
+        press(&mut adapter, &mut editor, none, NamedKey::Undo);
+        for (modifiers, named, expected) in [
+            (
+                control,
+                NamedKey::Insert,
+                ClipboardEvent::Copy("secret".into()),
+            ),
+            (none, NamedKey::Copy, ClipboardEvent::Copy("secret".into())),
+            (shift, NamedKey::Insert, ClipboardEvent::PasteRequest),
+            (none, NamedKey::Paste, ClipboardEvent::PasteRequest),
+        ] {
+            let outcome = press(&mut adapter, &mut editor, modifiers, named);
+            assert!(outcome.handled && !outcome.changed);
+            assert_eq!(outcome.clipboard, Some(expected));
+        }
+        let cut = press(&mut adapter, &mut editor, none, NamedKey::Cut);
+        assert_eq!(cut.clipboard, Some(ClipboardEvent::Cut("secret".into())));
+        press(&mut adapter, &mut editor, none, NamedKey::Undo);
+
+        adapter.set_read_only(true, &mut editor);
+        for (modifiers, named) in [(shift, NamedKey::Delete), (none, NamedKey::Cut)] {
+            let copy = press(&mut adapter, &mut editor, modifiers, named);
+            assert!(copy.handled && !copy.changed);
+            assert_eq!(copy.clipboard, Some(ClipboardEvent::Copy("secret".into())));
+        }
+        for (modifiers, named) in [
+            (shift, NamedKey::Insert),
+            (none, NamedKey::Paste),
+            (none, NamedKey::Undo),
+            (none, NamedKey::Redo),
+        ] {
+            let outcome = press(&mut adapter, &mut editor, modifiers, named);
+            assert!(outcome.handled && !outcome.changed);
+            assert_eq!(outcome.clipboard, None);
+        }
+        assert_eq!(editor.document().plain_text(), "secret");
+        adapter.set_read_only(false, &mut editor);
+
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        let delete = press(&mut adapter, &mut editor, shift, NamedKey::Delete);
+        assert_eq!(delete.clipboard, None);
+        assert_eq!(editor.document().plain_text(), "ecret");
+
+        let mut editor = Editor::from_text("secret");
+        editor.select_all();
+        let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+        adapter.set_focused(true, &mut editor);
+        let delete = press(&mut adapter, &mut editor, shift, NamedKey::Delete);
+        assert_eq!(delete.clipboard, None);
+        assert_eq!(editor.document().plain_text(), "");
+        let copy = press(&mut adapter, &mut editor, none, NamedKey::Copy);
+        assert!(copy.handled && copy.clipboard.is_none());
+    }
+
+    #[test]
+    fn cut_is_a_separate_undo_step_from_typing() {
+        let mut editor = Editor::default();
+        let mut adapter = focused(&mut editor);
+        for text in ["a", "b", "c"] {
+            key(
+                &mut adapter,
+                &mut editor,
+                Key::Character(text.into()),
+                Some(text),
+            );
+        }
+        adapter.set_modifiers(ModifiersState::SHIFT);
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::ArrowLeft),
+            None,
+        );
+        let cut = chord(
+            &mut adapter,
+            &mut editor,
+            ModifiersState::CONTROL,
+            "x",
+            KeyCode::KeyX,
+            Some("x"),
+        );
+        assert_eq!(cut.clipboard, Some(ClipboardEvent::Cut("c".into())));
+        adapter.set_modifiers(ModifiersState::empty());
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Character("d".into()),
+            Some("d"),
+        );
+        assert_eq!(editor.document().plain_text(), "abd");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "ab");
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "abc");
+    }
+
+    #[test]
+    fn read_only_passes_command_enter_to_the_host_like_editable_mode() {
+        for read_only in [false, true] {
+            let mut editor = Editor::from_text("text");
+            let mut adapter = focused(&mut editor);
+            adapter.set_read_only(read_only, &mut editor);
+            adapter.set_modifiers(ModifiersState::CONTROL);
+            let submit = key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Enter),
+                Some("\r"),
+            );
+            assert!(!submit.handled && !submit.changed);
+            adapter.set_modifiers(ModifiersState::empty());
+            let enter = key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Enter),
+                Some("\r"),
+            );
+            assert!(enter.handled);
+            let paragraphs = if read_only { 1 } else { 2 };
+            assert_eq!(editor.document().paragraphs().len(), paragraphs);
+        }
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_soft_line_break_unless_read_only() {
+        for read_only in [false, true] {
+            let mut editor = Editor::from_text("text");
+            let mut adapter = focused(&mut editor);
+            adapter.set_read_only(read_only, &mut editor);
+            adapter.set_modifiers(ModifiersState::SHIFT);
+            let outcome = key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Enter),
+                Some("\r"),
+            );
+            assert!(outcome.handled);
+            assert_eq!(outcome.changed, !read_only);
+            assert_eq!(editor.document().paragraphs().len(), 1);
+            let expected = if read_only { "text" } else { "\u{2028}text" };
+            assert_eq!(editor.document().paragraph(0).unwrap().text(), expected);
+            adapter.set_modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+            let submit = key(
+                &mut adapter,
+                &mut editor,
+                Key::Named(NamedKey::Enter),
+                Some("\r"),
+            );
+            assert!(!submit.handled && !submit.changed);
+        }
+    }
+
+    #[test]
+    fn enter_and_backspace_leave_quotes_while_tab_stays_with_the_host() {
+        let mut editor = Editor::from_text("quote");
+        editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let mut adapter = focused(&mut editor);
+        let kinds = |editor: &Editor| -> Vec<_> {
+            editor
+                .document()
+                .paragraphs()
+                .iter()
+                .map(|paragraph| paragraph.kind())
+                .collect()
+        };
+        let enter = Key::Named(NamedKey::Enter);
+        assert!(key(&mut adapter, &mut editor, enter.clone(), Some("\r")).changed);
+        assert_eq!(kinds(&editor), [ParagraphKind::Quote; 2]);
+        assert!(key(&mut adapter, &mut editor, enter, Some("\r")).changed);
+        assert_eq!(kinds(&editor), [ParagraphKind::Quote, ParagraphKind::Body]);
+        assert_eq!(editor.document().paragraphs().len(), 2);
+        editor
+            .set_selection(Selection::caret(Position::new(0, 0)))
+            .unwrap();
+        let backspace = Key::Named(NamedKey::Backspace);
+        assert!(key(&mut adapter, &mut editor, backspace, None).changed);
+        assert_eq!(kinds(&editor), [ParagraphKind::Body; 2]);
+        assert_eq!(editor.document().plain_text(), "quote\n");
+        editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+        let tab = key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None);
+        assert!(!tab.handled && !tab.changed);
+        assert_eq!(kinds(&editor), [ParagraphKind::Quote, ParagraphKind::Body]);
+    }
+
+    #[test]
+    fn windows_ime_process_keys_are_consumed() {
+        let mut editor = Editor::from_text("text");
+        let mut adapter = focused(&mut editor);
+        let outcome = key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::Process),
+            None,
+        );
+        assert!(outcome.handled && !outcome.changed);
+        assert_eq!(editor.document().plain_text(), "text");
     }
 }

@@ -1,10 +1,16 @@
 use super::{
     RichClipboard,
     layout::ParagraphLayouts,
-    navigation::{VerticalNavigation, preedit_byte_range, vertical_position},
+    navigation::{
+        VerticalNavigation, page_position, preedit_byte_range, row_boundary_position,
+        vertical_position,
+    },
     record,
 };
-use crate::{Document, Editor, Error, Movement, ParagraphKind, Position, Selection, StylePatch};
+use crate::{
+    Document, Editor, Error, Movement, ParagraphKind, Position, Selection,
+    adapter::{Shortcut, clean_text, shortcut_key_name},
+};
 use egui::{Event, ImeEvent, Key, Modifiers, Ui};
 
 pub(super) fn copy_selection(
@@ -32,6 +38,13 @@ pub(super) fn copy_selection(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct InputOptions {
+    pub(super) read_only: bool,
+    pub(super) page_height: f32,
+    pub(super) heading_shortcuts: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_event(
     editor: &mut Editor,
@@ -41,10 +54,10 @@ pub(super) fn handle_event(
     navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
-    read_only: bool,
+    options: &InputOptions,
     clipboard: &mut Option<&mut dyn RichClipboard>,
 ) -> bool {
-    if read_only {
+    if options.read_only {
         match event {
             Event::Cut => {
                 copy_selection(editor, ui, clipboard);
@@ -54,7 +67,11 @@ pub(super) fn handle_event(
             _ => {}
         }
     }
-    if matches!(event, Event::Paste(text) if text.is_empty()) {
+    let paste = match event {
+        Event::Paste(text) => Some((text, clean_text(text, true))),
+        _ => None,
+    };
+    if paste.as_ref().is_some_and(|(_, clean)| clean.is_empty()) {
         return true;
     }
     if editor
@@ -70,7 +87,8 @@ pub(super) fn handle_event(
             copy_selection(editor, ui, clipboard);
             true
         }
-        Event::Cut if editor.composition().is_none() => {
+        Event::Cut | Event::Paste(_) | Event::Text(_) if editor.composition().is_some() => true,
+        Event::Cut => {
             if !editor.selection().is_caret() {
                 copy_selection(editor, ui, clipboard);
                 editor.break_history_group();
@@ -79,25 +97,33 @@ pub(super) fn handle_event(
             }
             true
         }
-        Event::Paste(text) if editor.composition().is_none() => {
-            let fragment = clipboard
-                .as_deref_mut()
-                .and_then(|clipboard| clipboard.paste(text));
-            editor.break_history_group();
-            record(
-                match fragment {
-                    Some(fragment) => editor.insert_fragment(&fragment),
-                    None => editor.insert_text(text),
-                },
-                errors,
-            );
-            editor.break_history_group();
+        Event::Paste(_) => {
+            if let Some((text, clean)) = &paste {
+                let fragment = clipboard
+                    .as_deref_mut()
+                    .and_then(|clipboard| clipboard.paste(text));
+                editor.break_history_group();
+                record(
+                    match fragment {
+                        Some(fragment) => editor.insert_fragment(&fragment),
+                        None => editor.insert_text(clean),
+                    },
+                    errors,
+                );
+                editor.break_history_group();
+            }
             true
         }
-        Event::Text(text) if editor.composition().is_none() => {
-            if !text.is_empty() && text != "\n" && text != "\r" {
-                record(editor.insert_text(text), errors);
+        Event::Text(text) => {
+            let clean = clean_text(text, false);
+            if !clean.is_empty() {
+                record(editor.insert_text(&clean), errors);
             }
+            true
+        }
+        Event::Ime(ImeEvent::Preedit { text, .. } | ImeEvent::Commit(text))
+            if matches!(text.as_str(), "\n" | "\r" | "\r\n") =>
+        {
             true
         }
         Event::Ime(ImeEvent::Preedit {
@@ -121,8 +147,15 @@ pub(super) fn handle_event(
             true
         }
         Event::Ime(ImeEvent::Commit(text)) => {
-            if !text.is_empty() || editor.composition().is_some() {
-                record(editor.commit_composition(text), errors);
+            let clean = clean_text(text, true);
+            if editor.composition().is_none() {
+                if !clean.is_empty() {
+                    record(editor.insert_text(&clean), errors);
+                }
+            } else if clean.is_empty() && !text.is_empty() {
+                editor.cancel_composition();
+            } else {
+                record(editor.commit_composition(&clean), errors);
             }
             true
         }
@@ -143,6 +176,7 @@ pub(super) fn handle_event(
         Event::Ime(ImeEvent::Enabled) => true,
         Event::Key {
             key,
+            physical_key,
             pressed: true,
             modifiers,
             ..
@@ -163,140 +197,120 @@ pub(super) fn handle_event(
                 return false;
             }
             handle_key(
-                editor, *key, *modifiers, layouts, navigation, errors, read_only,
+                editor,
+                *key,
+                *physical_key,
+                *modifiers,
+                layouts,
+                navigation,
+                errors,
+                options,
             )
         }
         _ => false,
     }
 }
 
+fn resolve_shortcut(
+    key: Key,
+    physical_key: Option<Key>,
+    shift: bool,
+    headings: bool,
+) -> Option<Shortcut> {
+    let physical = physical_key
+        .and_then(key_character)
+        .filter(|key| key.is_ascii_alphanumeric() || matches!(key, '[' | ']'));
+    let name = shortcut_key_name(key_character(key), physical)?;
+    match Shortcut::new(name, shift)? {
+        Shortcut::Copy | Shortcut::Cut | Shortcut::Paste => None,
+        Shortcut::Paragraph(ParagraphKind::Body | ParagraphKind::Heading { .. }) if !headings => {
+            None
+        }
+        shortcut => Some(shortcut),
+    }
+}
+
+fn key_character(key: Key) -> Option<char> {
+    match key {
+        Key::Minus => Some('-'),
+        Key::Quote => Some('\''),
+        Key::Space => Some(' '),
+        _ => {
+            let mut characters = key.symbol_or_name().chars();
+            characters
+                .next()
+                .filter(|character| character.is_ascii() && characters.next().is_none())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_key(
     editor: &mut Editor,
     key: Key,
+    physical_key: Option<Key>,
     modifiers: Modifiers,
     layouts: &ParagraphLayouts,
     navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
-    read_only: bool,
+    options: &InputOptions,
 ) -> bool {
     let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
-    if command || !matches!(key, Key::ArrowUp | Key::ArrowDown) {
+    let paging = !modifiers.command && !modifiers.alt;
+    let prefer_next_row = navigation
+        .as_ref()
+        .is_none_or(|navigation| navigation.prefer_next_row);
+    if command
+        || !(matches!(key, Key::ArrowUp | Key::ArrowDown)
+            || paging && matches!(key, Key::PageUp | Key::PageDown))
+    {
         *navigation = None;
     }
-    if read_only
-        && (matches!(key, Key::Backspace | Key::Delete | Key::Enter)
-            || command
-                && matches!(
-                    key,
-                    Key::Z
-                        | Key::Y
-                        | Key::B
-                        | Key::I
-                        | Key::U
-                        | Key::Num0
-                        | Key::Num1
-                        | Key::Num2
-                        | Key::Num3
-                        | Key::Num4
-                        | Key::Num5
-                        | Key::Num6
-                        | Key::Num7
-                        | Key::Num8
-                ))
+    if command
+        && let Some(shortcut) = resolve_shortcut(
+            key,
+            physical_key,
+            modifiers.shift,
+            options.heading_shortcuts,
+        )
     {
+        if !options.read_only || !shortcut.edits() {
+            record(shortcut.apply(editor), errors);
+        }
         return true;
     }
-    if command {
-        match key {
-            Key::A => {
-                editor.select_all();
-                return true;
-            }
-            Key::Z => {
-                if modifiers.shift {
-                    editor.redo();
-                } else {
-                    editor.undo();
-                }
-                return true;
-            }
-            Key::Y => {
-                editor.redo();
-                return true;
-            }
-            Key::B => {
-                record(
-                    editor.apply_style(StylePatch {
-                        bold: Some(editor.selection_style().bold != Some(true)),
-                        ..Default::default()
-                    }),
-                    errors,
-                );
-                return true;
-            }
-            Key::I => {
-                record(
-                    editor.apply_style(StylePatch {
-                        italic: Some(editor.selection_style().italic != Some(true)),
-                        ..Default::default()
-                    }),
-                    errors,
-                );
-                return true;
-            }
-            Key::U => {
-                record(
-                    editor.apply_style(StylePatch {
-                        underline: Some(editor.selection_style().underline != Some(true)),
-                        ..Default::default()
-                    }),
-                    errors,
-                );
-                return true;
-            }
-            Key::Num0 => {
-                record(editor.set_paragraph_kind(ParagraphKind::Body), errors);
-                return true;
-            }
-            Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 => {
-                let level = match key {
-                    Key::Num1 => 1,
-                    Key::Num2 => 2,
-                    Key::Num3 => 3,
-                    Key::Num4 => 4,
-                    Key::Num5 => 5,
-                    _ => 6,
-                };
-                record(
-                    editor.set_paragraph_kind(ParagraphKind::Heading { level }),
-                    errors,
-                );
-                return true;
-            }
-            Key::Num7 if modifiers.shift => {
-                record(
-                    editor.set_paragraph_kind(ParagraphKind::Ordered {
-                        indent: 0,
-                        start: 1,
-                    }),
-                    errors,
-                );
-                return true;
-            }
-            Key::Num8 if modifiers.shift => {
-                record(
-                    editor.set_paragraph_kind(ParagraphKind::Bullet { indent: 0 }),
-                    errors,
-                );
-                return true;
-            }
-            _ => {}
-        }
-    }
     let by_word = modifiers.ctrl || modifiers.alt;
+    let row_end = match key {
+        Key::ArrowLeft if command && modifiers.mac_cmd => Some(false),
+        Key::ArrowRight if command && modifiers.mac_cmd => Some(true),
+        Key::Home if !modifiers.command => Some(false),
+        Key::End if !modifiers.command => Some(true),
+        _ => None,
+    };
+    if let Some(end) = row_end {
+        if let Some((position, preferred_x, prefer_next_row)) =
+            row_boundary_position(editor, layouts, prefer_next_row, end)
+        {
+            set_visual_selection(
+                editor,
+                navigation,
+                errors,
+                position,
+                preferred_x,
+                prefer_next_row,
+                modifiers.shift,
+            );
+        } else {
+            let movement = if end {
+                Movement::ParagraphEnd
+            } else {
+                Movement::ParagraphStart
+            };
+            record(editor.move_cursor(movement, modifiers.shift), errors);
+        }
+        return true;
+    }
     let movement = match key {
-        Key::ArrowLeft if command && modifiers.mac_cmd => Some(Movement::ParagraphStart),
-        Key::ArrowRight if command && modifiers.mac_cmd => Some(Movement::ParagraphEnd),
         Key::ArrowUp if command => Some(Movement::DocumentStart),
         Key::ArrowDown if command => Some(Movement::DocumentEnd),
         Key::ArrowLeft => Some(if by_word {
@@ -309,16 +323,8 @@ pub(super) fn handle_key(
         } else {
             Movement::GraphemeForward
         }),
-        Key::Home => Some(if modifiers.command {
-            Movement::DocumentStart
-        } else {
-            Movement::ParagraphStart
-        }),
-        Key::End => Some(if modifiers.command {
-            Movement::DocumentEnd
-        } else {
-            Movement::ParagraphEnd
-        }),
+        Key::Home => Some(Movement::DocumentStart),
+        Key::End => Some(Movement::DocumentEnd),
         _ => None,
     };
     if let Some(movement) = movement {
@@ -327,31 +333,47 @@ pub(super) fn handle_key(
     }
     match key {
         Key::ArrowUp | Key::ArrowDown => {
-            let Some((position, preferred_x, prefer_next_row)) =
+            if let Some((position, preferred_x, prefer_next_row)) =
                 vertical_position(editor, layouts, navigation.as_ref(), key == Key::ArrowDown)
-            else {
-                return true;
-            };
-            let anchor = if modifiers.shift {
-                editor.selection().anchor
-            } else {
-                position
-            };
-            record(
-                editor.set_selection(Selection::new(anchor, position)),
-                errors,
-            );
-            *navigation = Some(VerticalNavigation {
-                selection: editor.selection(),
-                preferred_x,
-                prefer_next_row,
-            });
+            {
+                set_visual_selection(
+                    editor,
+                    navigation,
+                    errors,
+                    position,
+                    preferred_x,
+                    prefer_next_row,
+                    modifiers.shift,
+                );
+            }
             true
         }
+        Key::PageUp | Key::PageDown if paging => {
+            if let Some((position, preferred_x, prefer_next_row)) = page_position(
+                editor,
+                layouts,
+                navigation.as_ref(),
+                key == Key::PageDown,
+                options.page_height,
+            ) {
+                set_visual_selection(
+                    editor,
+                    navigation,
+                    errors,
+                    position,
+                    preferred_x,
+                    prefer_next_row,
+                    modifiers.shift,
+                );
+            }
+            true
+        }
+        Key::Backspace | Key::Delete if options.read_only => true,
+        Key::Enter if options.read_only && !modifiers.command => true,
         Key::Backspace => {
             record(
                 if command && modifiers.mac_cmd {
-                    crate::adapter::delete_to_paragraph_start(editor)
+                    editor.delete_to_paragraph_start()
                 } else if by_word {
                     editor.delete_word_backward()
                 } else {
@@ -372,16 +394,20 @@ pub(super) fn handle_key(
             );
             true
         }
+        Key::Enter if modifiers.shift && !modifiers.command => {
+            record(editor.insert_line_break(), errors);
+            true
+        }
         Key::Enter if !modifiers.command => {
             record(editor.insert_paragraph(), errors);
             true
         }
         Key::Tab
-            if !read_only
+            if !options.read_only
                 && !modifiers.command
                 && !modifiers.ctrl
                 && !modifiers.alt
-                && selection_contains_list(editor) =>
+                && layouts.contains_list(editor.selected_paragraphs()) =>
         {
             record(
                 if modifiers.shift {
@@ -397,25 +423,29 @@ pub(super) fn handle_key(
     }
 }
 
-pub(super) fn selection_contains_list(editor: &Editor) -> bool {
-    editor.document().paragraphs()[selected_paragraphs(editor)]
-        .iter()
-        .any(|paragraph| {
-            matches!(
-                paragraph.kind(),
-                ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. }
-            )
-        })
-}
-
-pub(super) fn selected_paragraphs(editor: &Editor) -> std::ops::Range<usize> {
-    let range = editor.selection().range();
-    let end = if range.end.paragraph > range.start.paragraph && range.end.byte == 0 {
-        range.end.paragraph
+fn set_visual_selection(
+    editor: &mut Editor,
+    navigation: &mut Option<VerticalNavigation>,
+    errors: &mut Vec<Error>,
+    position: Position,
+    preferred_x: f32,
+    prefer_next_row: bool,
+    extend: bool,
+) {
+    let anchor = if extend {
+        editor.selection().anchor
     } else {
-        range.end.paragraph + 1
+        position
     };
-    range.start.paragraph..end
+    record(
+        editor.set_selection(Selection::new(anchor, position)),
+        errors,
+    );
+    *navigation = Some(VerticalNavigation {
+        selection: editor.selection(),
+        preferred_x,
+        prefer_next_row,
+    });
 }
 
 pub(super) fn delete_surrounding(

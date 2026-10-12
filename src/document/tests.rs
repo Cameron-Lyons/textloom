@@ -3,20 +3,102 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[test]
 fn newline_normalization_handles_all_adjacent_breaks_and_keeps_lf_borrowed() {
-    let tokens = ["a", "é", "\r", "\n"];
+    let tokens = ["a", "é", "\r", "\n", "\u{2028}", "\u{2029}"];
     for length in 0..=5 {
-        for mut case in 0..4usize.pow(length) {
+        for mut case in 0..tokens.len().pow(length) {
             let mut text = String::new();
             for _ in 0..length {
                 text.push_str(tokens[case % tokens.len()]);
                 case /= tokens.len();
             }
-            let expected = text.replace("\r\n", "\n").replace('\r', "\n");
+            let expected = text.replace("\r\n", "\n").replace(['\r', '\u{2029}'], "\n");
             let normalized = normalize_newlines(&text);
             assert_eq!(normalized, expected, "input {text:?}");
-            assert_eq!(matches!(normalized, Cow::Borrowed(_)), !text.contains('\r'));
+            assert_eq!(
+                matches!(normalized, Cow::Borrowed(_)),
+                !text.contains(['\r', '\u{2029}'])
+            );
         }
     }
+}
+
+#[test]
+fn soft_line_breaks_are_whitespace_graphemes_inside_one_paragraph() {
+    let document = Document::from_text("ab\u{2028}cd\u{2029}e\r\u{2028}");
+    let texts: Vec<_> = document
+        .paragraphs()
+        .iter()
+        .map(|paragraph| paragraph.text())
+        .collect();
+    assert_eq!(texts, ["ab\u{2028}cd", "e", "\u{2028}"]);
+    let paragraph = &document.paragraphs()[0];
+    assert_eq!(paragraph.grapheme_count(), 5);
+    assert_eq!(paragraph.byte_from_grapheme(3), Some(5));
+    assert_eq!(paragraph.next_grapheme(2), 5);
+    assert_eq!(paragraph.previous_grapheme(5), 2);
+    assert_eq!(paragraph.next_word(2), 7);
+    assert_eq!(paragraph.previous_word(5), 0);
+    assert_eq!(paragraph.word_ranges(), [0..2, 5..7]);
+    for byte in [3, 4] {
+        assert!(document.validate_position(Position::new(0, byte)).is_err());
+    }
+    let span = |range: Range<usize>, bold| Span {
+        range,
+        style: InlineStyle {
+            bold,
+            ..InlineStyle::default()
+        },
+        link: None,
+    };
+    let rich = Paragraph::new(
+        "a\u{2028}b",
+        vec![span(0..1, false), span(1..4, true), span(4..5, false)],
+        ParagraphKind::Heading { level: 1 },
+    )
+    .unwrap();
+    assert_eq!(rich.text(), "a\u{2028}b");
+    assert_eq!(
+        Paragraph::new(
+            "a\u{2028}b",
+            vec![span(0..2, false), span(2..5, true)],
+            ParagraphKind::Body
+        ),
+        Err(Error::InvalidFragment)
+    );
+
+    let mut document = Document::from_text("a");
+    let (_, caret) = document
+        .replace(
+            Position::new(0, 1)..Position::new(0, 1),
+            "\u{2028}\u{301}",
+            InlineStyle::default(),
+        )
+        .unwrap();
+    assert_eq!(caret, Position::new(0, 6));
+    assert_eq!(document.paragraphs()[0].grapheme_count(), 3);
+    assert_normalized(&document);
+}
+
+#[test]
+fn word_selection_treats_soft_line_ends_like_paragraph_ends() {
+    let document = Document::from_text("one two\u{2028}three\u{2028}\u{2028}four\u{2028}");
+    let word = |byte| {
+        let range = document.word_range_at(Position::new(0, byte)).unwrap();
+        assert_eq!(range.start.paragraph, 0);
+        assert_eq!(range.end.paragraph, 0);
+        range.start.byte..range.end.byte
+    };
+    assert_eq!(word(7), 4..7);
+    assert_eq!(word(10), 10..15);
+    assert_eq!(word(15), 10..15);
+    assert_eq!(word(18), 18..18);
+    assert_eq!(word(document.end().byte), 28..28);
+    assert_eq!(word(21), 21..25);
+    let document = Document::from_text("\u{2028}x");
+    assert_eq!(
+        document.word_range_at(Position::default()),
+        Ok(Position::default()..Position::default())
+    );
 }
 
 #[test]
@@ -365,7 +447,26 @@ fn unicode_editing_snaps_carets_and_indexes_only_long_contexts() {
 }
 
 #[test]
-fn word_navigation_matches_unicode_segmentation() {
+fn word_navigation_stops_at_unicode_words_and_symbol_runs() {
+    let stops = |text: &str| -> Vec<Range<usize>> {
+        let mut stops: Vec<Range<usize>> = Vec::new();
+        let mut symbols = false;
+        for (start, segment) in text.split_word_bound_indices() {
+            let range = start..start + segment.len();
+            if text.unicode_word_indices().any(|(word, _)| word == start) {
+                stops.push(range);
+                symbols = false;
+            } else if segment.trim().is_empty() {
+                symbols = false;
+            } else if symbols {
+                stops.last_mut().unwrap().end = range.end;
+            } else {
+                stops.push(range);
+                symbols = true;
+            }
+        }
+        stops
+    };
     for text in [
         "",
         "one, two's!",
@@ -374,42 +475,58 @@ fn word_navigation_matches_unicode_segmentation() {
         "café 👩‍💻 नमस्ते 🇺🇸",
         "你好世界 e\u{301}",
         "!!!",
+        "hello 🦀🦀🦀",
+        "foo ---------- bar",
+        "a--b 👩‍💻!? c",
     ] {
         let paragraph = Paragraph::plain(text);
+        let stops = stops(text);
         for byte in 0..=text.len() + 1 {
-            let previous = text
-                .unicode_word_indices()
+            let previous = stops
+                .iter()
                 .rev()
-                .find(|(start, _)| *start < byte)
-                .map_or(0, |(start, _)| start);
-            let next = text
-                .unicode_word_indices()
-                .find(|(start, word)| start + word.len() > byte)
-                .map_or(text.len(), |(start, word)| start + word.len());
+                .find(|stop| stop.start < byte)
+                .map_or(0, |stop| stop.start);
+            let next = stops
+                .iter()
+                .find(|stop| stop.end > byte)
+                .map_or(text.len(), |stop| stop.end);
             assert_eq!(
                 paragraph.previous_word(byte),
-                paragraph.boundary_at_or_before(previous)
+                paragraph.boundary_at_or_before(previous),
+                "{text:?} previous from {byte}"
             );
             assert_eq!(
                 paragraph.next_word(byte),
-                paragraph.boundary_at_or_after(next)
+                paragraph.boundary_at_or_after(next),
+                "{text:?} next from {byte}"
             );
         }
     }
+    let crabs = Paragraph::plain("hello 🦀🦀🦀");
+    assert_eq!(crabs.previous_word(crabs.text().len()), 6);
+    assert_eq!(crabs.previous_word(6), 0);
+    assert_eq!(crabs.next_word(5), crabs.text().len());
+    let dashes = Paragraph::plain("foo ---------- bar");
+    assert_eq!(dashes.previous_word(14), 4);
+    assert_eq!(dashes.next_word(3), 14);
+    let mixed = Paragraph::plain("one, two's!");
+    assert_eq!(mixed.word_ranges(), &[0..3, 3..4, 5..10, 10..11]);
 }
 
 #[test]
 fn unicode_indexes_are_independently_lazy_and_shared_across_metadata_changes() {
     let mut document = Document::from_text("café 👩‍💻");
     let original = Arc::clone(&document.paragraphs()[0]);
-    let indices = original.indices.get().unwrap();
-    assert!(indices.graphemes.get().is_none());
-    assert!(indices.scalars.get().is_none());
-    assert!(indices.words.get().is_none());
+    assert!(original.indices.get().is_none());
+    assert_eq!(original.scalar_count(), 8);
+    assert!(original.indices.get().is_none());
     let equal = Paragraph::plain(original.text());
     assert_eq!(*original, equal);
     original.grapheme_count();
     assert_eq!(*original, equal);
+    assert_eq!(format!("{original:?}"), format!("{equal:?}"));
+    let indices = original.indices.get().unwrap();
     assert!(indices.graphemes.get().is_some());
     assert!(indices.scalars.get().is_none());
     assert!(indices.words.get().is_none());
@@ -436,10 +553,17 @@ fn unicode_indexes_are_independently_lazy_and_shared_across_metadata_changes() {
     document
         .replace(document.end()..document.end(), "!", InlineStyle::default())
         .unwrap();
-    assert!(!Arc::ptr_eq(
-        indices,
-        document.paragraph(0).unwrap().indices.get().unwrap()
+    let edited = Arc::clone(&document.paragraphs()[0]);
+    assert!(edited.indices.get().is_none());
+    document.set_kind(0..1, ParagraphKind::Body).unwrap();
+    let retyped = document.paragraph(0).unwrap();
+    assert!(Arc::ptr_eq(
+        edited.indices.get().unwrap(),
+        retyped.indices.get().unwrap()
     ));
+    assert!(!Arc::ptr_eq(indices, retyped.indices.get().unwrap()));
+    retyped.grapheme_count();
+    assert!(edited.cached_grapheme_boundaries().is_some());
     assert!(Paragraph::plain("ASCII").indices.get().is_none());
 }
 
@@ -504,38 +628,40 @@ fn uniform_unicode_end_typing_does_not_build_text_indexes() {
             .unwrap();
         let paragraph = document.paragraph(0).unwrap();
         assert_eq!(paragraph.spans().len(), 1);
-        let indices = paragraph.indices.get().unwrap();
-        assert!(indices.graphemes.get().is_none());
-        assert!(indices.scalars.get().is_none());
-        assert!(indices.words.get().is_none());
+        assert!(paragraph.indices.get().is_none());
     }
     assert_normalized(&document);
 }
 
 #[test]
 fn rich_parts_validate_and_merge_runs() {
-    let paragraph = Paragraph::from_parts(
+    let paragraph = Paragraph::new(
         "aéébc",
         vec![
             Span {
                 range: 0..1,
                 style: bold(),
+                link: None,
             },
             Span {
                 range: 1..3,
                 style: bold(),
+                link: None,
             },
             Span {
                 range: 3..5,
                 style: bold(),
+                link: None,
             },
             Span {
                 range: 5..6,
                 style: InlineStyle::default(),
+                link: None,
             },
             Span {
                 range: 6..7,
                 style: InlineStyle::default(),
+                link: None,
             },
         ],
         ParagraphKind::Heading { level: 1 },
@@ -546,21 +672,30 @@ fn rich_parts_validate_and_merge_runs() {
         &[
             Span {
                 range: 0..5,
-                style: bold()
+                style: bold(),
+                link: None,
             },
             Span {
                 range: 5..7,
-                style: InlineStyle::default()
+                style: InlineStyle::default(),
+                link: None,
             }
         ]
     );
-    assert!(Paragraph::from_parts("", vec![], ParagraphKind::Body).is_ok());
+    assert!(Paragraph::new("", vec![], ParagraphKind::Body).is_ok());
+    for level in [0, 7] {
+        assert_eq!(
+            Paragraph::new("", vec![], ParagraphKind::Heading { level }),
+            Err(Error::InvalidHeadingLevel(level))
+        );
+    }
     for (text, spans, kind) in [
         (
             "a\nb",
             vec![Span {
                 range: 0..3,
                 style: bold(),
+                link: None,
             }],
             ParagraphKind::Body,
         ),
@@ -569,16 +704,9 @@ fn rich_parts_validate_and_merge_runs() {
             vec![Span {
                 range: 0..3,
                 style: bold(),
+                link: None,
             }],
             ParagraphKind::Body,
-        ),
-        (
-            "a",
-            vec![Span {
-                range: 0..1,
-                style: bold(),
-            }],
-            ParagraphKind::Heading { level: 0 },
         ),
         ("a", vec![], ParagraphKind::Body),
         (
@@ -586,6 +714,7 @@ fn rich_parts_validate_and_merge_runs() {
             vec![Span {
                 range: 0..0,
                 style: bold(),
+                link: None,
             }],
             ParagraphKind::Body,
         ),
@@ -594,6 +723,7 @@ fn rich_parts_validate_and_merge_runs() {
             vec![Span {
                 range: 0..1,
                 style: bold(),
+                link: None,
             }],
             ParagraphKind::Body,
         ),
@@ -602,6 +732,7 @@ fn rich_parts_validate_and_merge_runs() {
             vec![Span {
                 range: 1..2,
                 style: bold(),
+                link: None,
             }],
             ParagraphKind::Body,
         ),
@@ -610,6 +741,7 @@ fn rich_parts_validate_and_merge_runs() {
             vec![Span {
                 range: 0..3,
                 style: bold(),
+                link: None,
             }],
             ParagraphKind::Body,
         ),
@@ -619,10 +751,12 @@ fn rich_parts_validate_and_merge_runs() {
                 Span {
                     range: 0..1,
                     style: bold(),
+                    link: None,
                 },
                 Span {
                     range: 1..3,
                     style: bold(),
+                    link: None,
                 },
             ],
             ParagraphKind::Body,
@@ -633,47 +767,102 @@ fn rich_parts_validate_and_merge_runs() {
                 Span {
                     range: 0..1,
                     style: bold(),
+                    link: None,
                 },
                 Span {
                     range: 1..2,
                     style: bold(),
+                    link: None,
                 },
             ],
             ParagraphKind::Body,
         ),
     ] {
         assert_eq!(
-            Paragraph::from_parts(text, spans, kind),
+            Paragraph::new(text, spans, kind),
             Err(Error::InvalidFragment)
         );
     }
 }
 
 #[test]
+fn documents_assemble_from_validated_or_shared_paragraphs() {
+    let heading = Paragraph::new(
+        "Title",
+        vec![Span {
+            range: 0..5,
+            style: bold(),
+            link: None,
+        }],
+        ParagraphKind::Heading { level: 2 },
+    )
+    .unwrap();
+    let item = Paragraph::new(
+        "ité",
+        vec![Span {
+            range: 0..4,
+            style: InlineStyle::default(),
+            link: None,
+        }],
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: Some(9),
+        },
+    )
+    .unwrap();
+    let document = Document::from_paragraphs([heading.clone(), item]);
+    assert_eq!(document.plain_text(), "Title\nité");
+    assert_eq!(*document.paragraph(0).unwrap(), heading);
+    assert_eq!(
+        document.paragraph(1).unwrap().kind(),
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: Some(9)
+        }
+    );
+    assert_eq!(document.list_number(1), Some(9));
+    assert_eq!(
+        Document::from_bytes(&document.to_bytes()).unwrap(),
+        document
+    );
+    let fragment = Fragment::from_document(&document);
+    let shared = Document::from_paragraphs(fragment.paragraphs().iter().cloned());
+    for (source, copy) in fragment.paragraphs().iter().zip(shared.paragraphs()) {
+        assert!(Arc::ptr_eq(source, copy));
+    }
+    let empty = Document::from_paragraphs(Vec::<Paragraph>::new());
+    assert_eq!(empty, Document::new());
+    assert_eq!(
+        format!("{empty:?}"),
+        "Document { paragraphs: [Paragraph { text: \"\", spans: [], kind: Body }], revision: 0, .. }"
+    );
+}
+
+#[test]
 fn rich_unicode_run_validation_keeps_navigation_indexes_lazy() {
-    let paragraph = Paragraph::from_parts(
+    let paragraph = Paragraph::new(
         "ééé🦀",
         vec![
             Span {
                 range: 0..2,
                 style: bold(),
+                link: None,
             },
             Span {
                 range: 2..6,
                 style: InlineStyle::default(),
+                link: None,
             },
             Span {
                 range: 6..10,
                 style: bold(),
+                link: None,
             },
         ],
         ParagraphKind::Body,
     )
     .unwrap();
-    let indices = paragraph.indices.get().unwrap();
-    assert!(indices.graphemes.get().is_none());
-    assert!(indices.scalars.get().is_none());
-    assert!(indices.words.get().is_none());
+    assert!(paragraph.indices.get().is_none());
     assert_eq!(paragraph.spans().len(), 3);
     assert_eq!(paragraph.grapheme_count(), 4);
 }
@@ -863,7 +1052,8 @@ fn formatting_merges_runs_and_is_a_noop_when_unchanged() {
         document.paragraph(0).unwrap().spans(),
         &[Span {
             range: 0..6,
-            style: bold()
+            style: bold(),
+            link: None,
         }]
     );
     assert_eq!(document.style_at(Position::new(0, 0)), bold());
@@ -890,6 +1080,10 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
             foreground: Some(blue),
             ..bold()
         },
+        InlineStyle {
+            background: Some(crate::Color::YELLOW),
+            ..InlineStyle::default()
+        },
     ];
     let texts = ["ab e\u{301}👩‍💻cd 🇺🇸ef", "", "क्‍ष xyz"];
     let source = Document::from_paragraphs(
@@ -903,6 +1097,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                     .map(|(grapheme, (byte, text))| Span {
                         range: byte..byte + text.len(),
                         style: styles[(grapheme / 2 + index) % styles.len()],
+                        link: None,
                     })
                     .collect();
                 Arc::new(
@@ -918,7 +1113,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                     .unwrap(),
                 )
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     );
     let positions: Vec<_> = source
         .paragraphs()
@@ -945,6 +1140,14 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
             foreground: Some(Some(blue)),
             ..StylePatch::default()
         },
+        StylePatch {
+            background: Some(None),
+            ..StylePatch::default()
+        },
+        StylePatch {
+            background: Some(Some(crate::Color::YELLOW)),
+            ..StylePatch::default()
+        },
     ];
     for value in [false, true] {
         patches.extend([
@@ -969,6 +1172,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                 strikethrough: Some(value),
                 code: Some(value),
                 foreground: Some(value.then_some(red)),
+                background: Some(value.then_some(blue)),
             },
         ]);
     }
@@ -996,6 +1200,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                                 Span {
                                     range: byte..byte + text.len(),
                                     style,
+                                    link: None,
                                 }
                             })
                             .collect();
@@ -1119,6 +1324,131 @@ fn history_retains_only_changed_paragraphs_and_shares_others() {
 }
 
 #[test]
+fn history_charges_the_larger_side_without_shared_text_or_runs() {
+    let record = std::mem::size_of::<Paragraph>();
+    let run = std::mem::size_of::<Span>();
+    let text = "word ".repeat(1000);
+    let mut document = Document::from_text(&format!("{text}\n{text}"));
+    let (typed, _) = document
+        .replace(Position::new(0, 0)..Position::new(0, 0), "x", bold())
+        .unwrap();
+    assert_eq!(typed.retained_bytes(), record + text.len() + 1 + 2 * run);
+
+    let formatted = document
+        .apply_style(
+            Position::new(0, 1)..Position::new(1, 4),
+            StylePatch {
+                italic: Some(true),
+                ..StylePatch::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(formatted.retained_bytes(), 2 * record + 4 * run);
+
+    let len = document.paragraphs().len();
+    let retyped = document
+        .set_kind(
+            0..len,
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(retyped.retained_bytes(), 2 * record);
+}
+
+fn numbers(document: &Document) -> Vec<Option<u32>> {
+    (0..document.paragraphs().len())
+        .map(|index| document.list_number(index))
+        .collect()
+}
+
+#[test]
+fn list_edits_share_following_items_and_text_edits_keep_computed_numbers() {
+    let mut document = Document::from_text(&vec!["item"; 100].join("\n"));
+    document
+        .set_kind(
+            0..100,
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            },
+        )
+        .unwrap();
+    document
+        .set_kind(
+            10..11,
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: Some(1),
+            },
+        )
+        .unwrap();
+    let expected: Vec<_> = (1..=10).chain(1..=90).map(Some).collect();
+    assert_eq!(numbers(&document), expected);
+    let before = document.paragraphs.clone();
+    let (delta, _) = document
+        .replace(
+            Position::new(0, 4)..Position::new(0, 4),
+            "\n",
+            InlineStyle::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        (delta.start, delta.before.len(), delta.after.len()),
+        (1, 0, 1)
+    );
+    for (old, new) in before.iter().zip(&document.paragraphs[1..]).skip(1) {
+        assert!(Arc::ptr_eq(old, new));
+    }
+    let expected: Vec<_> = (1..=11).chain(1..=90).map(Some).collect();
+    assert_eq!(numbers(&document), expected);
+    assert!(document.numbers.get().is_some());
+    document
+        .replace(
+            Position::new(5, 0)..Position::new(5, 4),
+            "text",
+            InlineStyle::default(),
+        )
+        .unwrap();
+    document
+        .apply_style(
+            Position::new(0, 0)..Position::new(3, 2),
+            StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        )
+        .unwrap();
+    assert!(document.numbers.get().is_some());
+    let clone = document.clone();
+    document.set_kind(3..4, ParagraphKind::Body).unwrap();
+    assert!(document.numbers.get().is_none());
+    assert_eq!(document.list_number(11), Some(1));
+    assert!(document.numbers.get().is_none());
+    assert_eq!(document.list_number(10), Some(10));
+    assert_eq!(numbers(&clone), expected);
+    let (delta, _) = document
+        .replace(
+            Position::new(0, 4)..Position::new(1, 0),
+            "",
+            InlineStyle::default(),
+        )
+        .unwrap();
+    assert_eq!(numbers(&document)[..4], [Some(1), Some(2), None, Some(3)]);
+    document.replay(&delta, false);
+    assert_eq!(
+        numbers(&document)[..5],
+        [Some(1), Some(2), Some(3), None, Some(4)]
+    );
+    assert_eq!(document.list_number(100), Some(90));
+    assert_eq!(document.list_number(101), None);
+}
+
+#[test]
 fn heading_and_list_splits_preserve_paragraph_semantics() {
     let mut document = Document::from_text("heading");
     document
@@ -1141,7 +1471,7 @@ fn heading_and_list_splits_preserve_paragraph_semantics() {
             1..2,
             ParagraphKind::Ordered {
                 indent: 1,
-                start: 7,
+                start: Some(7),
             },
         )
         .unwrap();
@@ -1152,20 +1482,16 @@ fn heading_and_list_splits_preserve_paragraph_semantics() {
             InlineStyle::default(),
         )
         .unwrap();
-    assert_eq!(
-        document.paragraph(2).unwrap().kind(),
-        ParagraphKind::Ordered {
-            indent: 1,
-            start: 8
-        }
-    );
-    assert_eq!(
-        document.paragraph(3).unwrap().kind(),
-        ParagraphKind::Ordered {
-            indent: 1,
-            start: 9
-        }
-    );
+    for index in 2..4 {
+        assert_eq!(
+            document.paragraph(index).unwrap().kind(),
+            ParagraphKind::Ordered {
+                indent: 1,
+                start: None
+            }
+        );
+    }
+    assert_eq!(numbers(&document), [None, Some(7), Some(8), Some(9)]);
     assert_normalized(&document);
 }
 

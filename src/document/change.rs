@@ -1,4 +1,9 @@
-use std::{ops::Range, sync::Arc};
+use std::{
+    cell::OnceCell,
+    collections::HashSet,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use super::{Document, Paragraph};
 
@@ -35,6 +40,7 @@ impl Document {
             delta.start..delta.start + remove.len(),
             insert.iter().cloned(),
         );
+        self.retain_numbers(remove, insert);
         self.record_change(delta.start, remove.len(), insert.len());
     }
 
@@ -67,9 +73,21 @@ impl Document {
         if !delta.is_empty() {
             self.paragraphs
                 .splice(start..end, delta.after.iter().cloned());
+            self.retain_numbers(&delta.before, &delta.after);
             self.record_change(start, end - start, delta.after.len());
         }
         delta
+    }
+
+    fn retain_numbers(&mut self, before: &[Arc<Paragraph>], after: &[Arc<Paragraph>]) {
+        if before.len() != after.len()
+            || before
+                .iter()
+                .zip(after)
+                .any(|(before, after)| before.kind != after.kind)
+        {
+            self.numbers = OnceLock::new();
+        }
     }
 
     fn record_change(&mut self, start: usize, old_len: usize, new_len: usize) {
@@ -119,15 +137,119 @@ impl Delta {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.before
+        side_bytes(&self.before, &self.after).max(side_bytes(&self.after, &self.before))
+    }
+}
+
+fn side_bytes(paragraphs: &[Arc<Paragraph>], other: &[Arc<Paragraph>]) -> usize {
+    let texts = Allocations::new(other, |paragraph| paragraph.text.as_ptr().addr());
+    let runs = Allocations::new(other, |paragraph| paragraph.spans.as_ptr().addr());
+    let shift = other.len().wrapping_sub(paragraphs.len());
+    let mut charged = HashSet::new();
+    paragraphs
+        .iter()
+        .enumerate()
+        .map(|(index, paragraph)| {
+            let near = [index, index.wrapping_add(shift)];
+            let mut bytes = std::mem::size_of::<Paragraph>();
+            if !paragraph.text.is_empty() && !texts.contains(paragraph, near) {
+                bytes = bytes.saturating_add(paragraph.text.len());
+            }
+            if !paragraph.spans.is_empty() && !runs.contains(paragraph, near) {
+                bytes = bytes.saturating_add(std::mem::size_of_val(paragraph.spans()));
+                if paragraph.linked {
+                    let near = near.map(|index| other.get(index).map(Arc::as_ref));
+                    bytes = bytes.saturating_add(link_bytes(paragraph, near, &mut charged));
+                }
+            }
+            bytes
+        })
+        .fold(0, usize::saturating_add)
+}
+
+fn link_bytes(
+    paragraph: &Paragraph,
+    near: [Option<&Paragraph>; 2],
+    charged: &mut HashSet<usize>,
+) -> usize {
+    let links = |paragraph: &Paragraph| {
+        paragraph
+            .spans
             .iter()
-            .chain(&self.after)
-            .map(|paragraph| {
-                std::mem::size_of::<Paragraph>()
-                    .saturating_add(paragraph.text.len())
-                    .saturating_add(std::mem::size_of_val(paragraph.spans()))
+            .filter_map(|span| span.link.as_ref().map(crate::Link::address))
+            .collect::<Vec<_>>()
+    };
+    let own = links(paragraph);
+    let near: Vec<Vec<usize>> = near
+        .into_iter()
+        .flatten()
+        .filter(|other| other.linked)
+        .map(links)
+        .collect();
+    let (mut prefix, mut suffix) = (0, 0);
+    for other in &near {
+        prefix = prefix.max(own.iter().zip(other).take_while(|(a, b)| a == b).count());
+        suffix = suffix.max(
+            own.iter()
+                .rev()
+                .zip(other.iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count(),
+        );
+    }
+    let start = prefix.min(own.len());
+    let middle = &own[start..own.len().saturating_sub(suffix).max(start)];
+    if middle.is_empty() {
+        return 0;
+    }
+    let shared: HashSet<usize> = near.iter().flatten().copied().collect();
+    let targets = paragraph
+        .spans
+        .iter()
+        .filter_map(|span| span.link.as_ref())
+        .skip(start)
+        .take(middle.len());
+    targets
+        .filter(|link| !shared.contains(&link.address()) && charged.insert(link.address()))
+        .map(|link| link.as_str().len())
+        .fold(0, usize::saturating_add)
+}
+
+struct Allocations<'a> {
+    paragraphs: &'a [Arc<Paragraph>],
+    address: fn(&Paragraph) -> usize,
+    set: OnceCell<HashSet<usize>>,
+}
+
+impl<'a> Allocations<'a> {
+    fn new(paragraphs: &'a [Arc<Paragraph>], address: fn(&Paragraph) -> usize) -> Self {
+        Self {
+            paragraphs,
+            address,
+            set: OnceCell::new(),
+        }
+    }
+
+    fn contains(&self, paragraph: &Paragraph, near: [usize; 2]) -> bool {
+        let target = (self.address)(paragraph);
+        let matches = |candidate: &Arc<Paragraph>| (self.address)(candidate) == target;
+        if near
+            .iter()
+            .any(|index| self.paragraphs.get(*index).is_some_and(matches))
+        {
+            return true;
+        }
+        if self.paragraphs.len() <= 8 {
+            return self.paragraphs.iter().any(matches);
+        }
+        self.set
+            .get_or_init(|| {
+                self.paragraphs
+                    .iter()
+                    .map(|paragraph| (self.address)(paragraph))
+                    .collect()
             })
-            .fold(0, usize::saturating_add)
+            .contains(&target)
     }
 }
 

@@ -1,9 +1,10 @@
 use std::{ops::Range, sync::Arc};
 
-use super::Editor;
+use super::{Editor, typing_group};
 use crate::{Error, Selection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Composition {
     pub text: String,
     pub selection: Option<Range<usize>>,
@@ -20,7 +21,6 @@ impl Editor {
     }
     pub fn begin_composition(&mut self) {
         if self.composition.is_none() {
-            self.break_history_group();
             self.composition = Some(Arc::new(Composition {
                 text: String::new(),
                 selection: None,
@@ -67,11 +67,10 @@ impl Editor {
     }
 
     pub fn commit_composition(&mut self, text: &str) -> Result<(), Error> {
-        self.break_history_group();
         if let Some(composition) = self.composition.take() {
             self.selection = composition.replacement;
         }
-        self.replace_selection(text, false)
+        self.replace_selection(text, typing_group(text))
     }
 
     pub fn cancel_composition(&mut self) -> bool {

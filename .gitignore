@@ -1,2 +1,6 @@
 target/
 __pycache__/
+/native-qa-*.json
+/native-smoke-*
+/native-observations/
+/native-qa-observations/
