@@ -2,6 +2,32 @@ use super::*;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[test]
+fn saved_state_cache_tracks_edits_and_rollback_after_revision_saturation() {
+    let mut document = Document::from_text("abc");
+    document.revision = u64::MAX;
+    let mut editor = crate::Editor::new(document);
+    assert!(!editor.is_modified());
+    editor.insert_text("x").unwrap();
+    assert_eq!(editor.document().revision(), u64::MAX);
+    assert!(editor.is_modified());
+    assert!(editor.undo());
+    assert!(!editor.is_modified());
+    assert!(editor.redo());
+    assert!(editor.is_modified());
+    editor.mark_saved();
+    assert!(!editor.is_modified());
+    let result: Result<(), Error> = editor.transaction(|editor| {
+        editor.insert_text("y")?;
+        assert!(editor.is_modified());
+        Err(Error::InvalidRange)
+    });
+    assert_eq!(result, Err(Error::InvalidRange));
+    assert_eq!(editor.document().plain_text(), "xabc");
+    assert!(!editor.is_modified());
+    assert_eq!(editor.document().revision(), u64::MAX);
+}
+
+#[test]
 fn newline_normalization_handles_all_adjacent_breaks_and_keeps_lf_borrowed() {
     let tokens = ["a", "é", "\r", "\n", "\u{2028}", "\u{2029}"];
     for length in 0..=5 {
@@ -512,6 +538,57 @@ fn word_navigation_stops_at_unicode_words_and_symbol_runs() {
     assert_eq!(dashes.next_word(3), 14);
     let mixed = Paragraph::plain("one, two's!");
     assert_eq!(mixed.word_ranges(), &[0..3, 3..4, 5..10, 10..11]);
+}
+
+#[test]
+fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
+    for text in ["", "plain", "é👩‍💻", "e\u{301}🇦🇧क्‍ष"] {
+        let paragraph = Paragraph::plain(text);
+        assert_eq!(paragraph.byte_from_grapheme(0), Some(0));
+        assert_eq!(paragraph.byte_from_scalar(0), Some(0));
+        assert!(paragraph.indices.get().is_none(), "{text:?}");
+        if let Some(first) = text.graphemes(true).next() {
+            assert_eq!(paragraph.byte_from_grapheme(1), Some(first.len()));
+            assert_eq!(
+                paragraph.byte_from_scalar(1),
+                Some(text.chars().next().unwrap().len_utf8())
+            );
+        }
+    }
+
+    let paragraph = "é👩‍💻e\u{301}".repeat(256);
+    let source = format!("start\n{paragraph}\n{paragraph}");
+    let mut editor = crate::Editor::from_text(&source);
+    editor
+        .move_cursor(crate::Movement::ParagraphDown, false)
+        .unwrap();
+    assert_eq!(
+        editor.selection(),
+        crate::Selection::caret(Position::new(1, 0))
+    );
+    editor
+        .move_cursor(crate::Movement::ParagraphDown, true)
+        .unwrap();
+    let selection = crate::Selection::new(Position::new(1, 0), Position::new(2, 0));
+    assert_eq!(editor.selection(), selection);
+    assert!(
+        editor
+            .document()
+            .paragraphs()
+            .iter()
+            .all(|paragraph| paragraph.indices.get().is_none())
+    );
+    editor.insert_text("x").unwrap();
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), source);
+    assert_eq!(editor.selection(), selection);
+    assert!(
+        editor
+            .document()
+            .paragraphs()
+            .iter()
+            .all(|paragraph| paragraph.indices.get().is_none())
+    );
 }
 
 #[test]
@@ -1367,6 +1444,60 @@ fn numbers(document: &Document) -> Vec<Option<u32>> {
 }
 
 #[test]
+fn numbering_cache_survives_equivalent_block_changes_and_replay() {
+    let ordered = |start| ParagraphKind::Ordered { indent: 0, start };
+    let mut document = Document::from_paragraphs(
+        [
+            ordered(Some(7)),
+            ParagraphKind::Body,
+            ordered(None),
+            ParagraphKind::Heading { level: 1 },
+            ordered(None),
+        ]
+        .map(|kind| Paragraph::plain("item").with_kind(kind)),
+    );
+    let expected = [Some(7), None, Some(8), None, Some(1)];
+    assert_eq!(numbers(&document), expected);
+    let cached = Arc::clone(document.numbers.get().unwrap());
+    let snapshot = document.clone();
+
+    for (index, kind) in [
+        (1, ParagraphKind::Quote),
+        (1, ParagraphKind::Body),
+        (3, ParagraphKind::Heading { level: 6 }),
+        (3, ParagraphKind::Heading { level: 2 }),
+    ] {
+        let before = document.paragraphs[index].kind;
+        let delta = document.set_kind(index..index + 1, kind).unwrap().unwrap();
+        assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
+        assert_eq!(numbers(&document), expected);
+        document.replay(&delta, false);
+        assert_eq!(document.paragraphs[index].kind, before);
+        assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
+        document.replay(&delta, true);
+        assert_eq!(document.paragraphs[index].kind, kind);
+        assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
+    }
+
+    let delta = document
+        .set_kind(3..4, ParagraphKind::Quote)
+        .unwrap()
+        .unwrap();
+    assert!(document.numbers.get().is_none());
+    assert_eq!(numbers(&document), [Some(7), None, Some(8), None, Some(9)]);
+    document.replay(&delta, false);
+    assert!(document.numbers.get().is_none());
+    assert_eq!(numbers(&document), expected);
+    document
+        .set_kind(1..2, ParagraphKind::Heading { level: 1 })
+        .unwrap();
+    assert!(document.numbers.get().is_none());
+    assert_eq!(numbers(&document), [Some(7), None, Some(1), None, Some(1)]);
+    assert!(Arc::ptr_eq(snapshot.numbers.get().unwrap(), &cached));
+    assert_eq!(numbers(&snapshot), expected);
+}
+
+#[test]
 fn list_edits_share_following_items_and_text_edits_keep_computed_numbers() {
     let mut document = Document::from_text(&vec!["item"; 100].join("\n"));
     document
@@ -1555,6 +1686,15 @@ fn invalid_operations_leave_document_unchanged() {
             .replace(Position::new(0, 1)..document.end(), "x", bold())
             .is_err()
     );
+    let invalid_caret = Position::new(0, 1)..Position::new(0, 1);
+    assert!(matches!(
+        document.replace_with_link(invalid_caret.clone(), "", bold(), None),
+        Err(Error::InvalidPosition(_))
+    ));
+    assert!(matches!(
+        document.replace_fragment(invalid_caret, &Fragment::from_text("")),
+        Err(Error::InvalidPosition(_))
+    ));
     assert!(matches!(
         document.set_kind(0..1, ParagraphKind::Heading { level: 0 }),
         Err(Error::InvalidHeadingLevel(0))

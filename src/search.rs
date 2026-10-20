@@ -213,14 +213,21 @@ impl Document {
         if options.case_sensitive && needle.len() > paragraph.text().len() {
             return ControlFlow::Continue(());
         }
-        visit_text_matches(paragraph.text(), needle, options, |bytes| {
+        let visit = |bytes: Range<usize>| {
             let range = Position::new(index, bytes.start)..Position::new(index, bytes.end);
             if self.is_grapheme_range(&range) {
                 accept(range).map_continue(|()| true)
             } else {
                 ControlFlow::Continue(false)
             }
-        })
+        };
+        if options.case_sensitive && !options.whole_word {
+            visit_literals_with_retry(paragraph.text(), needle, visit, |start| {
+                paragraph.next_grapheme(start)
+            })
+        } else {
+            visit_text_matches(paragraph.text(), needle, options, visit)
+        }
     }
 
     fn visit_normalized_matches(
@@ -283,12 +290,14 @@ fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
 }
 
 fn is_direct_literal(needle: &str, options: SearchOptions) -> bool {
-    options.case_sensitive
-        && !options.whole_word
-        && needle
-            .chars()
-            .next()
-            .is_some_and(|first| !needle[first.len_utf8()..].contains(first))
+    options.case_sensitive && !options.whole_word && has_unique_start(needle)
+}
+
+fn has_unique_start(needle: &str) -> bool {
+    needle
+        .chars()
+        .next()
+        .is_some_and(|first| !needle[first.len_utf8()..].contains(first))
 }
 
 fn lowercase(text: &str) -> String {
@@ -393,23 +402,102 @@ fn visit_text_matches(
 fn visit_literals(
     source: &str,
     needle: &str,
-    mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
+    accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
 ) -> ControlFlow<()> {
+    visit_literals_with_retry(source, needle, accept, |start| {
+        start
+            + source[start..]
+                .chars()
+                .next()
+                .expect("a nonempty query matched a character")
+                .len_utf8()
+    })
+}
+
+fn visit_literals_with_retry(
+    source: &str,
+    needle: &str,
+    mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
+    mut retry: impl FnMut(usize) -> usize,
+) -> ControlFlow<()> {
+    // Keep sparse rejection cases on the standard matcher, but bound both the
+    // number of restarts and repeated needle preprocessing before using KMP.
+    let mut retries = 2;
+    let mut retry_bytes = 64;
+    let mut may_overlap = None;
     let mut offset = 0;
     'search: loop {
-        for (relative_start, _) in source[offset..].match_indices(needle) {
-            let start = offset + relative_start;
-            if !accept(start..start + needle.len())? {
-                offset = start
-                    + source[start..]
-                        .chars()
-                        .next()
-                        .expect("a nonempty query matched a character")
-                        .len_utf8();
+        for (relative, _) in source[offset..].match_indices(needle) {
+            let start = offset + relative;
+            if accept(start..start + needle.len())?
+                || !*may_overlap.get_or_insert_with(|| !has_unique_start(needle))
+            {
+                continue;
+            }
+            let next = retry(start);
+            if needle.len() > source.len() - next {
+                return ControlFlow::Continue(());
+            }
+            if retries > 0 && needle.len() <= retry_bytes {
+                retries -= 1;
+                retry_bytes -= needle.len();
+                offset = next;
                 continue 'search;
             }
+            let prefixes = literal_prefixes(needle.as_bytes());
+            if prefixes[needle.len() - 1] == 0 {
+                // Without a shared prefix and suffix, occurrences cannot overlap.
+                may_overlap = Some(false);
+                continue;
+            }
+            return visit_overlapping_literals(source, needle, next, &prefixes, accept);
         }
-        break;
+        return ControlFlow::Continue(());
+    }
+}
+
+fn literal_prefixes(needle: &[u8]) -> Vec<usize> {
+    // Build a KMP failure table only after a rejected match might hide overlaps.
+    // Restarting a fresh str matcher for each rejection can be quadratic.
+    let mut prefixes = vec![0; needle.len()];
+    let mut matched = 0;
+    for index in 1..needle.len() {
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefixes[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefixes[index] = matched;
+    }
+    prefixes
+}
+
+fn visit_overlapping_literals(
+    source: &str,
+    needle: &str,
+    offset: usize,
+    prefixes: &[usize],
+    mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
+) -> ControlFlow<()> {
+    let needle = needle.as_bytes();
+    let mut matched = 0;
+    for (index, &byte) in source.as_bytes()[offset..].iter().enumerate() {
+        while matched > 0 && byte != needle[matched] {
+            matched = prefixes[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            let end = offset + index + 1;
+            // Accepted matches consume their bytes; rejected matches may overlap.
+            matched = if accept(end - needle.len()..end)? {
+                0
+            } else {
+                prefixes[matched - 1]
+            };
+        }
     }
     ControlFlow::Continue(())
 }

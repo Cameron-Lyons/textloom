@@ -84,7 +84,7 @@ impl Document {
             || before
                 .iter()
                 .zip(after)
-                .any(|(before, after)| before.kind != after.kind)
+                .any(|(before, after)| !super::same_numbering_effect(before.kind, after.kind))
         {
             self.numbers = OnceLock::new();
         }

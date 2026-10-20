@@ -376,9 +376,15 @@ class Probe:
                 clean = False
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass  # The child can exit after poll() but before the signal.
+                try:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     process.wait(timeout=3)
         self.observations["cleanup"]["native_processes_reaped"] = all(p.poll() is not None for p in self.hosts)
         self.observations["cleanup"]["native_sessions_closed_gracefully"] = clean
@@ -387,12 +393,18 @@ class Probe:
             if result.returncode == 0:
                 if Path(result.stdout.strip()).name != "TextEdit":
                     raise RuntimeError("TextEdit PID identity changed before cleanup")
-                os.kill(self.textedit_pid, signal.SIGTERM)
+                try:
+                    os.kill(self.textedit_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline and self.textedit() == self.textedit_pid:
                     time.sleep(0.15)
                 if self.textedit() == self.textedit_pid:
-                    os.kill(self.textedit_pid, signal.SIGKILL)
+                    try:
+                        os.kill(self.textedit_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     deadline = time.monotonic() + 3
                     while time.monotonic() < deadline and self.textedit() == self.textedit_pid:
                         time.sleep(0.15)

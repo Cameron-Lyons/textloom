@@ -230,6 +230,120 @@ fn overlapping_retries_preserve_earlier_and_later_matches() {
 }
 
 #[test]
+fn partial_grapheme_retries_keep_complete_matches_after_long_combining_clusters() {
+    let needle = "\u{301}".repeat(32);
+    let rejected = needle.repeat(2);
+    let source = format!("{needle}\u{2028}{rejected}\u{2028}{needle}");
+    let document = Document::from_text(&source);
+    let last = source.len() - needle.len();
+    let expected = vec![
+        Position::new(0, 0)..Position::new(0, needle.len()),
+        Position::new(0, last)..Position::new(0, source.len()),
+    ];
+    assert_eq!(document.find(&needle, default_options()), expected);
+    let mut editor = Editor::new(document);
+    editor
+        .set_selection(Selection::caret(Position::new(0, needle.len())))
+        .unwrap();
+    assert!(editor.find_next(&needle, default_options(), false).unwrap());
+    assert_eq!(editor.selection().range(), expected[1]);
+    assert!(
+        editor
+            .find_previous(&needle, default_options(), false)
+            .unwrap()
+    );
+    assert_eq!(editor.selection().range(), expected[0]);
+    assert_eq!(
+        editor
+            .replace_all(&needle, "found", default_options())
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        editor.document().paragraphs()[0].text(),
+        format!("found\u{2028}{rejected}\u{2028}found")
+    );
+    assert!(editor.undo());
+    assert_eq!(editor.document().paragraphs()[0].text(), source);
+}
+
+#[test]
+fn repetitive_rejected_matches_preserve_later_whole_matches() {
+    let cluster = "a\u{301}";
+    let needle = format!("{}a", cluster.repeat(32));
+    let rejected = cluster.repeat(64);
+    let source = format!("{rejected} {needle} {needle}");
+    let first = rejected.len() + 1;
+    let last = first + needle.len() + 1;
+    let expected = vec![
+        Position::new(0, first)..Position::new(0, first + needle.len()),
+        Position::new(0, last)..Position::new(0, source.len()),
+    ];
+    for case_sensitive in [true, false] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            let query = if case_sensitive {
+                needle.clone()
+            } else {
+                needle.to_uppercase()
+            };
+            let mut editor = Editor::from_text(&source);
+            assert_eq!(editor.document().find(&query, options), expected);
+            assert!(editor.find_next(&query, options, false).unwrap());
+            assert_eq!(editor.selection().range(), expected[0]);
+            assert!(editor.find_next(&query, options, false).unwrap());
+            assert_eq!(editor.selection().range(), expected[1]);
+            assert!(editor.find_previous(&query, options, false).unwrap());
+            assert_eq!(editor.selection().range(), expected[0]);
+            assert_eq!(editor.replace_all(&query, "found", options), Ok(2));
+            assert_eq!(
+                editor.document().plain_text(),
+                format!("{rejected} found found")
+            );
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), source);
+        }
+    }
+}
+
+#[test]
+fn alternating_rejected_and_valid_candidates_preserve_the_match_stream() {
+    for (part, match_start, whole_word) in [("\u{600}aaa ", 3, false), ("aaX aa ", 4, true)] {
+        let source = part.repeat(32);
+        let expected: Vec<_> = (0..32)
+            .map(|index| {
+                let start = index * part.len() + match_start;
+                Position::new(0, start)..Position::new(0, start + 2)
+            })
+            .collect();
+        for case_sensitive in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            let query = if case_sensitive { "aa" } else { "AA" };
+            let mut editor = Editor::from_text(&source);
+            assert_eq!(editor.document().find(query, options), expected);
+            for range in &expected {
+                assert!(editor.find_next(query, options, false).unwrap());
+                assert_eq!(editor.selection().range(), *range);
+            }
+            assert!(!editor.find_next(query, options, false).unwrap());
+            assert_eq!(editor.replace_all(query, "Z", options), Ok(32));
+            assert_eq!(
+                editor.document().plain_text(),
+                if whole_word { "aaX Z " } else { "\u{600}aZ " }.repeat(32)
+            );
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), source);
+        }
+    }
+}
+
+#[test]
 fn paragraph_local_options_fold_final_sigma_and_respect_word_boundaries() {
     let document = Document::from_text("ΟΣ\nΟΣΑ\nİ\ni\ncat's\ncat\n你好\n\u{0600}word\nword");
     let insensitive = SearchOptions {

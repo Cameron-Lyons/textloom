@@ -101,6 +101,17 @@ pub(super) fn numbers(paragraphs: &[Arc<Paragraph>]) -> Arc<[(usize, u32)]> {
         .collect()
 }
 
+pub(crate) fn same_effect(before: ParagraphKind, after: ParagraphKind) -> bool {
+    before == after
+        || matches!(
+            (before, after),
+            (
+                ParagraphKind::Body | ParagraphKind::Quote,
+                ParagraphKind::Body | ParagraphKind::Quote
+            ) | (ParagraphKind::Heading { .. }, ParagraphKind::Heading { .. })
+        )
+}
+
 pub(super) fn surviving_kind(
     removed: impl IntoIterator<Item = ParagraphKind>,
     kind: ParagraphKind,

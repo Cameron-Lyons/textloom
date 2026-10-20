@@ -1,15 +1,25 @@
-use std::{hint::black_box, time::Instant};
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 use textloom::{
-    Document, Editor, Fragment, HistoryLimits, Movement, Position, SearchOptions, Selection,
-    StylePatch,
+    Document, Editor, Fragment, HistoryLimits, Link, Movement, ParagraphKind, Position,
+    SearchOptions, Selection, StylePatch,
 };
 
 fn main() {
     short_paragraph_edits();
+    transaction_edits();
     paragraph_import();
+    fragment_capture();
+    numbering_cache();
+    saved_state_checks();
     serialization();
     formatting();
+    caret_link_queries();
+    empty_insertions();
     unicode_navigation();
+    cold_zero_index_navigation();
     long_unicode_edits();
     contextual_unicode_search();
     ascii_navigation();
@@ -21,6 +31,121 @@ fn main() {
     sparse_replacement();
     #[cfg(feature = "accesskit")]
     accessibility_navigation();
+}
+
+fn transaction_edits() {
+    for (label, nested) in [("transaction", false), ("nested transaction", true)] {
+        let text = "A short paragraph with café.";
+        let mut editor = Editor::from_text(text);
+        measure(
+            &format!("short Unicode paragraph {label} insert + undo"),
+            5_000,
+            || {
+                editor
+                    .transaction(|editor| {
+                        if nested {
+                            editor.transaction(|editor| editor.insert_text(black_box("x")))
+                        } else {
+                            editor.insert_text(black_box("x"))
+                        }
+                    })
+                    .unwrap();
+                assert!(editor.undo());
+            },
+        );
+        assert_eq!(editor.document().plain_text(), text);
+    }
+}
+
+fn fragment_capture() {
+    for paragraphs in [100, 100_000] {
+        let source = "A short paragraph with Unicode café 👩‍💻.\n".repeat(paragraphs);
+        let document = Document::from_text(&source);
+        let range = Position::new(paragraphs - 1, 2)..Position::new(paragraphs - 1, 7);
+        assert_eq!(
+            document.fragment(range.clone()).unwrap().plain_text(),
+            "short"
+        );
+        measure(
+            &format!("{paragraphs} paragraphs short fragment capture near document end"),
+            2_000,
+            || {
+                black_box(document.fragment(black_box(range.clone())).unwrap());
+            },
+        );
+    }
+}
+
+fn numbering_cache() {
+    for paragraphs in [100, 100_000] {
+        let mut editor = Editor::from_text(&vec!["item"; paragraphs].join("\n"));
+        editor.select_all();
+        editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            })
+            .unwrap();
+        editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        editor.set_history_limits(HistoryLimits {
+            max_entries: 0,
+            max_bytes: 0,
+        });
+        for (label, first, second) in [
+            ("body/quote", ParagraphKind::Body, ParagraphKind::Quote),
+            (
+                "heading level",
+                ParagraphKind::Heading { level: 1 },
+                ParagraphKind::Heading { level: 2 },
+            ),
+        ] {
+            editor.set_paragraph_kind(first).unwrap();
+            let expected = Some((paragraphs - 1) as u32);
+            assert_eq!(editor.document().list_number(paragraphs - 1), expected);
+            let mut kind = second;
+            measure(
+                &format!("{paragraphs} paragraphs {label} edit and cached list number"),
+                1_000,
+                || {
+                    editor.set_paragraph_kind(kind).unwrap();
+                    assert_eq!(
+                        black_box(editor.document()).list_number(paragraphs - 1),
+                        expected
+                    );
+                    kind = if kind == first { second } else { first };
+                },
+            );
+        }
+    }
+}
+
+fn saved_state_checks() {
+    for paragraphs in [100, 100_000] {
+        let mut editor = Editor::from_text(&"A short paragraph.\n".repeat(paragraphs));
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        editor.insert_text("x").unwrap();
+        assert!(editor.is_modified());
+        measure(
+            &format!("{paragraphs} paragraphs repeated dirty-state check"),
+            20_000,
+            || {
+                black_box(black_box(&editor).is_modified());
+            },
+        );
+        assert!(editor.undo());
+        assert!(!editor.is_modified());
+        measure(
+            &format!("{paragraphs} paragraphs repeated restored-state check"),
+            20_000,
+            || {
+                black_box(black_box(&editor).is_modified());
+            },
+        );
+    }
 }
 
 fn paragraph_import() {
@@ -94,6 +219,33 @@ fn styled_repetitions(phrase: &str, repetitions: usize) -> Document {
     Document::from_bytes(&bytes).unwrap()
 }
 
+fn caret_link_queries() {
+    for repetitions in [100, 100_000] {
+        let mut editor = Editor::new(styled_repetitions("é", repetitions));
+        let target = Link::new("https://example.com").unwrap();
+        editor.select_all();
+        editor.set_link(Some(target.clone())).unwrap();
+        editor.clear_history();
+        for (label, byte) in [
+            ("start", 0),
+            ("middle", repetitions),
+            ("end", repetitions * 2),
+        ] {
+            editor
+                .set_selection(Selection::caret(Position::new(0, byte)))
+                .unwrap();
+            assert_eq!(editor.selected_link(), Some(target.clone()));
+            measure(
+                &format!("{repetitions} linked styled spans caret target at {label}"),
+                20_000,
+                || {
+                    black_box(black_box(&editor).selected_link());
+                },
+            );
+        }
+    }
+}
+
 fn formatting() {
     let phrase = "match café 👩‍💻 ";
     for repetitions in [1, 10_000] {
@@ -155,8 +307,81 @@ fn formatting() {
     }
 }
 
+fn empty_insertions() {
+    for repetitions in [100, 10_000] {
+        let document = styled_repetitions("é", repetitions);
+        let original = document.to_bytes();
+        let mut editor = Editor::new(document);
+        let fragment = Fragment::from_text("");
+        measure(
+            &format!("{repetitions} styled spans empty text insertion"),
+            1_000,
+            || editor.insert_text(black_box("")).unwrap(),
+        );
+        measure(
+            &format!("{repetitions} styled spans empty fragment insertion"),
+            1_000,
+            || editor.insert_fragment(black_box(&fragment)).unwrap(),
+        );
+        measure(
+            &format!("{repetitions} styled spans empty composition commit"),
+            1_000,
+            || {
+                editor.begin_composition();
+                editor.commit_composition(black_box("")).unwrap();
+            },
+        );
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.undo_len(), 0);
+        assert_eq!(editor.document().to_bytes(), original);
+    }
+}
+
+fn cold_zero_index_navigation() {
+    for repetitions in [100, 100_000] {
+        let source = format!("x\n{}", "é👩‍💻e\u{301}".repeat(repetitions));
+        for (operation, label) in [
+            "grapheme zero conversion",
+            "scalar zero conversion",
+            "paragraph-down at column zero",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let iterations = scaled(30);
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                // Each operation gets an unindexed paragraph; construction is not timed.
+                let mut editor = Editor::from_text(&source);
+                let start = Instant::now();
+                match operation {
+                    0 => assert_eq!(
+                        black_box(editor.document().paragraph(1).unwrap())
+                            .byte_from_grapheme(black_box(0)),
+                        Some(0)
+                    ),
+                    1 => assert_eq!(
+                        black_box(editor.document().paragraph(1).unwrap())
+                            .byte_from_scalar(black_box(0)),
+                        Some(0)
+                    ),
+                    _ => editor
+                        .move_cursor(black_box(Movement::ParagraphDown), false)
+                        .unwrap(),
+                }
+                elapsed += start.elapsed();
+            }
+            println!(
+                "{repetitions} Unicode repetitions cold {label}: {:.2} µs / operation ({iterations} iterations)",
+                elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64,
+            );
+        }
+    }
+}
+
 fn sparse_whole_word_search() {
-    let source = format!("match {}", "other café 👩‍💻. ".repeat(50_000));
+    let tail = "other café 👩‍💻. ".repeat(50_000);
+    let source = format!("match {tail}");
     let document = Document::from_text(&source);
     let options = SearchOptions {
         whole_word: true,
@@ -192,6 +417,15 @@ fn sparse_whole_word_search() {
             );
         },
     );
+    for query in ["match", "abcaX", "aa"] {
+        let document = Document::from_text(&format!("{query}X {tail}"));
+        assert!(document.find(query, options).is_empty());
+        measure(
+            &format!("long Unicode paragraph rejected whole-word {query:?}"),
+            50,
+            || assert!(document.find(black_box(query), options).is_empty()),
+        );
+    }
 }
 
 fn short_paragraph_edits() {
@@ -345,6 +579,34 @@ fn contextual_unicode_search() {
         assert_eq!(matches.len(), 10_000);
         black_box(matches);
     });
+    for count in [1_000, 16_000] {
+        for (kind, source, query) in [
+            (
+                "combining scalars",
+                "\u{301}".repeat(count),
+                "\u{301}".repeat(count / 2),
+            ),
+            (
+                "repeated graphemes",
+                "a\u{301}".repeat(count),
+                format!("{}a", "a\u{301}".repeat(count / 2)),
+            ),
+        ] {
+            let document = Document::from_text(&source);
+            assert!(document.find(&query, SearchOptions::default()).is_empty());
+            measure(
+                &format!("{count} {kind} partial-grapheme literal miss"),
+                50,
+                || {
+                    assert!(
+                        document
+                            .find(black_box(&query), SearchOptions::default())
+                            .is_empty()
+                    );
+                },
+            );
+        }
+    }
 }
 
 fn paragraph_pair(editor: &mut Editor) {

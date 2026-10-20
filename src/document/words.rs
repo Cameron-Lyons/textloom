@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Document, LINE_SEPARATOR, Paragraph};
+use super::{Document, LINE_SEPARATOR};
 use crate::{Error, Position};
 
 impl Document {
@@ -24,19 +24,10 @@ impl Document {
             .split_word_bound_indices()
             .find(|(start, word)| *start <= byte && byte < start + word.len())
             .map_or(position.byte..position.byte, |(start, word)| {
-                snap_grapheme(paragraph, start)..snap_grapheme(paragraph, start + word.len())
+                paragraph.boundary_at_or_before(start)
+                    ..paragraph.boundary_at_or_after(start + word.len())
             });
         Ok(Position::new(position.paragraph, bytes.start)
             ..Position::new(position.paragraph, bytes.end))
-    }
-}
-
-fn snap_grapheme(paragraph: &Paragraph, byte: usize) -> usize {
-    let before = paragraph.boundary_at_or_before(byte);
-    let after = paragraph.boundary_at_or_after(byte);
-    if byte - before <= after - byte {
-        before
-    } else {
-        after
     }
 }

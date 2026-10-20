@@ -325,7 +325,7 @@ impl From<&Document> for Fragment {
 
 impl From<Fragment> for Document {
     fn from(fragment: Fragment) -> Self {
-        Self::from_fragment(&fragment)
+        Self::from_paragraphs(fragment.into_paragraphs())
     }
 }
 

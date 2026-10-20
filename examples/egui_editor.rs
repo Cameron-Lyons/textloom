@@ -1,4 +1,7 @@
-use textloom::{Editor, ParagraphKind, StylePatch, adapter::egui::RichTextEditor};
+use textloom::{
+    Editor, ParagraphKind, StylePatch,
+    adapter::egui::{RichTextEditor, install_input_routing},
+};
 
 fn editor_ui(ui: &mut egui::Ui, editor: &mut Editor) {
     let mut errors = Vec::new();
@@ -66,6 +69,7 @@ fn main() {
         "Textloom\nSelect text to format it. Native input stays in your GUI host.\nUnicode: 日本語, café, 👨‍👩‍👧‍👦",
     );
     let context = egui::Context::default();
+    install_input_routing(&context);
     let output = context.run_ui(egui::RawInput::default(), |ui| {
         egui::CentralPanel::default().show(ui, |ui| editor_ui(ui, &mut editor));
     });

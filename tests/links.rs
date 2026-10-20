@@ -369,6 +369,97 @@ fn insert_link_replaces_the_selection_and_defaults_to_its_target() {
 }
 
 #[test]
+fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
+    let first = link("https://first.example");
+    let second = link("https://second.example");
+    let replacement = link("https://replacement.example");
+    let spans = [
+        (0..2, false, Some(first.clone())),
+        (2..13, true, Some(first.clone())),
+        (13..14, false, Some(second.clone())),
+        (14..15, true, Some(second.clone())),
+        (15..17, false, None),
+        (17..18, false, Some(first.clone())),
+        (18..19, true, Some(first.clone())),
+    ]
+    .map(|(range, bold, link)| Span {
+        range,
+        style: InlineStyle {
+            bold,
+            ..InlineStyle::default()
+        },
+        link,
+    });
+    let document = Document::from_paragraphs([
+        Paragraph::new("é👩‍💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
+        Paragraph::new(
+            "next",
+            vec![Span {
+                range: 0..4,
+                style: InlineStyle::default(),
+                link: None,
+            }],
+            ParagraphKind::Body,
+        )
+        .unwrap(),
+    ]);
+    let original = document.to_bytes();
+    for (byte, target, range) in [
+        (0, Some(&first), Some(0..13)),
+        (2, Some(&first), Some(0..13)),
+        (13, Some(&first), Some(0..13)),
+        (14, Some(&second), Some(13..15)),
+        (15, Some(&second), Some(13..15)),
+        (16, None, None),
+        (17, Some(&first), Some(17..19)),
+        (18, Some(&first), Some(17..19)),
+        (19, Some(&first), Some(17..19)),
+    ] {
+        let mut editor = Editor::new(document.clone());
+        caret(&mut editor, 0, byte);
+        let selection = editor.selection();
+        assert_eq!(editor.selected_link().as_ref(), target, "byte {byte}");
+        editor.set_link(Some(replacement.clone())).unwrap();
+        assert_eq!(editor.selection(), selection);
+        let changed = editor.document().to_bytes();
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().spans().len(),
+            spans.len()
+        );
+        for (before, after) in spans
+            .iter()
+            .zip(editor.document().paragraph(0).unwrap().spans())
+        {
+            assert_eq!(after.range, before.range);
+            assert_eq!(after.style, before.style);
+            let expected = if range
+                .as_ref()
+                .is_some_and(|range| range.contains(&before.range.start))
+            {
+                Some(&replacement)
+            } else {
+                before.link.as_ref()
+            };
+            assert_eq!(after.link.as_ref(), expected, "byte {byte}");
+        }
+        assert_eq!(editor.undo(), range.is_some());
+        assert_eq!(editor.document().to_bytes(), original);
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.selected_link().as_ref(), target);
+        if range.is_some() {
+            assert!(editor.redo());
+            assert_eq!(editor.document().to_bytes(), changed);
+        }
+    }
+    let mut editor = Editor::new(document);
+    caret(&mut editor, 1, 0);
+    assert_eq!(editor.selected_link(), None);
+    editor.set_link(None).unwrap();
+    assert_eq!(editor.document().to_bytes(), original);
+    assert!(!editor.can_undo());
+}
+
+#[test]
 fn selected_link_requires_one_link_across_the_selected_text() {
     let mut editor = linked_editor();
     let target = link("https://example.com");

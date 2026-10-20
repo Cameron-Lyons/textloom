@@ -82,7 +82,7 @@ impl Paragraph {
     }
 
     pub fn byte_from_grapheme(&self, index: usize) -> Option<usize> {
-        if self.ascii {
+        if index == 0 || self.ascii {
             (index <= self.text.len()).then_some(index)
         } else {
             self.grapheme_boundaries().get(index).copied()
@@ -198,7 +198,7 @@ impl Paragraph {
     }
 
     pub fn byte_from_scalar(&self, index: usize) -> Option<usize> {
-        if self.ascii {
+        if index == 0 || self.ascii {
             (index <= self.text.len()).then_some(index)
         } else {
             self.scalar_boundaries().get(index).copied()

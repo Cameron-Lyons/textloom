@@ -229,9 +229,6 @@ impl WinitAdapter {
                 clipboard: None,
             });
         }
-        if editor.composition().is_some() {
-            editor.cancel_composition();
-        }
         let mut outcome = InputOutcome {
             handled: true,
             ..InputOutcome::default()
@@ -248,6 +245,11 @@ impl WinitAdapter {
             }
         }
         if let Some(shortcut) = shortcut.or_else(|| self.named_shortcut(key, editor)) {
+            if !(matches!(shortcut, Shortcut::Copy | Shortcut::Cut)
+                && editor.selection().is_caret())
+            {
+                editor.cancel_composition();
+            }
             outcome.clipboard = self.run_shortcut(shortcut, editor)?;
             outcome.changed = before.changed(editor);
             return Ok(outcome);
@@ -275,6 +277,7 @@ impl WinitAdapter {
             _ => None,
         };
         if let Some(movement) = movement {
+            editor.cancel_composition();
             editor.move_cursor(movement, shift)?;
         } else {
             match key {
@@ -284,15 +287,34 @@ impl WinitAdapter {
                 Key::Named(NamedKey::Process) => {}
                 Key::Named(NamedKey::Enter) if self.read_only && !command => {}
                 Key::Named(NamedKey::Backspace | NamedKey::Delete) if self.read_only => {}
-                Key::Named(NamedKey::Enter) if shift && !command => editor.insert_line_break()?,
-                Key::Named(NamedKey::Enter) if !command => editor.insert_paragraph()?,
-                Key::Named(NamedKey::Backspace) if super_command => {
-                    editor.delete_to_paragraph_start()?
+                Key::Named(NamedKey::Enter) if shift && !command => {
+                    editor.cancel_composition();
+                    editor.insert_line_break()?;
                 }
-                Key::Named(NamedKey::Backspace) if word => editor.delete_word_backward()?,
-                Key::Named(NamedKey::Delete) if word => editor.delete_word_forward()?,
-                Key::Named(NamedKey::Backspace) => editor.delete_backward()?,
-                Key::Named(NamedKey::Delete) => editor.delete_forward()?,
+                Key::Named(NamedKey::Enter) if !command => {
+                    editor.cancel_composition();
+                    editor.insert_paragraph()?;
+                }
+                Key::Named(NamedKey::Backspace) if super_command => {
+                    editor.cancel_composition();
+                    editor.delete_to_paragraph_start()?;
+                }
+                Key::Named(NamedKey::Backspace) if word => {
+                    editor.cancel_composition();
+                    editor.delete_word_backward()?;
+                }
+                Key::Named(NamedKey::Delete) if word => {
+                    editor.cancel_composition();
+                    editor.delete_word_forward()?;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    editor.cancel_composition();
+                    editor.delete_backward()?;
+                }
+                Key::Named(NamedKey::Delete) => {
+                    editor.cancel_composition();
+                    editor.delete_forward()?;
+                }
                 Key::Named(NamedKey::Tab)
                     if !self.read_only
                         && !self.modifiers.intersects(
@@ -300,6 +322,7 @@ impl WinitAdapter {
                         )
                         && selection_contains_list(editor) =>
                 {
+                    editor.cancel_composition();
                     if shift {
                         editor.outdent_list()?;
                     } else {
@@ -315,6 +338,7 @@ impl WinitAdapter {
                     if clean.is_empty() {
                         outcome.handled = false;
                     } else if !self.read_only {
+                        editor.cancel_composition();
                         editor.insert_text(&clean)?;
                     }
                 }
@@ -339,6 +363,17 @@ impl WinitAdapter {
                 clipboard: None,
             });
         }
+        if self.ime.preedit
+            && editor.composition().is_none()
+            && matches!(event, Ime::Preedit(..) | Ime::Commit(_))
+        {
+            // The host canceled this session. Keep its pending reset through the
+            // empty preedit that winit sends before a queued commit.
+            return Ok(InputOutcome {
+                handled: true,
+                ..InputOutcome::default()
+            });
+        }
         let before = EditorState::capture(editor);
         let was_enabled = self.ime_enabled;
         let mut preedit_changed = false;
@@ -360,7 +395,7 @@ impl WinitAdapter {
                 }
                 let selection = selection.map(|(start, end)| start..end);
                 if text.is_empty() {
-                    self.ime.preedit = false;
+                    self.ime.preedit = editor.composition().is_some();
                     if editor
                         .composition()
                         .is_some_and(|composition| !composition.text.is_empty())
@@ -368,7 +403,7 @@ impl WinitAdapter {
                         editor.update_composition(text, selection)?;
                         preedit_changed = true;
                     }
-                } else if !self.ime.preedit || editor.composition().is_some() {
+                } else {
                     preedit_changed = editor.composition().is_none_or(|composition| {
                         composition.text != *text || composition.selection != selection
                     });
@@ -1457,6 +1492,274 @@ mod tests {
     }
 
     #[test]
+    fn passive_keys_preserve_empty_preedit_and_its_following_commit() {
+        for (logical, modifiers, text, host_vertical, handled) in [
+            (
+                Key::Named(NamedKey::Process),
+                ModifiersState::empty(),
+                None,
+                false,
+                true,
+            ),
+            (
+                Key::Named(NamedKey::Shift),
+                ModifiersState::SHIFT,
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::Control),
+                ModifiersState::CONTROL,
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::Alt),
+                ModifiersState::ALT,
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::Super),
+                ModifiersState::SUPER,
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::F1),
+                ModifiersState::empty(),
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Dead(Some('^')),
+                ModifiersState::empty(),
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Character("k".into()),
+                ModifiersState::CONTROL,
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Character("x".into()),
+                ModifiersState::empty(),
+                Some("\0\u{7}"),
+                false,
+                false,
+            ),
+            (
+                Key::Character("x".into()),
+                ModifiersState::empty(),
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::Tab),
+                ModifiersState::empty(),
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::PageUp),
+                ModifiersState::empty(),
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::PageDown),
+                ModifiersState::empty(),
+                None,
+                false,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::ArrowUp),
+                ModifiersState::empty(),
+                None,
+                true,
+                false,
+            ),
+            (
+                Key::Named(NamedKey::ArrowDown),
+                ModifiersState::empty(),
+                None,
+                true,
+                false,
+            ),
+        ] {
+            for sync_after_key in [false, true] {
+                let mut editor = Editor::from_text("abc");
+                editor
+                    .set_selection(Selection::new(Position::new(0, 2), Position::new(0, 0)))
+                    .unwrap();
+                let selection = editor.selection();
+                let mut adapter = focused(&mut editor).host_vertical_navigation(host_vertical);
+                adapter.plan_ime(&editor, false, area(1.0));
+                adapter
+                    .handle_ime(&Ime::Preedit("candidate".into(), None), &mut editor)
+                    .unwrap();
+                adapter
+                    .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+                    .unwrap();
+                adapter.set_modifiers(modifiers);
+                let outcome = key(&mut adapter, &mut editor, logical.clone(), text);
+                assert_eq!(outcome.handled, handled, "{logical:?}");
+                assert!(!outcome.changed, "{logical:?}");
+                assert_eq!(editor.selection(), selection);
+                assert!(editor.composition().is_some(), "{logical:?}");
+                if sync_after_key {
+                    assert_eq!(
+                        adapter.plan_ime(&editor, false, area(1.0)),
+                        ImeRequests::default(),
+                        "{logical:?}"
+                    );
+                }
+                let commit = adapter
+                    .handle_ime(&Ime::Commit("é".into()), &mut editor)
+                    .unwrap();
+                assert!(commit.changed, "{logical:?}");
+                assert_eq!(editor.document().plain_text(), "éc");
+                assert!(editor.undo());
+                assert_eq!(editor.document().plain_text(), "abc");
+                assert_eq!(editor.selection(), selection);
+            }
+        }
+    }
+
+    #[test]
+    fn caret_clipboard_shortcuts_preserve_empty_preedit_and_its_commit() {
+        for (logical, modifiers) in [
+            (Key::Character("c".into()), ModifiersState::CONTROL),
+            (Key::Character("x".into()), ModifiersState::CONTROL),
+            (Key::Named(NamedKey::Copy), ModifiersState::empty()),
+            (Key::Named(NamedKey::Cut), ModifiersState::empty()),
+            (Key::Named(NamedKey::Insert), ModifiersState::CONTROL),
+        ] {
+            for rich_clipboard in [false, true] {
+                for sync_after_key in [false, true] {
+                    let mut editor = Editor::from_text("ab");
+                    let selection = Selection::caret(Position::new(0, 1));
+                    editor.set_selection(selection).unwrap();
+                    let revision = editor.document().revision();
+                    let mut adapter = focused(&mut editor).rich_clipboard(rich_clipboard);
+                    adapter.plan_ime(&editor, false, area(1.0));
+                    adapter
+                        .handle_ime(&Ime::Preedit("候".into(), None), &mut editor)
+                        .unwrap();
+                    adapter
+                        .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+                        .unwrap();
+                    let composition = editor.composition().cloned();
+                    adapter.set_modifiers(modifiers);
+                    let outcome = key(&mut adapter, &mut editor, logical.clone(), None);
+                    assert!(outcome.handled && !outcome.changed, "{logical:?}");
+                    assert!(outcome.clipboard.is_none(), "{logical:?}");
+                    assert_eq!(editor.composition(), composition.as_ref(), "{logical:?}");
+                    assert_eq!(editor.selection(), selection);
+                    assert_eq!(editor.document().revision(), revision);
+                    assert_eq!((editor.undo_len(), editor.redo_len()), (0, 0));
+                    if sync_after_key {
+                        assert_eq!(
+                            adapter.plan_ime(&editor, false, area(1.0)),
+                            ImeRequests::default(),
+                            "{logical:?}"
+                        );
+                    }
+                    let outcome = adapter
+                        .handle_ime(&Ime::Commit("候".into()), &mut editor)
+                        .unwrap();
+                    assert!(outcome.handled && outcome.changed, "{logical:?}");
+                    assert_eq!(editor.document().plain_text(), "a候b");
+                    assert!(editor.composition().is_none());
+                    assert!(editor.undo());
+                    assert_eq!(editor.document().plain_text(), "ab");
+                    assert_eq!(editor.selection(), selection);
+                    assert!(!editor.can_undo());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_keys_cancel_empty_preedit_and_reject_its_queued_commit() {
+        for (logical, modifiers, text) in [
+            (
+                Key::Named(NamedKey::ArrowLeft),
+                ModifiersState::empty(),
+                None,
+            ),
+            (Key::Named(NamedKey::Enter), ModifiersState::empty(), None),
+            (Key::Named(NamedKey::Enter), ModifiersState::SHIFT, None),
+            (
+                Key::Named(NamedKey::Backspace),
+                ModifiersState::empty(),
+                None,
+            ),
+            (
+                Key::Named(NamedKey::Backspace),
+                ModifiersState::CONTROL,
+                None,
+            ),
+            (Key::Named(NamedKey::Delete), ModifiersState::empty(), None),
+            (Key::Named(NamedKey::Delete), ModifiersState::CONTROL, None),
+            (Key::Named(NamedKey::Tab), ModifiersState::empty(), None),
+            (Key::Named(NamedKey::Tab), ModifiersState::SHIFT, None),
+            (Key::Named(NamedKey::Copy), ModifiersState::empty(), None),
+            (Key::Named(NamedKey::Paste), ModifiersState::empty(), None),
+            (Key::Character("b".into()), ModifiersState::CONTROL, None),
+            (
+                Key::Character("x".into()),
+                ModifiersState::empty(),
+                Some("x"),
+            ),
+        ] {
+            let mut editor = Editor::from_text("abc");
+            editor
+                .set_paragraph_kind(ParagraphKind::Bullet { indent: 1 })
+                .unwrap();
+            editor
+                .set_selection(Selection::new(Position::new(0, 2), Position::new(0, 0)))
+                .unwrap();
+            let mut adapter = focused(&mut editor);
+            adapter.plan_ime(&editor, false, area(1.0));
+            adapter
+                .handle_ime(&Ime::Preedit("candidate".into(), None), &mut editor)
+                .unwrap();
+            adapter
+                .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+                .unwrap();
+            adapter.set_modifiers(modifiers);
+            let outcome = key(&mut adapter, &mut editor, logical.clone(), text);
+            assert!(outcome.handled && outcome.changed, "{logical:?}");
+            assert!(editor.composition().is_none(), "{logical:?}");
+            let before = editor.document().to_bytes();
+            let selection = editor.selection();
+            let history = (editor.undo_len(), editor.redo_len());
+            let commit = adapter
+                .handle_ime(&Ime::Commit("candidate".into()), &mut editor)
+                .unwrap();
+            assert!(commit.handled && !commit.changed, "{logical:?}");
+            assert_eq!(editor.document().to_bytes(), before);
+            assert_eq!(editor.selection(), selection);
+            assert_eq!((editor.undo_len(), editor.redo_len()), history);
+            assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+        }
+    }
+
+    #[test]
     fn invalid_preedit_and_focus_loss_do_not_modify_the_document() {
         let mut editor = Editor::from_text("a");
         let mut adapter = focused(&mut editor);
@@ -2355,6 +2658,69 @@ mod tests {
                 .unwrap();
             assert_eq!(editor.composition().unwrap().text, "k");
             assert_eq!(editor.document().plain_text(), "abc");
+        }
+    }
+
+    #[test]
+    fn canceled_preedit_ignores_queued_commits_until_ime_is_interrupted() {
+        for host_click in [false, true] {
+            for (clear_before_cancel, clear_after_cancel) in
+                [(false, false), (false, true), (true, false)]
+            {
+                let mut editor = Editor::from_text("abc");
+                let mut adapter = focused(&mut editor);
+                adapter.plan_ime(&editor, false, area(1.0));
+                adapter
+                    .handle_ime(&Ime::Preedit("ni".into(), None), &mut editor)
+                    .unwrap();
+                if clear_before_cancel {
+                    adapter
+                        .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+                        .unwrap();
+                }
+                if host_click {
+                    editor
+                        .set_selection(Selection::caret(editor.document().end()))
+                        .unwrap();
+                } else {
+                    key(
+                        &mut adapter,
+                        &mut editor,
+                        Key::Named(NamedKey::Escape),
+                        None,
+                    );
+                }
+                let selection = editor.selection();
+                if clear_after_cancel {
+                    let cleared = adapter
+                        .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
+                        .unwrap();
+                    assert!(cleared.handled && !cleared.changed);
+                }
+                let commit = adapter
+                    .handle_ime(&Ime::Commit("に".into()), &mut editor)
+                    .unwrap();
+                assert!(commit.handled && !commit.changed);
+                assert_eq!(editor.document().plain_text(), "abc");
+                assert_eq!(editor.selection(), selection);
+                assert!(!editor.can_undo());
+                assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+
+                adapter
+                    .handle_ime(&Ime::Preedit("ka".into(), None), &mut editor)
+                    .unwrap();
+                assert_eq!(editor.composition().unwrap().text, "ka");
+                assert!(
+                    adapter
+                        .handle_ime(&Ime::Commit("か".into()), &mut editor)
+                        .unwrap()
+                        .changed
+                );
+                assert_eq!(
+                    editor.document().plain_text(),
+                    if host_click { "abcか" } else { "かabc" }
+                );
+            }
         }
     }
 

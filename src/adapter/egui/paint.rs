@@ -1,13 +1,72 @@
 use super::layout::{ParagraphLayoutView, ParagraphLayouts};
 use crate::{Document, Position, Selection};
-use egui::{Color32, Galley, Pos2, Rect, text::CharIndex};
-use std::{ops::Range, sync::Arc};
+use egui::{
+    Color32, Galley, Pos2, Rect,
+    epaint::FontsView,
+    text::{CharIndex, LayoutJob},
+};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 pub(super) type BackgroundRanges<'a> = (&'a [Range<Position>], Color32);
+
+#[derive(Clone, Default)]
+pub(super) struct PaintCache {
+    probe: Option<Arc<Galley>>,
+    galleys: HashMap<usize, PaintedGalley>,
+}
+
+#[derive(Clone)]
+struct PaintedGalley {
+    // Retaining the source prevents its address from being reused by another layout.
+    source: Arc<Galley>,
+    current: Arc<Galley>,
+    used: bool,
+}
+
+impl PaintCache {
+    fn begin(&mut self, fonts: &mut FontsView<'_>) {
+        let mut job = LayoutJob::default();
+        job.wrap.max_rows = 0;
+        let probe = fonts.layout_job(job);
+        // Atlas recreation clears egui's galley cache. A tiny cached job detects that
+        // without cloning and hashing every visible paragraph on every idle frame.
+        // Cache eviction after a hidden pass also conservatively refreshes the glyphs.
+        if self
+            .probe
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, &probe))
+        {
+            self.galleys.clear();
+        }
+        self.probe = Some(probe);
+        for cached in self.galleys.values_mut() {
+            cached.used = false;
+        }
+    }
+
+    fn refresh(&mut self, fonts: &mut FontsView<'_>, source: &Arc<Galley>) -> Arc<Galley> {
+        let cached = self
+            .galleys
+            .entry(Arc::as_ptr(source) as usize)
+            .or_insert_with(|| PaintedGalley {
+                source: source.clone(),
+                current: fonts.layout_job((*source.job).clone()),
+                used: true,
+            });
+        debug_assert!(Arc::ptr_eq(&cached.source, source));
+        cached.used = true;
+        cached.current.clone()
+    }
+
+    fn end(&mut self) {
+        self.galleys.retain(|_, cached| cached.used);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_document(
     painter: &egui::Painter,
+    cache: &mut PaintCache,
     document: &Document,
     layouts: &ParagraphLayouts,
     origin: Pos2,
@@ -30,12 +89,14 @@ pub(super) fn paint_document(
         })
         .collect();
     painter.fonts_mut(|fonts| {
+        cache.begin(fonts);
         for paragraph in &mut visible {
-            paragraph.galley = fonts.layout_job((*paragraph.layout.galley.job).clone());
+            paragraph.galley = cache.refresh(fonts, paragraph.layout.galley);
             if let Some(marker) = paragraph.layout.marker {
-                paragraph.marker = Some(fonts.layout_job((*marker.job).clone()));
+                paragraph.marker = Some(cache.refresh(fonts, marker));
             }
         }
+        cache.end();
     });
     let mut bar: Option<Rect> = None;
     for next in visible

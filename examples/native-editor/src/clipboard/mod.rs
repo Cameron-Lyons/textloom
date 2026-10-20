@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    collections::VecDeque,
     ffi::OsString,
     io::{Read, Write},
     process::{Child, Command, Stdio},
@@ -148,7 +150,8 @@ impl NativeItem {
     }
 
     fn same_publication(&self, expected: &Self) -> bool {
-        normalize_text(&self.plain) == normalize_text(&expected.plain)
+        (self.plain == expected.plain
+            || normalize_text(&self.plain) == normalize_text(&expected.plain))
             && self.html == expected.html
             && matches!((self.envelope(), expected.envelope()), (Ok(actual), Ok(expected)) if actual == expected)
     }
@@ -163,18 +166,18 @@ fn native_html(fragment: &Fragment) -> String {
     html
 }
 
-fn normalize_text(text: &str) -> String {
+fn normalize_text(text: &str) -> Cow<'_, str> {
     if !text.contains('\r') {
-        return text.to_owned();
+        return Cow::Borrowed(text);
     }
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 fn capture_paste(
-    input: &mut egui::RawInput,
+    events: &mut [egui::Event],
     capture: impl FnOnce() -> Result<Option<NativeItem>, String>,
 ) -> Option<(String, Fragment)> {
-    let mut pastes = input.events.iter_mut().filter_map(|event| match event {
+    let mut pastes = events.iter_mut().filter_map(|event| match event {
         egui::Event::Paste(text) => Some(text),
         _ => None,
     });
@@ -190,6 +193,37 @@ fn capture_paste(
     }
     *plain = captured_plain;
     Some((plain.clone(), fragment))
+}
+
+#[derive(Default)]
+struct PendingPastes(VecDeque<Option<(String, Fragment)>>);
+
+impl PendingPastes {
+    fn record(&mut self, events: &[egui::Event], mut captured: Option<(String, Fragment)>) {
+        for event in events {
+            if matches!(event, egui::Event::Paste(_)) {
+                self.0.push_back(captured.take());
+            }
+        }
+    }
+
+    fn take_pass(&mut self, events: &[egui::Event]) -> Option<(String, Fragment)> {
+        let mut pastes = events.iter().filter_map(|event| match event {
+            egui::Event::Paste(text) => Some(text),
+            _ => None,
+        });
+        let plain = pastes.next()?;
+        let mut captured = self
+            .0
+            .pop_front()
+            .flatten()
+            .filter(|(text, _)| text == plain);
+        for _ in pastes {
+            self.0.pop_front();
+            captured = None;
+        }
+        captured
+    }
 }
 
 fn write_item(mut output: impl Write, item: &NativeItem) -> Result<(), String> {
@@ -253,7 +287,7 @@ fn exchange(
     };
     let input = child.stdin.take();
     let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = thread::spawn(move || {
+    let worker = thread::Builder::new().spawn(move || {
         let result = (|| {
             if let Some(item) = item {
                 let input = input.ok_or("Clipboard helper stdin was unavailable")?;
@@ -281,6 +315,22 @@ fn exchange(
         })();
         let _ = sender.send(result);
     });
+    wait_for_reply(child, worker, receiver, deadline)
+}
+
+fn wait_for_reply(
+    child: Child,
+    worker: std::io::Result<thread::JoinHandle<()>>,
+    receiver: mpsc::Receiver<Result<Reply, String>>,
+    deadline: Instant,
+) -> Result<(Reply, Child), String> {
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(_) => {
+            stop_child(child);
+            return Err("Clipboard pipe worker could not start".into());
+        }
+    };
     let result = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     match result {
         Ok(Ok(reply)) => {
@@ -305,6 +355,7 @@ pub struct NativeClipboard {
     owner: usize,
     backend: Option<&'static str>,
     copy_owner: Option<Child>,
+    pending_pastes: PendingPastes,
     staged: Option<(String, Fragment)>,
     last_error: Option<String>,
 }
@@ -330,6 +381,7 @@ impl NativeClipboard {
             owner,
             backend,
             copy_owner: None,
+            pending_pastes: PendingPastes::default(),
             staged: None,
             last_error: None,
         })
@@ -398,8 +450,20 @@ impl NativeClipboard {
         }
     }
 
-    pub fn stage_paste(&mut self, input: &mut egui::RawInput) {
-        self.staged = capture_paste(input, || self.capture());
+    pub fn capture_pastes(&mut self, input: &mut egui::RawInput, capture_native: bool) {
+        let captured = capture_native
+            .then(|| capture_paste(&mut input.events, || self.capture()))
+            .flatten();
+        // Keep a slot even for plain-only or native-field pastes. Every delivered
+        // Paste advances the queue, including ones the document does not handle.
+        self.pending_pastes.record(&input.events, captured);
+    }
+
+    pub fn stage_paste(&mut self, events: &[egui::Event], document_owns_input: bool) {
+        self.staged = self
+            .pending_pastes
+            .take_pass(events)
+            .filter(|_| document_owns_input);
     }
 
     pub fn clear_staged_paste(&mut self) {
@@ -414,13 +478,15 @@ impl NativeClipboard {
         &mut self,
         context: &egui::Context,
         editor: &mut textloom::Editor,
-        input: egui::RawInput,
+        mut input: egui::RawInput,
     ) -> Result<(), String> {
         let id = egui::Id::new("native-clipboard-fixture");
         let mut failed = false;
+        let mut captured = capture_paste(&mut input.events, || self.capture());
         let output = context.run_ui(input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.memory_mut(|memory| memory.request_focus(id));
+                self.staged = captured.take();
                 let output = textloom::adapter::egui::RichTextEditor::new(editor)
                     .id(id)
                     .rich_clipboard(self)
@@ -484,11 +550,10 @@ impl NativeClipboard {
         }
         let mut destination = textloom::Editor::from_text("original");
         destination.select_all();
-        let mut input = egui::RawInput {
+        let input = egui::RawInput {
             events: vec![egui::Event::Paste(captured.plain)],
             ..Default::default()
         };
-        self.stage_paste(&mut input);
         self.fixture_frame(&context, &mut destination, input)?;
         if destination.undo_len() != 1 {
             return Err("Native rich paste history failed".into());
@@ -682,20 +747,20 @@ mod tests {
             events: vec![egui::Event::Paste(native.plain.replace('\n', "\r\n"))],
             ..Default::default()
         };
-        let captured = capture_paste(&mut input, || Ok(Some(native.clone()))).unwrap();
+        let captured = capture_paste(&mut input.events, || Ok(Some(native.clone()))).unwrap();
         assert_eq!(captured.1, native.fragment().unwrap());
         assert_eq!(input.events, vec![egui::Event::Paste(native.plain.clone())]);
 
         for alternative in ["different clipboard", "same text, native format absent"] {
             let events = vec![egui::Event::Paste(alternative.into())];
             input.events.clone_from(&events);
-            assert!(capture_paste(&mut input, || Ok(Some(native.clone()))).is_none());
+            assert!(capture_paste(&mut input.events, || Ok(Some(native.clone()))).is_none());
             assert_eq!(input.events, events);
         }
         input.events = vec![egui::Event::Paste(native.plain.clone())];
         let events = input.events.clone();
-        assert!(capture_paste(&mut input, || Ok(None)).is_none());
-        assert!(capture_paste(&mut input, || Err("unavailable".into())).is_none());
+        assert!(capture_paste(&mut input.events, || Ok(None)).is_none());
+        assert!(capture_paste(&mut input.events, || Err("unavailable".into())).is_none());
         assert_eq!(input.events, events);
     }
 
@@ -713,9 +778,164 @@ mod tests {
                 events: events.clone(),
                 ..Default::default()
             };
-            assert!(capture_paste(&mut input, || panic!("ambiguous native capture")).is_none());
+            assert!(
+                capture_paste(&mut input.events, || panic!("ambiguous native capture")).is_none()
+            );
             assert_eq!(input.events, events);
         }
+    }
+
+    #[test]
+    fn deferred_paste_keeps_its_original_rich_snapshot_and_advances_field_slots() {
+        struct Staged(Option<(String, Fragment)>);
+        impl textloom::adapter::egui::RichClipboard for Staged {
+            fn copy(&mut self, _fragment: &Fragment) -> bool {
+                false
+            }
+
+            fn paste(&mut self, plain: &str) -> Option<Fragment> {
+                let (captured, fragment) = self.0.take()?;
+                assert_eq!(plain, captured);
+                Some(fragment)
+            }
+        }
+
+        for max_passes in [1, 2, 8] {
+            for scenario in 0..3 {
+                let context = egui::Context::default();
+                textloom::adapter::egui::install_input_routing(&context);
+                context.enable_accesskit();
+                context.options_mut(|options| {
+                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                });
+                let field_id = egui::Id::new("clipboard-source-field");
+                let document_id = egui::Id::new("clipboard-target-document");
+                context.memory_mut(|memory| memory.request_focus(field_id));
+                let focus = |id: egui::Id| {
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target_node: id.accesskit_id(),
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        data: None,
+                    })
+                };
+                let mut field = String::new();
+                let mut editor = textloom::Editor::from_text("original");
+                editor.select_all();
+                let native = item();
+                let mut changed = textloom::Editor::from_text(&native.plain);
+                changed.select_all();
+                changed
+                    .apply_style(textloom::StylePatch {
+                        bold: Some(true),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let changed =
+                    NativeItem::from_fragment(&Fragment::from_document(changed.document()))
+                        .unwrap();
+                assert_eq!(native.plain, changed.plain);
+                assert_ne!(native.fragment().unwrap(), changed.fragment().unwrap());
+                let mut available_clipboard = native.clone();
+                let mut captures = 0;
+                let mut clipboard = Staged(None);
+                let mut pending = PendingPastes::default();
+                let mut batches = VecDeque::new();
+                let paste = egui::Event::Paste(native.plain.replace('\n', "\r\n"));
+                match scenario {
+                    0 => batches.push_back(vec![
+                        egui::Event::Text("field".into()),
+                        focus(document_id),
+                        paste,
+                    ]),
+                    1 => {
+                        batches
+                            .push_back(vec![focus(field_id), egui::Event::Paste("field".into())]);
+                        batches.push_back(vec![focus(document_id), paste]);
+                    }
+                    2 => {
+                        batches
+                            .push_back(vec![egui::Event::Text("field".into()), focus(document_id)]);
+                        batches.push_back(vec![paste]);
+                    }
+                    _ => unreachable!(),
+                }
+                for _ in 0..6 {
+                    let events = batches.pop_front().unwrap_or_default();
+                    if scenario == 2
+                        && max_passes == 1
+                        && matches!(events.first(), Some(egui::Event::Paste(_)))
+                    {
+                        assert!(context.memory(|memory| memory.has_focus(field_id)));
+                    }
+                    let mut input = egui::RawInput {
+                        focused: true,
+                        events,
+                        ..Default::default()
+                    };
+                    let captured = capture_paste(&mut input.events, || {
+                        captures += 1;
+                        Ok(Some(available_clipboard.clone()))
+                    });
+                    if captured.is_some() {
+                        // A different publication with identical plain text arrives
+                        // before deferred input is delivered. Never reread it.
+                        available_clipboard = changed.clone();
+                    }
+                    pending.record(&input.events, captured);
+                    let output = context.run_ui(input, |ui| {
+                        let captured = ui.input(|input| pending.take_pass(&input.events));
+                        clipboard.0 =
+                            captured.filter(|_| ui.memory(|memory| memory.has_focus(document_id)));
+                        ui.add(egui::TextEdit::singleline(&mut field).id(field_id));
+                        let output = textloom::adapter::egui::RichTextEditor::new(&mut editor)
+                            .id(document_id)
+                            .rich_clipboard(&mut clipboard)
+                            .show(ui);
+                        assert!(output.errors.is_empty());
+                        clipboard.0 = None;
+                    });
+                    output.drop_without_applying_deltas();
+                }
+                assert_eq!(captures, if scenario == 1 { 2 } else { 1 });
+                assert!(pending.0.is_empty());
+                assert_eq!(field, "field");
+                assert_eq!(
+                    Fragment::from_document(editor.document()),
+                    native.fragment().unwrap()
+                );
+                assert_ne!(
+                    Fragment::from_document(editor.document()),
+                    available_clipboard.fragment().unwrap()
+                );
+                assert_eq!(editor.undo_len(), 1);
+                assert!(editor.undo());
+                assert_eq!(editor.document().plain_text(), "original");
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_paste_snapshots_remain_plain_across_separate_focus_passes() {
+        let native = item();
+        let mut events = vec![
+            egui::Event::Paste("field".into()),
+            egui::Event::Paste(native.plain.clone()),
+        ];
+        let mut pending = PendingPastes::default();
+        let captured = capture_paste(&mut events, || panic!("ambiguous snapshot"));
+        pending.record(&events, captured);
+        assert!(pending.take_pass(&events[..1]).is_none());
+        assert!(pending.take_pass(&[]).is_none());
+        assert!(pending.take_pass(&events[1..]).is_none());
+        let mut events = vec![egui::Event::Paste(native.plain.clone())];
+        let captured = capture_paste(&mut events, || Ok(Some(native.clone())));
+        pending.record(&events, captured);
+        assert_eq!(
+            pending.take_pass(&events).unwrap().1,
+            native.fragment().unwrap()
+        );
+        assert!(pending.0.is_empty());
     }
 
     #[test]
@@ -762,6 +982,49 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "stalled child or pipe worker survived"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_start_failure_reaps_helper_and_preserves_plain_paste() {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let (_sender, receiver) = mpsc::channel();
+        let events = vec![egui::Event::Paste("plain fallback".into())];
+        let mut input = egui::RawInput {
+            events: events.clone(),
+            ..Default::default()
+        };
+        let staged = capture_paste(&mut input.events, || {
+            let result = wait_for_reply(
+                child,
+                Err(std::io::ErrorKind::WouldBlock.into()),
+                receiver,
+                Instant::now() + OPERATION_TIMEOUT,
+            );
+            match result {
+                Err(error) => {
+                    assert_eq!(error, "Clipboard pipe worker could not start");
+                    Err(error)
+                }
+                Ok((_, child)) => {
+                    stop_child(child);
+                    panic!("a failed worker cannot return a clipboard reply");
+                }
+            }
+        });
+        assert!(staged.is_none());
+        assert_eq!(input.events, events);
+        assert_eq!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+            rustix::io::Errno::CHILD,
+            "the helper must be terminated and reaped on worker startup failure"
         );
     }
 }

@@ -13,7 +13,7 @@ mod paragraph;
 mod words;
 
 pub(crate) use change::Delta;
-pub(crate) use numbering::Levels;
+pub(crate) use numbering::{Levels, same_effect as same_numbering_effect};
 pub use paragraph::{Paragraph, Span};
 use paragraph::{append_slice, push_span};
 
@@ -109,9 +109,17 @@ impl Document {
 
     pub fn fragment(&self, range: Range<Position>) -> Result<Fragment, Error> {
         self.validate_range(&range)?;
-        let numbering = Levels::before(&self.paragraphs, range.start.paragraph, |index| {
-            self.list_number(index)
-        });
+        let numbering = if range.start.paragraph != 0
+            && self.paragraphs[range.start.paragraph..=range.end.paragraph]
+                .iter()
+                .any(|paragraph| matches!(paragraph.kind, ParagraphKind::Ordered { .. }))
+        {
+            Levels::before(&self.paragraphs, range.start.paragraph, |index| {
+                self.list_number(index)
+            })
+        } else {
+            Levels::default()
+        };
         let mut levels = numbering.clone();
         let mut captured_levels: Vec<u8> = Vec::new();
         let paragraphs = self
@@ -294,18 +302,27 @@ impl Document {
         (before == after).then_some(before)
     }
 
-    pub(crate) fn caret_link(&self, position: Position) -> Option<(&Link, Range<Position>)> {
+    fn caret_link_location(&self, position: Position) -> Option<(&Paragraph, usize)> {
         let paragraph = self.paragraph(position.paragraph)?;
         let byte = [position.byte.checked_sub(1), Some(position.byte)]
             .into_iter()
             .flatten()
             .find(|byte| paragraph.link_for_byte(*byte).is_some())?;
+        Some((paragraph, byte))
+    }
+
+    pub(crate) fn caret_link(&self, position: Position) -> Option<&Link> {
+        let (paragraph, byte) = self.caret_link_location(position)?;
+        paragraph.link_for_byte(byte)
+    }
+
+    pub(crate) fn caret_link_range(&self, position: Position) -> Option<Range<Position>> {
+        let (paragraph, byte) = self.caret_link_location(position)?;
         let range = paragraph.link_range(byte)?;
-        Some((
-            paragraph.link_for_byte(byte)?,
+        Some(
             Position::new(position.paragraph, range.start)
                 ..Position::new(position.paragraph, range.end),
-        ))
+        )
     }
 
     pub(crate) fn replace(
@@ -327,6 +344,16 @@ impl Document {
         link: Option<&Link>,
     ) -> Result<(Delta, Position), Error> {
         self.validate_range(&range)?;
+        if range.is_empty() && text.is_empty() {
+            return Ok((
+                Delta {
+                    start: range.start.paragraph,
+                    before: Vec::new(),
+                    after: Vec::new(),
+                },
+                range.start,
+            ));
+        }
         let text = normalize_newlines(text);
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
@@ -403,6 +430,19 @@ impl Document {
         fragment: &Fragment,
     ) -> Result<(Delta, Position), Error> {
         self.validate_range(&range)?;
+        if range.is_empty()
+            && let [paragraph] = fragment.paragraphs()
+            && paragraph.text.is_empty()
+        {
+            return Ok((
+                Delta {
+                    start: range.start.paragraph,
+                    before: Vec::new(),
+                    after: Vec::new(),
+                },
+                range.start,
+            ));
+        }
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
         let count = fragment.paragraphs().len();

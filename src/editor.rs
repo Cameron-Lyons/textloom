@@ -1,4 +1,8 @@
-use std::{fmt, ops::Range, sync::Arc};
+use std::{
+    fmt,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 mod composition;
 mod history;
@@ -67,6 +71,8 @@ impl fmt::Debug for Editor {
 struct SavePoint {
     revision: u64,
     paragraphs: Vec<Arc<Paragraph>>,
+    // Edits and history/transaction restores invalidate this content comparison.
+    cached_match: OnceLock<bool>,
 }
 
 impl SavePoint {
@@ -74,12 +80,15 @@ impl SavePoint {
         Self {
             revision: document.revision(),
             paragraphs: document.paragraphs().to_vec(),
+            cached_match: OnceLock::new(),
         }
     }
 
     fn matches(&self, document: &Document) -> bool {
         (self.revision == document.revision() && self.revision != u64::MAX)
-            || self.paragraphs == document.paragraphs()
+            || *self
+                .cached_match
+                .get_or_init(|| self.paragraphs == document.paragraphs())
     }
 }
 
@@ -151,10 +160,7 @@ impl Editor {
     #[must_use]
     pub fn selected_link(&self) -> Option<Link> {
         if self.selection.is_caret() {
-            return self
-                .document
-                .caret_link(self.selection.focus)
-                .map(|(link, _)| link.clone());
+            return self.document.caret_link(self.selection.focus).cloned();
         }
         let range = self.selection.range();
         let mut shared: Option<&Link> = None;
@@ -204,33 +210,36 @@ impl Editor {
         kinds.all(|kind| same_block(first, kind)).then_some(first)
     }
     pub fn can_undo(&self) -> bool {
-        self.history.undo_len() != 0
+        self.undo_len() != 0
     }
     pub fn can_redo(&self) -> bool {
-        self.history.redo_len() != 0
+        self.redo_len() != 0
     }
     pub fn history_limits(&self) -> HistoryLimits {
         self.history.limits()
     }
     pub fn history_bytes(&self) -> usize {
-        self.history.bytes()
+        self.history.resolved(self.state()).bytes()
     }
     pub fn undo_len(&self) -> usize {
-        self.history.undo_len()
+        self.history.resolved(self.state()).undo_len()
     }
     pub fn redo_len(&self) -> usize {
-        self.history.redo_len()
+        self.history.resolved(self.state()).redo_len()
     }
 
     pub fn set_history_limits(&mut self, limits: HistoryLimits) {
+        self.normalize_history();
         self.history.set_limits(limits);
     }
 
     pub fn clear_history(&mut self) {
+        self.normalize_history();
         self.history.clear();
     }
 
     pub fn break_history_group(&mut self) {
+        self.normalize_history();
         self.history.break_group();
     }
 
@@ -247,6 +256,7 @@ impl Editor {
     }
 
     pub fn mark_saved(&mut self) {
+        self.normalize_history();
         self.saved = SavePoint::new(&self.document);
     }
 
@@ -258,6 +268,7 @@ impl Editor {
     pub fn set_selection(&mut self, selection: Selection) -> Result<(), Error> {
         self.document.validate_position(selection.anchor)?;
         self.document.validate_position(selection.focus)?;
+        self.normalize_history();
         self.composition = None;
         self.selection = selection;
         self.typing_style = self.selection_typing_style(selection);
@@ -559,8 +570,8 @@ impl Editor {
         self.ensure_no_composition()?;
         self.break_history_group();
         let range = if self.selection.is_caret() {
-            match self.document.caret_link(self.selection.focus) {
-                Some((_, range)) => range,
+            match self.document.caret_link_range(self.selection.focus) {
+                Some(range) => range,
                 None => return Ok(()),
             }
         } else {
@@ -708,6 +719,7 @@ impl Editor {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.normalize_history();
         if self.history.in_transaction() {
             return false;
         }
@@ -721,6 +733,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.normalize_history();
         if self.history.in_transaction() {
             return false;
         }
@@ -739,7 +752,12 @@ impl Editor {
             style: self.typing_style,
         }
     }
+    fn normalize_history(&mut self) {
+        self.history.normalize(self.state());
+    }
+
     fn restore(&mut self, state: EditState) {
+        self.saved.cached_match.take();
         self.selection = state.selection;
         self.typing_style = state.style;
         self.preferred_column = None;
@@ -807,6 +825,7 @@ impl Editor {
     }
 
     fn record(&mut self, delta: Delta, before: EditState, group: Group) {
+        self.saved.cached_match.take();
         self.history.record(delta, before, self.state(), group);
     }
 
@@ -923,6 +942,7 @@ fn same_block(first: ParagraphKind, other: ParagraphKind) -> bool {
 struct TransactionGuard<'a> {
     editor: &'a mut Editor,
     level: TransactionLevel,
+    _scope: Arc<()>,
     rollback: Option<Rollback>,
 }
 
@@ -935,8 +955,10 @@ struct Rollback {
 impl<'a> TransactionGuard<'a> {
     fn begin(editor: &'a mut Editor) -> Self {
         let state = editor.state();
+        let (level, scope) = editor.history.begin_transaction(state);
         Self {
-            level: editor.history.begin_transaction(state),
+            level,
+            _scope: scope,
             rollback: Some(Rollback {
                 state,
                 preferred_column: editor.preferred_column,
@@ -948,6 +970,7 @@ impl<'a> TransactionGuard<'a> {
 
     fn commit(mut self) {
         self.rollback = None;
+        self.editor.normalize_history();
         let after = self.editor.state();
         self.editor.history.commit_transaction(self.level, after);
     }
@@ -957,6 +980,7 @@ impl Drop for TransactionGuard<'_> {
     fn drop(&mut self) {
         if let Some(rollback) = self.rollback.take() {
             let editor = &mut *self.editor;
+            editor.normalize_history();
             if !editor
                 .history
                 .rollback_transaction(self.level, &mut editor.document)

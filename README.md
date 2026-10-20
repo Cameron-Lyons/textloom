@@ -67,6 +67,12 @@ assert!(editor.undo()); // The whole transaction is one step.
 assert!(!editor.is_modified());
 ```
 
+Replacing an editor inside a transaction leaves the replacement intact. An
+editor moved out of the callback becomes an independent snapshot once its
+transaction scopes end, retaining its edits as one undo step subject to history
+limits, like a clone. Errors and panics roll back only the editor still
+associated with the matching transaction guard.
+
 ```rust
 use textloom::{Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch};
 
@@ -98,7 +104,7 @@ Positions are `(paragraph index, UTF-8 byte offset)`. Document selections must l
 
 ## Rich clipboard and interchange
 
-`selected_fragment()` captures text, styles, links, and paragraph kinds. An ordered item that begins a list and is the fragment's first item at its level is captured with start 1, so a copied list stays a new list; items continuing an earlier list keep continuing. `insert_fragment()` pastes in one undo step, preserving surviving edge styles. Complete pasted paragraphs keep their source kinds and explicit starts, so pasted continuations continue the destination's list, and destination text that survives on a pasted line keeps its paragraph kind. A fragment without a paragraph break adopts its source kind only when it fills an empty line or whole selected paragraphs. An empty fragment changes nothing. The GUI host owns clipboard MIME types and transport.
+`selected_fragment()` captures text, styles, links, and paragraph kinds. An ordered item that begins a list and is the fragment's first item at its level is captured with start 1, so a copied list stays a new list; items continuing an earlier list keep continuing. `insert_fragment()` pastes in one undo step, preserving surviving edge styles. Complete pasted paragraphs keep their source kinds and explicit starts, so pasted continuations continue the destination's list, and destination text that survives on a pasted line keeps its paragraph kind. A nonempty fragment without a paragraph break adopts its source kind only when it fills an empty line or whole selected paragraphs. A single empty fragment paragraph leaves document content unchanged at a caret, but deletes a nonempty selection. Multiple empty paragraphs still insert paragraph breaks. The GUI host owns clipboard MIME types and transport.
 
 ```rust
 use textloom::{Document, Editor, SearchOptions};
@@ -128,7 +134,14 @@ ui.add(textloom::adapter::egui::RichTextEditor::new(&mut editor));
 
 The widget draws rich paragraphs, selections, list markers, headings, block quotes, and preedit text. Fills paint behind the glyphs and replace inline code's background, with selections and highlights visible over them. Links use egui's hyperlink color unless explicitly colored and are always underlined. Quote paragraphs are indented with a bar in the gutter that continues across consecutive quotes. Soft line breaks start new rows for the caret, hit testing, Home/End, Up/Down, IME preview, and selection painting. It routes pointer and keyboard input through the same core and publishes a caret-local IME area (the caret plus same-row preedit) through egui's platform output, so candidate windows follow the caret. It checks layout character counts and retries inconsistent font shaping to keep rendered text and cursor positions aligned. Each independently stored editor should use a stable widget ID. For a scrolling editor, place the widget inside an egui `ScrollArea`. Cached layouts stay in egui's temporary memory until `RichTextEditor::forget_state(ctx, id)` releases them, for example when an editor closes.
 
-A primary-button press places the caret, dragging extends the selection from the press point, Shift+click extends it, and double/triple click select a word or paragraph on release; a press and release within one frame, such as a touchpad tap, also counts as a click. Ctrl/Command+click on a link in an editable widget, or a click in a read-only one, activates it on release over the same link without moving the caret; a drag from a link still selects. Hovering a link shows its target in a tooltip, and a pointing hand while a click would activate it. On touch screens, swipes scroll the enclosing area until the editor has focus. Clicks retain the chosen visual row at wrap boundaries, and selection highlighting extends a hard paragraph break only after the final wrapped row. Focused caret and preedit changes scroll into view even when the widget starts outside the viewport. Clicking, dragging, or moving focus away during IME composition commits the visible preedit, as native text views do, after first applying IME events queued earlier in the same frame; one immediate identical commit that an input method repeats after the click is ignored. Escape, read-only mode, and disabling the widget cancel it. Keyboard and accessibility actions follow their input batch order; accessibility actions based on content changed by an earlier event are rejected as stale.
+A primary-button press places the caret, dragging extends the selection from the press point, Shift+click extends it, and double/triple click select a word or paragraph on release; a press and release within one frame, such as a touchpad tap, also counts as a click. Ctrl/Command+click on a link in an editable widget, or a click in a read-only one, activates it on release over the same link without moving the caret; a drag from a link still selects. Document changes discard pending link presses. Hovering a link shows its target in a tooltip, and a pointing hand while a click would activate it. On touch screens, swipes scroll the enclosing area until the editor has focus. Clicks retain the chosen visual row at wrap boundaries, and selection highlighting extends a hard paragraph break only after the final wrapped row. Focused caret and preedit changes scroll into view even when the widget starts outside the viewport. Clicking, dragging, or moving focus away during IME composition commits the visible preedit, as native text views do, after first applying IME events queued earlier in the same frame; one immediate identical commit that an input method repeats after the click or focus change is ignored, including after focus returns. Escape, read-only mode, and disabling the widget cancel it. Cancellation also suppresses one immediate identical commit, even after ignored or invalid input; valid nonempty preedit starts a fresh composition. Typing or navigation after an empty preedit also cancels the old candidate. Keyboard and accessibility actions follow their input batch order; accessibility actions based on content changed by an earlier event are rejected as stale.
+
+When pointer events arrive together, selection uses the press position and its
+modifiers, and a drag ends at its release position even if the pointer subsequently
+moves elsewhere. A first preedit queued before a click applies to the original
+selection before the click places the caret.
+Ignored keys, editing commands blocked by read-only mode, and changes to pending
+typing style preserve the caret's visual row and preferred vertical column.
 
 Both input adapters share these Ctrl/Command shortcuts:
 
@@ -167,6 +180,17 @@ paste events preserve selection and history. A nonempty preedit blocks paste and
 cut, while an empty preedit is canceled before a nonempty paste. Plain clipboard behavior remains
 the default and does not capture rich fragments. Egui hosts may omit a paste
 event when native plain text is unavailable, so rich writers also need that fallback.
+
+Call `textloom::adapter::egui::install_input_routing(&context)` when creating
+the egui context (in eframe, use the creation callback's `egui_ctx`). This
+preserves input order around AccessKit focus requests for rich editors and
+native `TextEdit` fields, regardless of widget draw order. Each focus request
+gets a separate UI pass before subsequent input is delivered. Ordinary input
+needs no extra pass; if egui's pass limit is reached, remaining input waits for
+the next repaint, ahead of newer input. The widget also installs routing on
+first use, taking effect on the next pass. Hosts must honor the returned repaint
+requests to deliver pending input, including when using manual `begin_pass` /
+`end_pass` calls. Window lifecycle and dropped-file handling remain host-owned.
 
 Run `cargo run --example egui_editor --features egui` for a display-independent integration example. A native window/renderer is supplied by your existing egui host; this crate does not select one for you. Egui integrations other than eframe that rely on egui's bundled fonts must enable `egui/default_fonts` themselves. Bold spans use egui's strong text color; register a bold font family and select it with `.bold_font_family()` for bold glyphs as well. If the selected bold family is not registered, bold text keeps the base family, and without a monospace family, code uses the base family; neither panics.
 
@@ -215,9 +239,14 @@ for report revision labeling, font examples, and host checks.
 
 Enable `features = ["winit"]`. `adapter::winit::WinitAdapter` maps keyboard events, modifiers, and native IME events to editor commands. The host provides text layout, pointer hit testing, clipboard access, and painting. Calls return a `#[must_use]` `InputOutcome`: whether the event was handled, whether presentation changed, and any clipboard request.
 
-Call `set_focused` when the editor widget gains or loses focus and pass window events to `handle_window_event`, which supplies each key's physical key; hosts calling `handle_key(&key, physical_key, state, text, editor)` directly pass `event.physical_key`. Forward `ModifiersChanged` to every adapter, because modifiers belong to the window and survive widget blur. Call `sync_ime(&window, &editor, position, size)` with the caret's logical window area every frame while the editor is focused and at least once after it blurs; when focus moves between editors, sync the one losing focus first. It sends only changes: it allows IME after focus gain or `Ime::Disabled`, releases it once on blur or read-only mode, and interrupts a preedit the editor dropped. Winit 0.30's spurious macOS `Focused(false)` at startup (winit #4371) is corrected automatically. Deliver clipboard text through `paste`. Avoid routing the same events through both egui and winit adapters. Run `cargo run --example winit_input --features winit` for a window-independent example of selection, clipboard requests, and IME replacement.
+Call `set_focused` when the editor widget gains or loses focus and pass window events to `handle_window_event`, which supplies each key's physical key; hosts calling `handle_key(&key, physical_key, state, text, editor)` directly pass `event.physical_key`. Forward `ModifiersChanged` to every adapter, because modifiers belong to the window and survive widget blur. Call `sync_ime(&window, &editor, position, size)` with the caret's logical window area every frame while the editor is focused and at least once after it blurs; when focus moves between editors, sync the one losing focus first. It sends only changes: it allows IME after focus gain or `Ime::Disabled`, releases it once on blur or read-only mode, and interrupts a preedit the editor dropped. Pending preedit and commit events from a canceled composition are ignored until that interruption, including an empty preedit preceding the commit. Winit 0.30's spurious macOS `Focused(false)` at startup (winit #4371) is corrected automatically. Deliver clipboard text through `paste`. Avoid routing the same events through both egui and winit adapters. Run `cargo run --example winit_input --features winit` for a window-independent example of selection, clipboard requests, and IME replacement.
 
-Shortcuts use the `CommandModifier`: Control by default, or Super (Command) on macOS. Beyond the shared table above, Home/End move to paragraph edges and Up/Down move by paragraph; `host_vertical_navigation(true)` leaves Up/Down to the host for visual-line movement, and PageUp/PageDown always stay with the host. With Super, Command+Left/Right also move to paragraph edges. With Control, Shift+Delete cuts a selection, Ctrl+Insert copies, and Shift+Insert requests paste; dedicated Cut, Copy, Paste, Undo, and Redo keys work in both modes, and read-only rules apply to all of them. Ctrl+Alt chords type text only on Windows, where they produce AltGr characters; elsewhere they reach the host. Typed text drops control characters; paste and IME commits keep line breaks and tabs. During a nonempty preedit, `paste` and `paste_fragment` return a handled outcome without changes; an empty preedit is canceled first.
+Shortcuts use the `CommandModifier`: Control by default, or Super (Command) on macOS. Beyond the shared table above, Home/End move to paragraph edges and Up/Down move by paragraph; `host_vertical_navigation(true)` leaves Up/Down to the host for visual-line movement, and PageUp/PageDown always stay with the host. With Super, Command+Left/Right also move to paragraph edges. With Control, Shift+Delete cuts a selection, Ctrl+Insert copies, and Shift+Insert requests paste; dedicated Cut, Copy, Paste, Undo, and Redo keys work in both modes, and read-only rules apply to all of them. Ctrl+Alt character chords type text only on Windows, where they produce AltGr characters; elsewhere they reach the host. Typed text drops control characters; paste and IME commits keep line breaks and tabs. During a nonempty preedit, `paste` and `paste_fragment` return a handled outcome without changes; an empty preedit is canceled first.
+
+An empty preedit survives IME processing keys, Copy/Cut with no selection, and
+input the adapter leaves unhandled, including navigation delegated to the host.
+Other handled editor commands and actual typed text cancel it before applying
+their action.
 
 Opt into `WinitAdapter::new().rich_clipboard(true)` for `CopyRich`/`CutRich` fragment payloads, then deliver native rich clipboard content through `paste_fragment()`. Plain clipboard events remain the default.
 
@@ -244,16 +273,26 @@ plain-text export use one implementation.
 
 Text and formatting are shared between immutable paragraphs. Editing rebuilds only the affected paragraphs; undo keeps localized before/after deltas instead of copying the full document. ASCII and uniformly styled Unicode edits reuse their owned span vectors, mixed-style runs that already end at grapheme boundaries are kept without segmenting the paragraph, and Enter at a paragraph end keeps the existing paragraph. Fragment text imports and document snapshot imports move paragraph vectors from their temporary owners. Snapshot decoding validates borrowed text before retaining it and merges validated spans in place. Single-paragraph typing merges history entries without retaining every intermediate string. Each history entry holds its delta directly, and disabled history skips retention work. CR/CRLF normalization copies unchanged text in one pass.
 
+Capturing a selection without numbered items visits only the selected paragraphs;
+it does not scan earlier paragraphs for list context.
+Inserting empty text or a single empty fragment paragraph at a valid caret
+returns without rebuilding paragraph text or formatting runs.
+`is_modified()` caches its content comparison until the next document change,
+so repeated reads between edits take constant time. The first comparison after
+an edit or history replay may still visit the complete document.
+
 Inline formatting locates selected runs with binary search. Commands that leave
 their styles unchanged retain the original paragraph and runs. Changes patch
 selected runs, copy untouched edges directly, and share paragraph text and
 Unicode indexes. Rebuilding changed runs still copies the paragraph's run array.
+Reading the selected link at a caret also uses binary lookup. Explicit link-range
+queries and link edits still visit the linked formatting runs.
 
-Grapheme, scalar, and word indexes are built independently when needed and shared across formatting/history snapshots. Position validation, style lookup, boundary snapping, and adjacent grapheme movement reuse an existing grapheme index or inspect bounded local Unicode context. If that context is insufficient, they build the full index once and reuse it. Ordinary arrow movement and grapheme deletion avoid indexing an entire newly edited paragraph. Grapheme counting and index conversion still build the full index, while scalar counting does not; indexed navigation uses binary searches instead of rescanning long paragraphs. ASCII grapheme/scalar offsets need no indexes, and ASCII word indexes are allocated only when used. `history_bytes()` estimates retained text, formatting, and link targets, charging the larger side of each change once so that text and runs shared by both sides are not counted twice, and each shared link target once per side; shared navigation caches and allocator overhead are excluded.
+Grapheme, scalar, and word indexes are built independently when needed and shared across formatting/history snapshots. Position validation, style lookup, boundary snapping, and adjacent grapheme movement reuse an existing grapheme index or inspect bounded local Unicode context. If that context is insufficient, they build the full index once and reuse it. Ordinary arrow movement and grapheme deletion avoid indexing an entire newly edited paragraph. Conversions at paragraph start return zero without building either index. Grapheme counting and other index conversions still build the full index, while scalar counting does not; indexed navigation uses binary searches instead of rescanning long paragraphs. ASCII grapheme/scalar offsets need no indexes, and ASCII word indexes are allocated only when used. `history_bytes()` estimates retained text, formatting, and link targets, charging the larger side of each change once so that text and runs shared by both sides are not counted twice, and each shared link target once per side; shared navigation caches and allocator overhead are excluded.
 
-A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. List edits change only the paragraphs they touch: displayed numbers are computed from paragraph kinds and cached, and the first lookup after a change to kinds or the paragraph count recomputes them in one pass. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers.
+A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. List edits change only the paragraphs they touch: displayed numbers are computed from paragraph kinds and cached, and the first lookup after a change that affects numbering or the paragraph count recomputes them in one pass. Switching between body and quote, or between heading levels, preserves the numbering cache, including undo/redo. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers.
 
-Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Word indexes and lowercase coordinate maps are prepared only when a literal candidate needs validation. Word indexes grow only through the prefix needed by candidates and remain local to each search. Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. For case-sensitive queries without whole-word matching, navigation scans directly from the selection when the query's first Unicode scalar occurs only once. Other queries retain the complete forward match stream and lowercase context. All matches respect the original paragraph's grapheme boundaries. A nearby match can be found without searching unrelated earlier text; missing queries may still visit the whole document. Cross-paragraph queries temporarily flatten the document and preserve its complete forward match stream. Literal searchers are reused across matches within each searched text; replace-all shares complete untouched paragraphs and builds text only for joined or edited paragraphs. It reuses validated search ranges and prepares replacement chunks once per operation.
+Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Word indexes and lowercase coordinate maps are prepared only when a literal candidate needs validation. Word indexes grow only through the prefix needed by candidates and remain local to each search. Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. For case-sensitive queries without whole-word matching, navigation scans directly from the selection when the query's first Unicode scalar occurs only once. Other queries retain the complete forward match stream and lowercase context. All matches respect the original paragraph's grapheme boundaries. A nearby match can be found without searching unrelated earlier text; missing queries may still visit the whole document. Cross-paragraph queries temporarily flatten the document and preserve its complete forward match stream. Literal searchers are reused across matches within each searched text. After a rejected candidate, case-sensitive paragraph-local searches without whole-word matching can skip to the next grapheme start. Potentially overlapping candidates get at most two retries for short queries before using a linear byte matcher with temporary memory proportional to the query length; patterns that cannot overlap retain the standard string iterator. This avoids repeatedly rescanning long, repetitive queries. Replace-all shares complete untouched paragraphs and builds text only for joined or edited paragraphs. It reuses validated search ranges and prepares replacement chunks once per operation.
 
 The egui widget separates layout, input, navigation, painting, and composition
 preview. It retains galleys and paints visible paragraphs. Committed edits carry
@@ -261,10 +300,10 @@ a compact description of the replaced paragraph range to the adapters. Ordinary
 local edits update the affected cache entries and paths in a persistent layout
 index, which tracks paragraph heights, scalar totals, and list membership.
 Retained layout snapshots keep their original geometry. Structural edits also
-shift later paragraph-cache references; after changes to kinds or the paragraph
-count, only markers whose computed number changed are rebuilt, reusing their
-items' shaped text. Actual changes to font definitions, text options, DPI, or
-appearance still rebuild all layouts. If an adapter misses an edit or receives
+shift later paragraph-cache references; after changes that affect numbering or
+the paragraph count, only markers whose computed number changed are rebuilt,
+reusing their items' shaped text. Actual changes to font definitions, text
+options, DPI, or appearance still rebuild all layouts. If an adapter misses an edit or receives
 an unrelated document, it compares paragraph identities to recover safely.
 Height totals use `f64` internally before conversion to egui coordinates,
 reducing accumulated rounding drift in long documents.
@@ -274,9 +313,11 @@ preview layout cache; cursor-only changes reuse the preview document too. Native
 preedit scalar ranges convert to byte ranges in one scan through the requested
 endpoint. Word-selection snapping reuses paragraph boundary queries. Idle frames
 compare the layout environment (pixels per point, text options, and font
-definitions) and request the visible galleys again, so their cost grows with the
-visible paragraphs. Other viewports' passes and frames that hide the widget
-neither relay out the document nor reset vertical navigation, and font atlas
+definitions) and reuse cached painted galleys for visible paragraphs without
+cloning or hashing their full layout jobs. A tiny cached job detects font-cache
+resets and refreshes visible glyphs when needed. Each widget retains only its
+most recently visible painted galleys. Other viewports' passes and frames that
+hide the widget neither relay out the document nor reset vertical navigation, and font atlas
 recreation refreshes only painted texture coordinates. Accessibility validates
 text and layout snapshots with shared identity tokens and locates text runs
 through an index. Egui paragraph node IDs stay stable across structural edits,
