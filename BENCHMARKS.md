@@ -758,10 +758,9 @@ the remaining rows used workloads that the harnesses do not include.
 | Egui relayout after Enter in a 10,000-item list | 4.2 ms | 2.9 ms |
 | Egui pass for another viewport or a hidden frame, 2,000 paragraphs | up to about 294 ms | no relayout |
 
-Idle frames became slower because each frame now requests the visible galleys
-again, so a font-atlas rebuild cannot leave stale texture coordinates; idle
-validation therefore grows with the visible paragraphs instead of taking
-constant time. In
+At that stage, idle frames became slower because each frame requested the visible
+galleys again, preventing stale texture coordinates after a font-atlas rebuild.
+The later retained-paint measurements below revisit that cost. In
 exchange, other viewports' passes and frames that hide the widget no longer
 relay out the document. Direct AccessKit structural edits rebuild only the
 replaced paragraphs, and egui accessibility keeps paragraph node IDs across
@@ -785,3 +784,135 @@ links supported, typing measured during that pass took about 4–5 µs per
 keystroke in a paragraph with 1,000 style runs and 76–95 µs with 20,000 runs,
 the magnitude measured before links were added; these figures carry the same
 caveats as the table above.
+
+On October 20, 2026, the complete rendering harness was run before and after
+making scalar-count fallbacks lazy in caret and character-offset queries, with
+Rust 1.99.1, locked dependencies, all features, and the default release profile
+on the same Linux machine. Each version ran once, without
+`TEXTLOOM_BENCH_QUICK`; these are workload averages, not medians or confidence
+intervals. The long Unicode preedit workload improved from 31.40 to 22.02 µs
+per idle frame, from 34.43 to 23.98 µs per identical update/frame, and from
+42.07 to 34.72 µs per native cursor-at-start/frame. A valid offset at byte zero
+now avoids scanning the complete paragraph for an unused fallback. Cursor-at-end
+and generic cursor-update timings stayed similar. Cursor-only frames with
+100 and 10,000 paragraphs both remained about 13 µs.
+
+The same review measured copying five bytes near the end of documents containing
+100 or 100,000 plain Unicode paragraphs. Each binary ran 2,000 captures per
+sample, with three alternating before/after samples using Rust 1.99.1 and the
+default release profile. Median capture time changed from 0.190 to 0.117 µs for
+100 paragraphs and from 511.268 to 0.121 µs for 100,000 paragraphs. Selections
+without ordered items now skip scanning earlier paragraphs for list numbering.
+Captures containing ordered items still restore that context. The workload is
+included in `benches/editing.rs`; these results apply to the stated small
+selection, not whole-document copies.
+
+Repeated `is_modified()` calls also now reuse their content comparison until
+the next edit or history replay. In a separate single before/after release run
+on 100,000 paragraphs, checks after an edit at the end or after undoing that
+edit averaged about 36.6 µs before caching; cached reads were below 0.01 µs.
+The first content comparison can still scan the document. The editing harness
+now measures repeated dirty and restored-state checks separately.
+
+An isolated release measurement rebuilt egui accessibility snapshots eight times
+from retained layouts of one paragraph with alternating red and blue characters.
+Before/after averages were 11.772/4.262 ms for 4,000 style runs and
+141.658/17.178 ms for 16,000 runs. Looking up each run's formatting section now
+uses binary search instead of scanning from the first section. These single-run
+measurements exclude shaping and platform screen readers. The rendering harness
+now includes a related formatting-edit/frame workload at both sizes, which also
+measures layout, painting, and full tree publication.
+
+Literal-search rejection was measured with three alternating before/after runs
+using the same October 20 release setup. Each sample timed one cold search,
+including lazy grapheme indexing, after constructing the document and query.
+For a paragraph containing 16,000 combining acute accents (32 KB), searching for
+8,000 accents produced no complete-grapheme match: median time fell from
+236.58 to 0.26 ms. For 16,000 repeated `a` + combining-acute graphemes (48 KB),
+searching for 8,000 repetitions followed by a final `a` also produced no valid
+match: median time fell from 352.30 to 0.53 ms. These are deliberately repetitive
+cases, not representative averages for ordinary searches.
+
+Rejected case-sensitive paragraph-local matches without whole-word matching can
+skip directly to the next grapheme start. Search allows at most two standard
+matcher retries, with a total budget of 64 query bytes to preprocess again.
+Further rejections that could hide overlapping matches build one failure table
+proportional to the query's byte length and scan the remaining bytes without
+repeatedly restarting the string matcher. Patterns that cannot overlap retain
+the standard string iterator. The editing harness now includes both rejection
+workloads at 1,000 and 16,000 repetitions, with warmed indexes.
+
+A follow-up comparison measured this bounded retry policy against the immediate
+overlap-matcher fallback above. Nine alternating release samples each averaged
+20 searches of a paragraph beginning with `aaX ` followed by 50,000 repetitions
+of `other café 👩‍💻. `. Whole-word search for `aa` rejects the first candidate,
+then finds no match in the 1.3 MB remainder. Median time improved from 0.62 to
+0.26 ms. Equivalent nonoverlapping queries stayed near 0.10 ms, and the median
+for the long repetitive query above remained below 0.6 ms. The editing harness includes these
+sparse rejection cases as well; CI applies no timing thresholds.
+
+Numbering-cache retention was measured with seven alternating before/after
+release runs. Each sample averaged 100 changes to the first paragraph of an
+otherwise ordered document, alternating body/quote or heading levels and reading
+the final item's number after each edit. Construction, disabling history, and
+initial cache warming occurred before timing. At 100,000 paragraphs, median time
+fell from 801.293 to 0.187 µs for body/quote and from 745.400 to 0.172 µs for heading
+levels. At 100 paragraphs, the corresponding medians were 0.688/0.158 and
+0.669/0.140 µs. These changes have identical effects on list numbering, so they
+now preserve the cached ordinals; egui also skips scanning subsequent markers.
+The core-only measurements exclude layout and painting. The editing harness
+includes both workloads at both document sizes.
+
+Retained painting was measured with five alternating before/after release
+processes using egui 0.36.0. Each process rendered five warmup frames followed by
+100 measured idle frames in an 800×600 scroll area. The document contained one
+paragraph with alternating red and blue single-character spans. Median frame
+times fell from 57.591 to 6.404 µs at 1,000 spans, from 740.478 to 6.356 µs at
+16,000 spans, and from 3084.217 to 6.236 µs at 64,000 spans. Unchanged visible
+galleys are retained between font-cache resets, removing repeated copies and
+hashes of their complete layout jobs. The rendering harness includes all three
+sizes. These headless timings exclude initial shaping, accessibility publication,
+tessellation, and GPU work; they measure idle frames with already retained
+layouts, not the cost of editing or initially rendering these paragraphs.
+
+Empty caret insertions were measured with nine alternating before/after release
+runs, each averaging 100 operations after constructing a paragraph of 10,000
+`é` graphemes with alternating bold/plain spans. Median empty text insertion
+fell from 428.364 to 0.021 µs, single-paragraph empty fragment insertion from
+450.845 to 0.057 µs, and beginning a composition followed by an empty commit
+from 484.458 to 0.032 µs. These operations now return after range validation
+without rebuilding the unchanged paragraph. The editing harness includes all
+three workloads at 100 and 10,000 spans. Replacing a selection with empty input
+still performs deletion, and a fragment containing multiple empty paragraphs
+still inserts paragraph breaks.
+
+Zero-index conversion was measured with nine alternating before/after release
+runs, each averaging 30 cold operations. Every operation used a fresh editor;
+document construction occurred before timing. The large paragraph contained
+100,000 repetitions of `é👩‍💻e\u{301}` (1.6 MB). Median conversion from grapheme
+index zero fell from 17.950 ms to 0.028 µs, scalar index zero from 2.804 ms to
+0.035 µs, and paragraph-down movement from column zero from 11.965 ms to
+0.138 µs. The zero-index paths now return without allocating or populating an
+index. Baseline timings varied with system load, and the shortest results are
+close to timer overhead. The editing harness includes these cold workloads at
+100 and 100,000 repetitions; they exclude layout and painting.
+
+Caret link queries were measured with nine alternating before/after release
+runs, each averaging 1,000 queries after document construction and caret
+placement. One hyperlink covered 100,000 `é` graphemes with alternating bold/plain
+spans. Median `selected_link()` times fell from 104.289 to 0.060 µs at the link
+start, 102.805 to 0.057 µs at its middle, and 102.622 to 0.058 µs at its end.
+The lookup now finds only the target instead of expanding both ends of the
+linked range on every toolbar read. Link editing still expands that range.
+The editing harness includes all three caret positions at 100 and 100,000 spans;
+these core-only timings exclude toolbar rendering.
+
+Transaction lifetime tracking was checked with eleven alternating before/after
+release runs using Rust 1.99.1. Each sample averaged 50,000 insert/undo pairs in
+one short Unicode paragraph, excluding construction. Median plain edit/undo
+time was 0.284/0.291 µs, one transaction per pair was 0.298/0.335 µs, and a nested
+transaction per pair was 0.297/0.356 µs. Each transaction scope now allocates a
+small lifetime token so moving an editor out cannot permanently disable its
+history; ordinary edits allocate no such token. The editing harness includes
+the two transaction workloads. These core-only timings describe the cost of
+the correctness fix and exclude rendering.

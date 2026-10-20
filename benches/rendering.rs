@@ -144,7 +144,9 @@ fn main() {
             "{paragraphs:>6} paragraphs: {idle:.2} µs / idle frame; {edit:.2} µs / local edit + frame; {split:.2} µs / paragraph split or undo + frame; {preedit:.2} µs / preedit update + frame; {cursor:.2} µs / preedit cursor + frame"
         );
     }
+    formatted_idle_frames();
     accessibility_frames();
+    formatted_accessibility_frames();
     native_preedit_frames();
     long_preedit_frames();
     initialization_and_invalidation_frames();
@@ -258,6 +260,84 @@ fn accessibility_frames() {
         let edit = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64 / 2.0;
         assert_eq!(editor.document().plain_text(), source);
         println!("{paragraphs:>6} paragraphs: {edit:.2} µs / accessible local edit + frame");
+    }
+}
+
+fn formatted_editor(count: usize) -> Editor {
+    use textloom::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
+
+    let colors = [Color([255, 0, 0, 255]), Color([0, 0, 255, 255])];
+    let paragraph = Paragraph::new(
+        &"x".repeat(count),
+        (0..count)
+            .map(|index| Span {
+                range: index..index + 1,
+                style: InlineStyle {
+                    foreground: Some(colors[index % 2]),
+                    ..Default::default()
+                },
+                link: None,
+            })
+            .collect(),
+        ParagraphKind::Body,
+    )
+    .unwrap();
+    Editor::new(Document::from_paragraphs([paragraph]))
+}
+
+fn formatted_idle_frames() {
+    for count in [1_000, 16_000, 64_000] {
+        let mut editor = formatted_editor(count);
+        let context = egui::Context::default();
+        for _ in 0..5 {
+            frame(&context, &mut editor);
+        }
+        let iterations = scaled(1_000);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            frame(&context, &mut editor);
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        assert_eq!(editor.document().plain_text(), "x".repeat(count));
+        println!("{count:>6} styled spans: {elapsed:.2} µs / retained idle frame");
+    }
+}
+
+fn formatted_accessibility_frames() {
+    use textloom::{Color, StylePatch};
+
+    for count in [4_000, 16_000] {
+        let mut editor = formatted_editor(count);
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
+            .unwrap();
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let recolor = |editor: &mut Editor, index: usize| {
+            editor
+                .apply_style(StylePatch {
+                    foreground: Some(Some(if index.is_multiple_of(2) {
+                        Color([0, 255, 0, 255])
+                    } else {
+                        Color([255, 0, 0, 255])
+                    })),
+                    ..Default::default()
+                })
+                .unwrap();
+        };
+        for index in 0..4 {
+            recolor(&mut editor, index);
+            frame(&context, &mut editor);
+        }
+        let iterations = scaled(20);
+        let start = Instant::now();
+        for index in 0..iterations {
+            recolor(&mut editor, index);
+            frame(&context, &mut editor);
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        assert_eq!(editor.document().plain_text(), "x".repeat(count));
+        println!("{count:>6} styled spans: {elapsed:.2} µs / accessible formatting edit + frame");
     }
 }
 

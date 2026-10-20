@@ -1,5 +1,5 @@
 use super::{
-    RichClipboard,
+    CommitEcho, RichClipboard,
     layout::ParagraphLayouts,
     navigation::{
         VerticalNavigation, page_position, preedit_byte_range, row_boundary_position,
@@ -52,6 +52,7 @@ pub(super) fn handle_event(
     event: &Event,
     layouts: &ParagraphLayouts,
     navigation: &mut Option<VerticalNavigation>,
+    commit_echo: &mut Option<CommitEcho>,
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
     options: &InputOptions,
@@ -67,29 +68,36 @@ pub(super) fn handle_event(
             _ => {}
         }
     }
-    let paste = match event {
+    if matches!(event, Event::Cut | Event::Paste(_) | Event::Text(_))
+        && editor
+            .composition()
+            .is_some_and(|composition| !composition.text.is_empty())
+    {
+        return true;
+    }
+    let input_text = match event {
+        Event::Text(text) => Some((text, clean_text(text, false))),
         Event::Paste(text) => Some((text, clean_text(text, true))),
         _ => None,
     };
-    if paste.as_ref().is_some_and(|(_, clean)| clean.is_empty()) {
+    if input_text
+        .as_ref()
+        .is_some_and(|(_, clean)| clean.is_empty())
+    {
         return true;
     }
-    if editor
-        .composition()
-        .is_some_and(|composition| composition.text.is_empty())
-        && (matches!(event, Event::Text(_) | Event::Paste(_) | Event::Cut)
-            || matches!(event, Event::Key { key, pressed: true, .. } if *key != Key::Escape))
-    {
-        *interrupted |= editor.cancel_composition();
+    if matches!(event, Event::Text(_) | Event::Paste(_)) {
+        *interrupted |= cancel_empty_composition(editor);
     }
     match event {
         Event::Copy => {
             copy_selection(editor, ui, clipboard);
             true
         }
-        Event::Cut | Event::Paste(_) | Event::Text(_) if editor.composition().is_some() => true,
         Event::Cut => {
             if !editor.selection().is_caret() {
+                *interrupted |= cancel_empty_composition(editor);
+                *commit_echo = None;
                 copy_selection(editor, ui, clipboard);
                 editor.break_history_group();
                 record(editor.insert_text(""), errors);
@@ -98,7 +106,8 @@ pub(super) fn handle_event(
             true
         }
         Event::Paste(_) => {
-            if let Some((text, clean)) = &paste {
+            if let Some((text, clean)) = &input_text {
+                *commit_echo = None;
                 let fragment = clipboard
                     .as_deref_mut()
                     .and_then(|clipboard| clipboard.paste(text));
@@ -114,10 +123,10 @@ pub(super) fn handle_event(
             }
             true
         }
-        Event::Text(text) => {
-            let clean = clean_text(text, false);
-            if !clean.is_empty() {
-                record(editor.insert_text(&clean), errors);
+        Event::Text(_) => {
+            if let Some((_, clean)) = &input_text {
+                *commit_echo = None;
+                record(editor.insert_text(clean), errors);
             }
             true
         }
@@ -142,12 +151,19 @@ pub(super) fn handle_event(
                 }
             };
             if !text.is_empty() || editor.composition().is_some() {
+                if !text.is_empty() {
+                    // Only an accepted candidate starts a new IME input session.
+                    *commit_echo = None;
+                }
                 record(editor.update_composition(text, range), errors);
             }
             true
         }
         Event::Ime(ImeEvent::Commit(text)) => {
             let clean = clean_text(text, true);
+            if !clean.is_empty() || editor.composition().is_some() {
+                *commit_echo = None;
+            }
             if editor.composition().is_none() {
                 if !clean.is_empty() {
                     record(editor.insert_text(&clean), errors);
@@ -163,6 +179,7 @@ pub(super) fn handle_event(
             before_chars,
             after_chars,
         }) => {
+            *commit_echo = None;
             *interrupted |= editor.cancel_composition();
             delete_surrounding(editor, *before_chars, *after_chars, errors);
             true
@@ -182,6 +199,9 @@ pub(super) fn handle_event(
             ..
         } => {
             if *key == Key::Escape {
+                if !options.read_only {
+                    *commit_echo = None;
+                }
                 let canceled = editor.cancel_composition();
                 *interrupted |= canceled;
                 if !canceled {
@@ -193,10 +213,15 @@ pub(super) fn handle_event(
                 }
                 return true;
             }
-            if editor.composition().is_some() {
+            if editor
+                .composition()
+                .is_some_and(|composition| !composition.text.is_empty())
+            {
                 return false;
             }
-            handle_key(
+            // Printable and clipboard keys may deliver their actual input as a later event.
+            let composing = editor.composition().is_some();
+            let handled = handle_key(
                 editor,
                 *key,
                 *physical_key,
@@ -205,10 +230,22 @@ pub(super) fn handle_event(
                 navigation,
                 errors,
                 options,
-            )
+            );
+            *interrupted |= composing && editor.composition().is_none();
+            if handled && !options.read_only {
+                *commit_echo = None;
+            }
+            handled
         }
         _ => false,
     }
+}
+
+fn cancel_empty_composition(editor: &mut Editor) -> bool {
+    editor
+        .composition()
+        .is_some_and(|composition| composition.text.is_empty())
+        && editor.cancel_composition()
 }
 
 fn resolve_shortcut(
@@ -260,12 +297,14 @@ pub(super) fn handle_key(
     let prefer_next_row = navigation
         .as_ref()
         .is_none_or(|navigation| navigation.prefer_next_row);
-    if command
+    let reset_navigation = command
         || !(matches!(key, Key::ArrowUp | Key::ArrowDown)
-            || paging && matches!(key, Key::PageUp | Key::PageDown))
-    {
-        *navigation = None;
-    }
+            || paging && matches!(key, Key::PageUp | Key::PageDown));
+    let previous_navigation = if reset_navigation {
+        navigation.take()
+    } else {
+        None
+    };
     if command
         && let Some(shortcut) = resolve_shortcut(
             key,
@@ -274,8 +313,15 @@ pub(super) fn handle_key(
             options.heading_shortcuts,
         )
     {
+        let revision = editor.document().revision();
+        let selection = editor.selection();
         if !options.read_only || !shortcut.edits() {
+            cancel_empty_composition(editor);
             record(shortcut.apply(editor), errors);
+        }
+        if editor.document().revision() == revision && editor.selection() == selection {
+            // Changing the pending typing style must preserve the visual caret.
+            *navigation = previous_navigation;
         }
         return true;
     }
@@ -288,6 +334,7 @@ pub(super) fn handle_key(
         _ => None,
     };
     if let Some(end) = row_end {
+        cancel_empty_composition(editor);
         if let Some((position, preferred_x, prefer_next_row)) =
             row_boundary_position(editor, layouts, prefer_next_row, end)
         {
@@ -328,11 +375,13 @@ pub(super) fn handle_key(
         _ => None,
     };
     if let Some(movement) = movement {
+        cancel_empty_composition(editor);
         record(editor.move_cursor(movement, modifiers.shift), errors);
         return true;
     }
     match key {
         Key::ArrowUp | Key::ArrowDown => {
+            cancel_empty_composition(editor);
             if let Some((position, preferred_x, prefer_next_row)) =
                 vertical_position(editor, layouts, navigation.as_ref(), key == Key::ArrowDown)
             {
@@ -349,6 +398,7 @@ pub(super) fn handle_key(
             true
         }
         Key::PageUp | Key::PageDown if paging => {
+            cancel_empty_composition(editor);
             if let Some((position, preferred_x, prefer_next_row)) = page_position(
                 editor,
                 layouts,
@@ -368,9 +418,16 @@ pub(super) fn handle_key(
             }
             true
         }
-        Key::Backspace | Key::Delete if options.read_only => true,
-        Key::Enter if options.read_only && !modifiers.command => true,
+        Key::Backspace | Key::Delete if options.read_only => {
+            *navigation = previous_navigation;
+            true
+        }
+        Key::Enter if options.read_only && !modifiers.command => {
+            *navigation = previous_navigation;
+            true
+        }
         Key::Backspace => {
+            cancel_empty_composition(editor);
             record(
                 if command && modifiers.mac_cmd {
                     editor.delete_to_paragraph_start()
@@ -384,6 +441,7 @@ pub(super) fn handle_key(
             true
         }
         Key::Delete => {
+            cancel_empty_composition(editor);
             record(
                 if by_word {
                     editor.delete_word_forward()
@@ -395,10 +453,12 @@ pub(super) fn handle_key(
             true
         }
         Key::Enter if modifiers.shift && !modifiers.command => {
+            cancel_empty_composition(editor);
             record(editor.insert_line_break(), errors);
             true
         }
         Key::Enter if !modifiers.command => {
+            cancel_empty_composition(editor);
             record(editor.insert_paragraph(), errors);
             true
         }
@@ -409,6 +469,7 @@ pub(super) fn handle_key(
                 && !modifiers.alt
                 && layouts.contains_list(editor.selected_paragraphs()) =>
         {
+            cancel_empty_composition(editor);
             record(
                 if modifiers.shift {
                     editor.outdent_list()
@@ -419,7 +480,14 @@ pub(super) fn handle_key(
             );
             true
         }
-        _ => false,
+        _ => {
+            // Delegating a key to the host must not move the painted caret or
+            // discard the column used by a later vertical movement.
+            if reset_navigation {
+                *navigation = previous_navigation;
+            }
+            false
+        }
     }
 }
 

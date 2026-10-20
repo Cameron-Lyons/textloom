@@ -15,6 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod accessibility;
 mod composition;
 mod input;
+mod input_routing;
 mod layout;
 mod navigation;
 mod paint;
@@ -24,6 +25,7 @@ use composition::CompositionPreview;
 use input::{InputOptions, handle_event};
 #[cfg(test)]
 use input::{handle_key, surrounding_position};
+pub use input_routing::install_input_routing;
 #[cfg(test)]
 use layout::paragraph_job;
 use layout::{Appearance, LayoutCache, ParagraphLayouts};
@@ -33,7 +35,7 @@ use navigation::{
 };
 #[cfg(test)]
 use navigation::{preedit_byte_range, snap_grapheme};
-use paint::{BackgroundRanges, paint_document};
+use paint::{BackgroundRanges, PaintCache, paint_document};
 
 pub trait RichClipboard {
     fn copy(&mut self, _fragment: &Fragment) -> bool {
@@ -179,6 +181,7 @@ impl<'a> RichTextEditor<'a> {
     }
 
     pub fn show(mut self, ui: &mut Ui) -> RichTextEditorOutput {
+        install_input_routing(ui.ctx());
         let id = self.id.unwrap_or_else(|| {
             self.salt
                 .map_or_else(|| ui.next_auto_id(), |salt| ui.make_persistent_id(salt))
@@ -223,8 +226,21 @@ impl<'a> RichTextEditor<'a> {
         let mut layouts = cache.layout(ui, self.editor, &appearance);
         cache.validate_navigation(self.editor.selection());
         let old_text = publish_text.then(|| cache.plain_text(self.editor.document()));
+        let now = ui.input(|input| input.time);
         let mut interrupted =
             (self.read_only || !ui.is_enabled()) && self.editor.cancel_composition();
+        if interrupted && let Some(composition) = &old_composition {
+            cache
+                .interaction
+                .remember_composition_end(clean_text(&composition.text, true).into_owned(), now);
+        }
+        if self
+            .editor
+            .composition()
+            .is_none_or(|composition| !composition.text.is_empty())
+        {
+            cache.interaction.cleared_preedit = None;
+        }
         let initial_preview = match cache.layout_preview(ui, self.editor, &appearance) {
             Ok(layouts) => layouts,
             Err(error) => {
@@ -260,7 +276,6 @@ impl<'a> RichTextEditor<'a> {
         let origin = rect.min + Vec2::splat(PADDING);
         let mut pointer_interaction = false;
 
-        let now = ui.input(|input| input.time);
         let mut clicked_link = None;
         if ui.is_enabled() {
             let options = InputOptions {
@@ -268,32 +283,65 @@ impl<'a> RichTextEditor<'a> {
                 page_height: (ui.clip_rect().height() - row_height).max(row_height),
                 heading_shortcuts: self.heading_shortcuts,
             };
-            let pressed = drag_to_select
-                && (response.is_pointer_button_down_on() || response.clicked())
-                && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+            let press_event = if !drag_to_select {
+                None
+            } else if response.is_pointer_button_down_on() {
+                primary_pointer_event(ui, PointerEventKind::Press)
+            } else if response.clicked() {
+                primary_pointer_event(ui, PointerEventKind::ClickPress)
+            } else {
+                None
+            };
+            let pressed = press_event.is_some();
             let clicked = response.clicked()
                 && (!drag_to_select || response.double_clicked() || response.triple_clicked());
             let pointer = response.interact_pointer_pos();
+            let pointer_event = if pressed {
+                press_event
+            } else if clicked {
+                primary_pointer_event(ui, PointerEventKind::Release)
+            } else {
+                None
+            };
+            let click_pointer = pointer_event.map(|(position, _)| position).or(pointer);
+            let click_modifiers = pointer_event
+                .map(|(_, modifiers)| modifiers)
+                .unwrap_or_else(|| ui.input(|input| input.modifiers));
+            let drag_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
+            let released_pointer = if response.clicked() || drag_stopped {
+                let event_kind = if drag_stopped {
+                    PointerEventKind::DragRelease
+                } else {
+                    PointerEventKind::Release
+                };
+                primary_pointer_event(ui, event_kind)
+                    .map(|(position, _)| position)
+                    .or(pointer)
+            } else {
+                pointer
+            };
+            let drag_pointer = if drag_stopped {
+                released_pointer
+            } else {
+                pointer
+            };
             let dragged = drag_to_select
-                && !pressed
-                && response.dragged_by(egui::PointerButton::Primary)
-                && pointer.is_some();
-            if !was_focused
-                || cache
-                    .interaction
-                    .commit_echo
-                    .as_ref()
-                    .is_some_and(|echo| now - echo.time > COMMIT_ECHO_SECONDS)
+                && (response.dragged_by(egui::PointerButton::Primary) || drag_stopped)
+                && drag_pointer.is_some();
+            if cache
+                .interaction
+                .commit_echo
+                .as_ref()
+                .is_some_and(|echo| now - echo.time > COMMIT_ECHO_SECONDS)
             {
                 cache.interaction.commit_echo = None;
             }
-            let ends_composition = ((pressed || clicked) && pointer.is_some())
+            let ends_composition = ((pressed || clicked) && click_pointer.is_some())
                 || dragged
                 || !(pressed || clicked || response.has_focus());
-            let follows_links = self.read_only || ui.input(|input| input.modifiers.command);
+            let follows_links = self.read_only || click_modifiers.command;
             let previous_press = cache.interaction.link_press.take();
-            let applied = if was_focused && ends_composition && self.editor.composition().is_some()
-            {
+            let applied = if was_focused && ends_composition {
                 apply_queued_ime(
                     self.editor,
                     ui,
@@ -313,11 +361,11 @@ impl<'a> RichTextEditor<'a> {
                 if !response.has_focus() {
                     response.request_focus();
                 }
-                if let Some(pointer) = pointer {
+                if let Some(pointer) = click_pointer {
                     if let Some(committed) = finish_composition(self.editor, &mut errors) {
                         interrupted = true;
                         layouts = cache.layout(ui, self.editor, &appearance);
-                        cache.interaction.commit_echo = CommitEcho::new(committed, now);
+                        cache.interaction.remember_composition_end(committed, now);
                     }
                     let single = !response.double_clicked() && !response.triple_clicked();
                     let link = (follows_links && single)
@@ -333,7 +381,7 @@ impl<'a> RichTextEditor<'a> {
                     } else {
                         let (position, prefer_next_row) =
                             hit_test(self.editor, &layouts, pointer - origin);
-                        let shift = ui.input(|input| input.modifiers.shift);
+                        let shift = click_modifiers.shift;
                         let result = if response.triple_clicked() {
                             self.editor.select_paragraph(position.paragraph)
                         } else if response.double_clicked() {
@@ -361,19 +409,19 @@ impl<'a> RichTextEditor<'a> {
                 && !response.double_clicked()
                 && !response.triple_clicked()
                 && let Some(press) = link_press.take()
-                && let Some(pointer) = pointer
+                && let Some(pointer) = released_pointer
                 && link_at_point(self.editor.document(), &layouts, pointer - origin).as_ref()
                     == Some(&press.link)
             {
                 clicked_link = Some(press.link);
             }
-            if dragged && let Some(pointer) = pointer {
+            if dragged && let Some(pointer) = drag_pointer {
                 pointer_interaction = true;
                 cache.interaction.navigation = None;
                 if let Some(committed) = finish_composition(self.editor, &mut errors) {
                     interrupted = true;
                     layouts = cache.layout(ui, self.editor, &appearance);
-                    cache.interaction.commit_echo = CommitEcho::new(committed, now);
+                    cache.interaction.remember_composition_end(committed, now);
                 }
                 let (position, prefer_next_row) = hit_test(self.editor, &layouts, pointer - origin);
                 let anchor = link_press
@@ -422,12 +470,20 @@ impl<'a> RichTextEditor<'a> {
                     continue;
                 }
                 let revision = self.editor.document().revision();
+                let composition = composition_before_event(self.editor, event);
                 let link = match event {
                     Event::AccessKitActionRequest(request) => link_click(request),
                     _ => None,
                 };
                 let handled = if let Some(link) = link {
-                    clicked_link = Some(link);
+                    if published
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.matches_document(self.editor))
+                    {
+                        clicked_link = Some(link);
+                    } else {
+                        accessibility_errors.push(AccessibilityError::StaleDocument);
+                    }
                     true
                 } else if let Event::AccessKitActionRequest(request) = event
                     && request.target_node == id.accesskit_id()
@@ -437,6 +493,8 @@ impl<'a> RichTextEditor<'a> {
                         self.editor,
                         request,
                         cache.accessibility.as_deref(),
+                        &layouts,
+                        &mut cache.interaction.navigation,
                         self.read_only,
                         &mut interrupted,
                         &mut errors,
@@ -450,6 +508,7 @@ impl<'a> RichTextEditor<'a> {
                             event,
                             &layouts,
                             &mut cache.interaction.navigation,
+                            &mut cache.interaction.commit_echo,
                             &mut errors,
                             &mut interrupted,
                             &options,
@@ -461,6 +520,13 @@ impl<'a> RichTextEditor<'a> {
                 if handled {
                     consumed.push(index);
                 }
+                observe_composition_event(
+                    &mut cache.interaction,
+                    composition,
+                    self.editor,
+                    event,
+                    now,
+                );
                 if revision != self.editor.document().revision() {
                     layouts = cache.layout(ui, self.editor, &appearance);
                 }
@@ -484,8 +550,9 @@ impl<'a> RichTextEditor<'a> {
             }
             if response.has_focus() {
                 self.set_focus_filter(ui, id, &cache);
-            } else {
-                interrupted |= finish_composition(self.editor, &mut errors).is_some();
+            } else if let Some(committed) = finish_composition(self.editor, &mut errors) {
+                interrupted = true;
+                cache.interaction.remember_composition_end(committed, now);
             }
         }
 
@@ -547,6 +614,7 @@ impl<'a> RichTextEditor<'a> {
             };
             paint_document(
                 &painter,
+                &mut cache.paint,
                 display_document,
                 display_layouts,
                 origin,
@@ -589,6 +657,7 @@ impl<'a> RichTextEditor<'a> {
             || composition_changed
             || old_selection != self.editor.selection()
             || old_revision != self.editor.document().revision()
+            || cache.interaction.caret_rect != Some(local_caret)
         {
             cache.interaction.last_interaction = now;
         }
@@ -782,6 +851,7 @@ const PARAGRAPH_GAP: f32 = 4.0;
 #[derive(Clone, Default)]
 struct Cache {
     layout: LayoutCache,
+    paint: PaintCache,
     plain_text: Option<Arc<str>>,
     preview: Option<Box<CompositionPreview>>,
     accessibility: Option<Arc<accessibility::Snapshot>>,
@@ -796,7 +866,19 @@ struct InteractionState {
     focused: bool,
     last_interaction: f64,
     commit_echo: Option<CommitEcho>,
+    cleared_preedit: Option<Arc<crate::Composition>>,
     link_press: Option<LinkPress>,
+}
+
+impl InteractionState {
+    fn remember_composition_end(&mut self, mut text: String, time: f64) {
+        if let Some(previous) = self.cleared_preedit.take()
+            && text.is_empty()
+        {
+            text = clean_text(&previous.text, true).into_owned();
+        }
+        self.commit_echo = CommitEcho::new(text, time);
+    }
 }
 
 #[derive(Clone)]
@@ -828,6 +910,7 @@ impl Cache {
         if document_changed {
             self.plain_text = None;
             self.preview = None;
+            self.interaction.link_press = None;
         }
         if layout_changed {
             self.interaction.navigation = None;
@@ -846,7 +929,7 @@ impl Cache {
                 .map_or(0, |paragraph| {
                     paragraph
                         .scalar_index(position.byte)
-                        .unwrap_or(paragraph.scalar_count())
+                        .unwrap_or_else(|| paragraph.scalar_count())
                 })
     }
     fn selection_contains_list(&self, editor: &Editor) -> bool {
@@ -860,6 +943,49 @@ fn record(result: Result<(), Error>, errors: &mut Vec<Error>) {
     if let Err(error) = result {
         errors.push(error);
     }
+}
+
+#[derive(Clone, Copy)]
+enum PointerEventKind {
+    Press,
+    ClickPress,
+    Release,
+    DragRelease,
+}
+
+fn primary_pointer_event(ui: &Ui, kind: PointerEventKind) -> Option<(Pos2, egui::Modifiers)> {
+    let (position, modifiers) = ui.input(|input| {
+        let mut events = input.events.iter().filter_map(|event| match event {
+            Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers,
+            } => Some((*pressed, *pos, *modifiers)),
+            _ => None,
+        });
+        let event = match kind {
+            PointerEventKind::Press => events.rfind(|(pressed, _, _)| *pressed),
+            PointerEventKind::ClickPress => {
+                // A later press can belong to another widget. Only the press
+                // immediately preceding this click's release belongs to it.
+                events.rfind(|(pressed, _, _)| !*pressed)?;
+                events.next_back().filter(|(pressed, _, _)| *pressed)
+            }
+            PointerEventKind::Release => events.rfind(|(pressed, _, _)| !*pressed),
+            PointerEventKind::DragRelease => {
+                // This drag began in an earlier frame. Its release can precede a
+                // complete click on another widget within the current batch.
+                events.find(|(pressed, _, _)| !*pressed)
+            }
+        }?;
+        Some((event.1, event.2))
+    })?;
+    let position = ui
+        .ctx()
+        .layer_transform_from_global(ui.layer_id())
+        .map_or(position, |transform| transform * position);
+    Some((position, modifiers))
 }
 
 fn finish_composition(editor: &mut Editor, errors: &mut Vec<Error>) -> Option<String> {
@@ -908,21 +1034,27 @@ fn apply_queued_ime(
             .collect()
     });
     let mut applied = Vec::new();
+    let now = ui.input(|input| input.time);
     for (index, event) in queued {
         let revision = editor.document().revision();
-        if handle_event(
-            editor,
-            ui,
-            &event,
-            layouts,
-            &mut cache.interaction.navigation,
-            errors,
-            interrupted,
-            options,
-            &mut None,
-        ) {
+        let composition = composition_before_event(editor, &event);
+        if is_commit_echo(&mut cache.interaction.commit_echo, &event, editor)
+            || handle_event(
+                editor,
+                ui,
+                &event,
+                layouts,
+                &mut cache.interaction.navigation,
+                &mut cache.interaction.commit_echo,
+                errors,
+                interrupted,
+                options,
+                &mut None,
+            )
+        {
             applied.push(index);
         }
+        observe_composition_event(&mut cache.interaction, composition, editor, &event, now);
         if revision != editor.document().revision() {
             *layouts = cache.layout(ui, editor, appearance);
         }
@@ -944,36 +1076,85 @@ impl CommitEcho {
     }
 }
 
+#[allow(deprecated)]
+fn composition_before_event(editor: &Editor, event: &Event) -> Option<Arc<crate::Composition>> {
+    use egui::accesskit::Action;
+
+    let preserve = match event {
+        Event::Ime(ImeEvent::Preedit { text, .. }) => {
+            text.is_empty()
+                && editor
+                    .composition()
+                    .is_some_and(|composition| !composition.text.is_empty())
+        }
+        Event::Key {
+            key: egui::Key::Escape,
+            pressed: true,
+            ..
+        }
+        | Event::Ime(ImeEvent::Disabled) => true,
+        Event::Text(_) | Event::Paste(_) | Event::Cut | Event::Key { pressed: true, .. } => editor
+            .composition()
+            .is_some_and(|composition| composition.text.is_empty()),
+        Event::AccessKitActionRequest(request) => matches!(
+            request.action,
+            Action::SetTextSelection | Action::SetValue | Action::ReplaceSelectedText
+        ),
+        _ => false,
+    };
+    // Surrounding deletion belongs to an IME edit whose following commit is still valid.
+    preserve.then(|| editor.composition_snapshot()).flatten()
+}
+
+fn observe_composition_event(
+    interaction: &mut InteractionState,
+    previous: Option<Arc<crate::Composition>>,
+    editor: &Editor,
+    event: &Event,
+    time: f64,
+) {
+    let empty = editor
+        .composition()
+        .is_some_and(|composition| composition.text.is_empty());
+    if matches!(event, Event::Ime(ImeEvent::Preedit { text, .. }) if text.is_empty()) {
+        if empty && let Some(previous) = previous {
+            interaction.cleared_preedit = Some(previous);
+        }
+    } else if let Some(previous) = previous
+        && editor.composition().is_none()
+    {
+        // Some input methods still send the old preedit while processing an interruption.
+        interaction.remember_composition_end(clean_text(&previous.text, true).into_owned(), time);
+    }
+    if !empty {
+        interaction.cleared_preedit = None;
+    }
+}
+
 fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor) -> bool {
     let Some(pending) = echo else {
         return false;
     };
     match event {
         Event::Ime(ImeEvent::Commit(text))
-            if editor.composition().is_none() && clean_text(text, true) == pending.text =>
+            if !matches!(text.as_str(), "\n" | "\r" | "\r\n")
+                && editor.composition().is_none()
+                && clean_text(text, true) == pending.text =>
         {
             *echo = None;
             true
-        }
-        Event::Ime(ImeEvent::Preedit { text, .. }) if text.is_empty() => false,
-        #[allow(deprecated)]
-        Event::Ime(ImeEvent::Enabled | ImeEvent::Disabled) => false,
-        Event::Ime(_)
-        | Event::Text(_)
-        | Event::Paste(_)
-        | Event::Cut
-        | Event::Key { pressed: true, .. } => {
-            *echo = None;
-            false
         }
         _ => false,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_accessibility_action(
     editor: &mut Editor,
     request: &egui::accesskit::ActionRequest,
     snapshot: Option<&accessibility::Snapshot>,
+    layouts: &ParagraphLayouts,
+    navigation: &mut Option<VerticalNavigation>,
     read_only: bool,
     interrupted: &mut bool,
     errors: &mut Vec<Error>,
@@ -1000,12 +1181,16 @@ fn handle_accessibility_action(
     };
     match (&request.action, &request.data) {
         (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
-            if let (Some(anchor), Some(focus)) = (
+            if let (Some(anchor), Some((focus, prefer_next_row))) = (
                 snapshot.decode(selection.anchor),
-                snapshot.decode(selection.focus),
+                snapshot.decode_focus(selection.focus),
             ) {
                 *interrupted |= editor.cancel_composition();
-                record(editor.set_selection(Selection::new(anchor, focus)), errors);
+                let result = editor.set_selection(Selection::new(anchor, focus));
+                if result.is_ok() {
+                    *navigation = pointer_navigation(editor, layouts, focus, prefer_next_row);
+                }
+                record(result, errors);
             } else {
                 accessibility_errors.push(AccessibilityError::InvalidTextPosition);
             }
@@ -1014,7 +1199,12 @@ fn handle_accessibility_action(
             *interrupted |= editor.cancel_composition();
             editor.break_history_group();
             let result = if request.action == Action::SetValue {
-                editor.replace_range(Position::default()..editor.document().end(), value)
+                let style = editor.document().style_at(Position::default());
+                editor.replace_range_with_style(
+                    Position::default()..editor.document().end(),
+                    value,
+                    style,
+                )
             } else {
                 editor.insert_text(value)
             };

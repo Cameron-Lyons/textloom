@@ -20,6 +20,8 @@ and whole-word options; replace-all is one undo step.
   button applies the last color chosen, initially Yellow and Red, and the arrow
   opens a menu with **No Fill** or **Automatic** and Excel's ten standard colors.
 - **Link** and Ctrl/Command+K open a URL field prefilled with the selected link.
+  AltGr and combinations with Alt or both Control and macOS Command do not
+  trigger the shortcut.
   Applying it links the selection, or edits the link at the caret; with the
   caret outside a link it inserts the URL as linked text. An empty URL removes
   the link, and an invalid URL reports an error. **Remove link** removes the
@@ -44,9 +46,10 @@ Use `--disabled` to start with the document widget disabled, including focus,
 selection, and clipboard interaction. The independent **Enabled** and **Read only**
 checkboxes let you change these modes during an IME session. Formatting,
 undo/redo, replacement, and snapshot restoration controls follow the document's
-editing mode. Toolbar, find, and replace commands first end an active IME
-composition, committing its visible preedit as clicking outside the document
-does; an empty preedit is canceled. Choosing a list type keeps the item's
+editing mode. Toolbar, find, and replace commands wait for the document to process
+queued IME input, then end any remaining composition, committing its visible preedit
+as clicking outside the document does; an empty preedit is canceled. Undo/redo and
+snapshot capture follow the same ordering. Choosing a list type keeps the item's
 nesting level, and choosing the current paragraph type keeps list numbering.
 **Document**, **Find**, and **Replace** labels are associated with their widgets
 for native accessibility.
@@ -56,6 +59,12 @@ It adapts egui-winit 0.36.2's cursor-area output to the composing caret rectangl
 so native candidate windows follow the caret within a multiline document.
 After its text fields process IME input, the host retires those events to avoid
 repeated unchanged cursor-area requests and Fcitx preedit/redraw feedback.
+Moving focus from the document to Link, Find, or Replace suppresses one immediate
+identical commit echoed by the old composition. This also covers deferred keyboard
+focus traversal; fresh input or a new composition in the field ends the guard.
+AccessKit focus changes run in separate egui passes, preserving text before and
+after a handoff between the document and native fields. Longer sequences continue
+on the next repaint if they reach egui's pass limit.
 On Linux, the example workspace includes two upstream AccessKit compatibility
 backports for current AT-SPI activation and the application's desktop parent.
 See [the source and removal notes](vendor/accesskit_unix/BACKPORT.md). These
@@ -80,8 +89,11 @@ Native operations run in helper processes with hard deadlines and bounded
 transfers. Native lengths are checked before allocating Rust payload buffers;
 TLFR is limited to 64 MiB, plus the 32-byte transport envelope. Copy succeeds
 only after reading back the new rich, HTML, and plain representations. Errors
-retain egui's plain copy fallback. A rich paste uses one captured native item,
+retain egui's plain copy fallback. A pipe-worker startup failure also terminates
+and reaps its helper before falling back. A rich paste uses one captured native item,
 validates its fragment and plain alternative, and inserts it in one undo step.
+The item is captured when the paste arrives and retained if focus routing defers
+delivery, so later clipboard changes cannot replace its formatting.
 Unavailable or malformed rich data, mismatched text, empty events, and ambiguous
 multiple paste events retain the original paste event's plain fallback. The
 backend exports HTML for other applications; it does not import arbitrary HTML.

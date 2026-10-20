@@ -216,7 +216,12 @@ impl LayoutCache {
                     || self.paragraphs[old.clone()]
                         .iter()
                         .zip(&source[new.clone()])
-                        .any(|(cache, paragraph)| cache.paragraph.kind() != paragraph.kind());
+                        .any(|(cache, paragraph)| {
+                            !crate::document::same_numbering_effect(
+                                cache.paragraph.kind(),
+                                paragraph.kind(),
+                            )
+                        });
                 if old.len() == new.len() {
                     for ((cache, paragraph), index) in self.paragraphs[old.clone()]
                         .iter_mut()

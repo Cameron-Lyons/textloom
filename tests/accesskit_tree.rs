@@ -680,6 +680,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .set_selection(Selection::caret(Position::new(0, 7)))
         .unwrap();
     editor.set_link(None).unwrap();
+    assert!(matches!(
+        adapter.handle_action(&click, &mut editor),
+        Err(textloom::accessibility::AccessKitError::StaleDocument)
+    ));
     tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
     let node = text_input(&tree, &adapter);
     assert_eq!(link_nodes(node).len(), 1);

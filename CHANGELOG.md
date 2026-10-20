@@ -6,6 +6,80 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- Word selection expands Unicode word boundaries to whole graphemes, so
+  prepend characters joined to emoji or punctuation cannot produce empty selections.
+- Accessibility rejects link clicks from stale document snapshots. Egui full-value
+  replacement uses document-start formatting and restores the prior caret style on undo.
+- The native host processes queued IME input before applying toolbar commands,
+  then commits remaining preedit before Undo, Redo, and snapshot capture.
+- Egui discards pending link presses after document changes and suppresses one
+  repeated IME commit across focus loss and restoration. The native toolbar
+  supports Undo during the first composition and filters control characters
+  when committing preedit.
+- Caret and character-offset queries avoid counting an entire Unicode paragraph
+  when its scalar offset is already known.
+- Winit ignores queued preedit and commit events after composition cancellation
+  until IME synchronization resets the session. Native list-numbering commands
+  resolve their target paragraph after queued IME replacement.
+- Copying a selection without numbered items skips list-context scans through
+  preceding paragraphs.
+- Repeated `is_modified()` queries reuse the content comparison until an edit,
+  undo/redo, or transaction rollback invalidates it.
+- Egui accessibility locates formatting sections with binary search, avoiding
+  quadratic scans when a paragraph contains many formatted runs.
+- Egui suppresses delayed identical IME commits after cancellation, including
+  cleared preedit followed by editing or navigation. Ignored and invalid input
+  preserves that guard; new compositions and input-method surrounding-text
+  replacement still work.
+- Literal search avoids quadratic retries on repetitive queries rejected at
+  grapheme or word boundaries, preserving overlapping valid candidates.
+- Native clipboard verification borrows text when newline conversion is
+  unnecessary and checks identical publications without copying plain text.
+- Native clipboard worker startup failures terminate and reap their helper,
+  preserving plain-text fallback instead of panicking.
+- The native link shortcut leaves AltGr and combined command modifiers available
+  for text input. macOS QA cleanup tolerates processes exiting before a signal.
+- Body/quote and heading-level changes preserve cached list numbers, including
+  undo/redo, and avoid unnecessary scans of subsequent egui list markers.
+- Egui reuses visible painted text between font-atlas changes, avoiding repeated
+  cloning and hashing of long formatting jobs on idle frames.
+- Egui uses pointer-event positions and modifiers when several events arrive in
+  one frame, preserving click anchors and drag endpoints across widgets. A first
+  preedit queued before a click applies to the original selection.
+- The native host suppresses one delayed document IME commit after focus moves
+  to Link, Find, or Replace, including deferred keyboard focus traversal.
+- Winit preserves cleared preedit across IME processing keys and unhandled input,
+  so the following valid commit still replaces its original selection.
+- Empty text and single-paragraph empty fragment insertions at a valid caret
+  avoid rebuilding the paragraph, preserving editing and history behavior.
+- Egui preserves the caret's visual row and preferred column when keys are
+  delegated to the host, editing commands are blocked by read-only mode, or
+  formatting shortcuts change only the pending typing style.
+- Native Find and Replace commands use search options changed in the same
+  input batch.
+- Converting grapheme or scalar index zero returns byte zero without building
+  a Unicode index, including vertical movement into a paragraph at column zero.
+- Egui accessibility selection requests preserve the requested side of a wrapped
+  line boundary. Moving the visual caret restarts its blink even when the text
+  offset stays the same.
+- Caret link queries avoid expanding the entire linked range across formatting
+  runs; link editing still updates the complete range.
+- Native Link and Find fields handle Enter/Escape according to focus changes
+  within the input batch, so keys in another field cannot submit or cancel them.
+- Egui Cut and winit Copy/Cut with no selection preserve an empty preedit,
+  allowing its following IME commit to insert text normally.
+- Editors moved out of transaction callbacks retain usable undo/redo after
+  their transaction scopes end, including nested scopes and error/panic exits.
+- Native QA reporting compares preedit before copying it, avoiding repeated
+  string allocations on unchanged frames.
+- Egui routes AccessKit focus changes in separate UI passes, preserving text
+  before and after each handoff across rich editors and native `TextEdit` fields.
+  `install_input_routing()` enables this from the first pass; widgets install it
+  automatically on first use. Deferred input retains its batch order and window
+  focus. Native rich paste, IME handoff, and QA counts follow the routed passes.
+- Consuming a `Fragment` into a `Document`, including decoding with custom limits,
+  transfers the paragraph array without cloning every shared paragraph reference.
+
 - Internal document/Unicode, history/IME, and egui layout/input/navigation/painting
   responsibilities are separated as a refactor without behavior changes.
   Precise paragraph-change notifications and a persistent layout index make

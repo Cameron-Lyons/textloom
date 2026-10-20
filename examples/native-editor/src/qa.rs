@@ -216,7 +216,6 @@ impl Session {
 
     pub fn begin_frame(&mut self, context: &egui::Context) {
         self.frames += 1;
-        context.input(|input| self.input.observe(&input.raw.events));
         let scale = context.pixels_per_point();
         self.pixels_per_point = Some(scale);
         self.minimum_pixels_per_point = Some(
@@ -228,6 +227,10 @@ impl Session {
                 .map_or(scale, |old| old.max(scale)),
         );
         self.native_pixels_per_point = context.native_pixels_per_point();
+    }
+
+    pub fn observe_input_pass(&mut self, context: &egui::Context) {
+        context.input(|input| self.input.observe(&input.raw.events));
     }
 
     pub fn observe_editor(
@@ -249,11 +252,11 @@ impl Session {
         observe!(revision, revision_changes, editor.document().revision());
         observe!(selection, selection_changes, editor.selection());
         observe!(typing_style, typing_style_changes, editor.typing_style());
-        observe!(
-            composition,
-            composition_changes,
-            editor.composition().cloned()
-        );
+        let composition = editor.composition();
+        if self.composition.as_ref() != composition {
+            self.composition_changes += 1;
+            self.composition = composition.cloned();
+        }
         observe!(enabled, enabled_changes, enabled);
         observe!(read_only, read_only_changes, read_only);
         let focused = focus_state.window_focused && focus_state.widget_focus_retained;
@@ -590,6 +593,13 @@ mod tests {
         };
         session.observe_editor(&editor, focus, true, false);
         session.observe_editor(&editor, focus, true, false);
+        editor.update_composition("にほん", Some(0..3)).unwrap();
+        session.observe_editor(&editor, focus, true, false);
+        session.observe_editor(&editor, focus, true, false);
+        assert_eq!(session.composition_changes, 2);
+        editor.update_composition("にほん", Some(3..6)).unwrap();
+        session.observe_editor(&editor, focus, true, false);
+        session.observe_editor(&editor, focus, true, false);
         editor.cancel_composition();
         session.observe_editor(&editor, FocusState::default(), false, true);
         assert_eq!(session.input.text, 1);
@@ -598,9 +608,71 @@ mod tests {
         assert_eq!(session.input.ime_commit, 1);
         assert_eq!(session.revision_changes, 1);
         assert_eq!(session.selection_changes, 1);
-        assert_eq!(session.composition_changes, 2);
+        assert_eq!(session.composition_changes, 4);
         assert_eq!((session.focus_gains, session.focus_losses), (1, 1));
         assert_eq!((session.enabled_changes, session.read_only_changes), (1, 1));
+    }
+
+    #[test]
+    fn routed_input_passes_are_counted_once_without_inflating_frame_counts() {
+        for max_passes in [1, 2, 8] {
+            let editor = Editor::default();
+            let mut session = unwritten_session(&["--qa-report", "unused.json"], &editor);
+            let context = egui::Context::default();
+            textloom::adapter::egui::install_input_routing(&context);
+            context.enable_accesskit();
+            context.options_mut(|options| {
+                options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+            });
+            let first_id = egui::Id::new("qa-first-field");
+            let second_id = egui::Id::new("qa-second-field");
+            context.memory_mut(|memory| memory.request_focus(first_id));
+            let focus = |id: egui::Id| {
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target_node: id.accesskit_id(),
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                })
+            };
+            let mut events = vec![
+                egui::Event::Text("before".into()),
+                focus(second_id),
+                egui::Event::Paste("after".into()),
+                focus(first_id),
+                egui::Event::Text("!".into()),
+                egui::Event::WindowFocused(true),
+            ];
+            let mut last_frame = None;
+            let (mut first, mut second) = (String::new(), String::new());
+            for _ in 0..6 {
+                let output = context.run_ui(
+                    egui::RawInput {
+                        focused: true,
+                        events: std::mem::take(&mut events),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let frame = ui.ctx().cumulative_frame_nr();
+                        if last_frame != Some(frame) {
+                            last_frame = Some(frame);
+                            session.begin_frame(ui.ctx());
+                        }
+                        session.observe_input_pass(ui.ctx());
+                        ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+                        ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+                    },
+                );
+                output.drop_without_applying_deltas();
+            }
+            assert_eq!(session.frames, 6);
+            assert_eq!(session.input.text, 2);
+            assert_eq!(session.input.paste, 1);
+            assert_eq!(session.input.accessibility_action, 2);
+            assert_eq!(session.input.window_focus_gained, 1);
+            assert_eq!(first, "before!");
+            assert_eq!(second, "after");
+        }
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::document::Delta;
@@ -72,9 +75,10 @@ fn extends(previous: &Delta, delta: &Delta) -> bool {
 struct Transaction {
     token: u64,
     depth: usize,
+    scope: Weak<()>,
     deltas: Vec<Delta>,
     before: EditState,
-    marks: Vec<usize>,
+    marks: Vec<(usize, Weak<()>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,7 +87,7 @@ pub(super) struct TransactionLevel {
     depth: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(super) struct History {
     undo: VecDeque<HistoryEntry>,
     redo: VecDeque<HistoryEntry>,
@@ -91,9 +95,89 @@ pub(super) struct History {
     limits: HistoryLimits,
     group: Group,
     transaction: Option<Transaction>,
+    // Immutable queries can seal an editor moved out of its transaction closure.
+    // Its next mutation adopts this snapshot before changing the editor state.
+    detached: OnceLock<Box<History>>,
+}
+
+impl Clone for History {
+    fn clone(&self) -> Self {
+        if let Some(history) = self.detached.get() {
+            return history.as_ref().clone();
+        }
+        Self {
+            undo: self.undo.clone(),
+            redo: self.redo.clone(),
+            bytes: self.bytes,
+            limits: self.limits,
+            group: self.group,
+            transaction: self.transaction.clone(),
+            detached: OnceLock::new(),
+        }
+    }
 }
 
 impl History {
+    fn is_detached(&self) -> bool {
+        self.transaction.as_ref().is_some_and(|transaction| {
+            // A moved editor may have a live nested guard on another thread
+            // after its original outer guard has ended.
+            transaction.scope.strong_count() == 0
+                && transaction
+                    .marks
+                    .iter()
+                    .all(|(_, scope)| scope.strong_count() == 0)
+        })
+    }
+
+    #[inline]
+    pub(super) fn resolved(&self, after: EditState) -> &Self {
+        if self.transaction.is_none() {
+            self
+        } else {
+            self.resolve_transaction(after)
+        }
+    }
+
+    fn resolve_transaction(&self, after: EditState) -> &Self {
+        if !self.is_detached() {
+            return self;
+        }
+        self.detached.get_or_init(|| {
+            let mut history = self.clone();
+            history.close_transactions(after);
+            Box::new(history)
+        })
+    }
+
+    #[inline]
+    pub(super) fn normalize(&mut self, after: EditState) {
+        if self.transaction.is_some() {
+            self.normalize_transaction(after);
+        }
+    }
+
+    fn normalize_transaction(&mut self, after: EditState) {
+        if self.is_detached() {
+            if let Some(history) = self.detached.take() {
+                *self = *history;
+            } else {
+                self.close_transactions(after);
+            }
+        } else if let Some(transaction) = &mut self.transaction {
+            // A nested guard may have finished after its editor was moved out.
+            // Its edits join the still-active outer transaction.
+            while transaction
+                .marks
+                .last()
+                .is_some_and(|(_, scope)| scope.strong_count() == 0)
+            {
+                transaction.marks.pop();
+                transaction.depth -= 1;
+            }
+        }
+    }
+
     pub(super) fn limits(&self) -> HistoryLimits {
         self.limits
     }
@@ -164,8 +248,9 @@ impl History {
         after: EditState,
         group: Group,
     ) {
+        self.normalize(before);
         if let Some(transaction) = &mut self.transaction {
-            let floor = transaction.marks.last().copied().unwrap_or(0);
+            let floor = transaction.marks.last().map_or(0, |(mark, _)| *mark);
             let pending = transaction.deltas.len();
             match transaction.deltas.last_mut() {
                 Some(previous) if pending > floor && extends(previous, &delta) => {
@@ -202,26 +287,34 @@ impl History {
         self.enforce_limits();
     }
 
-    pub(super) fn begin_transaction(&mut self, before: EditState) -> TransactionLevel {
+    pub(super) fn begin_transaction(&mut self, before: EditState) -> (TransactionLevel, Arc<()>) {
+        self.normalize(before);
         static TOKENS: AtomicU64 = AtomicU64::new(0);
         self.break_group();
+        let scope = Arc::new(());
         if let Some(transaction) = &mut self.transaction {
-            transaction.marks.push(transaction.deltas.len());
+            transaction
+                .marks
+                .push((transaction.deltas.len(), Arc::downgrade(&scope)));
             transaction.depth += 1;
-            TransactionLevel {
-                token: transaction.token,
-                depth: transaction.depth,
-            }
+            (
+                TransactionLevel {
+                    token: transaction.token,
+                    depth: transaction.depth,
+                },
+                scope,
+            )
         } else {
             let token = TOKENS.fetch_add(1, Ordering::Relaxed);
             self.transaction = Some(Transaction {
                 token,
                 depth: 1,
+                scope: Arc::downgrade(&scope),
                 deltas: Vec::new(),
                 before,
                 marks: Vec::new(),
             });
-            TransactionLevel { token, depth: 1 }
+            (TransactionLevel { token, depth: 1 }, scope)
         }
     }
 
@@ -271,7 +364,7 @@ impl History {
         let mark = transaction
             .marks
             .pop()
-            .unwrap_or(0)
+            .map_or(0, |(mark, _)| mark)
             .min(transaction.deltas.len());
         for delta in transaction.deltas.drain(mark..).rev() {
             document.replay(&delta, false);

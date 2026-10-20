@@ -726,6 +726,9 @@ mod accesskit_bridge {
                             .find(|link| link.id == request.target_node)
                     })
                     .flatten();
+                if link.is_some() {
+                    self.validate_document(editor)?;
+                }
                 return Ok(AccessibilityOutcome {
                     handled: link.is_some(),
                     activated_link: link.map(|link| link.link.clone()),

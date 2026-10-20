@@ -20,6 +20,7 @@ impl Editor {
         self.composition.clone()
     }
     pub fn begin_composition(&mut self) {
+        self.normalize_history();
         if self.composition.is_none() {
             self.composition = Some(Arc::new(Composition {
                 text: String::new(),
@@ -67,6 +68,7 @@ impl Editor {
     }
 
     pub fn commit_composition(&mut self, text: &str) -> Result<(), Error> {
+        self.normalize_history();
         if let Some(composition) = self.composition.take() {
             self.selection = composition.replacement;
         }
@@ -74,6 +76,7 @@ impl Editor {
     }
 
     pub fn cancel_composition(&mut self) -> bool {
+        self.normalize_history();
         if let Some(composition) = self.composition.take() {
             self.selection = composition.replacement;
             self.break_history_group();
@@ -83,7 +86,8 @@ impl Editor {
         }
     }
 
-    pub(super) fn ensure_no_composition(&self) -> Result<(), Error> {
+    pub(super) fn ensure_no_composition(&mut self) -> Result<(), Error> {
+        self.normalize_history();
         if self.composition.is_some() {
             Err(Error::CompositionActive)
         } else {

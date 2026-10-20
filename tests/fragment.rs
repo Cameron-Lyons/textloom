@@ -285,6 +285,78 @@ fn rich_paste_normalizes_combining_joins_and_snaps_caret_to_grapheme_end() {
 }
 
 #[test]
+fn empty_single_paragraph_paste_preserves_blocks_and_restores_document_typing_style() {
+    let kinds = [
+        ParagraphKind::Body,
+        ParagraphKind::Quote,
+        ParagraphKind::Heading { level: 2 },
+        ParagraphKind::Bullet { indent: 1 },
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: Some(7),
+        },
+    ];
+    for destination in kinds {
+        for source in kinds {
+            let fragment = Fragment::from_document(&Document::from_paragraphs([Paragraph::new(
+                "",
+                Vec::new(),
+                source,
+            )
+            .unwrap()]));
+            for text in ["", "e\u{301}x"] {
+                let mut editor = Editor::from_text(text);
+                editor.set_paragraph_kind(destination).unwrap();
+                editor.clear_history();
+                for byte in [0, text.len()] {
+                    let position = Position::new(0, byte);
+                    editor.set_selection(Selection::caret(position)).unwrap();
+                    editor
+                        .apply_style(StylePatch {
+                            bold: Some(true),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    editor.mark_saved();
+                    let before = editor.document().clone();
+                    editor.insert_fragment(&fragment).unwrap();
+                    assert_eq!(editor.document(), &before);
+                    assert_eq!(editor.selection(), Selection::caret(position));
+                    assert_eq!(editor.typing_style(), before.style_at(position));
+                    assert_eq!(editor.document().paragraph(0).unwrap().kind(), destination);
+                    assert_eq!(editor.undo_len(), 0);
+                    assert!(!editor.is_modified());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_fragments_still_delete_selections_and_multiline_fragments_insert_breaks() {
+    let mut editor = Editor::from_text("e\u{301}x");
+    let selection = Selection::new(Position::new(0, 0), Position::new(0, 3));
+    editor.set_selection(selection).unwrap();
+    editor.insert_fragment(&Fragment::from_text("")).unwrap();
+    assert_eq!(editor.document().plain_text(), "x");
+    assert_eq!(editor.selection(), Selection::caret(Position::default()));
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "e\u{301}x");
+    assert_eq!(editor.selection(), selection);
+
+    editor
+        .set_selection(Selection::caret(Position::new(0, 3)))
+        .unwrap();
+    editor
+        .insert_fragment(&Fragment::from_text("\n\n"))
+        .unwrap();
+    assert_eq!(editor.document().plain_text(), "e\u{301}\n\nx");
+    assert_eq!(editor.selection(), Selection::caret(Position::new(2, 0)));
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "e\u{301}x");
+}
+
+#[test]
 fn rich_paste_joining_an_existing_combining_suffix_uses_inserted_base_style() {
     let mut source = Editor::from_text("a");
     source.select_all();

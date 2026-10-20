@@ -563,6 +563,18 @@ impl Snapshot {
         None
     }
 
+    pub(super) fn decode_focus(
+        &self,
+        position: accesskit::TextPosition,
+    ) -> Option<(Position, bool)> {
+        let decoded = self.decode(position)?;
+        // Equivalent run boundaries use the usual downstream caret, except
+        // when the request explicitly names the end of a soft-wrapped row.
+        let prefer_next_row = self.position(decoded) == Some(position)
+            || self.focus_position(decoded, false) != Some(position);
+        Some((decoded, prefer_next_row))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn publish(
         &self,
@@ -923,12 +935,13 @@ fn publish_style(
     if style.code {
         node.set_font_family("monospace");
     }
-    let format = galley
-        .job
-        .sections
-        .iter()
-        .find(|section| section.byte_range.contains(&egui::text::ByteIndex(byte)))
-        .or_else(|| galley.job.sections.last())
+    let byte = egui::text::ByteIndex(byte);
+    let sections = &galley.job.sections;
+    let index = sections.partition_point(|section| section.byte_range.end <= byte);
+    let format = sections
+        .get(index)
+        .filter(|section| section.byte_range.contains(&byte))
+        .or_else(|| sections.last())
         .map(|section| &section.format);
     let rgba = format.map_or([0, 0, 0, 255], |format| {
         format.color.to_srgba_unmultiplied()
@@ -2283,6 +2296,13 @@ mod tests {
             snapshot.position(after).unwrap().node,
             runs[1].id.accesskit_id()
         );
+        assert_eq!(
+            snapshot.decode_focus(accesskit::TextPosition {
+                node: runs[0].id.accesskit_id(),
+                character_index: 2,
+            }),
+            Some((after, true))
+        );
         for prefer_next_row in [false, true] {
             assert_eq!(
                 snapshot.focus_position(after, prefer_next_row),
@@ -2444,6 +2464,8 @@ mod tests {
         assert_eq!(snapshot.focus_position(seam, true), Some(lower));
         assert_eq!(snapshot.focus_position(seam, false), Some(upper));
         assert_eq!(snapshot.decode(upper), Some(seam));
+        assert_eq!(snapshot.decode_focus(upper), Some((seam, false)));
+        assert_eq!(snapshot.decode_focus(lower), Some((seam, true)));
         for position in [Position::new(0, 1), Position::new(0, text.len())] {
             assert_eq!(
                 snapshot.focus_position(position, false),
@@ -2709,6 +2731,60 @@ mod tests {
                 (15..19, Some(color(fill))),
             ]
         );
+    }
+
+    #[test]
+    fn formatted_runs_keep_their_colors_and_fonts_across_wraps_and_soft_breaks() {
+        let colors = [
+            Some(crate::Color([255, 0, 0, 255])),
+            None,
+            Some(crate::Color([0, 0, 255, 255])),
+        ];
+        let text = "e\u{301}猫\u{2028}".repeat(64);
+        let spans = text
+            .grapheme_indices(true)
+            .enumerate()
+            .map(|(index, (byte, grapheme))| Span {
+                range: byte..byte + grapheme.len(),
+                style: InlineStyle {
+                    foreground: colors[index % colors.len()],
+                    code: index % 2 == 0,
+                    ..Default::default()
+                },
+                link: None,
+            })
+            .collect();
+        let paragraph = Paragraph::new(&text, spans, ParagraphKind::Heading { level: 2 }).unwrap();
+        let editor = Editor::new(crate::Document::from_paragraphs([paragraph]));
+        for width in [8.0, 500.0] {
+            let (_, snapshot) = snapshot_for(&editor, width);
+            let paragraph = &snapshot.paragraphs[0];
+            assert!(paragraph.runs.last().unwrap().range.is_empty());
+            for run in paragraph.runs.iter() {
+                let style = paragraph
+                    .source
+                    .spans()
+                    .iter()
+                    .find(|span| span.range.contains(&run.range.start))
+                    .unwrap_or_else(|| paragraph.source.spans().last().unwrap())
+                    .style;
+                let crate::Color([red, green, blue, alpha]) =
+                    style.foreground.unwrap_or(crate::Color([255; 4]));
+                assert_eq!(
+                    run.node.foreground_color(),
+                    Some(accesskit::Color {
+                        red,
+                        green,
+                        blue,
+                        alpha,
+                    }),
+                    "width {width}, range {:?}",
+                    run.range,
+                );
+                assert_eq!(run.node.font_size(), Some(24.0));
+                assert_eq!(run.node.font_family(), style.code.then_some("monospace"));
+            }
+        }
     }
 
     #[test]

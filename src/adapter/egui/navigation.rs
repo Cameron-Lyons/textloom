@@ -147,7 +147,7 @@ pub(super) fn document_caret_rect(
         .map_or(0, |paragraph| {
             paragraph
                 .scalar_index(position.byte)
-                .unwrap_or(paragraph.scalar_count())
+                .unwrap_or_else(|| paragraph.scalar_count())
         });
     layout
         .galley

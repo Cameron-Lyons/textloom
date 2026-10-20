@@ -12,6 +12,7 @@ use textloom::{
 };
 
 mod clipboard;
+mod ime_handoff;
 mod qa;
 
 struct NativeEditor {
@@ -37,6 +38,30 @@ struct NativeEditor {
     font_color: Color,
     link_url: Option<String>,
     focus_link_field: bool,
+    commands: Vec<EditorCommand>,
+    text_field_ids: [Option<egui::Id>; 3],
+    cleared_document_preedit: Option<String>,
+    ime_handoff: Option<ime_handoff::Guard>,
+}
+
+enum EditorCommand {
+    Style(StylePatch),
+    ClearFormatting,
+    RemoveLink,
+    Undo,
+    Redo,
+    ParagraphKind(ParagraphKind),
+    Indent,
+    Outdent,
+    ItemKind(ParagraphKind),
+    CaptureSnapshot,
+    RestoreSnapshot,
+    ApplyLink(String),
+    Find {
+        previous: bool,
+        options: SearchOptions,
+    },
+    ReplaceAll(SearchOptions),
 }
 
 impl NativeEditor {
@@ -86,6 +111,10 @@ impl NativeEditor {
             font_color: Color::RED,
             link_url: None,
             focus_link_field: false,
+            commands: Vec::new(),
+            text_field_ids: [None; 3],
+            cleared_document_preedit: None,
+            ime_handoff: None,
         }
     }
 
@@ -104,19 +133,139 @@ impl NativeEditor {
     }
 
     fn finish_composition(&mut self, ui: &egui::Ui) {
-        let Some(text) = self
+        let Some(mut text) = self
             .editor
             .composition()
             .map(|composition| composition.text.clone())
         else {
             return;
         };
+        text.retain(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'));
         if text.is_empty() || self.read_only || !self.enabled {
             self.editor.cancel_composition();
         } else if let Err(error) = self.editor.commit_composition(&text) {
             self.command_error(error);
         }
         ui.memory_mut(|memory| memory.interrupt_ime());
+    }
+
+    fn apply_commands(&mut self, ui: &egui::Ui) {
+        for command in std::mem::take(&mut self.commands) {
+            self.apply_command(ui, command);
+        }
+    }
+
+    fn apply_command(&mut self, ui: &egui::Ui, command: EditorCommand) {
+        if (!self.enabled && !matches!(command, EditorCommand::CaptureSnapshot))
+            || (self.read_only
+                && !matches!(
+                    command,
+                    EditorCommand::CaptureSnapshot | EditorCommand::Find { .. }
+                ))
+        {
+            return;
+        }
+        self.finish_composition(ui);
+        match command {
+            EditorCommand::Style(patch) => {
+                let result = self.editor.apply_style(patch);
+                self.result(result);
+            }
+            EditorCommand::ClearFormatting => {
+                let result = self.editor.clear_formatting();
+                self.result(result);
+            }
+            EditorCommand::RemoveLink => {
+                self.link_url = None;
+                let result = link_selection(&mut self.editor, None);
+                self.result(result);
+            }
+            EditorCommand::Undo => {
+                self.editor.undo();
+                self.focus_editor = true;
+            }
+            EditorCommand::Redo => {
+                self.editor.redo();
+                self.focus_editor = true;
+            }
+            EditorCommand::ParagraphKind(kind) => {
+                if let ParagraphKind::Ordered { indent, .. } = kind {
+                    let result = self.editor.apply_numbered_list(indent);
+                    self.result(result);
+                } else {
+                    let selected = self.editor.selected_paragraphs();
+                    if let Some(kind) = chosen_kind(self.editor.document(), selected, kind) {
+                        let result = self.editor.set_paragraph_kind(kind);
+                        self.result(result);
+                    }
+                }
+            }
+            EditorCommand::Indent => {
+                let result = self.editor.indent_list();
+                self.result(result);
+            }
+            EditorCommand::Outdent => {
+                let result = self.editor.outdent_list();
+                self.result(result);
+            }
+            EditorCommand::ItemKind(kind) => {
+                let index = kind_paragraph(self.editor.selection());
+                let result = set_item_kind(&mut self.editor, index, kind);
+                self.result(result);
+            }
+            EditorCommand::CaptureSnapshot => {
+                let bytes = self.editor.document().to_bytes();
+                self.status = format!("Captured {} bytes in memory", bytes.len());
+                self.snapshot = Some(bytes);
+            }
+            EditorCommand::RestoreSnapshot => {
+                let Some(bytes) = &self.snapshot else {
+                    return;
+                };
+                match textloom::Document::from_bytes(bytes) {
+                    Ok(document) => {
+                        self.editor = Editor::new(document);
+                        if let Some(qa) = &mut self.qa {
+                            qa.snapshot_restored();
+                        }
+                        self.status = "Snapshot restored; editing history cleared".into();
+                        self.focus_editor = true;
+                    }
+                    Err(error) => self.command_error(error),
+                }
+            }
+            EditorCommand::ApplyLink(url) => match apply_link(&mut self.editor, &url) {
+                Ok(()) => {
+                    self.link_url = None;
+                    self.focus_editor = true;
+                }
+                Err(error) => self.command_error(error),
+            },
+            EditorCommand::Find { previous, options } => {
+                let found = if previous {
+                    self.editor.find_previous(&self.query, options, true)
+                } else {
+                    self.editor.find_next(&self.query, options, true)
+                };
+                match found {
+                    Ok(true) => self.status = "Match selected".into(),
+                    Ok(false) => self.status = "No matches".into(),
+                    Err(error) => self.command_error(error),
+                }
+                self.focus_editor = true;
+            }
+            EditorCommand::ReplaceAll(options) => {
+                match self
+                    .editor
+                    .replace_all(&self.query, &self.replacement, options)
+                {
+                    Ok(count) => self.status = format!("Replaced {count} matches"),
+                    Err(error) => self.command_error(error),
+                }
+                self.focus_editor = true;
+            }
+        }
+        ui.ctx().request_repaint();
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -174,9 +323,7 @@ impl NativeEditor {
                         response
                     };
                     if response.clicked() {
-                        self.finish_composition(ui);
-                        let result = self.editor.apply_style(patch);
-                        self.result(result);
+                        self.commands.push(EditorCommand::Style(patch));
                     }
                 }
                 let mut colored = None;
@@ -190,14 +337,10 @@ impl NativeEditor {
                     }
                 }
                 if let Some(patch) = colored {
-                    self.finish_composition(ui);
-                    let result = self.editor.apply_style(patch);
-                    self.result(result);
+                    self.commands.push(EditorCommand::Style(patch));
                 }
                 if ui.button("Clear formatting").clicked() {
-                    self.finish_composition(ui);
-                    let result = self.editor.clear_formatting();
-                    self.result(result);
+                    self.commands.push(EditorCommand::ClearFormatting);
                 }
                 let link = self.editor.selected_link();
                 let hint = link.as_ref().map_or_else(
@@ -215,22 +358,24 @@ impl NativeEditor {
                     .add_enabled(link.is_some(), egui::Button::new("Remove link"))
                     .clicked()
                 {
-                    self.finish_composition(ui);
-                    self.link_url = None;
-                    let result = link_selection(&mut self.editor, None);
-                    self.result(result);
+                    self.commands.push(EditorCommand::RemoveLink);
                 }
             });
             ui.separator();
             if ui
                 .add_enabled(
-                    self.enabled && !self.read_only && self.editor.can_undo(),
+                    self.enabled
+                        && !self.read_only
+                        && (self.editor.can_undo()
+                            || self
+                                .editor
+                                .composition()
+                                .is_some_and(|composition| !composition.text.is_empty())),
                     egui::Button::new("Undo"),
                 )
                 .clicked()
             {
-                self.editor.undo();
-                self.focus_editor = true;
+                self.commands.push(EditorCommand::Undo);
             }
             if ui
                 .add_enabled(
@@ -239,8 +384,7 @@ impl NativeEditor {
                 )
                 .clicked()
             {
-                self.editor.redo();
-                self.focus_editor = true;
+                self.commands.push(EditorCommand::Redo);
             }
             if ui.checkbox(&mut self.read_only, "Read only").changed() {
                 self.focus_editor = self.enabled;
@@ -282,27 +426,13 @@ impl NativeEditor {
                         }
                     });
                 if let Some(kind) = chosen {
-                    self.finish_composition(ui);
-                    if let ParagraphKind::Ordered { indent, .. } = kind {
-                        let result = self.editor.apply_numbered_list(indent);
-                        self.result(result);
-                    } else {
-                        let selected = self.editor.selected_paragraphs();
-                        if let Some(kind) = chosen_kind(self.editor.document(), selected, kind) {
-                            let result = self.editor.set_paragraph_kind(kind);
-                            self.result(result);
-                        }
-                    }
+                    self.commands.push(EditorCommand::ParagraphKind(kind));
                 }
                 if ui.button("Indent").clicked() {
-                    self.finish_composition(ui);
-                    let result = self.editor.indent_list();
-                    self.result(result);
+                    self.commands.push(EditorCommand::Indent);
                 }
                 if ui.button("Outdent").clicked() {
-                    self.finish_composition(ui);
-                    let result = self.editor.outdent_list();
-                    self.result(result);
+                    self.commands.push(EditorCommand::Outdent);
                 }
                 let focused = kind_paragraph(self.editor.selection());
                 let document = self.editor.document();
@@ -325,18 +455,14 @@ impl NativeEditor {
                         restart = Some(None);
                     }
                     if let Some(start) = restart {
-                        self.finish_composition(ui);
                         let kind = ParagraphKind::Ordered { indent, start };
-                        let result = set_item_kind(&mut self.editor, focused, kind);
-                        self.result(result);
+                        self.commands.push(EditorCommand::ItemKind(kind));
                     }
                 }
             });
             ui.separator();
             if ui.button("Capture snapshot").clicked() {
-                let bytes = self.editor.document().to_bytes();
-                self.status = format!("Captured {} bytes in memory", bytes.len());
-                self.snapshot = Some(bytes);
+                self.commands.push(EditorCommand::CaptureSnapshot);
             }
             if ui
                 .add_enabled(
@@ -345,18 +471,7 @@ impl NativeEditor {
                 )
                 .clicked()
             {
-                self.finish_composition(ui);
-                match textloom::Document::from_bytes(self.snapshot.as_ref().unwrap()) {
-                    Ok(document) => {
-                        self.editor = Editor::new(document);
-                        if let Some(qa) = &mut self.qa {
-                            qa.snapshot_restored();
-                        }
-                        self.status = "Snapshot restored; editing history cleared".into();
-                        self.focus_editor = true;
-                    }
-                    Err(error) => self.command_error(error),
-                }
+                self.commands.push(EditorCommand::RestoreSnapshot);
             }
         });
     }
@@ -372,12 +487,14 @@ impl NativeEditor {
     }
 
     fn link_field(&mut self, ui: &mut egui::Ui) {
+        self.text_field_ids[0] = None;
         let Some(mut url) = self.link_url.take() else {
             return;
         };
         let (mut apply, mut cancel) = (false, false);
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Link URL");
+            let field_focus = ui.memory(|memory| memory.focused());
             let response = ui
                 .add(
                     egui::TextEdit::singleline(&mut url)
@@ -385,13 +502,12 @@ impl NativeEditor {
                         .desired_width(320.0),
                 )
                 .labelled_by(label.id);
+            self.text_field_ids[0] = Some(response.id);
             if std::mem::take(&mut self.focus_link_field) {
                 response.request_focus();
             }
-            if response.lost_focus() {
-                apply |= ui.input(|input| input.key_pressed(egui::Key::Enter));
-                cancel |= ui.input(|input| input.key_pressed(egui::Key::Escape));
-            }
+            apply |= field_finished_with_key(ui, &response, field_focus, egui::Key::Enter);
+            cancel |= field_finished_with_key(ui, &response, field_focus, egui::Key::Escape);
             apply |= ui.button("Apply link").clicked();
             cancel |= ui.button("Cancel").clicked();
         });
@@ -400,14 +516,7 @@ impl NativeEditor {
             return;
         }
         if apply {
-            self.finish_composition(ui);
-            match apply_link(&mut self.editor, &url) {
-                Ok(()) => {
-                    self.focus_editor = true;
-                    return;
-                }
-                Err(error) => self.command_error(error),
-            }
+            self.commands.push(EditorCommand::ApplyLink(url.clone()));
         }
         self.link_url = Some(url);
     }
@@ -422,51 +531,53 @@ impl NativeEditor {
     }
 
     fn search(&mut self, ui: &mut egui::Ui) {
+        let (next, previous) = ui
+            .horizontal_wrapped(|ui| {
+                let label = ui.label("Find");
+                let field_focus = ui.memory(|memory| memory.focused());
+                let query_response = ui
+                    .add(egui::TextEdit::singleline(&mut self.query).desired_width(180.0))
+                    .labelled_by(label.id);
+                self.text_field_ids[1] = Some(query_response.id);
+                let next = ui
+                    .add_enabled(
+                        self.enabled && !self.query.is_empty(),
+                        egui::Button::new("Next"),
+                    )
+                    .clicked()
+                    || self.enabled
+                        && field_finished_with_key(
+                            ui,
+                            &query_response,
+                            field_focus,
+                            egui::Key::Enter,
+                        );
+                let previous = ui
+                    .add_enabled(
+                        self.enabled && !self.query.is_empty(),
+                        egui::Button::new("Previous"),
+                    )
+                    .clicked();
+                ui.checkbox(&mut self.case_sensitive, "Match case");
+                ui.checkbox(&mut self.whole_word, "Whole words");
+                (next, previous)
+            })
+            .inner;
         let options = SearchOptions {
             case_sensitive: self.case_sensitive,
             whole_word: self.whole_word,
         };
-        ui.horizontal_wrapped(|ui| {
-            let label = ui.label("Find");
-            let query_response = ui
-                .add(egui::TextEdit::singleline(&mut self.query).desired_width(180.0))
-                .labelled_by(label.id);
-            let next = ui
-                .add_enabled(
-                    self.enabled && !self.query.is_empty(),
-                    egui::Button::new("Next"),
-                )
-                .clicked()
-                || self.enabled
-                    && query_response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            let previous = ui
-                .add_enabled(
-                    self.enabled && !self.query.is_empty(),
-                    egui::Button::new("Previous"),
-                )
-                .clicked();
-            if next || previous {
-                self.finish_composition(ui);
-                let found = if previous {
-                    self.editor.find_previous(&self.query, options, true)
-                } else {
-                    self.editor.find_next(&self.query, options, true)
-                };
-                match found {
-                    Ok(true) => self.status = "Match selected".into(),
-                    Ok(false) => self.status = "No matches".into(),
-                    Err(error) => self.command_error(error),
-                }
-                self.focus_editor = true;
-            }
-            ui.checkbox(&mut self.case_sensitive, "Match case");
-            ui.checkbox(&mut self.whole_word, "Whole words");
-        });
+        if next || previous {
+            self.commands
+                .push(EditorCommand::Find { previous, options });
+        }
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Replace");
-            ui.add(egui::TextEdit::singleline(&mut self.replacement).desired_width(180.0))
-                .labelled_by(label.id);
+            self.text_field_ids[2] = Some(
+                ui.add(egui::TextEdit::singleline(&mut self.replacement).desired_width(180.0))
+                    .labelled_by(label.id)
+                    .id,
+            );
             if ui
                 .add_enabled(
                     self.enabled && !self.read_only && !self.query.is_empty(),
@@ -474,18 +585,63 @@ impl NativeEditor {
                 )
                 .clicked()
             {
-                self.finish_composition(ui);
-                match self
-                    .editor
-                    .replace_all(&self.query, &self.replacement, options)
-                {
-                    Ok(count) => self.status = format!("Replaced {count} matches"),
-                    Err(error) => self.command_error(error),
-                }
-                self.focus_editor = true;
+                self.commands.push(EditorCommand::ReplaceAll(options));
             }
         });
     }
+}
+
+fn field_finished_with_key(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    initial_focus: Option<egui::Id>,
+    requested: egui::Key,
+) -> bool {
+    // Escape can clear focus before the UI runs. Enter is handled by the
+    // field itself; a stale lost_focus response cannot establish its owner.
+    let mut owned = initial_focus == Some(response.id)
+        || (requested == egui::Key::Escape
+            && initial_focus.is_none()
+            && ui.memory(|memory| memory.had_focus_last_frame(response.id)));
+    ui.input(|input| {
+        for event in &input.events {
+            match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } => owned = response.rect.contains(*pos),
+                egui::Event::AccessKitActionRequest(request)
+                    if request.action == egui::accesskit::Action::Focus
+                        && request.target_tree == egui::accesskit::TreeId::ROOT
+                        && request.data.is_none() =>
+                {
+                    owned = request.target_node == response.id.accesskit_id();
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    if (*key == egui::Key::Enter
+                        && modifiers.matches_logically(egui::Modifiers::NONE))
+                        || (*key == egui::Key::Escape && !modifiers.any())
+                    {
+                        if owned {
+                            return *key == requested;
+                        }
+                    } else if *key == egui::Key::Tab && (!modifiers.any() || modifiers.shift_only())
+                    {
+                        owned = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -712,22 +868,12 @@ fn kind_name(kind: ParagraphKind) -> String {
 }
 
 impl eframe::App for NativeEditor {
-    fn raw_input_hook(&mut self, context: &egui::Context, input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, _context: &egui::Context, input: &mut egui::RawInput) {
         if let Some(clipboard) = &mut self.clipboard {
-            clipboard.clear_staged_paste();
-            if self.enabled
-                && !self.read_only
-                && input.focused
-                && self
-                    .document_id
-                    .is_some_and(|id| context.memory(|memory| memory.has_focus(id)))
-                && self
-                    .editor
-                    .composition()
-                    .is_none_or(|composition| composition.text.is_empty())
-            {
-                clipboard.stage_paste(input);
-            }
+            // An earlier queued Focus can change the eventual owner. Snapshot
+            // eligible pastes now, before the clipboard can change again.
+            let capture_native = self.enabled && !self.read_only && input.focused;
+            clipboard.capture_pastes(input, capture_native);
         }
     }
 
@@ -739,6 +885,52 @@ impl eframe::App for NativeEditor {
             if let Some(qa) = &mut self.qa {
                 qa.begin_frame(ui.ctx());
             }
+        }
+        if let Some(qa) = &mut self.qa {
+            qa.observe_input_pass(ui.ctx());
+        }
+        let focused = ui.memory(|memory| memory.focused());
+        let document_was_focused = focused.is_some() && focused == self.document_id;
+        // Backward keyboard focus traversal takes effect at the start of a frame.
+        // The destination then owns fresh IME input before any widgets are rendered.
+        let field_owned_ime = focused.is_some_and(|id| self.text_field_ids.contains(&Some(id)))
+            && self
+                .document_id
+                .is_some_and(|id| ui.memory(|memory| memory.had_focus_last_frame(id)));
+        if field_owned_ime
+            && let Some(candidate) = ime_handoff::candidate(
+                self.editor.composition(),
+                self.cleared_document_preedit.as_deref(),
+                &[],
+                false,
+            )
+        {
+            self.ime_handoff = Some(ime_handoff::Guard::new(
+                focused.unwrap(),
+                candidate,
+                ui.input(|input| input.time),
+            ));
+        }
+        if let Some(guard) = &self.ime_handoff {
+            let selected = focused
+                .and_then(|id| egui::text_edit::TextEditState::load(ui.ctx(), id))
+                .is_some_and(|state| !state.cursor.is_empty());
+            if !ui.input_mut(|input| guard.filter(input, focused, selected)) {
+                self.ime_handoff = None;
+            }
+        }
+        if let Some(clipboard) = &mut self.clipboard {
+            let document_owns_input = self.enabled
+                && !self.read_only
+                && ui.input(|input| input.focused)
+                && document_was_focused
+                && self
+                    .editor
+                    .composition()
+                    .is_none_or(|composition| composition.text.is_empty());
+            // Snapshot capture happens before routing. Advance every delivered
+            // Paste slot so native-field input cannot shift the document's queue.
+            ui.input(|input| clipboard.stage_paste(&input.events, document_owns_input));
         }
         if self.clipboard_self_test {
             self.clipboard_self_test = false;
@@ -762,10 +954,23 @@ impl eframe::App for NativeEditor {
         if self.enabled
             && !self.read_only
             && ui.input_mut(|input| {
-                input.consume_shortcut(&egui::KeyboardShortcut::new(
-                    egui::Modifiers::COMMAND,
-                    egui::Key::K,
-                ))
+                let mut requested = false;
+                input.events.retain(|event| {
+                    let matches = matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::K,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.command
+                            && !modifiers.alt
+                            && !(modifiers.mac_cmd && modifiers.ctrl)
+                    );
+                    requested |= matches;
+                    !matches
+                });
+                requested
             })
         {
             self.open_link_field();
@@ -791,6 +996,43 @@ impl eframe::App for NativeEditor {
                 }
             });
             let document_label = ui.label("Document");
+            if field_owned_ime {
+                // Text fields have already consumed the events they own. Leave the
+                // document's blur path to finish only its previous composition.
+                ui.input_mut(|input| {
+                    input
+                        .events
+                        .retain(|event| !matches!(event, egui::Event::Ime(_)));
+                });
+            }
+            if !self.commands.is_empty()
+                && self.editor.composition().is_some()
+                && let Some(id) = self.document_id
+                && ui.memory(|memory| memory.has_focus(id))
+            {
+                // Accessibility activation can leave the document focused. Use the
+                // widget's blur path to finish IME input and remember its commit echo.
+                ui.memory_mut(|memory| memory.surrender_focus(id));
+                self.focus_editor = self.enabled;
+            }
+            let target = ui
+                .memory(|memory| memory.focused())
+                .filter(|id| document_was_focused && self.text_field_ids.contains(&Some(*id)));
+            let capture_candidate = target.is_some()
+                || (document_was_focused
+                    && ui.input(|input| ime_handoff::has_empty_preedit(&input.events)));
+            let candidate = capture_candidate
+                .then(|| {
+                    ui.input(|input| {
+                        ime_handoff::candidate(
+                            self.editor.composition(),
+                            self.cleared_document_preedit.as_deref(),
+                            &input.events,
+                            target.is_some(),
+                        )
+                    })
+                })
+                .flatten();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let output = ui
                     .add_enabled_ui(self.enabled, |ui| {
@@ -807,22 +1049,8 @@ impl eframe::App for NativeEditor {
                     .inner;
                 let response = output.response.labelled_by(document_label.id);
                 self.document_id = Some(response.id);
-                if self.focus_editor && self.enabled {
-                    response.request_focus();
-                    self.focus_editor = false;
-                }
                 if let Some(qa) = &mut self.qa {
                     qa.widget_errors(output.errors.len(), output.accessibility_errors.len());
-                    qa.observe_editor(
-                        &self.editor,
-                        qa::FocusState {
-                            window_focused: ui.input(|input| input.focused),
-                            widget_focus_retained: ui
-                                .memory(|memory| memory.has_focus(response.id)),
-                        },
-                        self.enabled,
-                        self.read_only,
-                    );
                 }
                 for error in output.errors {
                     self.status = error.to_string();
@@ -836,7 +1064,50 @@ impl eframe::App for NativeEditor {
                     self.follow_link(ui.ctx(), &link);
                 }
             });
+            if self
+                .editor
+                .composition()
+                .is_some_and(|composition| composition.text.is_empty())
+            {
+                if capture_candidate {
+                    self.cleared_document_preedit = candidate;
+                }
+            } else {
+                self.cleared_document_preedit = None;
+                if self.editor.composition().is_none()
+                    && let (Some(target), Some(candidate)) = (target, candidate)
+                {
+                    self.ime_handoff = Some(ime_handoff::Guard::new(
+                        target,
+                        candidate,
+                        ui.input(|input| input.time),
+                    ));
+                }
+            }
         });
+        // Let the document consume queued IME input before toolbar commands commit
+        // its remaining preedit or change its selection and history.
+        self.apply_commands(ui);
+        if self.focus_editor
+            && self.enabled
+            && let Some(id) = self.document_id
+        {
+            ui.memory_mut(|memory| memory.request_focus(id));
+            self.focus_editor = false;
+        }
+        if let Some(qa) = &mut self.qa {
+            qa.observe_editor(
+                &self.editor,
+                qa::FocusState {
+                    window_focused: ui.input(|input| input.focused),
+                    widget_focus_retained: self
+                        .document_id
+                        .is_some_and(|id| ui.memory(|memory| memory.has_focus(id))),
+                },
+                self.enabled,
+                self.read_only,
+            );
+        }
         ui.ctx().output_mut(|output| {
             if let Some(ime) = &mut output.ime {
                 ime.rect = ime.cursor_rect;
@@ -931,6 +1202,7 @@ fn main() -> eframe::Result {
         "TextLoom native example",
         options,
         Box::new(move |context| {
+            textloom::adapter::egui::install_input_routing(&context.egui_ctx);
             let mut fonts = egui::FontDefinitions::default();
             if let Some(bytes) = regular_font {
                 fonts.font_data.insert(
@@ -1014,6 +1286,7 @@ mod tests {
                 None,
             );
             let context = egui::Context::default();
+            textloom::adapter::egui::install_input_routing(&context);
             context.enable_accesskit();
             let mut harness = Self {
                 app,
@@ -1062,6 +1335,15 @@ mod tests {
         }
 
         fn click(&mut self, label: &str, role: Role) {
+            self.click_with_release_events(label, role, Vec::new());
+        }
+
+        fn click_with_release_events(
+            &mut self,
+            label: &str,
+            role: Role,
+            mut release_events: Vec<egui::Event>,
+        ) {
             self.step(Vec::new());
             let node = self
                 .nodes
@@ -1083,8 +1365,25 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             };
             self.step(vec![egui::Event::PointerMoved(position), button(true)]);
-            self.step(vec![button(false)]);
+            release_events.push(button(false));
+            self.step(release_events);
             self.step(Vec::new());
+        }
+
+        fn accessibility_click(&mut self, label: &str) {
+            let (&target, _) = self
+                .nodes
+                .iter()
+                .find(|(_, node)| node.role() == Role::Button && node.label() == Some(label))
+                .unwrap_or_else(|| panic!("no button labelled {label}"));
+            self.step(vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target_node: target,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                },
+            )]);
         }
 
         fn choose_paragraph_kind(&mut self, shown: &str, choice: &str) {
@@ -1144,6 +1443,621 @@ mod tests {
             let paragraph = editor.document().paragraph(1).unwrap().text();
             assert!(paragraph.starts_with(&format!("{committed}Select")));
         }
+    }
+
+    #[test]
+    fn undo_during_ime_composition_preserves_the_previous_edit() {
+        for queued_commit in [None, Some("日本")] {
+            let mut harness = Harness::new("ime-undo");
+            harness.step(vec![egui::Event::Text("existing ".into())]);
+            harness.app.editor.break_history_group();
+            let before_composition = harness.app.editor.document().plain_text();
+            harness.preedit("にほん");
+            let events = queued_commit
+                .map(|text| egui::Event::Ime(egui::ImeEvent::Commit(text.into())))
+                .into_iter()
+                .collect();
+            harness.click_with_release_events("Undo", Role::Button, events);
+            harness.assert_no_command_errors();
+            assert!(harness.app.editor.composition().is_none());
+            assert_eq!(
+                harness.app.editor.document().plain_text(),
+                before_composition
+            );
+            assert!(harness.editor_focused());
+            harness.click("Redo", Role::Button);
+            let committed = queued_commit.unwrap_or("にほん");
+            assert!(
+                harness
+                    .app
+                    .editor
+                    .document()
+                    .plain_text()
+                    .contains(&format!("existing {committed}Select"))
+            );
+        }
+    }
+
+    #[test]
+    fn undo_can_remove_the_initial_ime_composition() {
+        let mut harness = Harness::new("ime-first-undo");
+        let original = harness.app.editor.document().plain_text();
+        assert!(!harness.app.editor.can_undo());
+        harness.preedit("にほん");
+        harness.click("Undo", Role::Button);
+        harness.assert_no_command_errors();
+        assert!(harness.app.editor.composition().is_none());
+        assert_eq!(harness.app.editor.document().plain_text(), original);
+        harness.click("Redo", Role::Button);
+        assert!(
+            harness
+                .app
+                .editor
+                .document()
+                .plain_text()
+                .starts_with("TextLoom\nにほんSelect")
+        );
+    }
+
+    #[test]
+    fn toolbar_composition_commit_filters_control_characters() {
+        for accessibility in [false, true] {
+            for preedit in ["に\0ほん", "\0"] {
+                let mut harness = Harness::new("ime-toolbar-controls");
+                harness.preedit(preedit);
+                if accessibility {
+                    harness.accessibility_click("Bold");
+                } else {
+                    harness.click("Bold", Role::Button);
+                }
+                harness.assert_no_command_errors();
+                assert!(harness.app.editor.composition().is_none());
+                assert!(!harness.app.editor.document().plain_text().contains('\0'));
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_composition_commit_ignores_a_following_ime_echo() {
+        for accessibility in [false, true] {
+            let mut harness = Harness::new("ime-toolbar-echo");
+            harness.preedit("にほん");
+            if accessibility {
+                harness.accessibility_click("Bold");
+            } else {
+                harness.click("Bold", Role::Button);
+            }
+            let committed = harness.app.editor.document().plain_text();
+            harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit(
+                "にほん".into(),
+            ))]);
+            harness.assert_no_command_errors();
+            assert_eq!(harness.app.editor.document().plain_text(), committed);
+        }
+    }
+
+    #[test]
+    fn restarting_numbering_targets_the_item_after_ime_replaces_a_selection() {
+        let mut harness = Harness::new("ime-numbering-selection");
+        harness.app.editor = Editor::from_text("first\nsecond\nthird");
+        harness.app.editor.select_all();
+        harness
+            .app
+            .editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 2,
+                start: Some(7),
+            })
+            .unwrap();
+        harness.preedit("にほん");
+        harness.accessibility_click("Restart at 1");
+        harness.assert_no_command_errors();
+        assert_eq!(harness.app.editor.document().plain_text(), "にほん");
+        assert_eq!(
+            harness.kinds(0..=0),
+            [ParagraphKind::Ordered {
+                indent: 2,
+                start: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn redo_during_ime_composition_commits_it_before_changing_history() {
+        let mut harness = Harness::new("ime-redo");
+        harness.step(vec![egui::Event::Text("undone ".into())]);
+        harness.click("Undo", Role::Button);
+        harness.preedit("にほん");
+        harness.click("Redo", Role::Button);
+        harness.assert_no_command_errors();
+        assert!(harness.app.editor.composition().is_none());
+        assert!(
+            harness
+                .app
+                .editor
+                .document()
+                .plain_text()
+                .starts_with("TextLoom\nにほんSelect")
+        );
+        assert!(!harness.app.editor.can_redo());
+    }
+
+    #[test]
+    fn capturing_a_snapshot_commits_the_visible_ime_composition() {
+        let mut harness = Harness::new("ime-snapshot");
+        harness.preedit("にほん");
+        harness.click("Capture snapshot", Role::Button);
+        harness.assert_no_command_errors();
+        assert!(harness.app.editor.composition().is_none());
+        let captured = Document::from_bytes(harness.app.snapshot.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            captured.plain_text(),
+            harness.app.editor.document().plain_text()
+        );
+        assert!(captured.plain_text().starts_with("TextLoom\nにほんSelect"));
+    }
+
+    #[test]
+    fn capturing_a_snapshot_uses_ime_input_queued_before_the_click() {
+        for (event, committed) in [
+            (egui::ImeEvent::Commit("日本".into()), "日本"),
+            (
+                egui::ImeEvent::Preedit {
+                    text: "日本".into(),
+                    active_range_chars: Some(0..2),
+                },
+                "日本",
+            ),
+            (
+                egui::ImeEvent::Preedit {
+                    text: String::new(),
+                    active_range_chars: None,
+                },
+                "",
+            ),
+        ] {
+            let mut harness = Harness::new("ime-queued-snapshot");
+            harness.preedit("に");
+            harness.click_with_release_events(
+                "Capture snapshot",
+                Role::Button,
+                vec![egui::Event::Ime(event)],
+            );
+            harness.assert_no_command_errors();
+            assert!(harness.app.editor.composition().is_none());
+            let captured = Document::from_bytes(harness.app.snapshot.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                captured.plain_text(),
+                harness.app.editor.document().plain_text()
+            );
+            assert!(
+                captured
+                    .plain_text()
+                    .starts_with(&format!("TextLoom\n{committed}Select"))
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_accessibility_toolbar_commands_are_applied_in_one_frame() {
+        let mut harness = Harness::new("multiple-toolbar-commands");
+        harness.app.editor.select_all();
+        harness.step(Vec::new());
+        let events = ["Bold", "Italic"]
+            .map(|label| {
+                let (&target, _) = harness
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.role() == Role::Button && node.label() == Some(label))
+                    .unwrap();
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target_node: target,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                })
+            })
+            .into_iter()
+            .collect();
+        harness.step(events);
+        harness.assert_no_command_errors();
+        let style = harness.app.editor.selection_style();
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.italic, Some(true));
+    }
+
+    #[test]
+    fn replace_all_uses_search_options_changed_in_the_same_input_batch() {
+        for (label, text, query, expected) in [
+            ("Match case", "a A", "a", "x A"),
+            ("Whole words", "cat scatter", "cat", "x scatter"),
+        ] {
+            let mut harness = Harness::new("replace-current-options");
+            harness.app.editor = Editor::from_text(text);
+            harness.app.query = query.into();
+            harness.app.replacement = "x".into();
+            harness.step(Vec::new());
+            let events = [label, "Replace all"]
+                .map(|label| {
+                    let (&target, _) = harness
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .unwrap();
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target_node: target,
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        data: None,
+                    })
+                })
+                .into_iter()
+                .collect();
+            harness.step(events);
+            assert_eq!(harness.app.editor.document().plain_text(), expected);
+            harness.assert_no_command_errors();
+        }
+    }
+
+    #[test]
+    fn find_uses_search_options_changed_in_the_same_input_batch() {
+        for (label, text, query, expected) in [
+            ("Match case", "A a A", "a", 2..3),
+            ("Whole words", "scatter cat scatter", "cat", 8..11),
+        ] {
+            for button in ["Next", "Previous"] {
+                let mut harness = Harness::new("find-current-options");
+                harness.app.editor = Editor::from_text(text);
+                if button == "Previous" {
+                    harness
+                        .app
+                        .editor
+                        .set_selection(Selection::caret(Position::new(0, text.len())))
+                        .unwrap();
+                }
+                harness.app.query = query.into();
+                harness.step(Vec::new());
+                let events = [label, button]
+                    .map(|label| {
+                        let (&target, _) = harness
+                            .nodes
+                            .iter()
+                            .find(|(_, node)| node.label() == Some(label))
+                            .unwrap();
+                        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Click,
+                            target_node: target,
+                            target_tree: egui::accesskit::TreeId::ROOT,
+                            data: None,
+                        })
+                    })
+                    .into_iter()
+                    .collect();
+                harness.step(events);
+                assert_eq!(
+                    harness.app.editor.selection(),
+                    Selection::new(
+                        Position::new(0, expected.start),
+                        Position::new(0, expected.end)
+                    )
+                );
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    fn field_press(harness: &Harness, field: usize) -> Vec<egui::Event> {
+        let id = harness.app.text_field_ids[field].unwrap();
+        let bounds = harness.nodes[&id.accesskit_id()].bounds().unwrap();
+        let position = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn plain_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn accessibility_focus(id: egui::Id) -> egui::Event {
+        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Focus,
+            target_node: id.accesskit_id(),
+            target_tree: egui::accesskit::TreeId::ROOT,
+            data: None,
+        })
+    }
+
+    fn field_value(app: &NativeEditor, field: usize) -> &str {
+        match field {
+            0 => app.link_url.as_deref().unwrap(),
+            1 => &app.query,
+            2 => &app.replacement,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn accessibility_focus_routes_text_and_paste_between_native_fields() {
+        for max_passes in [1, 2, 8] {
+            for (source, target) in [(1, 2), (2, 1), (0, 1), (1, 0)] {
+                let mut harness = Harness::new("field-focus-text");
+                harness.context.options_mut(|options| {
+                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                });
+                harness.app.editor = Editor::from_text("document");
+                harness.app.link_url = Some(String::new());
+                harness.step(Vec::new());
+                let source_id = harness.app.text_field_ids[source].unwrap();
+                let target_id = harness.app.text_field_ids[target].unwrap();
+                harness
+                    .context
+                    .memory_mut(|memory| memory.request_focus(source_id));
+                harness.step(Vec::new());
+                harness.step(vec![
+                    egui::Event::Text("before".into()),
+                    accessibility_focus(target_id),
+                    egui::Event::Paste("after".into()),
+                ]);
+                for _ in 0..3 {
+                    harness.step(Vec::new());
+                }
+                assert_eq!(field_value(&harness.app, source), "before");
+                assert_eq!(field_value(&harness.app, target), "after");
+                assert_eq!(harness.app.editor.document().plain_text(), "document");
+                assert!(harness.context.memory(|memory| memory.has_focus(target_id)));
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
+    fn accessibility_focus_routes_each_document_and_field_input_segment_once() {
+        for max_passes in [1, 2, 8] {
+            for from_document in [false, true] {
+                let mut harness = Harness::new("document-focus-text");
+                harness.context.options_mut(|options| {
+                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                });
+                harness.app.editor = Editor::default();
+                let document = harness.app.document_id.unwrap();
+                let field = harness.app.text_field_ids[1].unwrap();
+                let (source, target) = if from_document {
+                    (document, field)
+                } else {
+                    (field, document)
+                };
+                harness
+                    .context
+                    .memory_mut(|memory| memory.request_focus(source));
+                harness.step(Vec::new());
+                harness.step(vec![
+                    egui::Event::Text("before".into()),
+                    accessibility_focus(target),
+                    egui::Event::Text("after".into()),
+                    accessibility_focus(source),
+                    egui::Event::Paste("!".into()),
+                ]);
+                for _ in 0..5 {
+                    harness.step(Vec::new());
+                }
+                let (document_text, query) = if from_document {
+                    ("before!", "after")
+                } else {
+                    ("after", "before!")
+                };
+                assert_eq!(harness.app.editor.document().plain_text(), document_text);
+                assert_eq!(harness.app.query, query);
+                assert!(harness.context.memory(|memory| memory.has_focus(source)));
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
+    fn accessibility_focus_preserves_document_ime_handoff_across_input_passes() {
+        for max_passes in [1, 2, 8] {
+            for cleared in [false, true] {
+                for fresh in [false, true] {
+                    let mut harness = Harness::new("focus-ime-passes");
+                    harness.context.options_mut(|options| {
+                        options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                    });
+                    harness.app.editor = Editor::from_text("original");
+                    harness.app.editor.select_all();
+                    let field = harness.app.text_field_ids[2].unwrap();
+                    let mut events = vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "한".into(),
+                        active_range_chars: None,
+                    })];
+                    if cleared {
+                        events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: String::new(),
+                            active_range_chars: None,
+                        }));
+                    }
+                    events.push(accessibility_focus(field));
+                    if fresh {
+                        events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "新".into(),
+                            active_range_chars: None,
+                        }));
+                    }
+                    events.push(egui::Event::Ime(egui::ImeEvent::Commit(
+                        if fresh { "新" } else { "한" }.into(),
+                    )));
+                    harness.step(events);
+                    for _ in 0..3 {
+                        harness.step(Vec::new());
+                    }
+                    assert_eq!(
+                        harness.app.editor.document().plain_text(),
+                        if cleared { "original" } else { "한" }
+                    );
+                    assert_eq!(harness.app.replacement, if fresh { "新" } else { "" });
+                    assert!(harness.app.editor.composition().is_none());
+                    harness.assert_no_command_errors();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_keys_after_focus_moves_do_not_submit_or_cancel_the_previous_field() {
+        for (source, key) in [
+            (1, egui::Key::Enter),
+            (0, egui::Key::Enter),
+            (0, egui::Key::Escape),
+        ] {
+            for accessibility in [false, true] {
+                for separate_frame in [false, true] {
+                    let mut harness = Harness::new("field-key-ownership");
+                    harness.app.editor = Editor::from_text("before target after");
+                    harness.app.query = "target".into();
+                    if source == 0 {
+                        harness.app.link_url = Some("https://example.com/".into());
+                    }
+                    harness.step(Vec::new());
+                    let id = harness.app.text_field_ids[source].unwrap();
+                    harness
+                        .context
+                        .memory_mut(|memory| memory.request_focus(id));
+                    harness.step(Vec::new());
+                    let selection = harness.app.editor.selection();
+                    let mut events = if accessibility {
+                        vec![egui::Event::AccessKitActionRequest(
+                            egui::accesskit::ActionRequest {
+                                action: egui::accesskit::Action::Focus,
+                                target_node: harness.app.text_field_ids[2].unwrap().accesskit_id(),
+                                target_tree: egui::accesskit::TreeId::ROOT,
+                                data: None,
+                            },
+                        )]
+                    } else {
+                        field_press(&harness, 2)
+                    };
+                    if separate_frame {
+                        harness.step(std::mem::take(&mut events));
+                    }
+                    events.push(plain_key(key));
+                    harness.step(events);
+                    assert_eq!(harness.app.editor.selection(), selection);
+                    assert_eq!(
+                        harness.app.editor.document().plain_text(),
+                        "before target after"
+                    );
+                    assert_ne!(harness.app.status, "Match selected");
+                    if source == 0 {
+                        assert_eq!(
+                            harness.app.link_url.as_deref(),
+                            Some("https://example.com/")
+                        );
+                    }
+                    harness.assert_no_command_errors();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_enter_respects_click_acquisition_and_submission_before_leaving() {
+        for field in [0, 1] {
+            for entering in [false, true] {
+                let mut harness = Harness::new("field-enter-order");
+                harness.app.editor = Editor::from_text("before target after");
+                harness.app.editor.select_all();
+                harness.app.query = "target".into();
+                if field == 0 {
+                    harness.app.link_url = Some("https://example.com/".into());
+                }
+                harness.step(Vec::new());
+                let mut events = if entering {
+                    field_press(&harness, field)
+                } else {
+                    let id = harness.app.text_field_ids[field].unwrap();
+                    harness
+                        .context
+                        .memory_mut(|memory| memory.request_focus(id));
+                    harness.step(Vec::new());
+                    Vec::new()
+                };
+                events.push(plain_key(egui::Key::Enter));
+                if !entering {
+                    events.extend(field_press(&harness, 2));
+                }
+                harness.step(events);
+                if field == 0 {
+                    assert!(harness.app.link_url.is_none());
+                    assert_eq!(
+                        harness.app.editor.selected_link().unwrap().as_str(),
+                        "https://example.com/"
+                    );
+                } else {
+                    assert_eq!(harness.app.status, "Match selected");
+                    assert_eq!(harness.app.editor.selected_text(), "target");
+                }
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_keyboard_focus_transfer_does_not_submit_the_previous_field() {
+        for field in [0, 1] {
+            let mut harness = Harness::new("field-delayed-enter");
+            harness.app.editor = Editor::from_text("before target after");
+            harness.app.query = "target".into();
+            if field == 0 {
+                harness.app.link_url = Some("https://example.com/".into());
+            }
+            harness.step(Vec::new());
+            let id = harness.app.text_field_ids[field].unwrap();
+            harness
+                .context
+                .memory_mut(|memory| memory.request_focus(id));
+            harness.step(Vec::new());
+            harness.step(vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }]);
+            let selection = harness.app.editor.selection();
+            harness.step(vec![plain_key(egui::Key::Enter)]);
+            assert_eq!(harness.app.editor.selection(), selection);
+            assert_eq!(
+                harness.app.editor.document().plain_text(),
+                "before target after"
+            );
+            if field == 0 {
+                assert_eq!(
+                    harness.app.link_url.as_deref(),
+                    Some("https://example.com/")
+                );
+            }
+            harness.assert_no_command_errors();
+        }
+        let mut harness = Harness::new("field-normal-escape");
+        harness.app.open_link_field();
+        harness.step(Vec::new());
+        harness.step(vec![plain_key(egui::Key::Escape)]);
+        assert!(harness.app.link_url.is_none());
     }
 
     #[test]
@@ -1660,6 +2574,340 @@ mod tests {
             Some("mailto:team@example.com")
         );
         assert_eq!(harness.app.qa.as_ref().unwrap().host_command_errors(), 1);
+    }
+
+    #[test]
+    fn link_shortcut_preserves_altgr_text_and_combined_modifiers() {
+        for modifiers in [
+            egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::COMMAND,
+            egui::Modifiers::MAC_CMD | egui::Modifiers::ALT | egui::Modifiers::COMMAND,
+            egui::Modifiers::CTRL | egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND,
+        ] {
+            let mut harness = Harness::new("link-altgr");
+            harness.app.editor = Editor::from_text("abc");
+            harness.app.editor.select_all();
+            harness.step(vec![
+                egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: Some(egui::Key::K),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text("ķ".into()),
+            ]);
+            assert!(
+                harness.app.link_url.is_none(),
+                "the link shortcut intercepted {modifiers:?}"
+            );
+            assert_eq!(harness.app.editor.document().plain_text(), "ķ");
+            assert!(harness.editor_focused());
+            harness.assert_no_command_errors();
+        }
+    }
+
+    #[test]
+    fn opening_link_field_does_not_receive_the_documents_late_ime_commit() {
+        let mut harness = Harness::new("link-ime-handoff");
+        harness.app.editor = Editor::from_text("abc");
+        harness.app.editor.select_all();
+        harness.preedit("한");
+        harness.step(vec![egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }]);
+        assert_eq!(harness.app.editor.document().plain_text(), "한");
+        assert_eq!(harness.app.link_url.as_deref(), Some(""));
+        harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
+        assert_eq!(harness.app.link_url.as_deref(), Some(""));
+        assert_eq!(harness.app.editor.document().plain_text(), "한");
+    }
+
+    #[test]
+    fn pointer_handoff_preserves_queued_and_cleared_document_preedit() {
+        for field in [1, 2] {
+            for (prior_empty, queued, candidate, document) in [
+                (false, None, "한", "한"),
+                (
+                    false,
+                    Some(egui::ImeEvent::Preedit {
+                        text: "漢".into(),
+                        active_range_chars: None,
+                    }),
+                    "漢",
+                    "漢",
+                ),
+                (
+                    false,
+                    Some(egui::ImeEvent::Preedit {
+                        text: String::new(),
+                        active_range_chars: None,
+                    }),
+                    "한",
+                    "abc",
+                ),
+                (
+                    false,
+                    Some(egui::ImeEvent::Commit("\0".into())),
+                    "한",
+                    "abc",
+                ),
+                (
+                    false,
+                    Some(egui::ImeEvent::Commit("\r\n".into())),
+                    "한",
+                    "한",
+                ),
+                (true, None, "한", "abc"),
+            ] {
+                for same_frame_echo in [false, true] {
+                    let mut harness = Harness::new("field-ime-handoff");
+                    harness.app.editor = Editor::from_text("abc");
+                    harness.app.editor.select_all();
+                    harness.preedit("한");
+                    if prior_empty {
+                        harness.preedit("");
+                    }
+                    let id = harness.app.text_field_ids[field].unwrap();
+                    let bounds = harness.nodes[&id.accesskit_id()].bounds().unwrap();
+                    let position = egui::pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    );
+                    let mut events = Vec::new();
+                    if let Some(event) = &queued {
+                        events.push(egui::Event::Ime(event.clone()));
+                    }
+                    events.extend([
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                    if same_frame_echo {
+                        events.push(egui::Event::Ime(egui::ImeEvent::Commit(candidate.into())));
+                    }
+                    harness.step(events);
+                    assert!(harness.context.memory(|memory| memory.has_focus(id)));
+                    assert_eq!(harness.app.editor.document().plain_text(), document);
+                    if !same_frame_echo {
+                        harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit(
+                            candidate.into(),
+                        ))]);
+                    }
+                    assert!(harness.app.query.is_empty());
+                    assert!(harness.app.replacement.is_empty());
+                    harness.assert_no_command_errors();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_queued_preedit_stays_with_document_when_a_field_receives_focus() {
+        for field in [1, 2] {
+            for cleared in [false, true] {
+                for same_frame_echo in [false, true] {
+                    let mut harness = Harness::new("first-preedit-field-handoff");
+                    harness.app.editor = Editor::from_text("abc");
+                    harness.app.editor.select_all();
+                    let id = harness.app.text_field_ids[field].unwrap();
+                    let bounds = harness.nodes[&id.accesskit_id()].bounds().unwrap();
+                    let position = egui::pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    );
+                    let mut events = vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "한".into(),
+                        active_range_chars: None,
+                    })];
+                    if cleared {
+                        events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: String::new(),
+                            active_range_chars: None,
+                        }));
+                    }
+                    events.extend([
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                    if same_frame_echo {
+                        events.push(egui::Event::Ime(egui::ImeEvent::Commit("한".into())));
+                    }
+                    harness.step(events);
+                    assert!(harness.context.memory(|memory| memory.has_focus(id)));
+                    assert_eq!(
+                        harness.app.editor.document().plain_text(),
+                        if cleared { "abc" } else { "한" }
+                    );
+                    if !same_frame_echo {
+                        harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
+                    }
+                    assert!(harness.app.query.is_empty());
+                    assert!(harness.app.replacement.is_empty());
+                    harness.assert_no_command_errors();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_focus_handoff_does_not_receive_the_documents_late_ime_commit() {
+        for cleared in [false, true] {
+            for (mut transfer, expected) in [
+                (vec![], ""),
+                (
+                    vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))],
+                    "",
+                ),
+                (
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "新".into(),
+                            active_range_chars: None,
+                        }),
+                        egui::Event::Ime(egui::ImeEvent::Commit("新".into())),
+                    ],
+                    "新",
+                ),
+                (
+                    vec![
+                        egui::Event::Text("x".into()),
+                        egui::Event::Ime(egui::ImeEvent::Commit("한".into())),
+                    ],
+                    "x한",
+                ),
+            ] {
+                let mut harness = Harness::new("tab-ime-handoff");
+                harness.app.editor = Editor::from_text("abc");
+                harness.app.editor.select_all();
+                harness.preedit("한");
+                if cleared {
+                    harness.preedit("");
+                }
+                harness.step(vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                }]);
+                let delayed_echo = transfer.is_empty();
+                harness.step(std::mem::take(&mut transfer));
+                let field = harness.app.text_field_ids[2].unwrap();
+                assert!(harness.context.memory(|memory| memory.has_focus(field)));
+                if delayed_echo {
+                    harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
+                }
+                assert_eq!(harness.app.replacement, expected);
+                assert_eq!(
+                    harness.app.editor.document().plain_text(),
+                    if cleared { "abc" } else { "한" }
+                );
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_echo_guard_preserves_ignored_events_and_accepts_fresh_field_input() {
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        for (before_echo, expected) in [
+            (vec![], ""),
+            (
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "invalid".into(),
+                        active_range_chars: Some(0..99),
+                    }),
+                    egui::Event::Ime(egui::ImeEvent::Commit("\r\n".into())),
+                    egui::Event::Ime(egui::ImeEvent::Commit("\0".into())),
+                    key(egui::Key::X, egui::Modifiers::NONE),
+                ],
+                "",
+            ),
+            (
+                vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "한".into(),
+                    active_range_chars: None,
+                })],
+                "한",
+            ),
+            (vec![egui::Event::Text("x".into())], "x한"),
+            (
+                vec![
+                    key(egui::Key::V, egui::Modifiers::COMMAND),
+                    egui::Event::Paste("x".into()),
+                ],
+                "x한",
+            ),
+        ] {
+            for separate_frame in [false, true] {
+                let mut harness = Harness::new("handoff-new-input");
+                harness.app.editor = Editor::from_text("abc");
+                harness.app.editor.select_all();
+                harness.preedit("한");
+                harness.step(vec![key(egui::Key::K, egui::Modifiers::COMMAND)]);
+                let mut events = before_echo.clone();
+                if separate_frame {
+                    harness.step(std::mem::take(&mut events));
+                }
+                events.push(egui::Event::Ime(egui::ImeEvent::Commit("한".into())));
+                harness.step(events);
+                assert_eq!(harness.app.link_url.as_deref(), Some(expected));
+                assert_eq!(harness.app.editor.document().plain_text(), "한");
+                harness.assert_no_command_errors();
+            }
+        }
+        for expire in [false, true] {
+            let mut harness = Harness::new("handoff-guard-lifetime");
+            harness.preedit("한");
+            harness.step(vec![key(egui::Key::K, egui::Modifiers::COMMAND)]);
+            if expire {
+                harness.time += 1.0;
+            } else {
+                harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
+            }
+            harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
+            assert_eq!(harness.app.link_url.as_deref(), Some("한"));
+        }
+        let mut harness = Harness::new("handoff-pointer-input");
+        harness.preedit("한");
+        harness.step(vec![key(egui::Key::K, egui::Modifiers::COMMAND)]);
+        let field = harness.app.text_field_ids[0].unwrap();
+        let bounds = harness.nodes[&field.accesskit_id()].bounds().unwrap();
+        let position = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        harness.step(vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Ime(egui::ImeEvent::Commit("한".into())),
+        ]);
+        assert_eq!(harness.app.link_url.as_deref(), Some("한"));
     }
 
     #[test]
