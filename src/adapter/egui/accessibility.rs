@@ -4,8 +4,8 @@ use super::{
 };
 use crate::{
     Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span,
-    accessibility::node_semantics::{SpanCursor, apply_text_style, set_paragraph_semantics},
-    document::{LINE_SEPARATOR, same_numbering_effect},
+    accessibility::node_semantics::{apply_text_style, set_paragraph_semantics},
+    document::{LINE_SEPARATOR, SpanCursor, same_numbering_effect},
 };
 use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, epaint::text::PlacedRow, text::CharIndex};
 use std::{

@@ -14,6 +14,8 @@ mod words;
 
 pub(crate) use change::Delta;
 pub(crate) use numbering::{Levels, same_effect as same_numbering_effect};
+#[cfg(any(feature = "accesskit", feature = "egui"))]
+pub(crate) use paragraph::SpanCursor;
 pub use paragraph::{Paragraph, Span};
 use paragraph::{append_slice, push_span};
 

@@ -21,6 +21,37 @@ impl Span {
     }
 }
 
+pub(crate) struct SpanCursor<'a> {
+    spans: &'a [Span],
+    index: usize,
+}
+
+impl<'a> SpanCursor<'a> {
+    pub(crate) fn new(spans: &'a [Span]) -> Self {
+        Self { spans, index: 0 }
+    }
+
+    #[cfg(feature = "accesskit")]
+    pub(crate) fn index(&self) -> usize {
+        self.index
+    }
+
+    pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'a Link>) {
+        while self
+            .spans
+            .get(self.index)
+            .is_some_and(|span| span.range.end <= byte)
+        {
+            self.index += 1;
+        }
+        self.spans
+            .get(self.index)
+            .map_or((InlineStyle::default(), None), |span| {
+                (span.style, span.link.as_ref())
+            })
+    }
+}
+
 #[derive(Clone)]
 pub struct Paragraph {
     pub(super) text: Arc<str>,
@@ -578,16 +609,9 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
         return raw;
     }
     let mut result = Vec::with_capacity(raw.len());
-    let mut index = 0;
+    let mut spans = SpanCursor::new(&raw);
     for (start, grapheme) in text.grapheme_indices(true) {
-        while raw.get(index).is_some_and(|span| span.range.end <= start) {
-            index += 1;
-        }
-        let (style, link) = raw
-            .get(index)
-            .map_or((InlineStyle::default(), None), |span| {
-                (span.style, span.link.as_ref())
-            });
+        let (style, link) = spans.at(start);
         push_span(&mut result, start..start + grapheme.len(), style, link);
     }
     result
@@ -628,4 +652,86 @@ fn word_stops(text: &str) -> Vec<Range<usize>> {
         }
     }
     stops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn span_cursor_scans_forward_for_bridges_and_grapheme_normalization() {
+        let bold = InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        };
+        let italic = InlineStyle {
+            italic: true,
+            ..InlineStyle::default()
+        };
+        let link = Link::new("https://example.com").unwrap();
+        let spans = [
+            Span {
+                range: 0..2,
+                style: bold,
+                link: None,
+            },
+            Span {
+                range: 2..4,
+                style: italic,
+                link: Some(link.clone()),
+            },
+            Span {
+                range: 6..8,
+                style: bold,
+                link: None,
+            },
+        ];
+        let mut cursor = SpanCursor::new(&spans);
+        for byte in 0..10 {
+            let current = spans.iter().position(|span| span.range.end > byte);
+            let expected = current.map_or((InlineStyle::default(), None), |index| {
+                (spans[index].style, spans[index].link.as_ref())
+            });
+            assert_eq!(cursor.at(byte), expected);
+            #[cfg(feature = "accesskit")]
+            assert_eq!(cursor.index(), current.unwrap_or(spans.len()));
+        }
+
+        let paragraph = Paragraph::styled(
+            "ae\u{301}x".to_owned(),
+            vec![
+                Span {
+                    range: 0..2,
+                    style: bold,
+                    link: None,
+                },
+                Span {
+                    range: 2..4,
+                    style: italic,
+                    link: Some(link),
+                },
+                Span {
+                    range: 4..5,
+                    style: italic,
+                    link: None,
+                },
+            ],
+            ParagraphKind::Body,
+        );
+        assert_eq!(
+            paragraph.spans(),
+            [
+                Span {
+                    range: 0..4,
+                    style: bold,
+                    link: None,
+                },
+                Span {
+                    range: 4..5,
+                    style: italic,
+                    link: None,
+                },
+            ]
+        );
+    }
 }

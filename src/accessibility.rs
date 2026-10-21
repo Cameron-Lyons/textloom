@@ -193,7 +193,7 @@ pub fn apply_action(
 
 #[cfg(any(feature = "accesskit", feature = "egui"))]
 pub(crate) mod node_semantics {
-    use crate::{InlineStyle, Link, ParagraphKind, Span};
+    use crate::{InlineStyle, ParagraphKind};
     #[cfg(feature = "accesskit")]
     use accesskit::{Color, ListStyle, Node, Role, TextDecoration, TextDecorationStyle};
     #[cfg(not(feature = "accesskit"))]
@@ -268,48 +268,17 @@ pub(crate) mod node_semantics {
             alpha,
         }
     }
-
-    pub(crate) struct SpanCursor<'a> {
-        spans: &'a [Span],
-        index: usize,
-    }
-
-    impl<'a> SpanCursor<'a> {
-        pub(crate) fn new(spans: &'a [Span]) -> Self {
-            Self { spans, index: 0 }
-        }
-
-        #[cfg(feature = "accesskit")]
-        pub(crate) fn index(&self) -> usize {
-            self.index
-        }
-
-        pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'a Link>) {
-            while self
-                .spans
-                .get(self.index)
-                .is_some_and(|span| span.range.end <= byte)
-            {
-                self.index += 1;
-            }
-            self.spans
-                .get(self.index)
-                .map_or((InlineStyle::default(), None), |span| {
-                    (span.style, span.link.as_ref())
-                })
-        }
-    }
 }
 
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
     use super::{
         AccessibilityOutcome, AccessibleAction, apply_action,
-        node_semantics::{SpanCursor, apply_text_style, set_paragraph_semantics},
+        node_semantics::{apply_text_style, set_paragraph_semantics},
     };
     use crate::{
         Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection,
-        document::LINE_SEPARATOR,
+        document::{LINE_SEPARATOR, SpanCursor},
     };
     use accesskit::{
         Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, Tree,
