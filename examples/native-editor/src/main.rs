@@ -222,7 +222,7 @@ impl NativeEditor {
                 let Some(bytes) = &self.snapshot else {
                     return;
                 };
-                match textloom::Document::from_bytes(bytes) {
+                match Document::from_bytes_with_limits(bytes, textloom::DecodeLimits::UNLIMITED) {
                     Ok(document) => {
                         self.editor = Editor::new(document);
                         if let Some(qa) = &mut self.qa {
@@ -1681,6 +1681,25 @@ mod tests {
             harness.app.editor.document().plain_text()
         );
         assert!(captured.plain_text().starts_with("TextLoom\nにほんSelect"));
+    }
+
+    #[test]
+    fn restoring_a_snapshot_reopens_documents_over_the_default_decode_limits() {
+        let mut harness = Harness::new("large-snapshot");
+        harness.app.editor = Editor::from_text(&"\n".repeat(1_000_000));
+        let (app, context) = (&mut harness.app, &harness.context);
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            app.apply_command(ui, EditorCommand::CaptureSnapshot);
+            app.editor = Editor::from_text("edited");
+            app.apply_command(ui, EditorCommand::RestoreSnapshot);
+        });
+        output.drop_without_applying_deltas();
+        harness.assert_no_command_errors();
+        assert_eq!(
+            harness.app.status,
+            "Snapshot restored; editing history cleared"
+        );
+        assert_eq!(harness.app.editor.document().paragraphs().len(), 1_000_001);
     }
 
     #[test]
