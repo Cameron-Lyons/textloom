@@ -155,7 +155,7 @@ Both input adapters share these Ctrl/Command shortcuts:
 | ]; [ | Indent; outdent selected list items |
 | Up or Home; Down or End | Document start; document end |
 
-Without Ctrl/Command, Enter inserts a paragraph break and Shift+Enter a soft line break in both adapters; read-only mode consumes both, and Ctrl/Command+Enter or Ctrl/Command+Shift+Enter reaches the host. Toggling makes a mixed selection uniformly emphasized and a uniformly emphasized selection plain for that attribute. Shortcuts listed without Shift ignore chords with Shift held, which reach the host (for example, Ctrl+Shift+V for paste as plain text). Latin logical keys select shortcuts, so Dvorak and Colemak keep their letters; non-Latin layouts use the physical US key, and the digit row uses its physical digit (AZERTY, German Shift+7). Ctrl/Alt+Left/Right/Backspace/Delete move or delete by word, and macOS Command+Backspace deletes to the paragraph start, or deletes the selected text, in one undo step. Tab/Shift+Tab indent/outdent selections containing list items; other Tab presses stay available for host focus traversal. Losing widget or window focus ends the current typing undo group.
+Without Ctrl/Command, Enter inserts a paragraph break and Shift+Enter a soft line break in both adapters; read-only mode consumes both, and Ctrl/Command+Enter or Ctrl/Command+Shift+Enter reaches the host. Toggling makes a mixed selection uniformly emphasized and a uniformly emphasized selection plain for that attribute. Shortcuts listed without Shift ignore chords with Shift held, which reach the host (for example, Ctrl+Shift+V for paste as plain text; egui delivers that chord as a paste event, which the widget pastes as plain text without its rich clipboard). Latin logical keys select shortcuts, so Dvorak and Colemak keep their letters; non-Latin layouts use the physical US key, and the digit row uses its physical digit (AZERTY, German Shift+7). Ctrl/Alt+Left/Right/Backspace/Delete move or delete by word, and macOS Command+Backspace deletes to the paragraph start, or deletes the selected text, in one undo step. Tab/Shift+Tab indent/outdent selections containing list items; other Tab presses stay available for host focus traversal. Losing widget or window focus ends the current typing undo group.
 
 In the widget, Home/End and macOS Command+Left/Right move to the edges of the visual (wrapped) row, Up/Down move by visual line, and PageUp/PageDown move about one viewport while keeping the column; Shift extends each. Escape cancels a composition, or otherwise releases focus. `.heading_shortcuts(false)` leaves Ctrl/Command+0–6 to the host, such as egui's zoom reset. `.read_only(true)` retains selection, copy, and accessibility while suppressing edits and IME, and consumes only the editing chords an editable widget handles. Typing, paste, and IME commits drop control characters; paste and commits keep line breaks and tabs, and IME text consisting of one line break is ignored, as in egui's `TextEdit`. A nonempty preedit blocks paste, cut, and typed text.
 
@@ -299,9 +299,9 @@ preview. It retains galleys and paints visible paragraphs. Committed edits carry
 a compact description of the replaced paragraph range to the adapters. Ordinary
 local edits update the affected cache entries and paths in a persistent layout
 index, which tracks paragraph heights, scalar totals, and list membership.
-Retained layout snapshots keep their original geometry. Structural edits also
-shift later paragraph-cache references; after changes that affect numbering or
-the paragraph count, only markers whose computed number changed are rebuilt,
+Retained layout snapshots keep their original geometry. Structural edits split
+and rejoin the same index without shifting later entries; after changes that
+affect numbering, only markers whose computed number changed are rebuilt,
 reusing their items' shaped text. Actual changes to font definitions, text
 options, DPI, or appearance still rebuild all layouts. If an adapter misses an edit or receives
 an unrelated document, it compares paragraph identities to recover safely.

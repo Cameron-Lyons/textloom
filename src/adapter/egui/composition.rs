@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub(super) struct CompositionPreview {
     pub(super) composition: Arc<Composition>,
     pub(super) style: InlineStyle,
+    source: Arc<()>,
     pub(super) document: Document,
     pub(super) render_cache: LayoutCache,
     pub(super) caret: Position,
@@ -37,23 +38,41 @@ impl Cache {
                     || preview.composition.text == composition.text
                         && preview.composition.replacement == composition.replacement)
         }) {
-            let previous = self.preview.take();
-            let mut document = editor.document().clone();
-            let range = composition.replacement.range();
+            let source = editor.document().content_identity();
             let mut preedit_style = style;
             preedit_style.underline = true;
-            document.replace(range, &composition.text, preedit_style)?;
-            let (caret, selection) = preedit_selection(&document, &composition);
-            let render_cache =
-                previous.map_or_else(|| self.layout.clone(), |preview| preview.render_cache);
-            self.preview = Some(Box::new(CompositionPreview {
-                composition: Arc::clone(&composition),
-                style,
-                document,
-                render_cache,
-                caret,
-                selection,
-            }));
+            if let Some(preview) = self.preview.as_deref_mut()
+                && preview.style == style
+                && preview.composition.replacement == composition.replacement
+                && Arc::ptr_eq(&preview.source, &source)
+                && replace_preedit(
+                    &mut preview.document,
+                    &preview.composition.text,
+                    &composition,
+                    preedit_style,
+                )
+            {
+                (preview.caret, preview.selection) =
+                    preedit_selection(&preview.document, &composition);
+                preview.composition = Arc::clone(&composition);
+            } else {
+                let previous = self.preview.take();
+                let mut document = editor.document().clone();
+                let range = composition.replacement.range();
+                document.replace(range, &composition.text, preedit_style)?;
+                let (caret, selection) = preedit_selection(&document, &composition);
+                let render_cache =
+                    previous.map_or_else(|| self.layout.clone(), |preview| preview.render_cache);
+                self.preview = Some(Box::new(CompositionPreview {
+                    composition: Arc::clone(&composition),
+                    style,
+                    source,
+                    document,
+                    render_cache,
+                    caret,
+                    selection,
+                }));
+            }
         }
         let preview = self.preview.as_mut().expect("preview initialized above");
         if preview.composition.selection != composition.selection {
@@ -66,6 +85,23 @@ impl Cache {
             appearance,
         )))
     }
+}
+
+fn replace_preedit(
+    document: &mut Document,
+    previous: &str,
+    composition: &Composition,
+    style: InlineStyle,
+) -> bool {
+    let inline = |text: &str| !crate::document::normalize_newlines(text).contains('\n');
+    if !inline(previous) || !inline(&composition.text) {
+        return false;
+    }
+    let start = composition.replacement.range().start;
+    let end = Position::new(start.paragraph, start.byte + previous.len());
+    document
+        .replace(start..end, &composition.text, style)
+        .is_ok()
 }
 
 fn preedit_selection(
