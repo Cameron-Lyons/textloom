@@ -582,8 +582,24 @@ mod accesskit_bridge {
                     .collect::<Result<Vec<_>, _>>()?;
                 (start..change.range.end, inserted)
             } else {
+                let reusable = |cached: &CachedParagraph, index: usize| {
+                    Arc::ptr_eq(&cached.paragraph, &source[index])
+                        && cached.line_break() == (index + 1 < source.len())
+                };
+                let prefix = self
+                    .paragraphs
+                    .iter()
+                    .zip(0..source.len())
+                    .take_while(|(cached, index)| reusable(cached, *index))
+                    .count();
+                let suffix = self.paragraphs[prefix..]
+                    .iter()
+                    .rev()
+                    .zip((prefix..source.len()).rev())
+                    .take_while(|(cached, index)| reusable(cached, *index))
+                    .count();
                 let mut cached: HashMap<(usize, bool), Vec<&Arc<CachedParagraph>>> = HashMap::new();
-                for paragraph in self.paragraphs.iter().rev() {
+                for paragraph in self.paragraphs[prefix..published - suffix].iter().rev() {
                     cached
                         .entry((
                             Arc::as_ptr(&paragraph.paragraph) as usize,
@@ -592,18 +608,19 @@ mod accesskit_bridge {
                         .or_default()
                         .push(paragraph);
                 }
-                let inserted = source
-                    .iter()
-                    .enumerate()
-                    .map(|(index, paragraph)| {
-                        let key = (Arc::as_ptr(paragraph) as usize, index + 1 < source.len());
+                let inserted = (prefix..source.len() - suffix)
+                    .map(|index| {
+                        let key = (
+                            Arc::as_ptr(&source[index]) as usize,
+                            index + 1 < source.len(),
+                        );
                         match cached.get_mut(&key).and_then(Vec::pop) {
                             Some(existing) => Ok(Arc::clone(existing)),
                             None => build(index),
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                (0..published, inserted)
+                (prefix..published - suffix, inserted)
             };
             let staged = Staged {
                 published: &self.paragraphs,
@@ -2462,6 +2479,106 @@ mod accesskit_bridge {
                 assert_positions_roundtrip(&adapter, &editor);
             }
             assert_runs_form_lines(&adapter);
+        }
+
+        #[test]
+        fn several_edits_between_updates_match_fresh_trees() {
+            fn random_position(
+                editor: &Editor,
+                random: &mut impl FnMut(usize) -> usize,
+            ) -> Position {
+                let paragraphs = editor.document().paragraphs();
+                let index = random(paragraphs.len());
+                let paragraph = &paragraphs[index];
+                let byte = paragraph
+                    .byte_from_grapheme(random(paragraph.grapheme_count() + 1))
+                    .unwrap();
+                Position::new(index, byte)
+            }
+            let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+            let mut random = move |limit: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % limit as u64) as usize
+            };
+            let kinds = [
+                ParagraphKind::Quote,
+                ParagraphKind::Body,
+                ParagraphKind::Bullet { indent: 0 },
+            ];
+            for _ in 0..40 {
+                let mut editor = Editor::from_text("zero\none é\ntwo\nthree");
+                let mut adapter = AccessKitAdapter::default();
+                adapter.update(&editor, "Notes", true).unwrap();
+                for _ in 0..60 {
+                    for _ in 0..2 + random(3) {
+                        let caret = random_position(&editor, &mut random);
+                        let _ = editor.set_selection(Selection::caret(caret));
+                        let _ = match random(12) {
+                            0 => editor.insert_text(["x", "é", "ab cd", "x\ny"][random(4)]),
+                            1 => editor.insert_paragraph(),
+                            2 => editor.insert_line_break(),
+                            3 => editor.delete_backward(),
+                            4 => editor.delete_forward(),
+                            5 => editor.set_paragraph_kind(kinds[random(3)]),
+                            6 => {
+                                editor.undo();
+                                Ok(())
+                            }
+                            7 => {
+                                editor.redo();
+                                Ok(())
+                            }
+                            8 => editor.transaction(|editor| {
+                                editor.insert_paragraph()?;
+                                editor.insert_text("t")?;
+                                editor.set_paragraph_kind(ParagraphKind::Quote)
+                            }),
+                            9 => {
+                                let _ =
+                                    editor.set_selection(Selection::caret(editor.document().end()));
+                                editor.insert_paragraph()
+                            }
+                            10 => {
+                                let paragraph = random(editor.document().paragraphs().len());
+                                let end = editor.document().paragraphs()[paragraph].text().len();
+                                let fragment = editor
+                                    .document()
+                                    .fragment(
+                                        Position::new(paragraph, 0)..Position::new(paragraph, end),
+                                    )
+                                    .unwrap();
+                                editor.insert_fragment(&fragment)
+                            }
+                            _ => {
+                                let focus = random_position(&editor, &mut random);
+                                editor.break_history_group();
+                                let _ = editor.set_selection(Selection::new(caret, focus));
+                                editor.delete_backward()
+                            }
+                        };
+                    }
+                    adapter.update(&editor, "Notes", true).unwrap();
+                    assert_matches_fresh_tree(&adapter, &editor);
+                    assert_positions_roundtrip(&adapter, &editor);
+                    let mut ids = std::collections::HashSet::from([
+                        adapter.root_node(),
+                        adapter.editor_node(),
+                    ]);
+                    assert!(adapter.quotes.iter().all(|quote| ids.insert(quote.id)));
+                    for (index, paragraph) in adapter.paragraphs.iter().enumerate() {
+                        assert!(ids.insert(paragraph.id));
+                        for run in &paragraph.runs {
+                            assert!(ids.insert(run.id));
+                            assert_eq!(
+                                adapter.locate_text_run(run.id),
+                                Some((index, run.range.clone()))
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         #[test]
