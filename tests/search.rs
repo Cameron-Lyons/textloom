@@ -144,6 +144,99 @@ fn whole_words_use_unicode_word_boundaries() {
 }
 
 #[test]
+fn matches_beside_ascii_punctuation_and_digits_follow_word_segmentation() {
+    let tokens = [
+        "a", "B", "x", "1", "2", ".", ":", ",", ";", "'", "_", " ", "  ", "\t", "-", "\"", "\n",
+        "ab", "a.b", "1.2", "1,2", "a:b", "x_1", "can't", "é", "É", "\u{301}", "\u{200d}", "’",
+        "·", "\u{5d0}", "١", "\u{3000}",
+    ];
+    let mut seed = 0xbb67_ae85_84ca_a73b_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let mut matched = 0;
+    for _ in 0..64 {
+        let mut source = String::new();
+        for _ in 0..next() % 48 {
+            source.push_str(tokens[next() % tokens.len()]);
+        }
+        let document = Document::from_text(&source);
+        let text = document.plain_text();
+        let graphemes: Vec<_> = text
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let words: Vec<_> = text
+            .split_word_bound_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let position = |byte: usize| {
+            let prefix = &text[..byte];
+            Position::new(
+                prefix.matches('\n').count(),
+                prefix
+                    .rfind('\n')
+                    .map_or(byte, |newline| byte - newline - 1),
+            )
+        };
+        let mut queries: Vec<String> = [
+            "a", "b", "1", "2", "ab", "a.b", "1.2", "1,2", "x_1", "can", "t", "é", "\u{5d0}", ".",
+            "_", "a\n1",
+        ]
+        .map(String::from)
+        .into();
+        for _ in 0..6 {
+            let start = graphemes[next() % graphemes.len()];
+            let end = graphemes[next() % graphemes.len()];
+            let slice = &text[start.min(end)..start.max(end)];
+            queries.extend([slice.to_string(), slice.to_uppercase()]);
+        }
+        for query in &queries {
+            for case_sensitive in [true, false] {
+                for whole_word in [true, false] {
+                    let options = SearchOptions {
+                        case_sensitive,
+                        whole_word,
+                    };
+                    let (searched, needle) = if case_sensitive {
+                        (text.clone(), query.clone())
+                    } else {
+                        (text.to_lowercase(), query.to_lowercase())
+                    };
+                    let mut expected = Vec::new();
+                    let mut consumed = 0;
+                    for &start in graphemes.iter().filter(|_| !needle.is_empty()) {
+                        let end = start + needle.len();
+                        if start >= consumed
+                            && searched[start..].starts_with(&needle)
+                            && graphemes.binary_search(&end).is_ok()
+                            && (!whole_word
+                                || words.binary_search(&start).is_ok()
+                                    && words.binary_search(&end).is_ok())
+                        {
+                            expected.push(position(start)..position(end));
+                            consumed = end;
+                        }
+                    }
+                    matched += expected.len();
+                    assert_eq!(
+                        document.find(query, options),
+                        expected,
+                        "query={query:?}, options={options:?}, source={source:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(matched > 1_000, "{matched}");
+}
+
+#[test]
 fn case_insensitive_cross_paragraph_queries_map_original_coordinates() {
     let document = Document::from_text("İ\nCAFÉ");
     let matches = document.find(

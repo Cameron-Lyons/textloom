@@ -335,7 +335,11 @@ impl Document {
         mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         let paragraph = &self.paragraphs()[index];
-        if options.case_sensitive && needle.len() > paragraph.text().len() {
+        let ascii = paragraph.is_ascii();
+        // ASCII text lowercases in place and cannot contain non-ASCII needles.
+        if (options.case_sensitive || ascii) && needle.len() > paragraph.text().len()
+            || ascii && !needle.is_ascii()
+        {
             return ControlFlow::Continue(());
         }
         let visit = |bytes: Range<usize>| {
@@ -351,7 +355,7 @@ impl Document {
                 paragraph.next_grapheme(start)
             })
         } else {
-            visit_text_matches(paragraph.text(), needle, options, visit)
+            visit_text_matches(paragraph.text(), ascii, needle, options, visit)
         }
     }
 
@@ -411,7 +415,7 @@ impl Document {
             let paragraph = paragraph_starts.partition_point(|start| *start <= byte) - 1;
             Position::new(paragraph, byte - paragraph_starts[paragraph])
         };
-        visit_text_matches(&source, needle, options, |bytes| {
+        visit_text_matches(&source, false, needle, options, |bytes| {
             let range = position(bytes.start)..position(bytes.end);
             if self.is_grapheme_range(&range) {
                 accept(range).map_continue(|()| true)
@@ -517,9 +521,75 @@ fn word_restart(text: &str, byte: usize) -> usize {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsciiWordClass {
+    Letter,
+    Numeric,
+    MidLetter,
+    MidNumLetQ,
+    MidNum,
+    ExtendNumLet,
+    Other,
+}
+
+fn ascii_word_class(byte: u8) -> AsciiWordClass {
+    match byte {
+        b'A'..=b'Z' | b'a'..=b'z' => AsciiWordClass::Letter,
+        b'0'..=b'9' => AsciiWordClass::Numeric,
+        b':' => AsciiWordClass::MidLetter,
+        b'.' | b'\'' => AsciiWordClass::MidNumLetQ,
+        b',' | b';' => AsciiWordClass::MidNum,
+        b'_' => AsciiWordClass::ExtendNumLet,
+        _ => AsciiWordClass::Other,
+    }
+}
+
+// The UAX #29 word rules inspect at most two characters on each side, and an
+// ASCII character is never Extend, Format, or ZWJ. Non-ASCII context is left
+// to the segmenter.
+fn ascii_word_boundary(text: &[u8], byte: usize) -> Option<bool> {
+    use AsciiWordClass::{ExtendNumLet, Letter, MidLetter, MidNum, MidNumLetQ, Numeric};
+
+    let (Some(&before), Some(&after)) = (
+        byte.checked_sub(1).and_then(|index| text.get(index)),
+        text.get(byte),
+    ) else {
+        return Some(true);
+    };
+    if !before.is_ascii() || !after.is_ascii() {
+        return None;
+    }
+    let newline = |byte: u8| matches!(byte, b'\n' | b'\x0b' | b'\x0c' | b'\r');
+    if before == b'\r' && after == b'\n' {
+        return Some(false);
+    }
+    if newline(before) || newline(after) {
+        return Some(true);
+    }
+    if before == b' ' && after == b' ' {
+        return Some(false);
+    }
+    let neighbor = |index: Option<usize>| match index.and_then(|index| text.get(index)) {
+        None => Some(None),
+        Some(&byte) if byte.is_ascii() => Some(Some(ascii_word_class(byte))),
+        Some(_) => None,
+    };
+    let joined = match (ascii_word_class(before), ascii_word_class(after)) {
+        (Letter | Numeric, Letter | Numeric)
+        | (Letter | Numeric | ExtendNumLet, ExtendNumLet)
+        | (ExtendNumLet, Letter | Numeric) => true,
+        (Letter, MidLetter | MidNumLetQ) => neighbor(Some(byte + 1))? == Some(Letter),
+        (MidLetter | MidNumLetQ, Letter) => neighbor(byte.checked_sub(2))? == Some(Letter),
+        (Numeric, MidNum | MidNumLetQ) => neighbor(Some(byte + 1))? == Some(Numeric),
+        (MidNum | MidNumLetQ, Numeric) => neighbor(byte.checked_sub(2))? == Some(Numeric),
+        _ => false,
+    };
+    Some(!joined)
+}
+
 struct WordBoundaries<'a> {
+    text: &'a str,
     start: usize,
-    end: usize,
     boundaries: Vec<usize>,
     remaining: UWordBoundIndices<'a>,
 }
@@ -527,8 +597,8 @@ struct WordBoundaries<'a> {
 impl<'a> WordBoundaries<'a> {
     fn new(text: &'a str, start: usize) -> Self {
         Self {
+            text,
             start,
-            end: text.len(),
             boundaries: Vec::new(),
             remaining: text[start..].split_word_bound_indices(),
         }
@@ -536,8 +606,8 @@ impl<'a> WordBoundaries<'a> {
 
     fn contains(&mut self, byte: usize) -> bool {
         debug_assert!(byte >= self.start);
-        if byte == self.end {
-            return true;
+        if let Some(boundary) = ascii_word_boundary(self.text.as_bytes(), byte) {
+            return boundary;
         }
         while self
             .boundaries
@@ -641,6 +711,7 @@ fn lowercase(text: &str) -> String {
 
 fn visit_text_matches(
     source: &str,
+    ascii: bool,
     needle: &str,
     options: SearchOptions,
     mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
@@ -650,42 +721,23 @@ fn visit_text_matches(
     }
     let searched = if options.case_sensitive {
         Cow::Borrowed(source)
+    } else if ascii {
+        Cow::Owned(source.to_ascii_lowercase())
     } else {
         Cow::Owned(lowercase(source))
     };
     if needle.len() > searched.len() {
         return ControlFlow::Continue(());
     }
-    let mut word_boundaries = None;
-    let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive);
+    let mut words = WordBoundaries::new(source, 0);
+    let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive && !ascii);
     visit_literals(&searched, needle, |bytes| {
         let range = offsets
             .original(bytes.start)
             .zip(offsets.original(bytes.end))
             .and_then(|(start, end)| {
-                if options.whole_word {
-                    let (boundaries, remaining) = word_boundaries.get_or_insert_with(|| {
-                        (
-                            Vec::new(),
-                            source
-                                .split_word_bound_indices()
-                                .map(|(byte, _)| byte)
-                                .chain([source.len()]),
-                        )
-                    });
-                    while boundaries.last().is_none_or(|byte| *byte < end) {
-                        let Some(byte) = remaining.next() else {
-                            break;
-                        };
-                        boundaries.push(byte);
-                    }
-                    if boundaries.binary_search(&start).is_err()
-                        || boundaries.binary_search(&end).is_err()
-                    {
-                        return None;
-                    }
-                }
-                Some(start..end)
+                (!options.whole_word || (words.contains(end) && words.contains(start)))
+                    .then_some(start..end)
             });
         if let Some(range) = range {
             accept(range)
@@ -1000,5 +1052,47 @@ mod tests {
             }
         }
         assert!(checked > 5_000 && matched > 1_000, "{checked} {matched}");
+    }
+
+    #[test]
+    fn ascii_word_boundaries_agree_with_unicode_segmentation() {
+        let tokens = [
+            "a", "Z", "q", "0", "7", ":", ".", "'", ",", ";", "_", " ", "  ", "\t", "\"", "-", "!",
+            "/", "\n", "\r", "\r\n", "\x0b", "\x0c", "\u{301}", "\u{200d}", "\u{ad}", "é",
+            "\u{5d0}", "\u{3000}", "\u{30a2}", "🇺", "👩", "’", "·", "\u{85}", "\u{2028}", "١",
+        ];
+        let ascii = tokens.iter().take_while(|token| token.is_ascii()).count();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut decided = 0;
+        for length in 0..4_000 {
+            let mut text = String::new();
+            for _ in 0..length % 24 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let index = if seed.is_multiple_of(4) {
+                    (seed >> 8) as usize % tokens.len()
+                } else {
+                    (seed >> 8) as usize % ascii
+                };
+                text.push_str(tokens[index]);
+            }
+            let boundaries: Vec<_> = text
+                .split_word_bound_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for byte in (0..=text.len()).filter(|byte| text.is_char_boundary(*byte)) {
+                if let Some(boundary) = ascii_word_boundary(text.as_bytes(), byte) {
+                    decided += 1;
+                    assert_eq!(
+                        boundary,
+                        boundaries.binary_search(&byte).is_ok(),
+                        "byte {byte} in {text:?}"
+                    );
+                }
+            }
+        }
+        assert!(decided > 10_000, "{decided}");
     }
 }

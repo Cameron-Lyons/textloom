@@ -73,6 +73,10 @@ impl Paragraph {
         self.kind
     }
 
+    pub(crate) fn is_ascii(&self) -> bool {
+        self.ascii
+    }
+
     pub fn grapheme_count(&self) -> usize {
         if self.ascii {
             self.text.len()
