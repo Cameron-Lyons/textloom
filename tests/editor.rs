@@ -1039,6 +1039,74 @@ fn history_limits_discard_farthest_redo_and_preserve_the_next_steps() {
 }
 
 #[test]
+fn sparse_document_wide_edits_stay_undoable_and_keep_earlier_history() {
+    use textloom::SearchOptions;
+
+    let identical = |editor: &Editor, document: &Document| {
+        let paragraphs = editor.document().paragraphs();
+        paragraphs.len() == document.paragraphs().len()
+            && paragraphs
+                .iter()
+                .zip(document.paragraphs())
+                .all(|(paragraph, expected)| Arc::ptr_eq(paragraph, expected))
+    };
+    let mut editor = Editor::from_text(&format!(
+        "match\n{}match",
+        "untouched café\n".repeat(20_000)
+    ));
+    editor.set_history_limits(HistoryLimits {
+        max_entries: 256,
+        max_bytes: 64 * 1024,
+    });
+    let original = editor.document().clone();
+    caret(&mut editor, 1, 0);
+    editor.insert_text("x").unwrap();
+    let typed = editor.document().clone();
+    let bytes = editor.history_bytes();
+    assert_eq!(
+        editor
+            .replace_all("match", "replacement", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(editor.undo_len(), 2);
+    assert!(editor.history_bytes() < bytes + 1024);
+    let replaced = editor.document().clone();
+    let heading = ParagraphKind::Heading { level: 2 };
+    caret(&mut editor, 0, 0);
+    editor.set_paragraph_kind(heading).unwrap();
+    caret(&mut editor, 20_001, 0);
+    editor.set_paragraph_kind(heading).unwrap();
+    let headed = editor.document().clone();
+    let bytes = editor.history_bytes();
+    editor.select_all();
+    editor.set_paragraph_kind(ParagraphKind::Body).unwrap();
+    assert_eq!(editor.undo_len(), 5);
+    assert!(editor.history_bytes() < bytes + 1024);
+    let flattened = editor.document().clone();
+    assert!(editor.undo());
+    assert!(identical(&editor, &headed));
+    assert!(editor.undo());
+    assert!(editor.undo());
+    assert!(identical(&editor, &replaced));
+    assert!(editor.undo());
+    assert!(identical(&editor, &typed));
+    assert!(editor.undo());
+    assert!(identical(&editor, &original));
+    while editor.redo() {}
+    assert!(identical(&editor, &flattened));
+    let result: Result<(), Error> = editor.transaction(|editor| {
+        editor.replace_all("replacement", "match", SearchOptions::default())?;
+        editor.select_all();
+        editor.set_paragraph_kind(heading)?;
+        Err(Error::InvalidRange)
+    });
+    assert_eq!(result, Err(Error::InvalidRange));
+    assert!(identical(&editor, &flattened));
+    assert_eq!(editor.undo_len(), 5);
+}
+
+#[test]
 fn unchanged_paragraphs_remain_shared_during_edit_and_undo() {
     let mut editor = Editor::from_text("before\nmiddle\nafter");
     let first = editor.document().paragraphs()[0].clone();

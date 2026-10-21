@@ -1401,6 +1401,86 @@ fn history_retains_only_changed_paragraphs_and_shares_others() {
 }
 
 #[test]
+fn sparse_changes_retain_only_their_changed_runs() {
+    let changed = [0, 3, 13, 14, 30, 39];
+    let source: Vec<String> = (0..40)
+        .map(|index| {
+            if changed.contains(&index) {
+                format!("match {index}")
+            } else {
+                format!("plain {index}")
+            }
+        })
+        .collect();
+    let mut document = Document::from_text(&source.join("\n"));
+    let original = document.paragraphs.clone();
+    let matches: Vec<_> = changed
+        .iter()
+        .map(|&paragraph| Position::new(paragraph, 0)..Position::new(paragraph, 5))
+        .collect();
+    let (delta, _) = document.replace_matches(&matches, "swap");
+    let splices: Vec<_> = std::iter::once(&delta)
+        .chain(&delta.rest)
+        .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
+        .collect();
+    assert_eq!(splices, [(0, 4, 4), (13, 2, 2), (30, 10, 10)]);
+    let contiguous = Delta {
+        start: 0,
+        before: original.clone(),
+        after: document.paragraphs.clone(),
+        rest: Vec::new(),
+    };
+    assert_eq!(
+        contiguous.retained_bytes() - delta.retained_bytes(),
+        24 * std::mem::size_of::<Paragraph>()
+    );
+    let shared = |expected: &[Arc<Paragraph>], document: &Document| {
+        expected
+            .iter()
+            .zip(&document.paragraphs)
+            .map(|(old, new)| Arc::ptr_eq(old, new))
+            .collect::<Vec<_>>()
+    };
+    let unchanged: Vec<_> = (0..40).map(|index| !changed.contains(&index)).collect();
+    assert_eq!(shared(&original, &document), unchanged);
+    let replaced = document.paragraphs.clone();
+    let revision = document.revision();
+    document.replay(&delta, false);
+    assert_eq!(document.revision(), revision + 1);
+    assert_eq!(shared(&original, &document), [true; 40]);
+    document.replay(&delta, true);
+    assert_eq!(shared(&replaced, &document), [true; 40]);
+    assert_eq!(
+        document.plain_text(),
+        source.join("\n").replace("match", "swap")
+    );
+}
+
+#[test]
+fn sparse_kind_changes_renumber_lists_through_history() {
+    let ordered = ParagraphKind::Ordered {
+        indent: 0,
+        start: None,
+    };
+    let mut document = Document::from_text(&["item"; 30].join("\n"));
+    document.set_kind(0..30, ordered).unwrap();
+    for index in [3, 20] {
+        document
+            .set_kind(index..index + 1, ParagraphKind::Body)
+            .unwrap();
+    }
+    let interrupted = numbers(&document);
+    let delta = document.set_kind(0..30, ordered).unwrap().unwrap();
+    assert_eq!(delta.rest.len(), 1);
+    let expected: Vec<_> = (1..=30).map(Some).collect();
+    assert_eq!(numbers(&document), expected);
+    document.replay(&delta, false);
+    assert_eq!(numbers(&document), interrupted);
+    document.replay(&delta, true);
+    assert_eq!(numbers(&document), expected);
+}
+
+#[test]
 fn history_charges_the_larger_side_without_shared_text_or_runs() {
     let record = std::mem::size_of::<Paragraph>();
     let run = std::mem::size_of::<Span>();

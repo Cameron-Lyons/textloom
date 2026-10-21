@@ -26,22 +26,37 @@ impl Document {
         if delta.is_empty() {
             return;
         }
-        let (remove, insert) = if forward {
-            (&delta.before, &delta.after)
+        let (old_len, new_len) = delta.extent();
+        if forward {
+            for splice in delta.splices() {
+                self.replay_splice(splice, true);
+            }
+            self.record_change(delta.start, old_len, new_len);
         } else {
-            (&delta.after, &delta.before)
+            for splice in delta.splices().rev() {
+                self.replay_splice(splice, false);
+            }
+            self.record_change(delta.start, new_len, old_len);
+        }
+    }
+
+    fn replay_splice(&mut self, splice: &Delta, forward: bool) {
+        let (remove, insert) = if forward {
+            (&splice.before, &splice.after)
+        } else {
+            (&splice.after, &splice.before)
         };
         debug_assert_eq!(
-            self.paragraphs.get(delta.start..delta.start + remove.len()),
+            self.paragraphs
+                .get(splice.start..splice.start + remove.len()),
             Some(remove.as_slice()),
             "history must be replayed against its corresponding document state"
         );
         self.paragraphs.splice(
-            delta.start..delta.start + remove.len(),
+            splice.start..splice.start + remove.len(),
             insert.iter().cloned(),
         );
         self.retain_numbers(remove, insert);
-        self.record_change(delta.start, remove.len(), insert.len());
     }
 
     pub(super) fn change(&mut self, range: Range<usize>, mut after: Vec<Arc<Paragraph>>) -> Delta {
@@ -64,19 +79,54 @@ impl Document {
             end -= 1;
             after.pop();
         }
-        let before = self.paragraphs[start..end].to_vec();
-        let delta = Delta {
-            start,
-            before,
-            after,
+        let new_len = after.len();
+        let runs = if end - start == new_len {
+            self.changed_runs(start, &after)
+        } else {
+            Vec::new()
+        };
+        let delta = if runs.len() > 1 {
+            let mut splices = runs.into_iter().map(|run| Delta {
+                start: start + run.start,
+                before: self.paragraphs[start + run.start..start + run.end].to_vec(),
+                after: after[run].to_vec(),
+                rest: Vec::new(),
+            });
+            let mut delta = splices.next().expect("several runs");
+            delta.rest = splices.collect();
+            delta
+        } else {
+            Delta {
+                start,
+                before: self.paragraphs[start..end].to_vec(),
+                after,
+                rest: Vec::new(),
+            }
         };
         if !delta.is_empty() {
-            self.paragraphs
-                .splice(start..end, delta.after.iter().cloned());
-            self.retain_numbers(&delta.before, &delta.after);
-            self.record_change(start, end - start, delta.after.len());
+            for splice in delta.splices() {
+                self.replay_splice(splice, true);
+            }
+            self.record_change(start, end - start, new_len);
         }
         delta
+    }
+
+    fn changed_runs(&self, start: usize, after: &[Arc<Paragraph>]) -> Vec<Range<usize>> {
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        if after.len() <= SHARED_GAP + 2 {
+            return runs;
+        }
+        for (index, (old, new)) in self.paragraphs[start..].iter().zip(after).enumerate() {
+            if Arc::ptr_eq(old, new) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(run) if index - run.end <= SHARED_GAP => run.end = index + 1,
+                _ => runs.push(index..index + 1),
+            }
+        }
+        runs
     }
 
     fn retain_numbers(&mut self, before: &[Arc<Paragraph>], after: &[Arc<Paragraph>]) {
@@ -124,20 +174,42 @@ impl Document {
     }
 }
 
+const SHARED_GAP: usize = 8;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Delta {
     pub start: usize,
     pub before: Vec<Arc<Paragraph>>,
     pub after: Vec<Arc<Paragraph>>,
+    // Later disjoint splices in document order, each positioned after its predecessors apply.
+    pub rest: Vec<Delta>,
 }
 
 impl Delta {
     pub fn is_empty(&self) -> bool {
-        self.before.is_empty() && self.after.is_empty()
+        self.before.is_empty() && self.after.is_empty() && self.rest.is_empty()
     }
 
     pub fn retained_bytes(&self) -> usize {
-        side_bytes(&self.before, &self.after).max(side_bytes(&self.after, &self.before))
+        self.splices()
+            .map(|splice| {
+                side_bytes(&splice.before, &splice.after)
+                    .max(side_bytes(&splice.after, &splice.before))
+            })
+            .fold(0, usize::saturating_add)
+    }
+
+    fn splices(&self) -> impl DoubleEndedIterator<Item = &Delta> {
+        std::iter::once(self).chain(&self.rest)
+    }
+
+    fn extent(&self) -> (usize, usize) {
+        let last = self.rest.last().unwrap_or(self);
+        let end = last.start + last.after.len();
+        let (removed, inserted) = self.splices().fold((0, 0), |(removed, inserted), splice| {
+            (removed + splice.before.len(), inserted + splice.after.len())
+        });
+        (end + removed - inserted - self.start, end - self.start)
     }
 }
 
@@ -323,6 +395,27 @@ mod tests {
         assert_change(&document, &undone, 1..2, 3);
         assert!(document.change_since(&original).is_none());
         assert_eq!(document.plain_text(), "zero\nfirst\nmiddle\nlast\ntwo");
+    }
+
+    #[test]
+    fn sparse_changes_and_their_history_notify_one_covering_range() {
+        let heading = ParagraphKind::Heading { level: 1 };
+        let mut document = Document::from_text(&"plain\n".repeat(30));
+        document.set_kind(2..3, heading).unwrap();
+        document.set_kind(25..26, heading).unwrap();
+        let original = document.content_identity();
+        let delta = document
+            .set_kind(0..31, ParagraphKind::Body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.rest.len(), 1);
+        assert_change(&document, &original, 2..26, 24);
+        let changed = document.content_identity();
+        document.replay(&delta, false);
+        assert_change(&document, &changed, 2..26, 24);
+        let undone = document.content_identity();
+        document.replay(&delta, true);
+        assert_change(&document, &undone, 2..26, 24);
     }
 
     #[test]

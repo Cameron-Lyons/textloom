@@ -363,6 +363,7 @@ impl Document {
                     start: range.start.paragraph,
                     before: Vec::new(),
                     after: Vec::new(),
+                    rest: Vec::new(),
                 },
                 range.start,
             ));
@@ -459,6 +460,7 @@ impl Document {
                     start: range.start.paragraph,
                     before: Vec::new(),
                     after: Vec::new(),
+                    rest: Vec::new(),
                 },
                 range.start,
             ));
