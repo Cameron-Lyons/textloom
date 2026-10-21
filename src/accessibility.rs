@@ -543,17 +543,6 @@ mod accesskit_bridge {
             let initialized = self.initialized;
             let mut next_id = self.next_id;
             let mut nodes = Vec::new();
-            let mut build = |index: usize| {
-                let paragraph = Arc::new(build_paragraph(
-                    Arc::clone(&source[index]),
-                    index + 1 < source.len(),
-                    &mut next_id,
-                )?);
-                if initialized {
-                    paragraph.push_nodes(&mut nodes);
-                }
-                Ok::<_, AccessKitError>(paragraph)
-            };
             let published = self.paragraphs.len();
             let change = self
                 .document_identity
@@ -563,6 +552,26 @@ mod accesskit_bridge {
                     change.range.end <= published
                         && published - change.range.len() + change.new_len == source.len()
                 });
+            let in_place = initialized
+                && change.as_ref().is_some_and(|change| {
+                    change.range.len() == change.new_len
+                        && self.paragraphs[change.range.clone()]
+                            .iter()
+                            .zip(&source[change.range.clone()])
+                            .all(|(cached, paragraph)| cached.paragraph.kind() == paragraph.kind())
+                });
+            let mut build = |index: usize| {
+                let paragraph = Arc::new(build_paragraph(
+                    Arc::clone(&source[index]),
+                    index + 1 < source.len(),
+                    in_place.then(|| self.paragraphs[index].id),
+                    &mut next_id,
+                )?);
+                if initialized {
+                    paragraph.push_nodes(&mut nodes);
+                }
+                Ok::<_, AccessKitError>(paragraph)
+            };
             let (range, inserted) = if let Some(change) = change {
                 let mut start = change.range.start;
                 if start > 0 && (start < published) != (start < source.len()) {
@@ -606,31 +615,42 @@ mod accesskit_bridge {
                     paragraph.push_nodes(&mut nodes);
                 }
             }
-            let quotes = self.stage_quotes(&staged, &mut next_id)?;
-            for (quote, previous) in &quotes {
+            let quotes = if in_place {
+                None
+            } else {
+                Some(self.stage_quotes(&staged, &mut next_id)?)
+            };
+            for (quote, previous) in quotes.iter().flatten() {
                 let previous = previous.and_then(|index| self.quotes.get(index));
                 if !initialized || previous.is_none_or(|previous| previous.node != quote.node) {
                     nodes.push((quote.id, quote.node.clone()));
                 }
             }
-            let mut editor_node = Node::new(Role::MultilineTextInput);
+            let mut editor_node = if in_place {
+                self.last_editor.clone().expect("initialized editor node")
+            } else {
+                let mut node = Node::new(Role::MultilineTextInput);
+                node.add_action(Action::Focus);
+                node.add_action(Action::SetTextSelection);
+                node
+            };
             editor_node.set_label(label);
-            editor_node.add_action(Action::Focus);
-            editor_node.add_action(Action::SetTextSelection);
             set_editable_actions(&mut editor_node, self.read_only);
-            let mut children = Vec::with_capacity(staged.len());
-            let mut containers = quotes.iter().map(|(quote, _)| quote.id);
-            let mut quoting = false;
-            for paragraph in staged.iter() {
-                let quote = paragraph.paragraph.kind() == ParagraphKind::Quote;
-                if !quote {
-                    children.push(paragraph.id);
-                } else if !quoting {
-                    children.push(containers.next().expect("a container per quote"));
+            if let Some(quotes) = &quotes {
+                let mut children = Vec::with_capacity(staged.len());
+                let mut containers = quotes.iter().map(|(quote, _)| quote.id);
+                let mut quoting = false;
+                for paragraph in staged.iter() {
+                    let quote = paragraph.paragraph.kind() == ParagraphKind::Quote;
+                    if !quote {
+                        children.push(paragraph.id);
+                    } else if !quoting {
+                        children.push(containers.next().expect("a container per quote"));
+                    }
+                    quoting = quote;
                 }
-                quoting = quote;
+                editor_node.set_children(children);
             }
-            editor_node.set_children(children);
             editor_node.set_text_selection(TextSelection {
                 anchor: paragraph_text_position(
                     staged.get(selection.anchor.paragraph),
@@ -677,7 +697,9 @@ mod accesskit_bridge {
                 self.run_locations = OnceLock::new();
             }
             self.paragraphs.splice(range, inserted);
-            self.quotes = quotes.into_iter().map(|(quote, _)| quote).collect();
+            if let Some(quotes) = quotes {
+                self.quotes = quotes.into_iter().map(|(quote, _)| quote).collect();
+            }
             self.last_editor = Some(editor_node);
             self.last_selection = Some(selection);
             self.document_identity = Some(document_identity);
@@ -893,9 +915,13 @@ mod accesskit_bridge {
     fn build_paragraph(
         paragraph: Arc<Paragraph>,
         line_break: bool,
+        id: Option<NodeId>,
         next_id: &mut Option<u64>,
     ) -> Result<CachedParagraph, AccessKitError> {
-        let id = allocate(next_id)?;
+        let id = match id {
+            Some(id) => id,
+            None => allocate(next_id)?,
+        };
         let mut node = Node::new(match paragraph.kind() {
             ParagraphKind::Body | ParagraphKind::Quote => Role::Paragraph,
             ParagraphKind::Heading { .. } => Role::Heading,
@@ -1824,7 +1850,7 @@ mod accesskit_bridge {
                 if structural {
                     editor.insert_paragraph().unwrap();
                 } else {
-                    editor.insert_text("supported").unwrap();
+                    editor.insert_text(&"supported".repeat(40)).unwrap();
                 }
                 adapter.next_id = Some(u64::MAX);
                 assert_eq!(
@@ -2264,12 +2290,7 @@ mod accesskit_bridge {
             let update = adapter.update(&editor, "Notes", true).unwrap();
             assert_eq!(
                 roles(&update),
-                [
-                    Role::Paragraph,
-                    Role::TextRun,
-                    Role::Blockquote,
-                    Role::MultilineTextInput
-                ]
+                [Role::Paragraph, Role::TextRun, Role::MultilineTextInput]
             );
             assert_eq!(adapter.quotes[0].id, quote);
             assert_matches_fresh_tree(&adapter, &editor);
@@ -2300,6 +2321,92 @@ mod accesskit_bridge {
                 assert_matches_fresh_tree(&adapter, &editor);
             }
             assert!(adapter.quotes.is_empty());
+        }
+
+        #[test]
+        fn in_place_edits_keep_paragraph_ids_and_the_editor_child_list() {
+            let roles = |update: &TreeUpdate| -> Vec<Role> {
+                update.nodes.iter().map(|(_, node)| node.role()).collect()
+            };
+            let mut editor = Editor::from_text("zero\none\ntwo\nthree");
+            editor
+                .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 1)))
+                .unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_positions_roundtrip(&adapter, &editor);
+            let ids: Vec<_> = (0..4)
+                .map(|index| adapter.paragraph_node(index).unwrap())
+                .collect();
+            let children = adapter.last_editor.as_ref().unwrap().children().to_vec();
+            let quote = adapter.quotes[0].id;
+            let obsolete = adapter
+                .to_text_position(&editor, Position::new(2, 1))
+                .unwrap();
+
+            editor
+                .set_selection(Selection::new(Position::new(1, 1), Position::new(2, 1)))
+                .unwrap();
+            editor.insert_text("x\ny").unwrap();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(
+                roles(&update),
+                [
+                    Role::Paragraph,
+                    Role::TextRun,
+                    Role::Paragraph,
+                    Role::TextRun,
+                    Role::MultilineTextInput
+                ]
+            );
+            assert_eq!(update.nodes[0].0, ids[1]);
+            assert_eq!(update.nodes[2].0, ids[2]);
+            assert_eq!(
+                adapter.from_text_position(&editor, obsolete),
+                Err(AccessKitError::InvalidTextPosition(obsolete))
+            );
+
+            editor
+                .set_selection(Selection::caret(Position::new(0, 0)))
+                .unwrap();
+            editor.insert_text("x").unwrap();
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(
+                roles(&update),
+                [Role::Paragraph, Role::TextRun, Role::MultilineTextInput]
+            );
+            assert_eq!(update.nodes[0].0, ids[0]);
+            let (_, editor_node) = update.nodes.last().unwrap();
+            assert_eq!(editor_node.children(), children);
+            assert_eq!(
+                (0..4)
+                    .map(|index| adapter.paragraph_node(index).unwrap())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(quote_groups(&adapter), [vec![1, 2]]);
+            assert_eq!(adapter.quotes[0].id, quote);
+            assert_matches_fresh_tree(&adapter, &editor);
+            assert_positions_roundtrip(&adapter, &editor);
+            assert_runs_form_lines(&adapter);
+
+            editor
+                .set_selection(Selection::caret(Position::new(3, 0)))
+                .unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+            adapter.update(&editor, "Notes", true).unwrap();
+            assert_ne!(adapter.paragraph_node(3), Some(ids[3]));
+            assert_eq!(quote_groups(&adapter), [vec![1, 2, 3]]);
+            assert_eq!(adapter.quotes[0].id, quote);
+            assert_matches_fresh_tree(&adapter, &editor);
+            assert_positions_roundtrip(&adapter, &editor);
+            while editor.undo() {
+                adapter.update(&editor, "Notes", true).unwrap();
+                assert_matches_fresh_tree(&adapter, &editor);
+                assert_positions_roundtrip(&adapter, &editor);
+            }
+            assert_eq!(adapter.paragraph_node(0), Some(ids[0]));
         }
 
         #[test]
