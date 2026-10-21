@@ -556,7 +556,10 @@ impl<'a> RichTextEditor<'a> {
                     event,
                     now,
                 );
-                layout_stale |= revision != self.editor.document().revision();
+                if revision != self.editor.document().revision() {
+                    cache.layout.track(self.editor.document());
+                    layout_stale = true;
+                }
                 cache.validate_navigation(self.editor.selection());
                 traversed |= response.has_focus()
                     && tab_moves_focus
@@ -1101,6 +1104,7 @@ fn apply_queued_ime(
             applied.push(index);
         }
         observe_composition_event(&mut cache.interaction, composition, editor, &event, now);
+        cache.layout.track(editor.document());
     }
     if revision != editor.document().revision() {
         *layouts = cache.layout(ui, editor, appearance);

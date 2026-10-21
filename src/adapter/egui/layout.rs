@@ -7,6 +7,7 @@ use egui::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::Range,
     sync::Arc,
 };
 mod index;
@@ -121,10 +122,45 @@ pub(super) struct LayoutCache {
     pub(super) appearance: Option<Appearance>,
     font_environment: Option<FontEnvironment>,
     pub(super) document_identity: Option<Arc<()>>,
+    pending: Option<PendingChange>,
     pub(super) layouts: ParagraphLayouts,
+    #[cfg(test)]
+    pub(super) scans: usize,
+}
+
+#[derive(Clone)]
+struct PendingChange {
+    identity: Arc<()>,
+    paragraphs: Option<(Range<usize>, usize)>,
 }
 
 impl LayoutCache {
+    // Call after each edit so that one later update knows which paragraphs all of them changed.
+    pub(super) fn track(&mut self, document: &Document) {
+        let Some(cached) = &self.document_identity else {
+            return;
+        };
+        let identity = document.content_identity();
+        let base = self
+            .pending
+            .as_ref()
+            .map_or(cached, |pending| &pending.identity);
+        if Arc::ptr_eq(base, &identity) {
+            return;
+        }
+        let step = document
+            .change_since(base)
+            .map(|change| (change.range, change.new_len));
+        let paragraphs = match self.pending.take() {
+            None => step,
+            Some(pending) => pending.paragraphs.zip(step).map(merge_changes),
+        };
+        self.pending = Some(PendingChange {
+            identity,
+            paragraphs,
+        });
+    }
+
     pub(super) fn layout_document(
         &mut self,
         ui: &Ui,
@@ -147,6 +183,8 @@ impl LayoutCache {
             .document_identity
             .as_ref()
             .is_none_or(|cached| !Arc::ptr_eq(cached, &document_identity));
+        self.track(document);
+        let change = self.pending.take().and_then(|pending| pending.paragraphs);
         let pixels_per_point = ui.ctx().pixels_per_point();
         ui.fonts_mut(|fonts| {
             let environment_changed = self
@@ -179,14 +217,14 @@ impl LayoutCache {
                 self.layouts.rebuild(&caches);
             } else {
                 let source = document.paragraphs();
-                let (old, new) = if let Some(change) = self
-                    .document_identity
-                    .as_ref()
-                    .and_then(|id| document.change_since(id))
-                {
-                    let new = change.range.start..change.range.start + change.new_len;
-                    (change.range, new)
+                let (old, new) = if let Some((old, new_len)) = change {
+                    let new = old.start..old.start + new_len;
+                    (old, new)
                 } else {
+                    #[cfg(test)]
+                    {
+                        self.scans += 1;
+                    }
                     let (prefix, suffix) = self.layouts.shared_edges(source);
                     (
                         prefix..self.layouts.len() - suffix,
@@ -279,6 +317,17 @@ impl LayoutCache {
         });
         (self.layouts.clone(), document_changed, layout_changed)
     }
+}
+
+// A change is a replaced range and its new length; `second` changes the result of `first`.
+fn merge_changes(
+    ((first, first_len), (second, second_len)): ((Range<usize>, usize), (Range<usize>, usize)),
+) -> (Range<usize>, usize) {
+    let start = first.start.min(second.start);
+    let end = (first.start + first_len).max(second.end);
+    let old_end = end - first_len + first.len();
+    let new_end = end - second.len() + second_len;
+    (start..old_end, new_end - start)
 }
 
 fn content_key(paragraph: &Paragraph) -> (*const u8, *const crate::Span) {
@@ -1288,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_edits_around_lists_match_a_fresh_layout() {
+    fn tracked_edit_batches_around_lists_match_a_fresh_layout() {
         let context = egui::Context::default();
         let appearance = appearance(16.0);
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -1312,6 +1361,7 @@ mod tests {
                 start: None,
             },
         };
+        let (mut merged, mut scanned) = (0, 0);
         for _ in 0..10 {
             let text: Vec<_> = (0..40).map(|index| format!("p{index}")).collect();
             let mut editor = Editor::from_text(&text.join("\n"));
@@ -1324,7 +1374,10 @@ mod tests {
             let mut cache = LayoutCache::default();
             layout_frame(&context, &mut cache, editor.document(), &appearance);
             for step in 0..20 {
-                for _ in 0..1 + usize::from(next(4) == 0) {
+                let scans = cache.scans;
+                let (mut changes, mut exact, mut untracked) = (0, true, false);
+                for _ in 0..1 + next(3) {
+                    let before = editor.document().content_identity();
                     let count = editor.document().paragraphs().len();
                     let paragraph = next(count);
                     let len = editor.document().paragraph(paragraph).unwrap().text().len();
@@ -1354,9 +1407,22 @@ mod tests {
                             .unwrap(),
                         _ => editor.insert_text("q").unwrap(),
                     }
+                    let document = editor.document();
+                    if !Arc::ptr_eq(&before, &document.content_identity()) {
+                        // An untracked edit is recovered only when it is the last of the batch.
+                        exact &= !untracked && document.change_since(&before).is_some();
+                        untracked = next(6) == 0;
+                        if !untracked {
+                            cache.track(document);
+                        }
+                        changes += 1;
+                    }
                 }
                 let (actual, _) =
                     layout_frame(&context, &mut cache, editor.document(), &appearance);
+                assert_eq!(cache.scans, scans + usize::from(!exact), "step {step}");
+                merged += usize::from(exact && changes > 1);
+                scanned += usize::from(!exact);
                 let mut fresh = LayoutCache::default();
                 let (expected, _) =
                     layout_frame(&context, &mut fresh, editor.document(), &appearance);
@@ -1381,6 +1447,37 @@ mod tests {
                     assert_eq!(actual.quote_bar, expected.quote_bar);
                     assert_eq!(actual.galley.job, expected.galley.job);
                 }
+            }
+        }
+        assert!(
+            merged > 50 && scanned > 5,
+            "{merged} merged, {scanned} scanned"
+        );
+    }
+
+    #[test]
+    fn merged_changes_cover_both_changes_and_nothing_before_them() {
+        fn replace(items: &[usize], range: Range<usize>, len: usize, id: usize) -> Vec<usize> {
+            let mut items = items.to_vec();
+            items.splice(range, (0..len).map(|index| id + index));
+            items
+        }
+        fn ranges(len: usize) -> impl Iterator<Item = (Range<usize>, usize)> {
+            (0..=len).flat_map(move |start| {
+                (start..=len).flat_map(move |end| (0..3).map(move |new| (start..end, new)))
+            })
+        }
+        let original: Vec<_> = (0..6).collect();
+        for (first, first_len) in ranges(original.len()) {
+            let middle = replace(&original, first.clone(), first_len, 100);
+            for (second, second_len) in ranges(middle.len()) {
+                let result = replace(&middle, second.clone(), second_len, 200);
+                let (old, new_len) =
+                    merge_changes(((first.clone(), first_len), (second.clone(), second_len)));
+                assert_eq!(old.start, first.start.min(second.start));
+                assert_eq!(result.len(), original.len() - old.len() + new_len);
+                assert_eq!(result[..old.start], original[..old.start]);
+                assert_eq!(result[old.start + new_len..], original[old.end..]);
             }
         }
     }

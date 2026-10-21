@@ -5752,6 +5752,60 @@ fn focus_requests_that_leave_focus_in_place_keep_queued_ime_before_a_host_focus_
 }
 
 #[test]
+fn edits_batched_in_one_frame_relayout_without_comparing_every_paragraph() {
+    let text: Vec<_> = (0..200).map(|index| format!("paragraph {index}")).collect();
+    let typed = vec![
+        Event::Text("a".into()),
+        Event::Text("b".into()),
+        key(Key::Enter, Modifiers::NONE),
+        Event::Text("c".into()),
+        key(Key::Backspace, Modifiers::NONE),
+        key(Key::Backspace, Modifiers::NONE),
+    ];
+    let mut queued = candidate_commit("你").to_vec();
+    queued.push(Event::Ime(ImeEvent::Commit("好".into())));
+    for (blurred, events, expected) in [
+        (false, typed, "paraabgraph 100"),
+        (true, queued, "para你好graph 100"),
+    ] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text(&text.join("\n"));
+        editor
+            .set_selection(Selection::caret(Position::new(100, 4)))
+            .unwrap();
+        if blurred {
+            composing_frame(&context, &mut editor, "ni");
+            context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+        } else {
+            widget_frame(&context, &mut editor, vec![], Some(0.0), true, unchanged);
+        }
+        let scans = widget_cache(&context).layout.scans;
+        widget_frame(
+            &context,
+            &mut editor,
+            events,
+            Some(0.2),
+            !blurred,
+            unchanged,
+        );
+        let document = editor.document();
+        assert_eq!(document.paragraph(100).unwrap().text(), expected);
+        assert_eq!(document.paragraphs().len(), 200);
+        let cache = widget_cache(&context);
+        assert_eq!(cache.layout.scans, scans, "blurred={blurred}");
+        assert_eq!(cache.layout.layouts.len(), 200);
+        assert!(
+            cache
+                .layout
+                .layouts
+                .caches(0..200)
+                .zip(document.paragraphs())
+                .all(|(cached, paragraph)| Arc::ptr_eq(&cached.paragraph, paragraph))
+        );
+    }
+}
+
+#[test]
 fn an_input_method_echoing_a_click_commit_is_inserted_once() {
     let click_commit = |context: &egui::Context, editor: &mut Editor| {
         let rect = composing_frame(context, editor, "한");
