@@ -119,11 +119,11 @@ with the intended desktop and physical keyboard.
   selection and caret requests, and native typing over the accessible selection.
   One-character replacement, undo, redo, and final undo restored the exact
   fixture. Speech logs and synthesized nonzero PCM captured the document and
-  selection announcements through a private file sink. The example's compatible
-  [AccessKit backports](examples/native-editor/vendor/accesskit_unix/BACKPORT.md)
-  fix current AT-SPI activation and the application's desktop parent.
-  This Unix adapter exposes `Text` but does not expose `EditableText`; direct
-  AT-SPI text replacement is unsupported and was not certified.
+  selection announcements through a private file sink. These sessions used the
+  example's former backport of the upstream AT-SPI activation and desktop-parent
+  fixes that `accesskit_unix` 0.24 now includes. That adapter exposed `Text` but
+  not `EditableText`, so direct AT-SPI text replacement was not certified;
+  `accesskit_unix` 0.24 adds `EditableText`, which has no recorded result yet.
 - A separate Qt 6.12 text editor received the native HTML/plain offer with exact
   Unicode multiline text, bold/italic emphasis, list structure, and foreground
   RGBA preserved. Its external HTML/plain offer without TLFR used the host's plain
@@ -144,7 +144,7 @@ the final clean commit remain required. Publish only after these checks pass.
 
 ## Native host validation record
 
-The standalone host in `examples/native-editor` uses eframe/egui 0.36.2 and
+The standalone host in `examples/native-editor` uses eframe/egui 0.37.0 and
 winit 0.30.13. It is available from a repository checkout and is intentionally
 excluded from the published library archive. Its renderer, window, clipboard,
 and platform accessibility dependencies remain outside the library's dependency
@@ -266,7 +266,7 @@ winit harness. The `NATIVE_QA.md` protocol gives steps for the feature rows.
 
 Textloom 1.x follows semantic versioning for the documented public API and feature
 names. Existing default builds remain independent of GUI libraries. Optional
-adapters expose types from egui 0.36, winit 0.30, and AccessKit 0.24; an upstream
+adapters expose types from egui 0.37, winit 0.30, and AccessKit 0.25; an upstream
 upgrade that breaks those exposed types requires a Textloom major release.
 Error enums (`Error`, `FragmentError`, `AccessKitError`, egui
 `AccessibilityError`), `ParagraphKind`, `Movement`, `InlineAttribute`,
@@ -283,8 +283,7 @@ timings are not API guarantees.
 
 Rust 1.95 is the minimum supported compiler for 1.0. The locked dependency graph
 is tested on that compiler, and a CI job also compiles the lowest direct
-dependency versions that `Cargo.toml` permits (AccessKit 0.24.1, as egui 0.36
-requires). Any future minimum-version increase must be announced
+dependency versions that `Cargo.toml` permits (AccessKit 0.25.1 with egui 0.37). Any future minimum-version increase must be announced
 in a minor or major release, never a patch release. Review dependency updates
 against the minimum compiler, all eight feature combinations, and the cargo-deny
 policy in `deny.toml`. Development-only dependencies, such as

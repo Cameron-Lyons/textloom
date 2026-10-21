@@ -99,7 +99,7 @@ def validate(report, revision, os_name, mode, interaction=False):
     host = report["host"]
     require(host["name"] == "textloom-native-example", "unexpected native host")
     require(
-        host["egui_api_version"] == host["eframe_api_version"] == "0.36",
+        host["egui_api_version"] == host["eframe_api_version"] == "0.37",
         "unexpected host API versions",
     )
     require(host["architecture"] in ("x86_64", "aarch64"), "unexpected runner architecture")

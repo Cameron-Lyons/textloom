@@ -480,7 +480,7 @@ impl NativeClipboard {
         editor: &mut textloom::Editor,
         mut input: egui::RawInput,
     ) -> Result<(), String> {
-        let id = egui::Id::new("native-clipboard-fixture");
+        let id = egui::Id::unique("native-clipboard-fixture");
         let mut failed = false;
         let mut captured = capture_paste(&mut input.events, || self.capture());
         let output = context.run_ui(input, |ui| {
@@ -808,8 +808,8 @@ mod tests {
                 context.options_mut(|options| {
                     options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
                 });
-                let field_id = egui::Id::new("clipboard-source-field");
-                let document_id = egui::Id::new("clipboard-target-document");
+                let field_id = egui::Id::unique("clipboard-source-field");
+                let document_id = egui::Id::unique("clipboard-target-document");
                 context.memory_mut(|memory| memory.request_focus(field_id));
                 let focus = |id: egui::Id| {
                     egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {

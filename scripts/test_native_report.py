@@ -13,8 +13,8 @@ def specimen(mode="editable"):
     report = empty(SCHEMA)
     report.update(schema_version=1, manual_signoff="not_recorded")
     report["host"].update(
-        name="textloom-native-example", egui_api_version="0.36",
-        eframe_api_version="0.36", os="linux", architecture="x86_64",
+        name="textloom-native-example", egui_api_version="0.37",
+        eframe_api_version="0.37", os="linux", architecture="x86_64",
         source_revision="candidate",
     )
     report["session"].update(
