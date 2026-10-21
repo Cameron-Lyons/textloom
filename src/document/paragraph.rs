@@ -611,15 +611,14 @@ fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
 }
 
 fn word_stops(text: &str) -> Vec<Range<usize>> {
-    let mut words = text
-        .unicode_word_indices()
-        .map(|(start, _)| start)
-        .peekable();
+    if text.is_ascii() {
+        return ascii_word_stops(text);
+    }
     let mut stops: Vec<Range<usize>> = Vec::new();
     let mut symbols = false;
     for (start, segment) in text.split_word_bound_indices() {
         let range = start..start + segment.len();
-        if words.next_if_eq(&start).is_some() {
+        if segment.chars().any(char::is_alphanumeric) {
             stops.push(range);
             symbols = false;
         } else if segment.chars().all(char::is_whitespace) {
@@ -632,4 +631,31 @@ fn word_stops(text: &str) -> Vec<Range<usize>> {
         }
     }
     stops
+}
+
+fn ascii_word_stops(text: &str) -> Vec<Range<usize>> {
+    let mut stops = Vec::new();
+    let mut end = 0;
+    for (start, word) in text.unicode_word_indices() {
+        push_symbol_runs(&mut stops, text.as_bytes(), end..start);
+        end = start + word.len();
+        stops.push(start..end);
+    }
+    push_symbol_runs(&mut stops, text.as_bytes(), end..text.len());
+    stops
+}
+
+fn push_symbol_runs(stops: &mut Vec<Range<usize>>, bytes: &[u8], gap: Range<usize>) {
+    let mut start = gap.start;
+    for index in gap.clone() {
+        if char::from(bytes[index]).is_whitespace() {
+            if start < index {
+                stops.push(start..index);
+            }
+            start = index + 1;
+        }
+    }
+    if start < gap.end {
+        stops.push(start..gap.end);
+    }
 }

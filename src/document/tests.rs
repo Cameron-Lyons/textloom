@@ -541,6 +541,96 @@ fn word_navigation_stops_at_unicode_words_and_symbol_runs() {
 }
 
 #[test]
+fn word_stops_match_general_word_segmentation() {
+    let check = |paragraph: &Paragraph| {
+        let text = paragraph.text();
+        let words: Vec<usize> = if text.is_ascii() {
+            text.split_word_bound_indices()
+                .filter(|(_, segment)| segment.bytes().any(|byte| byte.is_ascii_alphanumeric()))
+                .map(|(start, _)| start)
+                .collect()
+        } else {
+            text.unicode_word_indices()
+                .map(|(start, _)| start)
+                .collect()
+        };
+        let mut stops: Vec<Range<usize>> = Vec::new();
+        let mut symbols = false;
+        for (start, segment) in text.split_word_bound_indices() {
+            let range = start..start + segment.len();
+            if words.binary_search(&start).is_ok() {
+                stops.push(range);
+                symbols = false;
+            } else if segment.chars().all(char::is_whitespace) {
+                symbols = false;
+            } else if symbols {
+                stops.last_mut().unwrap().end = range.end;
+            } else {
+                stops.push(range);
+                symbols = true;
+            }
+        }
+        assert_eq!(paragraph.word_ranges(), stops, "{text:?}");
+    };
+    for text in [
+        "",
+        " ",
+        "___",
+        "__x__ a_b _1",
+        "can't 'twas rock 'n' roll''",
+        "1,000.5 3.14 1;2 1'000 1..2 1.,2 x.1 1.x",
+        "e.g. a:b a::b a..b a.'b",
+        "http://example.com/a_b?c=d&e#f",
+        "\r\n\r\n\t \u{b}\u{c}\r \n",
+        "!!! a!!!b --a-- #1 $2 %3 \"quoted\"",
+        "x\u{0}y\u{1f}z\u{7f}w",
+    ] {
+        check(&Paragraph::plain(text));
+    }
+    check(&Paragraph::plain(
+        &"A short paragraph with ASCII words, 1,000.5 e.g. can't __x__ ___ !? \t".repeat(50),
+    ));
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let ascii: Vec<char> = (0..=127u8).map(char::from).collect();
+    let punctuated: Vec<char> = "aZ09_'.,;:\"-!?/@ \t\u{b}\u{c}\r\n\u{0}\u{1f}\u{7f}"
+        .chars()
+        .collect();
+    let unicode: Vec<char> = "aZ09_'.,: \t\r\néß你ा\u{301}\u{200d}👩💻🇺🇸\u{a0}\u{2028}\u{3000}٣²"
+        .chars()
+        .collect();
+    for alphabet in [&ascii, &punctuated, &unicode] {
+        for _ in 0..10_000 {
+            let text: String = (0..next() % 24)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            check(&Paragraph::plain(&text));
+        }
+    }
+    let mut document = Document::from_text("can't 1,000 e.g. __x__");
+    for _ in 0..500 {
+        let paragraph = document.paragraph(0).unwrap();
+        check(paragraph);
+        let len = paragraph.text().len();
+        let start = next() % (len + 1);
+        let end = (start + next() % 3).min(len);
+        let token = ["a", "0", "_", "'", ".", ",", ":", "-", " ", "\t", "", "x.y"][next() % 12];
+        document
+            .replace(
+                Position::new(0, start)..Position::new(0, end),
+                token,
+                InlineStyle::default(),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
 fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
     for text in ["", "plain", "é👩‍💻", "e\u{301}🇦🇧क्‍ष"] {
         let paragraph = Paragraph::plain(text);
