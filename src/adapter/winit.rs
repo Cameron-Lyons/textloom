@@ -214,7 +214,7 @@ impl WinitAdapter {
         if !self.is_focused() || state != ElementState::Pressed {
             return Ok(InputOutcome::default());
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         if self.read_only {
             editor.cancel_composition();
         }
@@ -240,7 +240,7 @@ impl WinitAdapter {
             shortcut = shortcut_key(key, physical_key).and_then(|name| Shortcut::new(name, shift));
             if shortcut.is_none() && matches!(key, Key::Character(_)) {
                 outcome.handled = false;
-                outcome.changed = before.changed(editor);
+                outcome.changed = before != editor.presentation();
                 return Ok(outcome);
             }
         }
@@ -251,7 +251,7 @@ impl WinitAdapter {
                 editor.cancel_composition();
             }
             outcome.clipboard = self.run_shortcut(shortcut, editor)?;
-            outcome.changed = before.changed(editor);
+            outcome.changed = before != editor.presentation();
             return Ok(outcome);
         }
 
@@ -345,7 +345,7 @@ impl WinitAdapter {
                 _ => outcome.handled = false,
             }
         }
-        outcome.changed = before.changed(editor);
+        outcome.changed = before != editor.presentation();
         Ok(outcome)
     }
 
@@ -378,7 +378,7 @@ impl WinitAdapter {
                 ..InputOutcome::default()
             });
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         let was_enabled = self.ime_enabled;
         let mut preedit_changed = false;
         match event {
@@ -429,7 +429,9 @@ impl WinitAdapter {
         }
         Ok(InputOutcome {
             handled: true,
-            changed: before.changed(editor) || preedit_changed || was_enabled != self.ime_enabled,
+            changed: before != editor.presentation()
+                || preedit_changed
+                || was_enabled != self.ime_enabled,
             clipboard: None,
         })
     }
@@ -449,7 +451,7 @@ impl WinitAdapter {
         if clean.is_empty() {
             return Ok(blocked);
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         if !cancel_empty_composition(editor) {
             return Ok(blocked);
         }
@@ -458,7 +460,7 @@ impl WinitAdapter {
         editor.break_history_group();
         Ok(InputOutcome {
             handled: true,
-            changed: before.changed(editor),
+            changed: before != editor.presentation(),
             clipboard: None,
         })
     }
@@ -478,14 +480,14 @@ impl WinitAdapter {
         if self.read_only {
             return Ok(blocked);
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         if !cancel_empty_composition(editor) {
             return Ok(blocked);
         }
         editor.insert_fragment(fragment)?;
         Ok(InputOutcome {
             handled: true,
-            changed: before.changed(editor),
+            changed: before != editor.presentation(),
             clipboard: None,
         })
     }
@@ -699,31 +701,6 @@ fn selection_contains_list(editor: &Editor) -> bool {
                 ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. }
             )
         })
-}
-
-struct EditorState {
-    revision: u64,
-    selection: crate::Selection,
-    style: crate::InlineStyle,
-    composing: bool,
-}
-
-impl EditorState {
-    fn capture(editor: &Editor) -> Self {
-        Self {
-            revision: editor.document().revision(),
-            selection: editor.selection(),
-            style: editor.typing_style(),
-            composing: editor.composition().is_some(),
-        }
-    }
-
-    fn changed(&self, editor: &Editor) -> bool {
-        self.revision != editor.document().revision()
-            || self.selection != editor.selection()
-            || self.style != editor.typing_style()
-            || self.composing != editor.composition().is_some()
-    }
 }
 
 #[cfg(test)]

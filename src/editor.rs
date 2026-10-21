@@ -106,6 +106,14 @@ struct StyleCache {
     style: Option<SelectionStyle>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Presentation {
+    revision: u64,
+    selection: Selection,
+    typing_style: InlineStyle,
+    pub(crate) composing: bool,
+}
+
 impl Editor {
     pub fn new(document: Document) -> Self {
         Self {
@@ -741,6 +749,15 @@ impl Editor {
         };
         self.restore(state);
         true
+    }
+
+    pub(crate) fn presentation(&self) -> Presentation {
+        Presentation {
+            revision: self.document.revision(),
+            selection: self.selection,
+            typing_style: self.typing_style,
+            composing: self.composition.is_some(),
+        }
     }
 
     fn state(&self) -> EditState {

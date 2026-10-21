@@ -142,12 +142,7 @@ pub fn apply_action(
     editor: &mut Editor,
     action: AccessibleAction<'_>,
 ) -> Result<AccessibilityOutcome, Error> {
-    let before = (
-        editor.document().revision(),
-        editor.selection(),
-        editor.typing_style(),
-        editor.composition().is_some(),
-    );
+    let before = editor.presentation();
     match action {
         AccessibleAction::Focus => {
             return Ok(AccessibilityOutcome {
@@ -170,18 +165,12 @@ pub fn apply_action(
             editor.break_history_group();
         }
     }
-    let composing = editor.composition().is_some();
+    let after = editor.presentation();
     Ok(AccessibilityOutcome {
         handled: true,
         focus_requested: false,
-        changed: before
-            != (
-                editor.document().revision(),
-                editor.selection(),
-                editor.typing_style(),
-                composing,
-            ),
-        composition_canceled: before.3 && !composing,
+        changed: before != after,
+        composition_canceled: before.composing && !after.composing,
         activated_link: None,
     })
 }
