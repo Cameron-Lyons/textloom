@@ -791,6 +791,67 @@ fn heading_enter_returns_to_body() {
 }
 
 #[test]
+fn accessible_full_value_replacement_keeps_the_document_start_kind_and_style() {
+    use textloom::accessibility::{AccessibleAction, apply_action};
+    let heading = ParagraphKind::Heading { level: 1 };
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    let started = ParagraphKind::Ordered {
+        indent: 0,
+        start: Some(3),
+    };
+    let continued = ParagraphKind::Ordered {
+        indent: 0,
+        start: None,
+    };
+    for (start_kind, text, expected) in [
+        (heading, "x", vec![heading]),
+        (heading, "brand new\ncontent", vec![heading, BODY]),
+        (bullet, "a\nb", vec![bullet, bullet]),
+        (started, "a\nb\n", vec![started, continued, continued]),
+    ] {
+        let mut editor = Editor::from_text("Title\nbody bold");
+        editor.set_paragraph_kind(start_kind).unwrap();
+        editor
+            .set_selection(Selection::new(Position::new(1, 5), Position::new(1, 9)))
+            .unwrap();
+        editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let selection = Selection::caret(Position::new(1, 9));
+        editor.set_selection(selection).unwrap();
+        let typing_style = editor.typing_style();
+        assert!(typing_style.bold);
+        let original = editor.document().paragraphs().to_vec();
+        let steps = editor.undo_len();
+
+        apply_action(&mut editor, AccessibleAction::ReplaceAllText(text)).unwrap();
+        assert_eq!(editor.document().plain_text(), text);
+        assert_eq!(kinds(&editor), expected, "{start_kind:?} {text:?}");
+        assert!(
+            editor
+                .document()
+                .paragraphs()
+                .iter()
+                .flat_map(|paragraph| paragraph.spans())
+                .all(|span| !span.style.bold)
+        );
+        assert!(!editor.typing_style().bold);
+        assert_eq!(editor.undo_len(), steps + 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().paragraphs(), original);
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.typing_style(), typing_style);
+
+        editor.select_all();
+        editor.insert_text(text).unwrap();
+        assert!(kinds(&editor).iter().all(|kind| *kind == BODY));
+    }
+}
+
+#[test]
 fn paragraph_formatting_excludes_end_at_next_paragraph_start() {
     let mut editor = Editor::from_text("one\ntwo\nthree");
     editor

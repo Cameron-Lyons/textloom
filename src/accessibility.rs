@@ -166,12 +166,7 @@ pub fn apply_action(
         AccessibleAction::ReplaceAllText(text) => {
             editor.cancel_composition();
             editor.break_history_group();
-            let style = editor.document().style_at(Position::default());
-            editor.replace_range_with_style(
-                Position::default()..editor.document().end(),
-                text,
-                style,
-            )?;
+            editor.replace_all_text(text)?;
             editor.break_history_group();
         }
     }

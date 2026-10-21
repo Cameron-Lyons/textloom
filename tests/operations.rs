@@ -1142,6 +1142,195 @@ fn typing_over_a_selection_from_a_paragraph_start_matches_deleting_it_first() {
 }
 
 #[test]
+fn pasting_lines_over_a_selection_from_a_paragraph_start_matches_deleting_it_first() {
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    for (text, paragraph_kinds, end, inserted, expected) in [
+        (
+            "Title\nbody",
+            vec![H1, BODY],
+            Position::new(1, 2),
+            "x\ny",
+            vec![line("x", BODY), line("ydy", BODY)],
+        ),
+        (
+            "Title\nbody",
+            vec![H1, BODY],
+            Position::new(1, 0),
+            "a\nb\n",
+            vec![line("a", BODY), line("b", BODY), line("body", BODY)],
+        ),
+        (
+            "Title\nbody text",
+            vec![H1, BODY],
+            Position::new(1, 4),
+            "\n",
+            vec![line("", BODY), line(" text", BODY)],
+        ),
+        (
+            "item\nTitle",
+            vec![bullet, H1],
+            Position::new(1, 5),
+            "x\ny",
+            vec![line("x", H1), line("y", BODY)],
+        ),
+        (
+            "a\nb\nc",
+            vec![ord(0, 1), ord(0, 5), ord(0, 6)],
+            Position::new(1, 0),
+            "x\ny",
+            vec![
+                line("x", ord(0, 5)),
+                line("yb", ord(0, 6)),
+                line("c", ord(0, 7)),
+            ],
+        ),
+    ] {
+        let selection = Selection::new(Position::default(), end);
+        let mut pasted = with_kinds(text, &paragraph_kinds);
+        pasted.set_selection(selection).unwrap();
+        pasted.insert_text(inserted).unwrap();
+        assert_eq!(lines(&pasted), expected, "{text:?} {end:?} {inserted:?}");
+
+        let mut deleted = with_kinds(text, &paragraph_kinds);
+        deleted.set_selection(selection).unwrap();
+        deleted.delete_backward().unwrap();
+        deleted.insert_text(inserted).unwrap();
+        assert_eq!(
+            deleted.document().paragraphs(),
+            pasted.document().paragraphs(),
+            "{text:?} {end:?} {inserted:?}"
+        );
+
+        let mut replaced = with_kinds(text, &paragraph_kinds);
+        let query = replaced.document().text(selection.range()).unwrap();
+        replaced
+            .replace_all(&query, inserted, SearchOptions::default())
+            .unwrap();
+        assert_eq!(
+            replaced.document().paragraphs(),
+            pasted.document().paragraphs(),
+            "{text:?} {end:?} {inserted:?}"
+        );
+    }
+
+    let mut entered = with_kinds("Title\nbody text", &[H1, BODY]);
+    entered
+        .set_selection(Selection::new(Position::default(), Position::new(1, 4)))
+        .unwrap();
+    entered.insert_paragraph().unwrap();
+    assert_eq!(lines(&entered), [line("", BODY), line(" text", BODY)]);
+}
+
+#[test]
+fn seeded_documents_replace_selections_like_deleting_them_first() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let paragraph_kinds = [
+        BODY,
+        H1,
+        ParagraphKind::Quote,
+        ParagraphKind::Bullet { indent: 0 },
+        ParagraphKind::Bullet { indent: 1 },
+        ParagraphKind::Ordered {
+            indent: 0,
+            start: None,
+        },
+        ParagraphKind::Ordered {
+            indent: 0,
+            start: Some(4),
+        },
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: None,
+        },
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: Some(2),
+        },
+    ];
+    let styles = [
+        InlineStyle::default(),
+        InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        },
+    ];
+    for case in 0..300 {
+        let document = Document::from_paragraphs((0..1 + next(4)).map(|_| {
+            let mut text = String::new();
+            let mut spans = Vec::new();
+            for _ in 0..next(3) {
+                let start = text.len();
+                text.push_str(["a", "bc", "e\u{301}"][next(3)]);
+                spans.push(Span {
+                    range: start..text.len(),
+                    style: styles[next(styles.len())],
+                    link: None,
+                });
+            }
+            Paragraph::new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
+        }));
+        let positions: Vec<_> = document
+            .paragraphs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, paragraph)| {
+                (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                    Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+                })
+            })
+            .collect();
+        for (index, &start) in positions.iter().enumerate() {
+            for &end in &positions[index..] {
+                for text in ["", "x", "x\ny", "\n", "a\n\nb", "x\n"] {
+                    let selection = Selection::new(start, end);
+                    let mut replaced = Editor::new(document.clone());
+                    replaced.set_selection(selection).unwrap();
+                    replaced.insert_text(text).unwrap();
+                    let mut deleted = Editor::new(document.clone());
+                    deleted.set_selection(selection).unwrap();
+                    if !selection.is_caret() {
+                        deleted.delete_backward().unwrap();
+                    }
+                    deleted.insert_text(text).unwrap();
+                    // The rule covers selections from a paragraph start. After a later
+                    // start, text following a selection across a break keeps its own
+                    // paragraph's kind on the last inserted line, as with rich paste.
+                    let tail = (start.byte > 0 && start.paragraph < end.paragraph)
+                        .then(|| start.paragraph + text.matches('\n').count())
+                        .filter(|&tail| tail > start.paragraph);
+                    let paragraphs = |editor: &Editor| -> Vec<_> {
+                        editor
+                            .document()
+                            .paragraphs()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, paragraph)| {
+                                (
+                                    paragraph.text().to_owned(),
+                                    paragraph.spans().to_vec(),
+                                    (Some(index) != tail).then(|| paragraph.kind()),
+                                )
+                            })
+                            .collect()
+                    };
+                    assert_eq!(
+                        (paragraphs(&replaced), replaced.selection()),
+                        (paragraphs(&deleted), deleted.selection()),
+                        "case {case}: {document:?} {start:?}..{end:?} {text:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn rich_paste_without_a_copied_paragraph_break_keeps_the_destination_kind() {
     let mut source = Editor::from_text("some word here");
     source

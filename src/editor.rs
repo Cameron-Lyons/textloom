@@ -436,6 +436,23 @@ impl Editor {
         self.replace_selection_with_before(text, Group::None, before)
     }
 
+    pub(crate) fn replace_all_text(&mut self, text: &str) -> Result<(), Error> {
+        self.ensure_no_composition()?;
+        let before = self.state();
+        let start = Position::default();
+        self.selection = Selection::new(start, self.document.end());
+        self.typing_style = self.document.style_at(start);
+        let kind = self.document.paragraphs()[0].kind();
+        let result = self.document.replace_with_kind(
+            self.selection.range(),
+            text,
+            self.typing_style,
+            None,
+            Some(kind),
+        );
+        self.finish_replacement(result, Group::None, before)
+    }
+
     pub fn insert_paragraph(&mut self) -> Result<(), Error> {
         self.ensure_no_composition()?;
         if self

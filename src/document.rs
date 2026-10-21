@@ -345,6 +345,17 @@ impl Document {
         style: InlineStyle,
         link: Option<&Link>,
     ) -> Result<(Delta, Position), Error> {
+        self.replace_with_kind(range, text, style, link, None)
+    }
+
+    pub(crate) fn replace_with_kind(
+        &mut self,
+        range: Range<Position>,
+        text: &str,
+        style: InlineStyle,
+        link: Option<&Link>,
+        kind: Option<ParagraphKind>,
+    ) -> Result<(Delta, Position), Error> {
         self.validate_range(&range)?;
         if range.is_empty() && text.is_empty() {
             return Ok((
@@ -360,25 +371,32 @@ impl Document {
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
         let chunks: Vec<&str> = text.split('\n').collect();
-        let leading = removes_leading_paragraph(&range, chunks.len() == 1);
+        let leading = removes_leading_paragraph(&range);
+        let base = kind.unwrap_or_else(|| {
+            if leading {
+                self.surviving_kind(range.start.paragraph..range.end.paragraph, last.kind)
+            } else {
+                first.kind
+            }
+        });
         let mut after = Vec::with_capacity(chunks.len());
         let mut insertion_end = 0;
         for (index, chunk) in chunks.iter().enumerate() {
             let is_first = index == 0;
             let is_last = index + 1 == chunks.len();
             let kind = if is_first {
-                if leading {
-                    self.surviving_kind(range.start.paragraph..range.end.paragraph, last.kind)
-                } else {
-                    first.kind
-                }
+                base
             } else if is_last {
-                suffix_kind(first, last, &range, index)
+                suffix_kind(base, last, &range, leading, index)
             } else {
-                continuation_kind(first.kind, index)
+                continuation_kind(base, index)
             };
             if chunk.is_empty() && !is_last && is_first && range.start.byte == first.text.len() {
-                after.push(Arc::clone(first));
+                after.push(if kind == first.kind {
+                    Arc::clone(first)
+                } else {
+                    Arc::new(first.with_kind(kind))
+                });
                 continue;
             }
             if chunk.is_empty() && is_last && !is_first && range.end.byte == 0 {
@@ -452,7 +470,7 @@ impl Document {
         let prefix = range.start.byte > 0;
         let suffix = range.end.byte < last.text.len();
         let inline = count == 1 && (prefix || suffix || fragment.paragraphs()[0].text.is_empty());
-        let leading = inline && removes_leading_paragraph(&range, true);
+        let leading = inline && removes_leading_paragraph(&range);
         let mut after: Vec<Arc<Paragraph>> = Vec::with_capacity(count);
         let mut insertion_end = 0;
         for (index, source) in fragment.paragraphs().iter().enumerate() {
@@ -594,7 +612,8 @@ impl Document {
             };
             let link = source.link_for_byte(range.start.byte);
             let multiple = range.start.paragraph != range.end.paragraph;
-            if builder.is_empty() && multiple && !multiline {
+            let leading = builder.is_empty() && multiple;
+            if leading {
                 let removed = self.paragraphs[range.start.paragraph + 1..range.end.paragraph]
                     .iter()
                     .map(|paragraph| paragraph.kind);
@@ -609,7 +628,7 @@ impl Document {
                 link,
                 range.end.byte < end.text.len(),
             );
-            if multiple && multiline {
+            if multiple && multiline && !leading {
                 builder.kind = end.kind;
             }
             caret = Position::new(
@@ -881,22 +900,23 @@ pub(crate) fn normalize_newlines(text: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-fn removes_leading_paragraph(range: &Range<Position>, single_paragraph: bool) -> bool {
-    single_paragraph && range.start.paragraph != range.end.paragraph && range.start.byte == 0
+fn removes_leading_paragraph(range: &Range<Position>) -> bool {
+    range.start.paragraph != range.end.paragraph && range.start.byte == 0
 }
 
 fn suffix_kind(
-    first: &Paragraph,
+    base: ParagraphKind,
     last: &Paragraph,
     range: &Range<Position>,
+    leading: bool,
     index: usize,
 ) -> ParagraphKind {
-    if range.start.paragraph != range.end.paragraph {
+    if range.start.paragraph != range.end.paragraph && !leading {
         last.kind
     } else if range.end.byte < last.text.len() {
-        numbered_kind(first.kind, index)
+        numbered_kind(base, index)
     } else {
-        continuation_kind(first.kind, index)
+        continuation_kind(base, index)
     }
 }
 

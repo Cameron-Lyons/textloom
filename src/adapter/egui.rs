@@ -1199,12 +1199,7 @@ fn handle_accessibility_action(
             *interrupted |= editor.cancel_composition();
             editor.break_history_group();
             let result = if request.action == Action::SetValue {
-                let style = editor.document().style_at(Position::default());
-                editor.replace_range_with_style(
-                    Position::default()..editor.document().end(),
-                    value,
-                    style,
-                )
+                editor.replace_all_text(value)
             } else {
                 editor.insert_text(value)
             };
