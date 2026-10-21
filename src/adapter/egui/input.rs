@@ -45,24 +45,23 @@ pub(super) struct InputOptions {
     pub(super) heading_shortcuts: bool,
 }
 
-pub(super) fn reads_layout(event: &Event) -> bool {
+pub(super) fn reads_layout(event: &Event, options: &InputOptions) -> bool {
     match event {
         Event::Key {
             key,
+            physical_key,
             pressed: true,
             modifiers,
             ..
-        } => match key {
-            Key::ArrowUp
-            | Key::ArrowDown
-            | Key::PageUp
-            | Key::PageDown
-            | Key::Home
-            | Key::End
-            | Key::Tab => true,
-            Key::ArrowLeft | Key::ArrowRight => modifiers.mac_cmd,
-            _ => false,
-        },
+        } => matches!(
+            classify_key(*key, *physical_key, *modifiers, options),
+            Some(
+                KeyCommand::RowBoundary { .. }
+                    | KeyCommand::Vertical { .. }
+                    | KeyCommand::Page { .. }
+                    | KeyCommand::ListEdit(_)
+            )
+        ),
         Event::AccessKitActionRequest(_) => true,
         _ => false,
     }
@@ -334,14 +333,13 @@ enum KeyCommand {
     Vertical { down: bool },
     Page { down: bool },
     Edit(fn(&mut Editor) -> Result<(), Error>),
+    ListEdit(fn(&mut Editor) -> Result<(), Error>),
 }
 
 fn classify_key(
-    editor: &Editor,
     key: Key,
     physical_key: Option<Key>,
     modifiers: Modifiers,
-    layouts: &ParagraphLayouts,
     options: &InputOptions,
 ) -> Option<KeyCommand> {
     let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
@@ -391,13 +389,9 @@ fn classify_key(
         }
         Key::Enter if !modifiers.command => KeyCommand::Edit(Editor::insert_paragraph),
         Key::Tab
-            if !options.read_only
-                && !modifiers.command
-                && !modifiers.ctrl
-                && !modifiers.alt
-                && layouts.contains_list(editor.selected_paragraphs()) =>
+            if !options.read_only && !modifiers.command && !modifiers.ctrl && !modifiers.alt =>
         {
-            KeyCommand::Edit(if modifiers.shift {
+            KeyCommand::ListEdit(if modifiers.shift {
                 Editor::outdent_list
             } else {
                 Editor::indent_list
@@ -420,8 +414,10 @@ pub(super) fn handle_key(
 ) -> bool {
     // Keys delegated to the host and blocked edits keep the painted caret and
     // the column used by a later vertical movement.
-    let Some(key_command) = classify_key(editor, key, physical_key, modifiers, layouts, options)
-    else {
+    let Some(key_command) = classify_key(key, physical_key, modifiers, options).filter(|command| {
+        !matches!(command, KeyCommand::ListEdit(_))
+            || layouts.contains_list(editor.selected_paragraphs())
+    }) else {
         return false;
     };
     match key_command {
@@ -478,7 +474,7 @@ pub(super) fn handle_key(
             record(editor.move_cursor(movement, modifiers.shift), errors);
             None
         }
-        KeyCommand::Edit(edit) => {
+        KeyCommand::Edit(edit) | KeyCommand::ListEdit(edit) => {
             record(edit(editor), errors);
             None
         }

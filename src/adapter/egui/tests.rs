@@ -3161,6 +3161,18 @@ fn typing_then_row_boundary_in_same_frame_uses_current_layout() {
 }
 
 #[test]
+fn enters_then_page_up_in_same_frame_uses_current_layout() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("");
+    let mut events = vec![key(Key::Enter, Modifiers::NONE); 40];
+    events.push(key(Key::PageUp, Modifiers::NONE));
+    frame(&context, &mut editor, events, true);
+    assert_eq!(editor.document().paragraphs().len(), 41);
+    let paragraph = editor.selection().focus.paragraph;
+    assert!((1..40).contains(&paragraph), "{paragraph}");
+}
+
+#[test]
 fn enter_then_tab_in_a_list_in_same_frame_indents_the_new_item() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("item");

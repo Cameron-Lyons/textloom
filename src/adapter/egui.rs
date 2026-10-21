@@ -495,7 +495,7 @@ impl<'a> RichTextEditor<'a> {
                 {
                     continue;
                 }
-                if layout_stale && reads_layout(event) {
+                if layout_stale && reads_layout(event, &options) {
                     layouts = cache.layout(ui, self.editor, &appearance);
                     layout_stale = false;
                 }
