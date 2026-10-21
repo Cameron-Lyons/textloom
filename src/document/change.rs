@@ -264,12 +264,16 @@ impl Delta {
     }
 
     pub fn retained_bytes(&self) -> usize {
+        let runs = self.rest.len().saturating_mul(std::mem::size_of::<Delta>());
         self.splices()
             .map(|splice| {
+                let pointers = (splice.before.len() + splice.after.len())
+                    .saturating_mul(std::mem::size_of::<Arc<Paragraph>>());
                 side_bytes(&splice.before, &splice.after)
                     .max(side_bytes(&splice.after, &splice.before))
+                    .saturating_add(pointers)
             })
-            .fold(0, usize::saturating_add)
+            .fold(runs, usize::saturating_add)
     }
 
     fn splices(&self) -> impl Iterator<Item = &Delta> {

@@ -1661,7 +1661,8 @@ fn sparse_changes_retain_only_their_changed_runs() {
     };
     assert_eq!(
         contiguous.retained_bytes() - delta.retained_bytes(),
-        24 * std::mem::size_of::<Paragraph>()
+        24 * (std::mem::size_of::<Paragraph>() + 2 * std::mem::size_of::<Arc<Paragraph>>())
+            - 2 * std::mem::size_of::<Delta>()
     );
     let shared = |expected: &[Arc<Paragraph>], document: &Document| {
         expected
@@ -1849,12 +1850,16 @@ fn sparse_kind_changes_renumber_lists_through_history() {
 fn history_charges_the_larger_side_without_shared_text_or_runs() {
     let record = std::mem::size_of::<Paragraph>();
     let run = std::mem::size_of::<Span>();
+    let pointer = std::mem::size_of::<Arc<Paragraph>>();
     let text = "word ".repeat(1000);
     let mut document = Document::from_text(&format!("{text}\n{text}"));
     let (typed, _) = document
         .replace(Position::new(0, 0)..Position::new(0, 0), "x", bold())
         .unwrap();
-    assert_eq!(typed.retained_bytes(), record + text.len() + 1 + 2 * run);
+    assert_eq!(
+        typed.retained_bytes(),
+        record + text.len() + 1 + 2 * run + 2 * pointer
+    );
 
     let formatted = document
         .apply_style(
@@ -1865,7 +1870,10 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
             },
         )
         .unwrap();
-    assert_eq!(formatted.retained_bytes(), 2 * record + 4 * run);
+    assert_eq!(
+        formatted.retained_bytes(),
+        2 * record + 4 * run + 4 * pointer
+    );
 
     let len = document.paragraphs().len();
     let retyped = document
@@ -1877,7 +1885,26 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
             },
         )
         .unwrap();
-    assert_eq!(retyped.retained_bytes(), 2 * record);
+    assert_eq!(retyped.retained_bytes(), 2 * record + 4 * pointer);
+}
+
+#[test]
+fn sparse_history_charges_the_pointers_and_record_of_each_run() {
+    let record = std::mem::size_of::<Paragraph>();
+    let pointer = std::mem::size_of::<Arc<Paragraph>>();
+    let mut document = Document::from_text(&vec!["text"; 100].join("\n"));
+    document.set_kind(0..100, ParagraphKind::Quote).unwrap();
+    for index in (0..100).step_by(10) {
+        document
+            .set_kind(index..index + 1, ParagraphKind::Body)
+            .unwrap();
+    }
+    let delta = document.set_kind(0..100, ParagraphKind::Quote).unwrap();
+    assert_eq!(delta.rest.len(), 9);
+    assert_eq!(
+        delta.retained_bytes(),
+        10 * (record + 2 * pointer) + 9 * std::mem::size_of::<Delta>()
+    );
 }
 
 fn numbers(document: &Document) -> Vec<Option<u32>> {

@@ -1483,7 +1483,10 @@ fn mid_list_enter_renumbers_following_items_and_shares_their_text() {
     assert!(Arc::ptr_eq(&before[2], &editor.document().paragraphs()[3]));
     assert_eq!(
         editor.history_bytes() - history,
-        2 * std::mem::size_of::<Paragraph>() + "two".len() + 2 * std::mem::size_of::<Span>()
+        2 * std::mem::size_of::<Paragraph>()
+            + "two".len()
+            + 2 * std::mem::size_of::<Span>()
+            + 3 * std::mem::size_of::<Arc<Paragraph>>()
     );
     assert_eq!(
         trailing_text,

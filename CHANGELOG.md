@@ -23,7 +23,9 @@ First stable release of the native Rust rich-text editing library.
 - Replace-all and kind, style, link, or list commands that change a few
   far-apart paragraphs keep only the changed paragraphs in undo history, also
   when replacements add or join paragraphs. Such edits in very large documents
-  stay undoable and no longer evict earlier undo steps.
+  stay undoable and no longer evict earlier undo steps. `history_bytes()` also
+  charges the paragraph pointers each change keeps and the record of each
+  separately kept run.
 - Egui IME input that arrives after Tab, Shift+Tab, or a routed AccessKit focus
   request has moved focus to another widget reaches that widget, whatever the
   draw order, instead of being taken or duplicated by the editor. The editor

@@ -927,7 +927,7 @@ the tables above.
 | Workload | Before | After |
 | --- | ---: | ---: |
 | `replace_all()` of two matches 100,000 untouched paragraphs apart | 12.9 ms | 3.2 ms |
-| History retained by that replacement | 6.4 MB | 374 B |
+| History retained by that replacement | 6.4 MB | 486 B |
 | Repeated `selection_style()` after Select All, 100,000 paragraphs | 1,253 µs | 0.03 µs |
 | Decoding 10,000 French paragraphs with one bold word near each end | 36.8 ms | 4.7 ms |
 | Case-insensitive whole-word find next, middle of a 1.1 MB paragraph | 10,227 µs | 3.5 µs |
