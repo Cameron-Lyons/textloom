@@ -489,9 +489,10 @@ impl<'a> RichTextEditor<'a> {
             let mut layout_stale = false;
             let mut traversed = false;
             for (index, event) in events.iter().enumerate() {
-                // egui moves focus for Shift+Tab next pass; later IME input belongs to that widget.
+                // egui moves focus for Shift+Tab next pass; a later preedit belongs to that widget,
+                // while commits stay here like Text.
                 if applied.binary_search(&index).is_ok()
-                    || (traversed && matches!(event, Event::Ime(_)))
+                    || (traversed && matches!(event, Event::Ime(ImeEvent::Preedit { .. })))
                 {
                     continue;
                 }

@@ -131,6 +131,16 @@ fn commit(value: &str) -> Event {
     Event::Ime(ImeEvent::Commit(value.into()))
 }
 
+fn shift_tab() -> Event {
+    Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    }
+}
+
 fn context(max_passes: usize) -> Context {
     let ctx = Context::default();
     ctx.enable_accesskit();
@@ -256,13 +266,6 @@ fn ime_input_after_tab_reaches_the_next_field() {
 
 #[test]
 fn ime_input_after_shift_tab_reaches_the_previous_field() {
-    let shift_tab = || Event::Key {
-        key: egui::Key::Tab,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::SHIFT,
-    };
     for list in [false, true] {
         for reversed in [false, true] {
             for batches in [
@@ -316,6 +319,36 @@ fn ime_input_after_shift_tab_reaches_the_previous_field() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn ime_commits_in_the_shift_tab_batch_stay_with_the_editor_like_text() {
+    for reversed in [false, true] {
+        for input in [commit("n"), text("n")] {
+            let ctx = context(1);
+            let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+            fields.fields = [
+                Field::new(FieldKind::Rich, "abc"),
+                Field::new(FieldKind::Native, ""),
+            ];
+            fields.reversed = reversed;
+            fields.warm(&ctx);
+            for batch in [vec![shift_tab(), input.clone()], vec![]] {
+                fields.frame(&ctx, batch).drop_without_applying_deltas();
+            }
+            fields.flush(&ctx);
+            assert_eq!(
+                ctx.memory(|memory| memory.focused()),
+                Some(Id::new("second")),
+                "reversed={reversed}, {input:?}"
+            );
+            assert_eq!(
+                fields.fields.each_ref().map(Field::text),
+                ["nabc", ""],
+                "reversed={reversed}, {input:?}"
+            );
         }
     }
 }

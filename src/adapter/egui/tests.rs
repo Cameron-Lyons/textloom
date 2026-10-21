@@ -6521,6 +6521,28 @@ fn ime_cancellation_precedes_a_commit_in_the_same_input_batch() {
 }
 
 #[test]
+fn ime_commit_after_shift_tab_in_one_batch_is_inserted_when_focus_stays() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    editor
+        .set_selection(Selection::caret(editor.document().end()))
+        .unwrap();
+    frame(&context, &mut editor, vec![], true);
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            key(Key::Tab, Modifiers::SHIFT),
+            Event::Text("t".into()),
+            Event::Ime(ImeEvent::Commit("x".into())),
+        ],
+        true,
+    );
+    frame(&context, &mut editor, vec![], true);
+    assert_eq!(editor.document().plain_text(), "abctx");
+}
+
+#[test]
 fn surrounding_deletion_keeps_a_following_commit_from_the_same_ime_edit() {
     for blur in [false, true] {
         for (before_chars, cleared) in [(0, false), (1, false), (0, true), (1, true)] {

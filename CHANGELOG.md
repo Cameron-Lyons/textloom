@@ -26,10 +26,13 @@ First stable release of the native Rust rich-text editing library.
   stay undoable and no longer evict earlier undo steps. `history_bytes()` also
   charges the paragraph pointers each change keeps and the record of each
   separately kept run.
-- Egui IME input that arrives after Tab, Shift+Tab, or a routed AccessKit focus
-  request has moved focus to another widget reaches that widget, whatever the
-  draw order, instead of being taken or duplicated by the editor. The editor
-  still commits its visible preedit on blur.
+- Egui IME input that arrives after Tab or a routed AccessKit focus request has
+  moved focus to another widget, or in a later input batch than a Shift+Tab
+  that moves focus, reaches that widget, whatever the draw order, instead of
+  being taken or duplicated by the editor. An IME commit in the Shift+Tab batch
+  is still inserted by the editor, like text, because egui moves focus for
+  Shift+Tab only in the next pass. The editor still commits its visible preedit
+  on blur.
 - Egui clicks, drags, Up/Down, and PageUp/PageDown on the right half of a wide
   grapheme, such as a flag, a skin-toned emoji, or a letter with combining
   marks, place the caret after it. Double-clicking the right half of a word's
