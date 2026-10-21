@@ -347,6 +347,12 @@ mod accesskit_bridge {
         node: Node,
     }
 
+    #[derive(Debug)]
+    struct PublishedEditor {
+        node: Node,
+        selection: Selection,
+    }
+
     struct Staged<'a> {
         published: &'a [Arc<CachedParagraph>],
         range: Range<usize>,
@@ -388,10 +394,8 @@ mod accesskit_bridge {
         paragraphs: Vec<Arc<CachedParagraph>>,
         quotes: Vec<CachedQuote>,
         run_locations: OnceLock<HashMap<NodeId, (usize, usize)>>,
-        last_editor: Option<Node>,
-        last_selection: Option<Selection>,
+        published_editor: Option<PublishedEditor>,
         document_identity: Option<Arc<()>>,
-        initialized: bool,
         read_only: bool,
     }
 
@@ -417,10 +421,8 @@ mod accesskit_bridge {
                 paragraphs: Vec::new(),
                 quotes: Vec::new(),
                 run_locations: OnceLock::new(),
-                last_editor: None,
-                last_selection: None,
+                published_editor: None,
                 document_identity: None,
-                initialized: false,
                 read_only: false,
             })
         }
@@ -432,8 +434,7 @@ mod accesskit_bridge {
         }
 
         pub fn invalidate(&mut self) {
-            self.initialized = false;
-            self.last_editor = None;
+            self.published_editor = None;
         }
 
         pub fn root_node(&self) -> NodeId {
@@ -512,25 +513,21 @@ mod accesskit_bridge {
                 .document_identity
                 .as_ref()
                 .is_some_and(|cached| Arc::ptr_eq(cached, &document_identity));
-            if self.initialized && same_document {
+            if same_document && let Some(published) = &mut self.published_editor {
                 let mut nodes = Vec::new();
-                if self.last_selection != Some(selection)
-                    || self.last_editor.as_ref().and_then(Node::label) != Some(label)
-                    || self
-                        .last_editor
-                        .as_ref()
-                        .is_some_and(|node| node.is_read_only() != self.read_only)
+                if published.selection != selection
+                    || published.node.label() != Some(label)
+                    || published.node.is_read_only() != self.read_only
                 {
-                    let mut node = self.last_editor.clone().expect("initialized editor node");
-                    node.set_label(label);
-                    set_editable_actions(&mut node, self.read_only);
-                    node.set_text_selection(TextSelection {
+                    let text_selection = TextSelection {
                         anchor: to_text_position(&self.paragraphs, selection.anchor)?,
                         focus: to_text_position(&self.paragraphs, selection.focus)?,
-                    });
-                    nodes.push((self.editor_id, node.clone()));
-                    self.last_editor = Some(node);
-                    self.last_selection = Some(selection);
+                    };
+                    published.node.set_label(label);
+                    set_editable_actions(&mut published.node, self.read_only);
+                    published.node.set_text_selection(text_selection);
+                    published.selection = selection;
+                    nodes.push((self.editor_id, published.node.clone()));
                 }
                 return Ok(TreeUpdate {
                     nodes,
@@ -540,7 +537,7 @@ mod accesskit_bridge {
                 });
             }
             let source = editor.document().paragraphs();
-            let initialized = self.initialized;
+            let initialized = self.published_editor.is_some();
             let mut next_id = self.next_id;
             let mut nodes = Vec::new();
             let published = self.paragraphs.len();
@@ -632,10 +629,12 @@ mod accesskit_bridge {
                     paragraph.push_nodes(&mut nodes);
                 }
             }
+            let mut children = Vec::new();
             let quotes = if in_place {
                 None
             } else {
-                Some(self.stage_quotes(&staged, &mut next_id)?)
+                children.reserve(staged.len());
+                Some(self.stage_quotes(&staged, &mut next_id, &mut children)?)
             };
             for (quote, previous) in quotes.iter().flatten() {
                 let previous = previous.and_then(|index| self.quotes.get(index));
@@ -643,29 +642,18 @@ mod accesskit_bridge {
                     nodes.push((quote.id, quote.node.clone()));
                 }
             }
-            let mut editor_node = if in_place {
-                self.last_editor.clone().expect("initialized editor node")
-            } else {
-                let mut node = Node::new(Role::MultilineTextInput);
-                node.add_action(Action::Focus);
-                node.add_action(Action::SetTextSelection);
-                node
+            let mut editor_node = match &self.published_editor {
+                Some(published) if in_place => published.node.clone(),
+                _ => {
+                    let mut node = Node::new(Role::MultilineTextInput);
+                    node.add_action(Action::Focus);
+                    node.add_action(Action::SetTextSelection);
+                    node
+                }
             };
             editor_node.set_label(label);
             set_editable_actions(&mut editor_node, self.read_only);
-            if let Some(quotes) = &quotes {
-                let mut children = Vec::with_capacity(staged.len());
-                let mut containers = quotes.iter().map(|(quote, _)| quote.id);
-                let mut quoting = false;
-                for paragraph in staged.iter() {
-                    let quote = paragraph.paragraph.kind() == ParagraphKind::Quote;
-                    if !quote {
-                        children.push(paragraph.id);
-                    } else if !quoting {
-                        children.push(containers.next().expect("a container per quote"));
-                    }
-                    quoting = quote;
-                }
+            if quotes.is_some() {
                 editor_node.set_children(children);
             }
             editor_node.set_text_selection(TextSelection {
@@ -678,7 +666,11 @@ mod accesskit_bridge {
                     selection.focus,
                 )?,
             });
-            if self.last_editor.as_ref() != Some(&editor_node) {
+            if self
+                .published_editor
+                .as_ref()
+                .is_none_or(|published| published.node != editor_node)
+            {
                 nodes.push((self.editor_id, editor_node.clone()));
             }
             let tree = (!initialized).then(|| {
@@ -717,10 +709,11 @@ mod accesskit_bridge {
             if let Some(quotes) = quotes {
                 self.quotes = quotes.into_iter().map(|(quote, _)| quote).collect();
             }
-            self.last_editor = Some(editor_node);
-            self.last_selection = Some(selection);
+            self.published_editor = Some(PublishedEditor {
+                node: editor_node,
+                selection,
+            });
             self.document_identity = Some(document_identity);
-            self.initialized = true;
             Ok(TreeUpdate {
                 nodes,
                 tree,
@@ -824,6 +817,7 @@ mod accesskit_bridge {
             &self,
             staged: &Staged<'_>,
             next_id: &mut Option<u64>,
+            children: &mut Vec<NodeId>,
         ) -> Result<Vec<(CachedQuote, Option<usize>)>, AccessKitError> {
             let is_quote =
                 |paragraph: &CachedParagraph| paragraph.paragraph.kind() == ParagraphKind::Quote;
@@ -857,14 +851,15 @@ mod accesskit_bridge {
             let mut paragraphs = staged.iter().enumerate().peekable();
             while let Some((index, paragraph)) = paragraphs.next() {
                 if !is_quote(paragraph) {
+                    children.push(paragraph.id);
                     continue;
                 }
-                let mut children = vec![paragraph.id];
+                let mut members = vec![paragraph.id];
                 let mut reused = previous(index, paragraph).filter(|old| !claimed[*old]);
                 while let Some((index, paragraph)) =
                     paragraphs.next_if(|(_, paragraph)| is_quote(paragraph))
                 {
-                    children.push(paragraph.id);
+                    members.push(paragraph.id);
                     reused =
                         reused.or_else(|| previous(index, paragraph).filter(|old| !claimed[*old]));
                 }
@@ -876,8 +871,9 @@ mod accesskit_bridge {
                     }
                     None => allocate(next_id)?,
                 };
+                children.push(id);
                 let mut node = Node::new(Role::Blockquote);
-                node.set_children(children);
+                node.set_children(members);
                 quotes.push((CachedQuote { id, node }, reused));
             }
             Ok(quotes)
@@ -1340,8 +1336,20 @@ mod accesskit_bridge {
             fresh.update(editor, "Notes", true).unwrap();
             assert_eq!(quote_groups(adapter), quote_groups(&fresh));
             assert_eq!(
-                adapter.last_editor.as_ref().unwrap().children().len(),
-                fresh.last_editor.as_ref().unwrap().children().len()
+                adapter
+                    .published_editor
+                    .as_ref()
+                    .unwrap()
+                    .node
+                    .children()
+                    .len(),
+                fresh
+                    .published_editor
+                    .as_ref()
+                    .unwrap()
+                    .node
+                    .children()
+                    .len()
             );
             assert_eq!(adapter.paragraphs.len(), fresh.paragraphs.len());
             for (cached, expected) in adapter.paragraphs.iter().zip(&fresh.paragraphs) {
@@ -1880,7 +1888,10 @@ mod accesskit_bridge {
                     assert!(Arc::ptr_eq(previous, current));
                 }
                 assert_eq!(adapter.run_locations.get(), locations.as_ref());
-                assert_eq!(adapter.last_editor.as_ref().unwrap().label(), Some("Notes"));
+                assert_eq!(
+                    adapter.published_editor.as_ref().unwrap().node.label(),
+                    Some("Notes")
+                );
                 assert_eq!(
                     adapter
                         .from_text_position(&published_editor, published)
@@ -2103,7 +2114,7 @@ mod accesskit_bridge {
                     exhausted.update(&Editor::from_text("a"), "Notes", true),
                     Err(AccessKitError::NodeIdExhausted)
                 );
-                assert!(exhausted.paragraphs.is_empty() && !exhausted.initialized);
+                assert!(exhausted.paragraphs.is_empty() && exhausted.published_editor.is_none());
             }
         }
 
@@ -2356,7 +2367,13 @@ mod accesskit_bridge {
             let ids: Vec<_> = (0..4)
                 .map(|index| adapter.paragraph_node(index).unwrap())
                 .collect();
-            let children = adapter.last_editor.as_ref().unwrap().children().to_vec();
+            let children = adapter
+                .published_editor
+                .as_ref()
+                .unwrap()
+                .node
+                .children()
+                .to_vec();
             let quote = adapter.quotes[0].id;
             let obsolete = adapter
                 .to_text_position(&editor, Position::new(2, 1))
