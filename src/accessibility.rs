@@ -2414,6 +2414,53 @@ mod accesskit_bridge {
         }
 
         #[test]
+        fn in_place_edits_refresh_the_label_and_read_only_capabilities() {
+            let editor_node = |adapter: &AccessKitAdapter, update: &TreeUpdate| {
+                update
+                    .nodes
+                    .iter()
+                    .find(|(id, _)| *id == adapter.editor_node())
+                    .map(|(_, node)| node.clone())
+                    .expect("the editor node is republished")
+            };
+            let mut editor = Editor::from_text("original");
+            editor
+                .set_selection(Selection::caret(Position::new(0, 8)))
+                .unwrap();
+            let mut adapter = AccessKitAdapter::default();
+            adapter.update(&editor, "Notes", true).unwrap();
+            let paragraph_id = adapter.paragraph_node(0);
+
+            editor.insert_text("!").unwrap();
+            assert!(adapter.set_read_only(true, &mut editor).changed);
+            let update = adapter.update(&editor, "Draft", true).unwrap();
+            assert_eq!(adapter.paragraph_node(0), paragraph_id);
+            let node = editor_node(&adapter, &update);
+            assert_eq!(node.label(), Some("Draft"));
+            assert!(node.is_read_only());
+            assert!(!node.supports_action(Action::SetValue));
+            assert!(!node.supports_action(Action::ReplaceSelectedText));
+            let replace = request(
+                &adapter,
+                Action::ReplaceSelectedText,
+                Some(ActionData::Value("x".into())),
+            );
+            let outcome = adapter.handle_action(&replace, &mut editor).unwrap();
+            assert!(outcome.handled && !outcome.changed);
+
+            editor.insert_text("?").unwrap();
+            assert!(adapter.set_read_only(false, &mut editor).changed);
+            let update = adapter.update(&editor, "Notes", true).unwrap();
+            assert_eq!(adapter.paragraph_node(0), paragraph_id);
+            let node = editor_node(&adapter, &update);
+            assert_eq!(node.label(), Some("Notes"));
+            assert!(!node.is_read_only());
+            assert!(node.supports_action(Action::SetValue));
+            assert!(node.supports_action(Action::ReplaceSelectedText));
+            assert_matches_fresh_tree(&adapter, &editor);
+        }
+
+        #[test]
         fn in_place_edits_keep_paragraph_ids_and_the_editor_child_list() {
             let roles = |update: &TreeUpdate| -> Vec<Role> {
                 update.nodes.iter().map(|(_, node)| node.role()).collect()
