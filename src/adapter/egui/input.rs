@@ -108,8 +108,10 @@ pub(super) fn handle_event(
         Event::Paste(_) => {
             if let Some((text, clean)) = &input_text {
                 *commit_echo = None;
+                let plain = ui.input(|input| input.modifiers.command && input.modifiers.shift);
                 let fragment = clipboard
                     .as_deref_mut()
+                    .filter(|_| !plain)
                     .and_then(|clipboard| clipboard.paste(text));
                 editor.break_history_group();
                 record(

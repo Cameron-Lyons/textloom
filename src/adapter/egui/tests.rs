@@ -295,6 +295,62 @@ fn rich_paste_replaces_selection_in_one_undo_step_with_plain_fallback() {
 }
 
 #[test]
+fn shifted_command_paste_pastes_plain_text_without_the_rich_clipboard() {
+    let fragment = styled_clipboard_editor().selected_fragment();
+    let text = fragment.plain_text();
+    for (modifiers, rich) in [
+        (Modifiers::CTRL | Modifiers::COMMAND, true),
+        (Modifiers::SHIFT, true),
+        (
+            Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
+        ),
+        (
+            Modifiers::MAC_CMD | Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
+        ),
+        (
+            Modifiers::MAC_CMD | Modifiers::COMMAND | Modifiers::SHIFT | Modifiers::ALT,
+            false,
+        ),
+    ] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("original");
+        editor.select_all();
+        let mut clipboard = TestClipboard {
+            fragment: Some(fragment.clone()),
+            ..Default::default()
+        };
+        clipboard_frame(
+            &context,
+            &mut editor,
+            vec![
+                Event::ModifiersChanged(modifiers),
+                Event::Paste(text.clone()),
+            ],
+            true,
+            false,
+            true,
+            Some(&mut clipboard),
+        );
+        let (calls, expected) = if rich {
+            (vec![ClipboardCall::Paste(text.clone())], fragment.clone())
+        } else {
+            (Vec::new(), Fragment::from_text(&text))
+        };
+        assert_eq!(clipboard.calls, calls, "{modifiers:?}");
+        assert_eq!(Fragment::from_document(editor.document()), expected);
+        assert_eq!(
+            context.input(|input| input.events.clone()),
+            vec![Event::ModifiersChanged(modifiers)]
+        );
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "original");
+    }
+}
+
+#[test]
 fn rich_clipboard_callbacks_follow_input_order_and_separate_typing_history() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("original");
@@ -7306,6 +7362,66 @@ fn link_releases_discard_presses_from_a_changed_document() {
     );
     assert_eq!(widget.clicked_link, None);
     assert_eq!(editor.selection(), selection);
+}
+
+#[test]
+fn link_drags_discard_presses_when_ime_changes_the_document_in_the_drag_frame() {
+    for text in ["日本語", "xy"] {
+        for queued in [true, false] {
+            let context = egui::Context::default();
+            let (mut editor, _) = linked_widget_editor();
+            let (_, widget) =
+                link_frame(&context, &mut editor, vec![], 0.0, Modifiers::NONE, false);
+            let point = caret_point(&context, widget.response.rect, &editor, Position::new(0, 8));
+            link_frame(
+                &context,
+                &mut editor,
+                vec![
+                    Event::PointerMoved(point),
+                    primary(point, true, Modifiers::COMMAND),
+                ],
+                1.0,
+                Modifiers::COMMAND,
+                false,
+            );
+            assert!(widget_cache(&context).interaction.link_press.is_some());
+            let mut events = Vec::new();
+            if queued {
+                events.push(Event::Ime(ImeEvent::Commit(text.into())));
+            } else {
+                link_frame(
+                    &context,
+                    &mut editor,
+                    vec![Event::Ime(ImeEvent::Preedit {
+                        text: text.into(),
+                        active_range_chars: None,
+                    })],
+                    1.05,
+                    Modifiers::COMMAND,
+                    false,
+                );
+                assert!(editor.composition().is_some());
+            }
+            events.push(Event::PointerMoved(point + Vec2::new(200.0, 0.0)));
+            link_frame(
+                &context,
+                &mut editor,
+                events,
+                1.1,
+                Modifiers::COMMAND,
+                false,
+            );
+            assert_eq!(
+                editor.document().plain_text(),
+                format!("{text}Visit example now")
+            );
+            assert_eq!(
+                editor.selection().anchor,
+                Position::new(0, text.len()),
+                "{text} queued={queued}"
+            );
+        }
+    }
 }
 
 #[test]

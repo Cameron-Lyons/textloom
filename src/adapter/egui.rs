@@ -377,7 +377,11 @@ impl<'a> RichTextEditor<'a> {
                     if let Some(link) = link {
                         if pressed {
                             let (anchor, _) = hit_test(self.editor, &layouts, pointer - origin);
-                            cache.interaction.link_press = Some(LinkPress { link, anchor });
+                            cache.interaction.link_press = Some(LinkPress {
+                                link,
+                                anchor,
+                                revision: self.editor.document().revision(),
+                            });
                         } else {
                             clicked_link = Some(link);
                         }
@@ -418,6 +422,7 @@ impl<'a> RichTextEditor<'a> {
                 && !response.double_clicked()
                 && !response.triple_clicked()
                 && let Some(press) = link_press.take()
+                && press.revision == self.editor.document().revision()
                 && let Some(pointer) = released_pointer
                 && link_at_point(self.editor.document(), &layouts, pointer - origin).as_ref()
                     == Some(&press.link)
@@ -435,6 +440,7 @@ impl<'a> RichTextEditor<'a> {
                 let (position, prefer_next_row) = hit_test(self.editor, &layouts, pointer - origin);
                 let anchor = link_press
                     .take()
+                    .filter(|press| press.revision == self.editor.document().revision())
                     .map_or(self.editor.selection().anchor, |press| press.anchor);
                 record(
                     self.editor.set_selection(Selection::new(anchor, position)),
@@ -897,6 +903,7 @@ impl InteractionState {
 struct LinkPress {
     link: Link,
     anchor: Position,
+    revision: u64,
 }
 
 impl Cache {
