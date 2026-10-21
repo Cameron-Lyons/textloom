@@ -3314,6 +3314,33 @@ fn moves_and_edits_that_keep_the_selection_reset_the_navigation_column() {
 }
 
 #[test]
+fn stationary_visual_moves_keep_a_pending_typing_style() {
+    for stationary in [Key::End, Key::ArrowDown, Key::PageDown] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("plain\ntext");
+        let end = editor.document().end();
+        editor.set_selection(Selection::caret(end)).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![
+                key(Key::B, Modifiers::COMMAND),
+                key(stationary, Modifiers::NONE),
+            ],
+            true,
+        );
+        assert_eq!(editor.selection(), Selection::caret(end), "{stationary:?}");
+        assert!(editor.typing_style().bold, "{stationary:?}");
+        frame(&context, &mut editor, vec![Event::Text("!".into())], true);
+        assert_eq!(editor.document().plain_text(), "plain\ntext!");
+        assert!(
+            editor.document().style_at(editor.document().end()).bold,
+            "{stationary:?}"
+        );
+    }
+}
+
+#[test]
 fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("aaaaaaaaa x aaaaaaaaa");
