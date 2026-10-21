@@ -149,6 +149,7 @@ fn main() {
     formatted_accessibility_frames();
     native_preedit_frames();
     long_preedit_frames();
+    batched_typing_frames();
     initialization_and_invalidation_frames();
 }
 
@@ -228,6 +229,48 @@ fn invalidated_frames(
     }
     assert_eq!(editor.document().plain_text(), source);
     elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64
+}
+
+fn batched_typing_frames() {
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    for paragraphs in [10_000, 100_000] {
+        let source = document_text(paragraphs);
+        let mut editor = Editor::from_text(&source);
+        let context = egui::Context::default();
+        editor
+            .set_selection(Selection::caret(Position::new(paragraphs / 2, 5)))
+            .unwrap();
+        frame(&context, &mut editor);
+        context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
+        for _ in 0..3 {
+            frame(&context, &mut editor);
+        }
+        let mut results = Vec::new();
+        for events in [1, 2, 4, 8] {
+            let typed = vec![egui::Event::Text("x".to_owned()); events];
+            let deleted = vec![key(egui::Key::Backspace); events];
+            for _ in 0..20 {
+                frame_with_events(&context, &mut editor, typed.clone());
+                frame_with_events(&context, &mut editor, deleted.clone());
+            }
+            let iterations = scaled(100);
+            let start = Instant::now();
+            for _ in 0..iterations {
+                frame_with_events(&context, &mut editor, black_box(typed.clone()));
+                frame_with_events(&context, &mut editor, black_box(deleted.clone()));
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64 / 2.0;
+            assert_eq!(editor.document().plain_text(), source);
+            results.push(format!("{elapsed:.2} µs / {events}-edit frame"));
+        }
+        println!("{paragraphs:>6} paragraphs: {}", results.join("; "));
+    }
 }
 
 fn document_text(paragraphs: usize) -> String {

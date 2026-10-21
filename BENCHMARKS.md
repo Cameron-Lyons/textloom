@@ -916,3 +916,60 @@ small lifetime token so moving an editor out cannot permanently disable its
 history; ordinary edits allocate no such token. The editing harness includes
 the two transaction workloads. These core-only timings describe the cost of
 the correctness fix and exclude rendering.
+
+On October 21, 2026, an audit pass measured its fixes with temporary release
+probes, deleted afterwards, on a shared machine under heavy background load.
+Each row compares builds without and with one change using the same probe,
+keeping the best of a few runs; run counts and ordering varied. Treat the rows
+as before/after ratios for the stated workloads, not as timings comparable with
+the tables above.
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| `replace_all()` of two matches 100,000 untouched paragraphs apart | 12.9 ms | 3.2 ms |
+| History retained by that replacement | 6.4 MB | 486 B |
+| Repeated `selection_style()` after Select All, 100,000 paragraphs | 1,253 µs | 0.03 µs |
+| Decoding 10,000 French paragraphs with one bold word near each end | 36.8 ms | 4.7 ms |
+| Case-insensitive whole-word find next, middle of a 1.1 MB paragraph | 10,227 µs | 3.5 µs |
+| Case-insensitive find next through all 3,592 matches of a 115 KB paragraph | 1,670 ms | 12.9 ms |
+| Case-insensitive find next of a two-paragraph query, 100,000 paragraphs | 26,187 µs | 0.31 µs |
+| Whole-word `Document::find()`, 100,000 ASCII paragraphs | 34.8 ms | 4.0 ms |
+| Constructing a 1 MB ASCII paragraph and its first word move | 12,326 µs | 3,764 µs |
+| Egui frame with 8 typed characters at the end of a 92 KB paragraph | 179.9 ms | 24.8 ms |
+| Egui Enter + frame, then undo + frame, top of 100,000 paragraphs | 1,102 µs | 48 µs |
+| Egui preedit text update + frame, 100,000 paragraphs | 1,526 µs | 33.1 µs |
+| Egui frame after another viewport's pass, 10,000 paragraphs | 340.5 µs | 11.3 µs |
+| Egui idle frame, 20,000 highlighted matches in a 1 MB paragraph | 1,168.8 µs | 18.8 µs |
+| Direct AccessKit update after a keystroke, 100,000 paragraphs | 3.10 ms | 63.5 µs |
+| Direct AccessKit update after two edits, 100,000 paragraphs | 20.49 ms | 4.37 ms |
+| Egui accessibility snapshot update after Enter or undo, 10,000 paragraphs | 2.57 ms | 0.083 ms |
+
+The sparse replacement places `match` in the first and last paragraphs around
+`untouched café` paragraphs; its undo fell from 1.58 ms to 0.36 µs.
+Single-paragraph search rows repeat
+`Some text with a Match and a test of café 👩‍💻 matches. `, and single presses
+start mid-paragraph. The two-paragraph query is `café 👩‍💻.\nA short`, searched
+from paragraph 50,000 of `A short paragraph with Unicode café 👩‍💻.` paragraphs.
+Whole-word presses in the middle of 1.1 MB Cyrillic, Greek, and space-separated
+CJK paragraphs took about 11–19 µs afterwards, down from milliseconds. Egui rows
+use an 800×600 scroll area, with the editor focused where input is involved; the
+long paragraph repeats `café 👩‍💻 नमस्ते 🇺🇸 `, and the highlighted one adds
+`match` to that phrase. After merging the ranges of batched edits, frames with
+1, 2, 4, or 8 edits at 100,000 paragraphs measured about 35–42 µs.
+
+Some costs remain or grew. Missing queries that wrap through 100,000 short
+paragraphs took 2–4% longer. Self-overlapping queries such as `test` still scan
+their paragraph, about 0.27 ms per press in the 1.1 MB paragraph. Whole-word
+presses in text without ASCII spaces, such as unspaced Japanese, still segment
+from the paragraph start, about 7.5 ms near the end of a 1 MB paragraph. The
+first preedit frame and the commit frame still copy the document, about 2.9 and
+2.3 ms at 100,000 paragraphs. After a change in paragraph count, the first egui
+accessibility action builds its run-location index, about 0.35 ms at 10,000
+paragraphs and 10 ms at 100,000, instead of every structural frame paying for
+it. Enter in a fully numbered list still renumbers every later item.
+
+The editing harness now measures lowercase whole-word navigation in 1.1 MB
+Latin, Cyrillic, Greek, and space-separated CJK paragraphs, and its sparse
+replacement uses the default history limits. The rendering harness measures
+frames of 1, 2, 4, or 8 typed characters followed by as many Backspaces at
+10,000 and 100,000 paragraphs.

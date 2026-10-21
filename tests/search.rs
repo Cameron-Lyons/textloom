@@ -144,6 +144,134 @@ fn whole_words_use_unicode_word_boundaries() {
 }
 
 #[test]
+fn matches_beside_ascii_punctuation_and_digits_follow_word_segmentation() {
+    let tokens = [
+        "a", "B", "x", "1", "2", ".", ":", ",", ";", "'", "_", " ", "  ", "\t", "-", "\"", "\n",
+        "ab", "a.b", "1.2", "1,2", "a:b", "x_1", "can't", "é", "É", "\u{301}", "\u{200d}", "’",
+        "·", "\u{5d0}", "١", "\u{3000}",
+    ];
+    let mut seed = 0xbb67_ae85_84ca_a73b_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let mut matched = 0;
+    for _ in 0..64 {
+        let mut source = String::new();
+        for _ in 0..next() % 48 {
+            source.push_str(tokens[next() % tokens.len()]);
+        }
+        let document = Document::from_text(&source);
+        let text = document.plain_text();
+        let graphemes: Vec<_> = text
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let words: Vec<_> = text
+            .split_word_bound_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let position = |byte: usize| {
+            let prefix = &text[..byte];
+            Position::new(
+                prefix.matches('\n').count(),
+                prefix
+                    .rfind('\n')
+                    .map_or(byte, |newline| byte - newline - 1),
+            )
+        };
+        let mut queries: Vec<String> = [
+            "a", "b", "1", "2", "ab", "a.b", "1.2", "1,2", "x_1", "can", "t", "é", "\u{5d0}", ".",
+            "_", "a\n1",
+        ]
+        .map(String::from)
+        .into();
+        for _ in 0..6 {
+            let start = graphemes[next() % graphemes.len()];
+            let end = graphemes[next() % graphemes.len()];
+            let slice = &text[start.min(end)..start.max(end)];
+            queries.extend([slice.to_string(), slice.to_uppercase()]);
+        }
+        for query in &queries {
+            for case_sensitive in [true, false] {
+                for whole_word in [true, false] {
+                    let options = SearchOptions {
+                        case_sensitive,
+                        whole_word,
+                    };
+                    let (searched, needle) = if case_sensitive {
+                        (text.clone(), query.clone())
+                    } else {
+                        (text.to_lowercase(), query.to_lowercase())
+                    };
+                    let mut expected = Vec::new();
+                    let mut consumed = 0;
+                    for &start in graphemes.iter().filter(|_| !needle.is_empty()) {
+                        let end = start + needle.len();
+                        if start >= consumed
+                            && searched[start..].starts_with(&needle)
+                            && graphemes.binary_search(&end).is_ok()
+                            && (!whole_word
+                                || words.binary_search(&start).is_ok()
+                                    && words.binary_search(&end).is_ok())
+                        {
+                            expected.push(position(start)..position(end));
+                            consumed = end;
+                        }
+                    }
+                    matched += expected.len();
+                    assert_eq!(
+                        document.find(query, options),
+                        expected,
+                        "query={query:?}, options={options:?}, source={source:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(matched > 1_000, "{matched}");
+}
+
+#[test]
+fn case_insensitive_cross_paragraph_middle_lines_must_fill_their_paragraphs() {
+    let insensitive = SearchOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+    for (text, query) in [("Σ\nfoo\nk", "σ\n\nk"), ("x\nABC\ny", "x\nab\ny")] {
+        let document = Document::from_text(text);
+        assert!(document.find(query, insensitive).is_empty(), "{text:?}");
+        let mut editor = Editor::new(document);
+        let prefix_match = Selection::new(Position::new(0, 0), Position::new(2, 1));
+        editor.set_selection(prefix_match).unwrap();
+        assert!(
+            !editor
+                .replace_selected_match(query, "_", insensitive)
+                .unwrap()
+        );
+        assert_eq!(editor.document().plain_text(), text);
+        for wrap in [false, true] {
+            for caret in [Position::new(0, 0), editor.document().end()] {
+                editor.set_selection(Selection::caret(caret)).unwrap();
+                assert!(!editor.find_next(query, insensitive, wrap).unwrap());
+                assert!(!editor.find_previous(query, insensitive, wrap).unwrap());
+                assert_eq!(editor.selection(), Selection::caret(caret));
+            }
+        }
+    }
+    let mut editor = Editor::from_text("x\nABC\ny");
+    assert!(editor.find_next("X\nabc\nY", insensitive, false).unwrap());
+    assert_eq!(
+        editor.selection(),
+        Selection::new(Position::new(0, 0), Position::new(2, 1))
+    );
+}
+
+#[test]
 fn case_insensitive_cross_paragraph_queries_map_original_coordinates() {
     let document = Document::from_text("İ\nCAFÉ");
     let matches = document.find(
@@ -806,6 +934,388 @@ fn navigation_matches_global_results_for_sparse_paragraphs_and_crossing_selectio
     }
     assert_eq!(editor.document().revision(), 0);
     assert_eq!(editor.undo_len(), 0);
+}
+
+#[test]
+fn nearby_navigation_in_long_paragraphs_matches_the_forward_match_stream() {
+    let mut text = String::new();
+    for index in 0..420 {
+        text.push_str(match index % 7 {
+            0 => "\u{212A}elvin İ matches ",
+            1 => "café 👩‍💻 ",
+            2 => "e\u{301}xmatch\u{2028}",
+            3 => "ΣΟΣ, ",
+            4 => "aab\u{3000}",
+            _ => "filler ",
+        });
+        if index % 97 == 0 {
+            text.push_str("Match. ");
+        }
+    }
+    let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+    let mut selections = Vec::new();
+    for index in 0..2 {
+        let paragraph = editor.document().paragraph(index).unwrap();
+        for grapheme in (0..=paragraph.grapheme_count()).step_by(53) {
+            let byte = paragraph.byte_from_grapheme(grapheme).unwrap();
+            selections.push(Selection::caret(Position::new(index, byte)));
+        }
+    }
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in ["match", "kelvin", "σος", "i\u{307}", "aab", "missing"] {
+                let matches = editor.document().find(query, options);
+                let mut selections = selections.clone();
+                for range in &matches {
+                    selections.push(Selection::new(range.start, range.end));
+                    let paragraph = editor.document().paragraph(range.start.paragraph).unwrap();
+                    let offsets = if matches.len() <= 16 {
+                        1020..1030
+                    } else {
+                        0..0
+                    };
+                    for offset in offsets {
+                        for byte in [
+                            range.start.byte.checked_sub(offset),
+                            Some(range.end.byte + offset),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let byte = paragraph.boundary_at_or_before(byte);
+                            selections
+                                .push(Selection::caret(Position::new(range.start.paragraph, byte)));
+                        }
+                    }
+                    let mut copy = editor.clone();
+                    copy.set_selection(Selection::new(range.start, range.end))
+                        .unwrap();
+                    assert!(copy.replace_selected_match(query, "x", options).unwrap());
+                }
+                for &selection in &selections {
+                    let range = selection.range();
+                    for backward in [false, true] {
+                        let expected = if backward {
+                            matches.iter().rev().find(|item| item.end <= range.start)
+                        } else {
+                            matches.iter().find(|item| item.start >= range.end)
+                        };
+                        editor.set_selection(selection).unwrap();
+                        let found = if backward {
+                            editor.find_previous(query, options, false).unwrap()
+                        } else {
+                            editor.find_next(query, options, false).unwrap()
+                        };
+                        assert_eq!(found, expected.is_some());
+                        assert_eq!(
+                            editor.selection(),
+                            expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nearby_navigation_keeps_shrinking_lowercase_and_joined_space_candidates_at_every_caret() {
+    let padding = "x ".repeat(520);
+    let mut editor = Editor::from_text(&format!(
+        "{padding}a\u{212A}\u{212A}\u{212A} x \u{3000}aab  aab \u{AD}aab{padding}"
+    ));
+    let paragraph = editor.document().paragraph(0).unwrap();
+    let carets: Vec<_> = (0..=paragraph.grapheme_count())
+        .map(|grapheme| {
+            Selection::caret(Position::new(
+                0,
+                paragraph.byte_from_grapheme(grapheme).unwrap(),
+            ))
+        })
+        .collect();
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in [
+                "a\u{212A}\u{212A}\u{212A}",
+                "\u{3000}aab",
+                " aab",
+                "\u{AD}aab",
+            ] {
+                let matches = editor.document().find(query, options);
+                for &selection in &carets {
+                    let range = selection.range();
+                    for backward in [false, true] {
+                        let expected = if backward {
+                            matches.iter().rev().find(|item| item.end <= range.start)
+                        } else {
+                            matches.iter().find(|item| item.start >= range.end)
+                        };
+                        editor.set_selection(selection).unwrap();
+                        let found = if backward {
+                            editor.find_previous(query, options, false).unwrap()
+                        } else {
+                            editor.find_next(query, options, false).unwrap()
+                        };
+                        assert_eq!(found, expected.is_some());
+                        assert_eq!(
+                            editor.selection(),
+                            expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn whole_word_navigation_in_long_non_latin_paragraphs_matches_the_forward_match_stream() {
+    let mut text = String::new();
+    for index in 0..600 {
+        text.push_str(match index % 9 {
+            0 => "Слово слово, ",
+            1 => "λόγος ΛΌΓΟΣ ",
+            2 => "世界 你好 ",
+            3 => "слово\u{301} ",
+            4 => " \u{3000}слово ",
+            5 => "\u{200d}слово \u{ad}λόγος ",
+            6 => "\u{5d0}\"\u{5d1} \u{30a2}\u{30a2} ",
+            7 => "🇺🇸🇺 слово\u{a0}",
+            _ => "прочее ",
+        });
+    }
+    let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+    let mut carets = Vec::new();
+    for index in 0..2 {
+        let paragraph = editor.document().paragraph(index).unwrap();
+        for grapheme in (0..=paragraph.grapheme_count()).step_by(41) {
+            let byte = paragraph.byte_from_grapheme(grapheme).unwrap();
+            carets.push(Selection::caret(Position::new(index, byte)));
+        }
+    }
+    let mut matched = 0;
+    for case_sensitive in [false, true] {
+        let options = SearchOptions {
+            case_sensitive,
+            whole_word: true,
+        };
+        for query in [
+            "слово",
+            "λόγος",
+            "世界",
+            "\u{5d1}",
+            "\u{30a2}",
+            "🇺",
+            "missing",
+        ] {
+            let matches = editor.document().find(query, options);
+            matched += matches.len();
+            for &selection in &carets {
+                let range = selection.range();
+                for backward in [false, true] {
+                    let expected = if backward {
+                        matches.iter().rev().find(|item| item.end <= range.start)
+                    } else {
+                        matches.iter().find(|item| item.start >= range.end)
+                    };
+                    editor.set_selection(selection).unwrap();
+                    let found = if backward {
+                        editor.find_previous(query, options, false).unwrap()
+                    } else {
+                        editor.find_next(query, options, false).unwrap()
+                    };
+                    assert_eq!(found, expected.is_some());
+                    assert_eq!(
+                        editor.selection(),
+                        expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                        "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(matched > 2_000, "{matched}");
+}
+
+#[test]
+fn navigation_after_edits_between_presses_matches_document_search() {
+    let text = "Match matches aab ΣΟΣ café 👩‍💻 \u{212A}elvin. ".repeat(80);
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in ["match", "aab", "kelvin"] {
+                let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+                let mut presses = 0;
+                loop {
+                    let selection = editor.selection();
+                    let range = selection.range();
+                    let matches = editor.document().find(query, options);
+                    let previous = matches.iter().rev().find(|item| item.end <= range.start);
+                    let mut copy = editor.clone();
+                    assert_eq!(
+                        copy.find_previous(query, options, false).unwrap(),
+                        previous.is_some()
+                    );
+                    assert_eq!(
+                        copy.selection(),
+                        previous.map_or(selection, |item| Selection::new(item.start, item.end)),
+                        "query={query:?}, options={options:?}, selection={selection:?}"
+                    );
+                    let Some(next) = matches.iter().find(|item| item.start >= range.end) else {
+                        assert!(!editor.find_next(query, options, false).unwrap());
+                        assert_eq!(editor.selection(), selection);
+                        break;
+                    };
+                    assert!(editor.find_next(query, options, false).unwrap());
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(next.start, next.end),
+                        "query={query:?}, options={options:?}, selection={selection:?}"
+                    );
+                    let revision = editor.document().revision();
+                    match presses % 4 {
+                        0 => assert!(editor.replace_selected_match(query, "x", options).unwrap()),
+                        1 => editor.replace_range(next.end..next.end, "s").unwrap(),
+                        2 => {
+                            let start = Position::new(next.start.paragraph, 0);
+                            let inserted = "MATCH \u{212A}ELVIN aab ";
+                            editor.replace_range(start..start, inserted).unwrap();
+                            let shift = |position: Position| {
+                                Position::new(position.paragraph, position.byte + inserted.len())
+                            };
+                            editor
+                                .set_selection(Selection::new(shift(next.start), shift(next.end)))
+                                .unwrap();
+                        }
+                        _ => assert!(editor.undo()),
+                    }
+                    assert!(editor.document().revision() > revision);
+                    presses += 1;
+                }
+                assert!(
+                    presses > 0 || (case_sensitive && query != "aab"),
+                    "query={query:?}, options={options:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cross_paragraph_navigation_after_edits_between_presses_matches_document_search() {
+    let text = "Match café 👩‍💻\nΣΟΣ matches \u{212A}elvin.\naab ΣΟΣ\n".repeat(12);
+    let mut total = 0;
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in [
+                "café 👩‍💻\r\nΣΟΣ",
+                "\u{212A}elvin.\naab",
+                "👩‍💻\nΣΟΣ matches \u{212A}elvin.\naab",
+                "οσ\nmatch",
+                "\n",
+                "\nΣΟΣ matches \u{212A}elvin.\n",
+            ] {
+                let mut editor = Editor::from_text(&text);
+                let mut presses = 0;
+                loop {
+                    let selection = editor.selection();
+                    let range = selection.range();
+                    let matches = editor.document().find(query, options);
+                    let context = format!("query={query:?}, options={options:?}, {selection:?}");
+                    let mut copy = editor.clone();
+                    assert_eq!(
+                        copy.replace_selected_match(query, "x", options).unwrap(),
+                        matches.contains(&range),
+                        "{context}"
+                    );
+                    for wrap in [false, true] {
+                        let previous = matches
+                            .iter()
+                            .rev()
+                            .find(|item| item.end <= range.start)
+                            .or_else(|| wrap.then(|| matches.last()).flatten());
+                        let mut copy = editor.clone();
+                        assert_eq!(
+                            copy.find_previous(query, options, wrap).unwrap(),
+                            previous.is_some()
+                        );
+                        assert_eq!(
+                            copy.selection(),
+                            previous.map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "wrap={wrap}, {context}"
+                        );
+                    }
+                    let Some(next) = matches.iter().find(|item| item.start >= range.end) else {
+                        assert!(!editor.find_next(query, options, false).unwrap());
+                        assert_eq!(editor.selection(), selection);
+                        assert_eq!(
+                            editor.find_next(query, options, true).unwrap(),
+                            !matches.is_empty()
+                        );
+                        assert_eq!(
+                            editor.selection(),
+                            matches
+                                .first()
+                                .map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "{context}"
+                        );
+                        break;
+                    };
+                    assert!(editor.find_next(query, options, false).unwrap());
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(next.start, next.end),
+                        "{context}"
+                    );
+                    let revision = editor.document().revision();
+                    match presses % 4 {
+                        0 => assert!(editor.replace_selected_match(query, "x", options).unwrap()),
+                        1 => editor.replace_range(next.end..next.end, "s").unwrap(),
+                        2 => {
+                            let start = Position::new(next.start.paragraph, 0);
+                            let inserted = "MATCH ";
+                            editor
+                                .replace_range(start..start, &format!("aab ΣΟΣ\n{inserted}"))
+                                .unwrap();
+                            let shift = |position: Position| {
+                                let byte = if position.paragraph == start.paragraph {
+                                    position.byte + inserted.len()
+                                } else {
+                                    position.byte
+                                };
+                                Position::new(position.paragraph + 1, byte)
+                            };
+                            editor
+                                .set_selection(Selection::new(shift(next.start), shift(next.end)))
+                                .unwrap();
+                        }
+                        _ => assert!(editor.undo()),
+                    }
+                    assert!(editor.document().revision() > revision);
+                    presses += 1;
+                }
+                total += presses;
+            }
+        }
+    }
+    assert!(total > 300, "{total}");
 }
 
 #[test]

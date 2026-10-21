@@ -45,6 +45,28 @@ pub(super) struct InputOptions {
     pub(super) heading_shortcuts: bool,
 }
 
+pub(super) fn reads_layout(event: &Event, options: &InputOptions) -> bool {
+    match event {
+        Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            modifiers,
+            ..
+        } => matches!(
+            classify_key(*key, *physical_key, *modifiers, options),
+            Some(
+                KeyCommand::RowBoundary { .. }
+                    | KeyCommand::Vertical { .. }
+                    | KeyCommand::Page { .. }
+                    | KeyCommand::ListEdit(_)
+            )
+        ),
+        Event::AccessKitActionRequest(_) => true,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_event(
     editor: &mut Editor,
@@ -58,6 +80,9 @@ pub(super) fn handle_event(
     options: &InputOptions,
     clipboard: &mut Option<&mut dyn RichClipboard>,
 ) -> bool {
+    if is_commit_echo(commit_echo, event, editor) {
+        return true;
+    }
     if options.read_only {
         match event {
             Event::Cut => {
@@ -99,27 +124,28 @@ pub(super) fn handle_event(
                 *interrupted |= cancel_empty_composition(editor);
                 *commit_echo = None;
                 copy_selection(editor, ui, clipboard);
-                editor.break_history_group();
-                record(editor.insert_text(""), errors);
-                editor.break_history_group();
+                record(
+                    editor.isolated_edit(|editor| editor.insert_text("")),
+                    errors,
+                );
             }
             true
         }
         Event::Paste(_) => {
             if let Some((text, clean)) = &input_text {
                 *commit_echo = None;
+                let plain = ui.input(|input| input.modifiers.command && input.modifiers.shift);
                 let fragment = clipboard
                     .as_deref_mut()
+                    .filter(|_| !plain)
                     .and_then(|clipboard| clipboard.paste(text));
-                editor.break_history_group();
                 record(
-                    match fragment {
+                    editor.isolated_edit(|editor| match fragment {
                         Some(fragment) => editor.insert_fragment(&fragment),
                         None => editor.insert_text(clean),
-                    },
+                    }),
                     errors,
                 );
-                editor.break_history_group();
             }
             true
         }
@@ -241,6 +267,23 @@ pub(super) fn handle_event(
     }
 }
 
+fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor) -> bool {
+    let Some(pending) = echo else {
+        return false;
+    };
+    match event {
+        Event::Ime(ImeEvent::Commit(text))
+            if !matches!(text.as_str(), "\n" | "\r" | "\r\n")
+                && editor.composition().is_none()
+                && clean_text(text, true) == pending.text =>
+        {
+            *echo = None;
+            true
+        }
+        _ => false,
+    }
+}
+
 fn cancel_empty_composition(editor: &mut Editor) -> bool {
     editor
         .composition()
@@ -281,6 +324,83 @@ fn key_character(key: Key) -> Option<char> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum KeyCommand {
+    Shortcut(Shortcut),
+    ReadOnlyNoop,
+    Move(Movement),
+    RowBoundary { end: bool },
+    Vertical { down: bool },
+    Page { down: bool },
+    Edit(fn(&mut Editor) -> Result<(), Error>),
+    ListEdit(fn(&mut Editor) -> Result<(), Error>),
+}
+
+fn classify_key(
+    key: Key,
+    physical_key: Option<Key>,
+    modifiers: Modifiers,
+    options: &InputOptions,
+) -> Option<KeyCommand> {
+    let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
+    if command
+        && let Some(shortcut) = resolve_shortcut(
+            key,
+            physical_key,
+            modifiers.shift,
+            options.heading_shortcuts,
+        )
+    {
+        return Some(KeyCommand::Shortcut(shortcut));
+    }
+    let by_word = modifiers.ctrl || modifiers.alt;
+    let row_command = command && modifiers.mac_cmd;
+    let paging = !modifiers.command && !modifiers.alt;
+    Some(match key {
+        Key::ArrowLeft | Key::ArrowRight if row_command => KeyCommand::RowBoundary {
+            end: key == Key::ArrowRight,
+        },
+        Key::Home | Key::End if !modifiers.command => KeyCommand::RowBoundary {
+            end: key == Key::End,
+        },
+        Key::ArrowUp if command => KeyCommand::Move(Movement::DocumentStart),
+        Key::ArrowDown if command => KeyCommand::Move(Movement::DocumentEnd),
+        Key::Home => KeyCommand::Move(Movement::DocumentStart),
+        Key::End => KeyCommand::Move(Movement::DocumentEnd),
+        Key::ArrowLeft if by_word => KeyCommand::Move(Movement::WordBackward),
+        Key::ArrowLeft => KeyCommand::Move(Movement::GraphemeBackward),
+        Key::ArrowRight if by_word => KeyCommand::Move(Movement::WordForward),
+        Key::ArrowRight => KeyCommand::Move(Movement::GraphemeForward),
+        Key::ArrowUp | Key::ArrowDown => KeyCommand::Vertical {
+            down: key == Key::ArrowDown,
+        },
+        Key::PageUp | Key::PageDown if paging => KeyCommand::Page {
+            down: key == Key::PageDown,
+        },
+        Key::Backspace | Key::Delete if options.read_only => KeyCommand::ReadOnlyNoop,
+        Key::Enter if options.read_only && !modifiers.command => KeyCommand::ReadOnlyNoop,
+        Key::Backspace if row_command => KeyCommand::Edit(Editor::delete_to_paragraph_start),
+        Key::Backspace if by_word => KeyCommand::Edit(Editor::delete_word_backward),
+        Key::Backspace => KeyCommand::Edit(Editor::delete_backward),
+        Key::Delete if by_word => KeyCommand::Edit(Editor::delete_word_forward),
+        Key::Delete => KeyCommand::Edit(Editor::delete_forward),
+        Key::Enter if modifiers.shift && !modifiers.command => {
+            KeyCommand::Edit(Editor::insert_line_break)
+        }
+        Key::Enter if !modifiers.command => KeyCommand::Edit(Editor::insert_paragraph),
+        Key::Tab
+            if !options.read_only && !modifiers.command && !modifiers.ctrl && !modifiers.alt =>
+        {
+            KeyCommand::ListEdit(if modifiers.shift {
+                Editor::outdent_list
+            } else {
+                Editor::indent_list
+            })
+        }
+        _ => return None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_key(
     editor: &mut Editor,
@@ -292,212 +412,85 @@ pub(super) fn handle_key(
     errors: &mut Vec<Error>,
     options: &InputOptions,
 ) -> bool {
-    let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
-    let paging = !modifiers.command && !modifiers.alt;
+    // Keys delegated to the host and blocked edits keep the painted caret and
+    // the column used by a later vertical movement.
+    let Some(key_command) = classify_key(key, physical_key, modifiers, options).filter(|command| {
+        !matches!(command, KeyCommand::ListEdit(_))
+            || layouts.contains_list(editor.selected_paragraphs())
+    }) else {
+        return false;
+    };
+    match key_command {
+        KeyCommand::ReadOnlyNoop => return true,
+        KeyCommand::Shortcut(shortcut) => {
+            if !options.read_only || !shortcut.edits() {
+                let revision = editor.document().revision();
+                let selection = editor.selection();
+                cancel_empty_composition(editor);
+                record(shortcut.apply(editor), errors);
+                // Changing only the pending typing style must preserve the visual caret.
+                if editor.document().revision() != revision || editor.selection() != selection {
+                    *navigation = None;
+                }
+            }
+            return true;
+        }
+        _ => {}
+    }
     let prefer_next_row = navigation
         .as_ref()
         .is_none_or(|navigation| navigation.prefer_next_row);
-    let reset_navigation = command
-        || !(matches!(key, Key::ArrowUp | Key::ArrowDown)
-            || paging && matches!(key, Key::PageUp | Key::PageDown));
-    let previous_navigation = if reset_navigation {
-        navigation.take()
-    } else {
-        None
-    };
-    if command
-        && let Some(shortcut) = resolve_shortcut(
-            key,
-            physical_key,
-            modifiers.shift,
-            options.heading_shortcuts,
-        )
-    {
-        let revision = editor.document().revision();
-        let selection = editor.selection();
-        if !options.read_only || !shortcut.edits() {
-            cancel_empty_composition(editor);
-            record(shortcut.apply(editor), errors);
-        }
-        if editor.document().revision() == revision && editor.selection() == selection {
-            // Changing the pending typing style must preserve the visual caret.
-            *navigation = previous_navigation;
-        }
-        return true;
+    if !matches!(
+        key_command,
+        KeyCommand::Vertical { .. } | KeyCommand::Page { .. }
+    ) {
+        *navigation = None;
     }
-    let by_word = modifiers.ctrl || modifiers.alt;
-    let row_end = match key {
-        Key::ArrowLeft if command && modifiers.mac_cmd => Some(false),
-        Key::ArrowRight if command && modifiers.mac_cmd => Some(true),
-        Key::Home if !modifiers.command => Some(false),
-        Key::End if !modifiers.command => Some(true),
-        _ => None,
-    };
-    if let Some(end) = row_end {
-        cancel_empty_composition(editor);
-        if let Some((position, preferred_x, prefer_next_row)) =
-            row_boundary_position(editor, layouts, prefer_next_row, end)
-        {
-            set_visual_selection(
-                editor,
-                navigation,
-                errors,
-                position,
-                preferred_x,
-                prefer_next_row,
-                modifiers.shift,
-            );
-        } else {
-            let movement = if end {
-                Movement::ParagraphEnd
-            } else {
-                Movement::ParagraphStart
-            };
+    cancel_empty_composition(editor);
+    let target = match key_command {
+        KeyCommand::RowBoundary { end } => {
+            let target = row_boundary_position(editor, layouts, prefer_next_row, end);
+            if target.is_none() {
+                let movement = if end {
+                    Movement::ParagraphEnd
+                } else {
+                    Movement::ParagraphStart
+                };
+                record(editor.move_cursor(movement, modifiers.shift), errors);
+            }
+            target
+        }
+        KeyCommand::Vertical { down } => {
+            vertical_position(editor, layouts, navigation.as_ref(), down)
+        }
+        KeyCommand::Page { down } => page_position(
+            editor,
+            layouts,
+            navigation.as_ref(),
+            down,
+            options.page_height,
+        ),
+        KeyCommand::Move(movement) => {
             record(editor.move_cursor(movement, modifiers.shift), errors);
+            None
         }
-        return true;
-    }
-    let movement = match key {
-        Key::ArrowUp if command => Some(Movement::DocumentStart),
-        Key::ArrowDown if command => Some(Movement::DocumentEnd),
-        Key::ArrowLeft => Some(if by_word {
-            Movement::WordBackward
-        } else {
-            Movement::GraphemeBackward
-        }),
-        Key::ArrowRight => Some(if by_word {
-            Movement::WordForward
-        } else {
-            Movement::GraphemeForward
-        }),
-        Key::Home => Some(Movement::DocumentStart),
-        Key::End => Some(Movement::DocumentEnd),
-        _ => None,
+        KeyCommand::Edit(edit) | KeyCommand::ListEdit(edit) => {
+            record(edit(editor), errors);
+            None
+        }
+        KeyCommand::Shortcut(_) | KeyCommand::ReadOnlyNoop => None,
     };
-    if let Some(movement) = movement {
-        cancel_empty_composition(editor);
-        record(editor.move_cursor(movement, modifiers.shift), errors);
-        return true;
+    if let Some(target) = target {
+        set_visual_selection(editor, navigation, errors, target, modifiers.shift);
     }
-    match key {
-        Key::ArrowUp | Key::ArrowDown => {
-            cancel_empty_composition(editor);
-            if let Some((position, preferred_x, prefer_next_row)) =
-                vertical_position(editor, layouts, navigation.as_ref(), key == Key::ArrowDown)
-            {
-                set_visual_selection(
-                    editor,
-                    navigation,
-                    errors,
-                    position,
-                    preferred_x,
-                    prefer_next_row,
-                    modifiers.shift,
-                );
-            }
-            true
-        }
-        Key::PageUp | Key::PageDown if paging => {
-            cancel_empty_composition(editor);
-            if let Some((position, preferred_x, prefer_next_row)) = page_position(
-                editor,
-                layouts,
-                navigation.as_ref(),
-                key == Key::PageDown,
-                options.page_height,
-            ) {
-                set_visual_selection(
-                    editor,
-                    navigation,
-                    errors,
-                    position,
-                    preferred_x,
-                    prefer_next_row,
-                    modifiers.shift,
-                );
-            }
-            true
-        }
-        Key::Backspace | Key::Delete if options.read_only => {
-            *navigation = previous_navigation;
-            true
-        }
-        Key::Enter if options.read_only && !modifiers.command => {
-            *navigation = previous_navigation;
-            true
-        }
-        Key::Backspace => {
-            cancel_empty_composition(editor);
-            record(
-                if command && modifiers.mac_cmd {
-                    editor.delete_to_paragraph_start()
-                } else if by_word {
-                    editor.delete_word_backward()
-                } else {
-                    editor.delete_backward()
-                },
-                errors,
-            );
-            true
-        }
-        Key::Delete => {
-            cancel_empty_composition(editor);
-            record(
-                if by_word {
-                    editor.delete_word_forward()
-                } else {
-                    editor.delete_forward()
-                },
-                errors,
-            );
-            true
-        }
-        Key::Enter if modifiers.shift && !modifiers.command => {
-            cancel_empty_composition(editor);
-            record(editor.insert_line_break(), errors);
-            true
-        }
-        Key::Enter if !modifiers.command => {
-            cancel_empty_composition(editor);
-            record(editor.insert_paragraph(), errors);
-            true
-        }
-        Key::Tab
-            if !options.read_only
-                && !modifiers.command
-                && !modifiers.ctrl
-                && !modifiers.alt
-                && layouts.contains_list(editor.selected_paragraphs()) =>
-        {
-            cancel_empty_composition(editor);
-            record(
-                if modifiers.shift {
-                    editor.outdent_list()
-                } else {
-                    editor.indent_list()
-                },
-                errors,
-            );
-            true
-        }
-        _ => {
-            // Delegating a key to the host must not move the painted caret or
-            // discard the column used by a later vertical movement.
-            if reset_navigation {
-                *navigation = previous_navigation;
-            }
-            false
-        }
-    }
+    true
 }
 
 fn set_visual_selection(
     editor: &mut Editor,
     navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
-    position: Position,
-    preferred_x: f32,
-    prefer_next_row: bool,
+    (position, preferred_x, prefer_next_row): (Position, f32, bool),
     extend: bool,
 ) {
     let anchor = if extend {

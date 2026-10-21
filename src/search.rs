@@ -3,7 +3,7 @@ use std::{
     ops::{ControlFlow, Range},
 };
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
 use crate::document::normalize_newlines;
 use crate::{Document, Position};
@@ -56,12 +56,23 @@ impl Document {
                         options,
                         Some(range.start),
                         false,
-                        is_direct_literal(&needle, options),
+                        ParagraphSearch::new(&needle, options),
                     )
                     .is_some_and(|found| found == *range);
         }
+        if let Some(lines) = paragraph_lines(&needle) {
+            return self
+                .find_lines_match(
+                    range.start.paragraph,
+                    &lines,
+                    options,
+                    Some(range.start),
+                    false,
+                )
+                .is_some_and(|found| found == *range);
+        }
         let mut found = false;
-        let _ = self.visit_normalized_matches(&needle, options, |candidate| {
+        let _ = self.visit_flattened_matches(&needle, options, |candidate| {
             if candidate.start < range.start {
                 return ControlFlow::Continue(());
             }
@@ -83,10 +94,11 @@ impl Document {
             return None;
         }
         let needle = search_needle(query, options);
-        if needle.contains('\n') {
+        let lines = paragraph_lines(&needle);
+        if lines.is_none() && needle.contains('\n') {
             let mut found = None;
             let mut wrapped = None;
-            let _ = self.visit_normalized_matches(&needle, options, |range| {
+            let _ = self.visit_flattened_matches(&needle, options, |range| {
                 if backward {
                     if range.end <= selection.start {
                         found = Some(range);
@@ -109,7 +121,7 @@ impl Document {
             return found.or(wrapped);
         }
 
-        let direct_literal = is_direct_literal(&needle, options);
+        let strategy = ParagraphSearch::new(&needle, options);
         let boundary = if backward {
             selection.start
         } else {
@@ -118,14 +130,12 @@ impl Document {
         let len = self.paragraphs().len();
         let start = boundary.paragraph;
         let search = |index: usize, bounded: bool| {
-            self.find_paragraph_match(
-                index,
-                &needle,
-                options,
-                bounded.then_some(boundary),
-                backward,
-                direct_literal,
-            )
+            let boundary = bounded.then_some(boundary);
+            if let Some(lines) = &lines {
+                self.find_lines_match(index, lines, options, boundary, backward)
+            } else {
+                self.find_paragraph_match(index, &needle, options, boundary, backward, strategy)
+            }
         };
         if backward {
             (0..=start)
@@ -156,50 +166,165 @@ impl Document {
         options: SearchOptions,
         boundary: Option<Position>,
         backward: bool,
-        direct_literal: bool,
+        strategy: ParagraphSearch,
     ) -> Option<Range<Position>> {
+        let text = self.paragraphs()[index].text();
         if boundary.is_some_and(|position| {
             if backward {
                 position.byte == 0
             } else {
-                position.byte == self.paragraphs()[index].text().len()
+                position.byte == text.len()
             }
         }) {
             return None;
         }
-        if direct_literal {
-            let text = self.paragraphs()[index].text();
-            let edge = boundary.map_or(if backward { text.len() } else { 0 }, |position| {
-                position.byte
-            });
-            let valid_match = |start| {
-                let range = Position::new(index, start)..Position::new(index, start + needle.len());
-                self.is_grapheme_range(&range).then_some(range)
-            };
-            return if backward {
-                text[..edge]
-                    .rmatch_indices(needle)
-                    .find_map(|(start, _)| valid_match(start))
-            } else {
-                text[edge..]
-                    .match_indices(needle)
-                    .find_map(|(start, _)| valid_match(edge + start))
-            };
-        }
-        let mut found = None;
-        let _ = self.visit_paragraph_matches(index, needle, options, |range| {
-            if backward {
-                if boundary.is_some_and(|position| range.end > position) {
-                    return ControlFlow::Break(());
-                }
-                found = Some(range);
-            } else if boundary.is_none_or(|position| range.start >= position) {
-                found = Some(range);
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
+        let edge = boundary.map_or(if backward { text.len() } else { 0 }, |position| {
+            position.byte
         });
-        found
+        match strategy {
+            ParagraphSearch::Literal => {
+                let window = if backward { 0..edge } else { edge..text.len() };
+                find_literal(&text[window.clone()], needle, backward, |bytes| {
+                    let range = Position::new(index, window.start + bytes.start)
+                        ..Position::new(index, window.start + bytes.end);
+                    self.is_grapheme_range(&range).then_some(range)
+                })
+            }
+            ParagraphSearch::Nearest => {
+                self.find_nearest_match(index, needle, options, edge, backward)
+            }
+            ParagraphSearch::Scan => {
+                let mut found = None;
+                let _ = self.visit_paragraph_matches(index, needle, options, |range| {
+                    if backward {
+                        if boundary.is_some_and(|position| range.end > position) {
+                            return ControlFlow::Break(());
+                        }
+                        found = Some(range);
+                    } else if boundary.is_none_or(|position| range.start >= position) {
+                        found = Some(range);
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                });
+                found
+            }
+        }
+    }
+
+    fn find_nearest_match(
+        &self,
+        index: usize,
+        needle: &str,
+        options: SearchOptions,
+        edge: usize,
+        backward: bool,
+    ) -> Option<Range<Position>> {
+        let text = self.paragraphs()[index].text();
+        // A character spans at most four bytes and lowercases to at least one,
+        // so windows sharing this many bytes keep candidates crossing an edge.
+        let overlap = needle.len().saturating_mul(4);
+        let mut width = overlap.saturating_mul(2).max(NEAREST_WINDOW);
+        let mut window = edge..edge;
+        let mut words: Option<WordBoundaries<'_>> = None;
+        loop {
+            window = if backward {
+                let end = text
+                    .ceil_char_boundary(window.start.saturating_add(overlap))
+                    .min(edge);
+                text.floor_char_boundary(end.saturating_sub(width))..end
+            } else {
+                let start = text
+                    .floor_char_boundary(window.end.saturating_sub(overlap))
+                    .max(edge);
+                start..text.ceil_char_boundary(start.saturating_add(width))
+            };
+            let source = &text[window.clone()];
+            let searched = if options.case_sensitive {
+                Cow::Borrowed(source)
+            } else {
+                Cow::Owned(lowercase(source))
+            };
+            let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive);
+            let found = find_literal(&searched, needle, backward, |bytes| {
+                let start = window.start + offsets.original(bytes.start)?;
+                let end = window.start + offsets.original(bytes.end)?;
+                if options.whole_word {
+                    let words = match &mut words {
+                        Some(words) if words.start <= start => words,
+                        words => words
+                            .insert(WordBoundaries::new(text, word_restart(text, window.start))),
+                    };
+                    if !words.contains(end) || !words.contains(start) {
+                        return None;
+                    }
+                }
+                let range = Position::new(index, start)..Position::new(index, end);
+                self.is_grapheme_range(&range).then_some(range)
+            });
+            let exhausted = if backward {
+                window.start == 0
+            } else {
+                window.end == text.len()
+            };
+            if found.is_some() || exhausted {
+                return found;
+            }
+            width = width.saturating_mul(2);
+        }
+    }
+
+    fn find_lines_match(
+        &self,
+        index: usize,
+        lines: &[&str],
+        options: SearchOptions,
+        boundary: Option<Position>,
+        backward: bool,
+    ) -> Option<Range<Position>> {
+        let [first_line, middle_lines @ .., last_line] = lines else {
+            return None;
+        };
+        let breaks = middle_lines.len() + 1;
+        let first_index = if backward {
+            index.checked_sub(breaks)?
+        } else {
+            index
+        };
+        let [first, middle @ .., last] = self
+            .paragraphs()
+            .get(first_index..=first_index.checked_add(breaks)?)?
+        else {
+            return None;
+        };
+        let (first, last) = (first.text(), last.text());
+        let mut middle = middle
+            .iter()
+            .map(|paragraph| paragraph.text())
+            .zip(middle_lines);
+        let (start, end) = if options.case_sensitive {
+            (first.ends_with(first_line)
+                && last.starts_with(last_line)
+                && middle.all(|(text, line)| text == *line))
+            .then(|| (first.len() - first_line.len(), last_line.len()))?
+        } else {
+            let start = lowered_suffix_start(first, first_line)?;
+            let end = lowered_prefix_end(last, last_line)?;
+            middle
+                .all(|(text, line)| lowered_prefix_end(text, line) == Some(text.len()))
+                .then_some((start, end))?
+        };
+        let range = Position::new(first_index, start)..Position::new(first_index + breaks, end);
+        (boundary.is_none_or(|boundary| {
+            if backward {
+                range.end <= boundary
+            } else {
+                range.start >= boundary
+            }
+        }) && self.is_grapheme_range(&range)
+            && (!options.whole_word
+                || (is_word_boundary(first, start) && is_word_boundary(last, end))))
+        .then_some(range)
     }
 
     fn visit_paragraph_matches(
@@ -210,7 +335,11 @@ impl Document {
         mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         let paragraph = &self.paragraphs()[index];
-        if options.case_sensitive && needle.len() > paragraph.text().len() {
+        let ascii = paragraph.is_ascii();
+        // ASCII text lowercases in place and cannot contain non-ASCII needles.
+        if (options.case_sensitive || ascii) && needle.len() > paragraph.text().len()
+            || ascii && !needle.is_ascii()
+        {
             return ControlFlow::Continue(());
         }
         let visit = |bytes: Range<usize>| {
@@ -226,7 +355,7 @@ impl Document {
                 paragraph.next_grapheme(start)
             })
         } else {
-            visit_text_matches(paragraph.text(), needle, options, visit)
+            visit_text_matches(paragraph.text(), ascii, needle, options, visit)
         }
     }
 
@@ -242,6 +371,23 @@ impl Document {
             }
             return ControlFlow::Continue(());
         }
+        if let Some(lines) = paragraph_lines(needle) {
+            for index in 0..self.paragraphs().len() {
+                if let Some(range) = self.find_lines_match(index, &lines, options, None, false) {
+                    accept(range)?;
+                }
+            }
+            return ControlFlow::Continue(());
+        }
+        self.visit_flattened_matches(needle, options, accept)
+    }
+
+    fn visit_flattened_matches(
+        &self,
+        needle: &str,
+        options: SearchOptions,
+        mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         let source = if let [paragraph] = self.paragraphs() {
             Cow::Borrowed(paragraph.text())
         } else {
@@ -269,7 +415,7 @@ impl Document {
             let paragraph = paragraph_starts.partition_point(|start| *start <= byte) - 1;
             Position::new(paragraph, byte - paragraph_starts[paragraph])
         };
-        visit_text_matches(&source, needle, options, |bytes| {
+        visit_text_matches(&source, false, needle, options, |bytes| {
             let range = position(bytes.start)..position(bytes.end);
             if self.is_grapheme_range(&range) {
                 accept(range).map_continue(|()| true)
@@ -289,8 +435,272 @@ fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
     }
 }
 
-fn is_direct_literal(needle: &str, options: SearchOptions) -> bool {
-    options.case_sensitive && !options.whole_word && has_unique_start(needle)
+const NEAREST_WINDOW: usize = 1024;
+
+#[derive(Clone, Copy)]
+enum ParagraphSearch {
+    Literal,
+    Nearest,
+    Scan,
+}
+
+impl ParagraphSearch {
+    fn new(needle: &str, options: SearchOptions) -> Self {
+        if !never_overlaps(needle) {
+            Self::Scan
+        } else if options.case_sensitive && !options.whole_word {
+            Self::Literal
+        } else {
+            Self::Nearest
+        }
+    }
+}
+
+// Occurrences of a query without a nonempty border never overlap, so every
+// occurrence belongs to the forward match stream and can be found locally.
+fn never_overlaps(needle: &str) -> bool {
+    has_unique_start(needle) || literal_prefixes(needle.as_bytes()).last() == Some(&0)
+}
+
+// A line of such a query must end, fill, or start the paragraph it matches.
+fn paragraph_lines(needle: &str) -> Option<Vec<&str>> {
+    (needle.contains('\n') && never_overlaps(needle)).then(|| needle.split('\n').collect())
+}
+
+fn lowercase_char(character: char) -> impl DoubleEndedIterator<Item = char> {
+    character
+        .to_lowercase()
+        .map(|lowered| if lowered == 'ς' { 'σ' } else { lowered })
+}
+
+fn lowered_prefix_end(text: &str, prefix: &str) -> Option<usize> {
+    let mut remaining = prefix.chars();
+    let mut end = 0;
+    for character in text.chars() {
+        if remaining.as_str().is_empty() {
+            break;
+        }
+        for lowered in lowercase_char(character) {
+            if remaining.next() != Some(lowered) {
+                return None;
+            }
+        }
+        end += character.len_utf8();
+    }
+    remaining.as_str().is_empty().then_some(end)
+}
+
+fn lowered_suffix_start(text: &str, suffix: &str) -> Option<usize> {
+    let mut remaining = suffix.chars();
+    let mut start = text.len();
+    for character in text.chars().rev() {
+        if remaining.as_str().is_empty() {
+            break;
+        }
+        for lowered in lowercase_char(character).rev() {
+            if remaining.next_back() != Some(lowered) {
+                return None;
+            }
+        }
+        start -= character.len_utf8();
+    }
+    remaining.as_str().is_empty().then_some(start)
+}
+
+fn is_word_boundary(text: &str, byte: usize) -> bool {
+    WordBoundaries::new(text, word_restart(text, byte)).contains(byte)
+}
+
+// A space is followed by a word boundary unless the next character is Extend,
+// Format, ZWJ, or WSegSpace (WB3d, WB4), and no later rule looks back past that
+// space, so segmentation restarted there matches segmentation from byte 0.
+fn word_restart(text: &str, byte: usize) -> usize {
+    let bytes = text.as_bytes();
+    let last = text.floor_char_boundary(byte.min(bytes.len().saturating_sub(1)));
+    text[..last]
+        .rmatch_indices(' ')
+        .map(|(space, _)| space + 1)
+        .find(|&start| {
+            if bytes[start].is_ascii() {
+                bytes[start] != b' '
+            } else {
+                let pair = &text[start - 1..text.ceil_char_boundary(start + 1)];
+                pair.split_word_bounds().next() == Some(" ")
+            }
+        })
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsciiWordClass {
+    Letter,
+    Numeric,
+    MidLetter,
+    MidNumLetQ,
+    MidNum,
+    ExtendNumLet,
+    Other,
+}
+
+fn ascii_word_class(byte: u8) -> AsciiWordClass {
+    match byte {
+        b'A'..=b'Z' | b'a'..=b'z' => AsciiWordClass::Letter,
+        b'0'..=b'9' => AsciiWordClass::Numeric,
+        b':' => AsciiWordClass::MidLetter,
+        b'.' | b'\'' => AsciiWordClass::MidNumLetQ,
+        b',' | b';' => AsciiWordClass::MidNum,
+        b'_' => AsciiWordClass::ExtendNumLet,
+        _ => AsciiWordClass::Other,
+    }
+}
+
+// The UAX #29 word rules inspect at most two characters on each side, and an
+// ASCII character is never Extend, Format, or ZWJ. Non-ASCII context is left
+// to the segmenter.
+fn ascii_word_boundary(text: &[u8], byte: usize) -> Option<bool> {
+    use AsciiWordClass::{ExtendNumLet, Letter, MidLetter, MidNum, MidNumLetQ, Numeric};
+
+    let (Some(&before), Some(&after)) = (
+        byte.checked_sub(1).and_then(|index| text.get(index)),
+        text.get(byte),
+    ) else {
+        return Some(true);
+    };
+    if !before.is_ascii() || !after.is_ascii() {
+        return None;
+    }
+    let newline = |byte: u8| matches!(byte, b'\n' | b'\x0b' | b'\x0c' | b'\r');
+    if before == b'\r' && after == b'\n' {
+        return Some(false);
+    }
+    if newline(before) || newline(after) {
+        return Some(true);
+    }
+    if before == b' ' && after == b' ' {
+        return Some(false);
+    }
+    let neighbor = |index: Option<usize>| match index.and_then(|index| text.get(index)) {
+        None => Some(None),
+        Some(&byte) if byte.is_ascii() => Some(Some(ascii_word_class(byte))),
+        Some(_) => None,
+    };
+    let joined = match (ascii_word_class(before), ascii_word_class(after)) {
+        (Letter | Numeric, Letter | Numeric)
+        | (Letter | Numeric | ExtendNumLet, ExtendNumLet)
+        | (ExtendNumLet, Letter | Numeric) => true,
+        (Letter, MidLetter | MidNumLetQ) => neighbor(Some(byte + 1))? == Some(Letter),
+        (MidLetter | MidNumLetQ, Letter) => neighbor(byte.checked_sub(2))? == Some(Letter),
+        (Numeric, MidNum | MidNumLetQ) => neighbor(Some(byte + 1))? == Some(Numeric),
+        (MidNum | MidNumLetQ, Numeric) => neighbor(byte.checked_sub(2))? == Some(Numeric),
+        _ => false,
+    };
+    Some(!joined)
+}
+
+struct WordBoundaries<'a> {
+    text: &'a str,
+    start: usize,
+    boundaries: Vec<usize>,
+    remaining: UWordBoundIndices<'a>,
+}
+
+impl<'a> WordBoundaries<'a> {
+    fn new(text: &'a str, start: usize) -> Self {
+        Self {
+            text,
+            start,
+            boundaries: Vec::new(),
+            remaining: text[start..].split_word_bound_indices(),
+        }
+    }
+
+    fn contains(&mut self, byte: usize) -> bool {
+        debug_assert!(byte >= self.start);
+        if let Some(boundary) = ascii_word_boundary(self.text.as_bytes(), byte) {
+            return boundary;
+        }
+        while self
+            .boundaries
+            .last()
+            .is_none_or(|boundary| *boundary < byte)
+        {
+            let Some((boundary, _)) = self.remaining.next() else {
+                return false;
+            };
+            self.boundaries.push(self.start + boundary);
+        }
+        self.boundaries.binary_search(&byte).is_ok()
+    }
+}
+
+struct LowercaseOffsets<'a> {
+    source: &'a str,
+    folded: bool,
+    changes: Option<Vec<(Range<usize>, Range<usize>)>>,
+}
+
+impl<'a> LowercaseOffsets<'a> {
+    fn new(source: &'a str, folded: bool) -> Self {
+        Self {
+            source,
+            folded,
+            changes: None,
+        }
+    }
+
+    fn original(&mut self, byte: usize) -> Option<usize> {
+        let source = self.source;
+        let folded = self.folded;
+        let changes = self.changes.get_or_insert_with(|| {
+            let mut changes = Vec::new();
+            if folded && !source.is_ascii() {
+                let mut lower_byte = 0;
+                for (byte, character) in source.char_indices() {
+                    let lowered_len = if character.is_ascii() {
+                        1
+                    } else {
+                        character.to_lowercase().map(char::len_utf8).sum::<usize>()
+                    };
+                    if lowered_len != character.len_utf8() {
+                        changes.push((
+                            lower_byte..lower_byte + lowered_len,
+                            byte..byte + character.len_utf8(),
+                        ));
+                    }
+                    lower_byte += lowered_len;
+                }
+            }
+            changes
+        });
+        let index = changes.partition_point(|(lowered, _)| lowered.end <= byte);
+        if let Some((lowered, original)) = changes.get(index)
+            && byte >= lowered.start
+        {
+            return (byte == lowered.start).then_some(original.start);
+        }
+        let original = index.checked_sub(1).map_or(byte, |index| {
+            let (lowered, original) = &changes[index];
+            byte - lowered.end + original.end
+        });
+        source.is_char_boundary(original).then_some(original)
+    }
+}
+
+fn find_literal<T>(
+    source: &str,
+    needle: &str,
+    backward: bool,
+    mut accept: impl FnMut(Range<usize>) -> Option<T>,
+) -> Option<T> {
+    if backward {
+        source
+            .rmatch_indices(needle)
+            .find_map(|(start, _)| accept(start..start + needle.len()))
+    } else {
+        source
+            .match_indices(needle)
+            .find_map(|(start, _)| accept(start..start + needle.len()))
+    }
 }
 
 fn has_unique_start(needle: &str) -> bool {
@@ -311,6 +721,7 @@ fn lowercase(text: &str) -> String {
 
 fn visit_text_matches(
     source: &str,
+    ascii: bool,
     needle: &str,
     options: SearchOptions,
     mut accept: impl FnMut(Range<usize>) -> ControlFlow<(), bool>,
@@ -320,76 +731,23 @@ fn visit_text_matches(
     }
     let searched = if options.case_sensitive {
         Cow::Borrowed(source)
+    } else if ascii {
+        Cow::Owned(source.to_ascii_lowercase())
     } else {
         Cow::Owned(lowercase(source))
     };
     if needle.len() > searched.len() {
         return ControlFlow::Continue(());
     }
-    let mut word_boundaries = None;
-    let mut lowercase_changes = None;
-    let mut original_byte = |byte: usize| -> Option<usize> {
-        let lowercase_changes = lowercase_changes.get_or_insert_with(|| {
-            let mut changes = Vec::new();
-            if !options.case_sensitive && !source.is_ascii() {
-                let mut lower_byte = 0;
-                for (byte, character) in source.char_indices() {
-                    let lowered_len = if character.is_ascii() {
-                        1
-                    } else {
-                        character.to_lowercase().map(char::len_utf8).sum::<usize>()
-                    };
-                    if lowered_len != character.len_utf8() {
-                        changes.push((
-                            lower_byte..lower_byte + lowered_len,
-                            byte..byte + character.len_utf8(),
-                        ));
-                    }
-                    lower_byte += lowered_len;
-                }
-                debug_assert_eq!(lower_byte, searched.len());
-            }
-            changes
-        });
-        let index = lowercase_changes.partition_point(|(lowered, _)| lowered.end <= byte);
-        if let Some((lowered, original)) = lowercase_changes.get(index)
-            && byte >= lowered.start
-        {
-            return (byte == lowered.start).then_some(original.start);
-        }
-        let original = index.checked_sub(1).map_or(byte, |index| {
-            let (lowered, original) = &lowercase_changes[index];
-            byte - lowered.end + original.end
-        });
-        source.is_char_boundary(original).then_some(original)
-    };
+    let mut words = WordBoundaries::new(source, 0);
+    let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive && !ascii);
     visit_literals(&searched, needle, |bytes| {
-        let range = original_byte(bytes.start)
-            .zip(original_byte(bytes.end))
+        let range = offsets
+            .original(bytes.start)
+            .zip(offsets.original(bytes.end))
             .and_then(|(start, end)| {
-                if options.whole_word {
-                    let (boundaries, remaining) = word_boundaries.get_or_insert_with(|| {
-                        (
-                            Vec::new(),
-                            source
-                                .split_word_bound_indices()
-                                .map(|(byte, _)| byte)
-                                .chain([source.len()]),
-                        )
-                    });
-                    while boundaries.last().is_none_or(|byte| *byte < end) {
-                        let Some(byte) = remaining.next() else {
-                            break;
-                        };
-                        boundaries.push(byte);
-                    }
-                    if boundaries.binary_search(&start).is_err()
-                        || boundaries.binary_search(&end).is_err()
-                    {
-                        return None;
-                    }
-                }
-                Some(start..end)
+                (!options.whole_word || (words.contains(end) && words.contains(start)))
+                    .then_some(start..end)
             });
         if let Some(range) = range {
             accept(range)
@@ -500,4 +858,377 @@ fn visit_overlapping_literals(
         }
     }
     ControlFlow::Continue(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Editor;
+
+    fn assert_matches_flattened_stream(
+        document: &Document,
+        query: &str,
+        options: SearchOptions,
+    ) -> Option<usize> {
+        let needle = search_needle(query, options);
+        paragraph_lines(&needle)?;
+        let mut matches = Vec::new();
+        let _ = document.visit_flattened_matches(&needle, options, |range| {
+            matches.push(range);
+            ControlFlow::Continue(())
+        });
+        let context = format!("{query:?} {options:?} {:?}", document.plain_text());
+        assert_eq!(document.find(query, options), matches, "{context}");
+        let positions: Vec<_> = document
+            .paragraphs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, paragraph)| {
+                (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                    Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+                })
+            })
+            .collect();
+        let mut ranges: Vec<_> = positions
+            .iter()
+            .map(|&position| position..position)
+            .collect();
+        for (index, &position) in positions.iter().enumerate() {
+            let other = positions[(index * 7 + 3) % positions.len()];
+            ranges.push(position.min(other)..position.max(other));
+        }
+        ranges.extend(matches.iter().cloned());
+        for range in ranges {
+            assert_eq!(
+                document.is_match(query, options, &range),
+                matches.iter().find(|item| item.start >= range.start) == Some(&range),
+                "{range:?} {context}"
+            );
+            for wrap in [false, true] {
+                for backward in [false, true] {
+                    let expected = if backward {
+                        matches
+                            .iter()
+                            .rev()
+                            .find(|item| item.end <= range.start)
+                            .or_else(|| wrap.then(|| matches.last()).flatten())
+                    } else {
+                        matches
+                            .iter()
+                            .find(|item| item.start >= range.end)
+                            .or_else(|| wrap.then(|| matches.first()).flatten())
+                    };
+                    assert_eq!(
+                        document.find_relative(query, options, range.clone(), wrap, backward),
+                        expected.cloned(),
+                        "{range:?} wrap={wrap} backward={backward} {context}"
+                    );
+                }
+            }
+        }
+        Some(matches.len())
+    }
+
+    #[test]
+    fn paragraph_wise_cross_paragraph_queries_agree_with_the_flattened_match_stream() {
+        let tokens = [
+            "a",
+            "A",
+            "aa",
+            " ",
+            "-",
+            "'",
+            ".",
+            "\n",
+            "\n\n",
+            "İ",
+            "i\u{307}",
+            "\u{307}",
+            "\u{212A}",
+            "K",
+            "k",
+            "Σ",
+            "σ",
+            "ς",
+            "ΟΣ",
+            "e\u{301}",
+            "\u{301}",
+            "é",
+            "🇨🇺",
+            "🇺",
+            "👩‍💻",
+            "\u{200d}",
+            "\u{2028}",
+            "word",
+            "Word",
+            "你好",
+            "\u{0600}",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let (mut checked, mut matched) = (0, 0);
+        for _ in 0..40 {
+            let mut source = String::new();
+            for _ in 0..next() % 40 {
+                source.push_str(tokens[next() % tokens.len()]);
+            }
+            let mut editor = Editor::from_text(&source);
+            for round in 0..4 {
+                let positions: Vec<_> = editor
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, paragraph)| {
+                        (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                            Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+                        })
+                    })
+                    .collect();
+                match round {
+                    0 => {}
+                    3 => {
+                        editor.undo();
+                    }
+                    _ => {
+                        let start = positions[next() % positions.len()];
+                        let end = positions[next() % positions.len()];
+                        editor
+                            .replace_range(
+                                start.min(end)..start.max(end),
+                                tokens[next() % tokens.len()],
+                            )
+                            .unwrap();
+                    }
+                }
+                let document = editor.document();
+                let text = document
+                    .paragraphs()
+                    .iter()
+                    .map(|paragraph| paragraph.text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let chars: Vec<_> = text
+                    .char_indices()
+                    .map(|(byte, _)| byte)
+                    .chain([text.len()])
+                    .collect();
+                let mut queries: Vec<String> = [
+                    "\n",
+                    "a\n",
+                    "\na",
+                    "\n\na",
+                    "\r\n",
+                    "a\u{2029}",
+                    "ς\n",
+                    "Σ\n\nk",
+                ]
+                .map(String::from)
+                .into();
+                for _ in 0..8 {
+                    let start = chars[next() % chars.len()];
+                    let end = chars[next() % chars.len()];
+                    let slice = &text[start.min(end)..start.max(end)];
+                    queries.extend([slice.to_string(), slice.to_uppercase()]);
+                }
+                for _ in 0..4 {
+                    queries.push(
+                        (0..=next() % 4)
+                            .map(|_| tokens[next() % tokens.len()])
+                            .collect(),
+                    );
+                }
+                for query in &queries {
+                    for case_sensitive in [true, false] {
+                        for whole_word in [false, true] {
+                            let options = SearchOptions {
+                                case_sensitive,
+                                whole_word,
+                            };
+                            if let Some(count) =
+                                assert_matches_flattened_stream(document, query, options)
+                            {
+                                checked += 1;
+                                matched += usize::from(count > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000 && matched > 1_000, "{checked} {matched}");
+    }
+
+    #[test]
+    fn case_insensitive_middle_lines_must_fill_their_paragraphs() {
+        for (text, query) in [
+            ("Σ\nfoo\nk", "σ\n\nk"),
+            ("Σ\nfoo\nk", "Σ\n\nK"),
+            ("x\nABC\ny", "x\nab\ny"),
+            ("x\nABC\ny", "X\nAB\nY"),
+            ("x\nABC\n\ny", "x\nab\n\ny"),
+            ("x\nABC\nDEF\ny", "x\nabc\nde\ny"),
+            ("x\nΟΣΑ\ny", "x\nοσ\ny"),
+            ("x\n\u{212A}\u{212A}\ny", "x\nk\ny"),
+        ] {
+            let document = Document::from_text(text);
+            for whole_word in [false, true] {
+                for case_sensitive in [false, true] {
+                    let options = SearchOptions {
+                        case_sensitive,
+                        whole_word,
+                    };
+                    assert_eq!(
+                        assert_matches_flattened_stream(&document, query, options),
+                        Some(0),
+                        "{text:?} {query:?} {options:?}"
+                    );
+                }
+            }
+        }
+        let insensitive = SearchOptions {
+            case_sensitive: false,
+            whole_word: false,
+        };
+        for (text, query) in [
+            ("Σ\n\nk", "σ\n\nk"),
+            ("x\nABC\ny", "x\nabc\ny"),
+            ("x\nΟΣ\ny", "X\nος\nY"),
+        ] {
+            let document = Document::from_text(text);
+            assert_eq!(
+                assert_matches_flattened_stream(&document, query, insensitive),
+                Some(1),
+                "{text:?} {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_word_boundaries_agree_with_unicode_segmentation() {
+        let tokens = [
+            "a", "Z", "q", "0", "7", ":", ".", "'", ",", ";", "_", " ", "  ", "\t", "\"", "-", "!",
+            "/", "\n", "\r", "\r\n", "\x0b", "\x0c", "\u{301}", "\u{200d}", "\u{ad}", "é",
+            "\u{5d0}", "\u{3000}", "\u{30a2}", "🇺", "👩", "’", "·", "\u{85}", "\u{2028}", "١",
+        ];
+        let ascii = tokens.iter().take_while(|token| token.is_ascii()).count();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut decided = 0;
+        for length in 0..4_000 {
+            let mut text = String::new();
+            for _ in 0..length % 24 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let index = if seed.is_multiple_of(4) {
+                    (seed >> 8) as usize % tokens.len()
+                } else {
+                    (seed >> 8) as usize % ascii
+                };
+                text.push_str(tokens[index]);
+            }
+            let boundaries: Vec<_> = text
+                .split_word_bound_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for byte in (0..=text.len()).filter(|byte| text.is_char_boundary(*byte)) {
+                if let Some(boundary) = ascii_word_boundary(text.as_bytes(), byte) {
+                    decided += 1;
+                    assert_eq!(
+                        boundary,
+                        boundaries.binary_search(&byte).is_ok(),
+                        "byte {byte} in {text:?}"
+                    );
+                }
+            }
+        }
+        assert!(decided > 10_000, "{decided}");
+    }
+
+    #[test]
+    fn word_restarts_agree_with_segmentation_from_the_paragraph_start() {
+        let tokens = [
+            " ", " ", " ", "  ", "a", "Z", "7", ":", ".", "'", ",", "\"", "_", "-", "\t", "é",
+            "\u{301}", "\u{200d}", "\u{ad}", "\u{2060}", "\u{3000}", "\u{a0}", "\u{2028}",
+            "\u{85}", "Мир", "λόγ", "你好", "\u{5d0}", "\u{5f3}", "\u{30a2}", "\u{ff70}", "🇺",
+            "👩", "١", "’", "·", "🏻",
+        ];
+        let mut seed = 0x3c6e_f372_fe94_f82b_u64;
+        let (mut checked, mut unicode_restarts) = (0, 0);
+        for length in 0..3_000 {
+            let mut text = String::new();
+            for _ in 0..length % 32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push_str(tokens[(seed >> 8) as usize % tokens.len()]);
+            }
+            let boundaries: Vec<_> = text
+                .split_word_bound_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for byte in (0..=text.len()).filter(|byte| text.is_char_boundary(*byte)) {
+                let restart = word_restart(&text, byte);
+                assert!(restart <= byte, "byte {byte} in {text:?}");
+                let restarted: Vec<_> = text[restart..]
+                    .split_word_bound_indices()
+                    .map(|(offset, _)| restart + offset)
+                    .chain([text.len()])
+                    .collect();
+                assert_eq!(
+                    restarted,
+                    boundaries[boundaries.partition_point(|boundary| *boundary < restart)..],
+                    "restart {restart} for byte {byte} in {text:?}"
+                );
+                assert_eq!(
+                    is_word_boundary(&text, byte),
+                    boundaries.binary_search(&byte).is_ok(),
+                    "byte {byte} in {text:?}"
+                );
+                checked += 1;
+                unicode_restarts +=
+                    usize::from(restart > 0 && !text.as_bytes()[restart].is_ascii());
+            }
+        }
+        assert!(
+            checked > 50_000 && unicode_restarts > 10_000,
+            "{checked} {unicode_restarts}"
+        );
+    }
+
+    #[test]
+    fn word_restarts_stay_near_the_caret_in_spaced_non_latin_prose() {
+        for word in [
+            "слово",
+            "Λόγος",
+            "你好",
+            "\u{5d0}\u{5d1}",
+            "\u{30a2}\u{30a4}",
+            "١٢",
+        ] {
+            let text = format!("{word} ").repeat(1_000);
+            let byte = text.len() / 2;
+            let restart = word_restart(&text, byte);
+            assert!(restart > 0 && byte - restart <= word.len() + 1, "{word:?}");
+            assert_eq!(&text[restart - 1..restart], " ", "{word:?}");
+        }
+        for (joined, restart) in [
+            ("\u{301}", 0),
+            ("\u{200d}", 0),
+            ("\u{ad}", 0),
+            ("\u{3000}", 0),
+            (" ", "слово  ".len()),
+            ("\u{a0}", "слово ".len()),
+        ] {
+            let text = format!("слово {joined}слово");
+            assert_eq!(word_restart(&text, text.len()), restart, "{joined:?}");
+        }
+    }
 }

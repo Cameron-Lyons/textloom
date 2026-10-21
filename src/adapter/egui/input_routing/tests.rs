@@ -120,6 +120,27 @@ fn text(value: &str) -> Event {
     Event::Text(value.into())
 }
 
+fn preedit(value: &str) -> Event {
+    Event::Ime(ImeEvent::Preedit {
+        text: value.into(),
+        active_range_chars: None,
+    })
+}
+
+fn commit(value: &str) -> Event {
+    Event::Ime(ImeEvent::Commit(value.into()))
+}
+
+fn shift_tab() -> Event {
+    Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    }
+}
+
 fn context(max_passes: usize) -> Context {
     let ctx = Context::default();
     ctx.enable_accesskit();
@@ -173,6 +194,161 @@ fn focus_actions_route_each_input_segment_to_its_field() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn ime_input_after_a_focus_request_reaches_the_newly_focused_field() {
+    for second in [FieldKind::Native, FieldKind::Rich] {
+        for reversed in [false, true] {
+            for max_passes in [1, 2, 8] {
+                for ime in [
+                    vec![commit("x")],
+                    vec![preedit("x")],
+                    vec![preedit("x"), commit("x")],
+                ] {
+                    let committed = matches!(ime.last(), Some(Event::Ime(ImeEvent::Commit(_))));
+                    let ctx = context(max_passes);
+                    let mut fields = Fields::new(FieldKind::Rich, second);
+                    fields.reversed = reversed;
+                    fields.warm(&ctx);
+                    let mut events = vec![focus("second")];
+                    events.extend(ime);
+                    fields.frame(&ctx, events).drop_without_applying_deltas();
+                    fields.flush(&ctx);
+                    assert_eq!(fields.fields[0].text(), "a");
+                    assert!(fields.fields[0].rich.composition().is_none());
+                    if committed {
+                        assert_eq!(fields.fields[1].text(), "xb");
+                    }
+                    assert_eq!(
+                        ctx.memory(|memory| memory.focused()),
+                        Some(Id::new("second"))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ime_input_after_tab_reaches_the_next_field() {
+    let ctx = context(1);
+    let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+    fields.fields = [
+        Field::new(FieldKind::Rich, "abc"),
+        Field::new(FieldKind::Native, ""),
+    ];
+    fields.warm(&ctx);
+    let tab = Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    fields
+        .frame(&ctx, vec![commit("x"), tab, preedit("n")])
+        .drop_without_applying_deltas();
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(Id::new("second"))
+    );
+    assert_eq!(fields.fields[0].text(), "xabc");
+    assert!(fields.fields[0].rich.composition().is_none());
+    fields
+        .frame(&ctx, vec![preedit(""), commit("n")])
+        .drop_without_applying_deltas();
+    fields.flush(&ctx);
+    assert_eq!(fields.fields.each_ref().map(Field::text), ["xabc", "n"]);
+}
+
+#[test]
+fn ime_input_after_shift_tab_reaches_the_previous_field() {
+    for list in [false, true] {
+        for reversed in [false, true] {
+            for batches in [
+                [
+                    vec![commit("x"), shift_tab(), preedit("n")],
+                    vec![preedit(""), commit("n")],
+                ],
+                [
+                    vec![commit("x"), shift_tab()],
+                    vec![preedit("n"), commit("n")],
+                ],
+            ] {
+                let ctx = context(1);
+                let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+                fields.fields = [
+                    Field::new(FieldKind::Rich, "abc"),
+                    Field::new(FieldKind::Native, ""),
+                ];
+                if list {
+                    fields.fields[0]
+                        .rich
+                        .set_paragraph_kind(crate::ParagraphKind::Bullet { indent: 1 })
+                        .unwrap();
+                }
+                fields.reversed = reversed;
+                fields.warm(&ctx);
+                for batch in batches {
+                    fields.frame(&ctx, batch).drop_without_applying_deltas();
+                }
+                fields.flush(&ctx);
+                let (focused, texts) = if list {
+                    ("first", ["xnabc", ""])
+                } else {
+                    ("second", ["xabc", "n"])
+                };
+                assert_eq!(
+                    ctx.memory(|memory| memory.focused()),
+                    Some(Id::new(focused)),
+                    "list={list}, reversed={reversed}"
+                );
+                assert!(fields.fields[0].rich.composition().is_none());
+                assert_eq!(
+                    fields.fields.each_ref().map(Field::text),
+                    texts,
+                    "list={list}, reversed={reversed}"
+                );
+                if list {
+                    assert_eq!(
+                        fields.fields[0].rich.document().paragraphs()[0].kind(),
+                        crate::ParagraphKind::Bullet { indent: 0 }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ime_commits_in_the_shift_tab_batch_stay_with_the_editor_like_text() {
+    for reversed in [false, true] {
+        for input in [commit("n"), text("n")] {
+            let ctx = context(1);
+            let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+            fields.fields = [
+                Field::new(FieldKind::Rich, "abc"),
+                Field::new(FieldKind::Native, ""),
+            ];
+            fields.reversed = reversed;
+            fields.warm(&ctx);
+            for batch in [vec![shift_tab(), input.clone()], vec![]] {
+                fields.frame(&ctx, batch).drop_without_applying_deltas();
+            }
+            fields.flush(&ctx);
+            assert_eq!(
+                ctx.memory(|memory| memory.focused()),
+                Some(Id::new("second")),
+                "reversed={reversed}, {input:?}"
+            );
+            assert_eq!(
+                fields.fields.each_ref().map(Field::text),
+                ["nabc", ""],
+                "reversed={reversed}, {input:?}"
+            );
         }
     }
 }

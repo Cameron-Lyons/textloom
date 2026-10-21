@@ -21,6 +21,37 @@ impl Span {
     }
 }
 
+pub(crate) struct SpanCursor<'a> {
+    spans: &'a [Span],
+    index: usize,
+}
+
+impl<'a> SpanCursor<'a> {
+    pub(crate) fn new(spans: &'a [Span]) -> Self {
+        Self { spans, index: 0 }
+    }
+
+    #[cfg(feature = "accesskit")]
+    pub(crate) fn index(&self) -> usize {
+        self.index
+    }
+
+    pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'a Link>) {
+        while self
+            .spans
+            .get(self.index)
+            .is_some_and(|span| span.range.end <= byte)
+        {
+            self.index += 1;
+        }
+        self.spans
+            .get(self.index)
+            .map_or((InlineStyle::default(), None), |span| {
+                (span.style, span.link.as_ref())
+            })
+    }
+}
+
 #[derive(Clone)]
 pub struct Paragraph {
     pub(super) text: Arc<str>,
@@ -58,7 +89,11 @@ impl fmt::Debug for Paragraph {
 
 impl Paragraph {
     pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
-        Self::from_parts(text, spans, kind)
+        let paragraph = Self::from_parts(text, spans, kind)?;
+        if text.contains(['\r', '\n', '\u{2029}']) {
+            return Err(Error::InvalidFragment);
+        }
+        Ok(paragraph)
     }
 
     pub fn text(&self) -> &str {
@@ -71,6 +106,10 @@ impl Paragraph {
 
     pub fn kind(&self) -> ParagraphKind {
         self.kind
+    }
+
+    pub(crate) fn is_ascii(&self) -> bool {
+        self.ascii
     }
 
     pub fn grapheme_count(&self) -> usize {
@@ -296,15 +335,18 @@ impl Paragraph {
         }
     }
 
-    pub(super) fn with_kind(&self, kind: ParagraphKind) -> Self {
-        Self {
+    pub(super) fn with_kind(self: &Arc<Self>, kind: ParagraphKind) -> Arc<Self> {
+        if self.kind == kind {
+            return Arc::clone(self);
+        }
+        Arc::new(Self {
             text: Arc::clone(&self.text),
             spans: Arc::clone(&self.spans),
             kind,
             ascii: self.ascii,
             linked: self.linked,
             indices: self.shared_indices(),
-        }
+        })
     }
 
     fn shared_indices(&self) -> OnceLock<Arc<TextIndices>> {
@@ -331,12 +373,10 @@ impl Paragraph {
         if range.is_empty() {
             return None;
         }
-        let first = self
-            .spans
-            .partition_point(|span| span.range.end <= range.start);
-        let last = self
-            .spans
-            .partition_point(|span| span.range.start < range.end);
+        let Range {
+            start: first,
+            end: last,
+        } = self.overlapping(range.clone());
         fn patched<'a>(
             span: &'a Span,
             patch: StylePatch,
@@ -438,19 +478,28 @@ impl Paragraph {
         {
             return Err(Error::InvalidHeadingLevel(level));
         }
-        if text.contains(['\r', '\n', '\u{2029}']) {
-            return Err(Error::InvalidFragment);
-        }
         let ascii = text.is_ascii();
         let mut end = 0;
-        let mut boundaries = text.grapheme_indices(true).map(|(byte, _)| byte);
+        let mut boundaries = None;
+        let mut is_boundary = |byte: usize| {
+            if !text.is_char_boundary(byte) {
+                return false;
+            }
+            let (chunk, start) = grapheme_context(text, byte);
+            GraphemeCursor::new(byte, text.len(), true)
+                .is_boundary(chunk, start)
+                .unwrap_or_else(|_| {
+                    boundaries
+                        .get_or_insert_with(|| text.grapheme_indices(true).map(|(byte, _)| byte))
+                        .find(|boundary| *boundary >= byte)
+                        == Some(byte)
+                })
+        };
         for span in &spans {
             if span.range.start != end
                 || span.range.start >= span.range.end
                 || span.range.end > text.len()
-                || (!ascii
-                    && span.range.end < text.len()
-                    && boundaries.find(|byte| *byte >= span.range.end) != Some(span.range.end))
+                || (!ascii && span.range.end < text.len() && !is_boundary(span.range.end))
             {
                 return Err(Error::InvalidFragment);
             }
@@ -475,6 +524,16 @@ impl Paragraph {
             ascii,
             indices: OnceLock::new(),
         })
+    }
+
+    pub(super) fn overlapping(&self, range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            return 0..0;
+        }
+        let first = self
+            .spans
+            .partition_point(|span| span.range.end <= range.start);
+        first..first + self.spans[first..].partition_point(|span| span.range.start < range.end)
     }
 
     pub(super) fn style_for_byte(&self, byte: usize) -> InlineStyle {
@@ -515,22 +574,15 @@ pub(super) fn append_slice(
 ) {
     let offset = text.len();
     text.push_str(&paragraph.text[range.clone()]);
-    let first = paragraph
-        .spans
-        .partition_point(|span| span.range.end <= range.start);
-    let last = paragraph
-        .spans
-        .partition_point(|span| span.range.start < range.end);
-    if first >= last {
+    let [head, rest @ ..] = &paragraph.spans[paragraph.overlapping(range.clone())] else {
         return;
-    }
+    };
     let clip = |span: &Span| {
         span.range.start.max(range.start) - range.start + offset
             ..span.range.end.min(range.end) - range.start + offset
     };
-    let head = &paragraph.spans[first];
     push_span(spans, clip(head), head.style, head.link.as_ref());
-    spans.extend(paragraph.spans[first + 1..last].iter().map(|span| Span {
+    spans.extend(rest.iter().map(|span| Span {
         range: clip(span),
         style: span.style,
         link: span.link.clone(),
@@ -578,16 +630,9 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
         return raw;
     }
     let mut result = Vec::with_capacity(raw.len());
-    let mut index = 0;
+    let mut spans = SpanCursor::new(&raw);
     for (start, grapheme) in text.grapheme_indices(true) {
-        while raw.get(index).is_some_and(|span| span.range.end <= start) {
-            index += 1;
-        }
-        let (style, link) = raw
-            .get(index)
-            .map_or((InlineStyle::default(), None), |span| {
-                (span.style, span.link.as_ref())
-            });
+        let (style, link) = spans.at(start);
         push_span(&mut result, start..start + grapheme.len(), style, link);
     }
     result
@@ -607,15 +652,14 @@ fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
 }
 
 fn word_stops(text: &str) -> Vec<Range<usize>> {
-    let mut words = text
-        .unicode_word_indices()
-        .map(|(start, _)| start)
-        .peekable();
+    if text.is_ascii() {
+        return ascii_word_stops(text);
+    }
     let mut stops: Vec<Range<usize>> = Vec::new();
     let mut symbols = false;
     for (start, segment) in text.split_word_bound_indices() {
         let range = start..start + segment.len();
-        if words.next_if_eq(&start).is_some() {
+        if is_word_segment(segment) {
             stops.push(range);
             symbols = false;
         } else if segment.chars().all(char::is_whitespace) {
@@ -628,4 +672,144 @@ fn word_stops(text: &str) -> Vec<Range<usize>> {
         }
     }
     stops
+}
+
+// The std tables follow the compiler's Unicode version; the segmenter's stay pinned.
+fn is_word_segment(segment: &str) -> bool {
+    let (major, minor, update) = char::UNICODE_VERSION;
+    if (u64::from(major), u64::from(minor), u64::from(update))
+        == unicode_segmentation::UNICODE_VERSION
+    {
+        segment.chars().any(char::is_alphanumeric)
+    } else {
+        segment.unicode_words().next().is_some()
+    }
+}
+
+fn ascii_word_stops(text: &str) -> Vec<Range<usize>> {
+    let mut stops = Vec::new();
+    let mut end = 0;
+    for (start, word) in text.unicode_word_indices() {
+        push_symbol_runs(&mut stops, text.as_bytes(), end..start);
+        end = start + word.len();
+        stops.push(start..end);
+    }
+    push_symbol_runs(&mut stops, text.as_bytes(), end..text.len());
+    stops
+}
+
+fn push_symbol_runs(stops: &mut Vec<Range<usize>>, bytes: &[u8], gap: Range<usize>) {
+    let mut start = gap.start;
+    for index in gap.clone() {
+        if char::from(bytes[index]).is_whitespace() {
+            if start < index {
+                stops.push(start..index);
+            }
+            start = index + 1;
+        }
+    }
+    if start < gap.end {
+        stops.push(start..gap.end);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn span_cursor_scans_forward_for_bridges_and_grapheme_normalization() {
+        let bold = InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        };
+        let italic = InlineStyle {
+            italic: true,
+            ..InlineStyle::default()
+        };
+        let link = Link::new("https://example.com").unwrap();
+        let spans = [
+            Span {
+                range: 0..2,
+                style: bold,
+                link: None,
+            },
+            Span {
+                range: 2..4,
+                style: italic,
+                link: Some(link.clone()),
+            },
+            Span {
+                range: 6..8,
+                style: bold,
+                link: None,
+            },
+        ];
+        let mut cursor = SpanCursor::new(&spans);
+        for byte in 0..10 {
+            let current = spans.iter().position(|span| span.range.end > byte);
+            let expected = current.map_or((InlineStyle::default(), None), |index| {
+                (spans[index].style, spans[index].link.as_ref())
+            });
+            assert_eq!(cursor.at(byte), expected);
+            #[cfg(feature = "accesskit")]
+            assert_eq!(cursor.index(), current.unwrap_or(spans.len()));
+        }
+
+        let paragraph = Paragraph::styled(
+            "ae\u{301}x".to_owned(),
+            vec![
+                Span {
+                    range: 0..2,
+                    style: bold,
+                    link: None,
+                },
+                Span {
+                    range: 2..4,
+                    style: italic,
+                    link: Some(link),
+                },
+                Span {
+                    range: 4..5,
+                    style: italic,
+                    link: None,
+                },
+            ],
+            ParagraphKind::Body,
+        );
+        assert_eq!(
+            paragraph.spans(),
+            [
+                Span {
+                    range: 0..4,
+                    style: bold,
+                    link: None,
+                },
+                Span {
+                    range: 4..5,
+                    style: italic,
+                    link: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn word_stops_classify_words_with_the_pinned_segmentation_tables() {
+        for character in '\u{80}'..=char::MAX {
+            let segment = character.to_string();
+            assert_eq!(
+                is_word_segment(&segment),
+                segment.unicode_words().next().is_some(),
+                "U+{:04X} with std Unicode {:?}",
+                u32::from(character),
+                char::UNICODE_VERSION
+            );
+        }
+        // U+0558 is unassigned in the pinned Unicode 17 tables and a letter in Unicode 18.
+        assert_eq!(
+            word_stops("ab \u{558}\u{558}\u{558} cd"),
+            [0..2, 3..9, 10..12]
+        );
+    }
 }

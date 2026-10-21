@@ -295,6 +295,55 @@ fn local_grapheme_checks_and_snapping_match_complete_segmentation() {
 }
 
 #[test]
+fn trailing_grapheme_tracking_matches_complete_segmentation_while_text_grows() {
+    let pieces = [
+        "a", " ", "\t", "é", "\u{301}", "\u{300}", "🇦", "🇧", "\u{200d}", "👩", "💻", "🏽", "क",
+        "\u{94d}", "ष", "\u{600}", "\u{1100}", "\u{1161}", "\u{11a8}", "\u{903}",
+    ];
+    let mut seed = 0x7a11_c105_7e25_0b5eu64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    for _ in 0..400 {
+        let mut text = String::new();
+        let (mut tail, mut scanned) = (0, 0);
+        for _ in 0..24 {
+            for _ in 0..=next(3) {
+                text.push_str(pieces[next(pieces.len())]);
+            }
+            if next(3) == 0 {
+                continue;
+            }
+            tail = last_grapheme_start(&text, tail, scanned);
+            scanned = text.len();
+            assert_eq!(
+                tail,
+                text.grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(start, _)| start),
+                "{text:?}"
+            );
+        }
+    }
+
+    for (prefix, appended, expected) in [("🇦🇧", "🇨", 8), ("🇦", "🇨", 0), ("🇦", "🇨🇩", 8)]
+    {
+        assert_eq!(
+            last_grapheme_start(&format!("{prefix}{appended}"), 0, prefix.len()),
+            expected,
+            "{prefix:?} + {appended:?}"
+        );
+    }
+    // The cached start is trusted rather than recomputed, so a growing cluster is never rescanned.
+    assert_eq!(last_grapheme_start("ab\u{301}", 0, 2), 0);
+    assert_eq!(last_grapheme_start("ab\u{301}c", 0, 2), 4);
+    assert_eq!(last_grapheme_start("abcd", 0, 2), 3);
+}
+
+#[test]
 fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
     use crate::{Editor, Movement, Selection};
 
@@ -538,6 +587,96 @@ fn word_navigation_stops_at_unicode_words_and_symbol_runs() {
     assert_eq!(dashes.next_word(3), 14);
     let mixed = Paragraph::plain("one, two's!");
     assert_eq!(mixed.word_ranges(), &[0..3, 3..4, 5..10, 10..11]);
+}
+
+#[test]
+fn word_stops_match_general_word_segmentation() {
+    let check = |paragraph: &Paragraph| {
+        let text = paragraph.text();
+        let words: Vec<usize> = if text.is_ascii() {
+            text.split_word_bound_indices()
+                .filter(|(_, segment)| segment.bytes().any(|byte| byte.is_ascii_alphanumeric()))
+                .map(|(start, _)| start)
+                .collect()
+        } else {
+            text.unicode_word_indices()
+                .map(|(start, _)| start)
+                .collect()
+        };
+        let mut stops: Vec<Range<usize>> = Vec::new();
+        let mut symbols = false;
+        for (start, segment) in text.split_word_bound_indices() {
+            let range = start..start + segment.len();
+            if words.binary_search(&start).is_ok() {
+                stops.push(range);
+                symbols = false;
+            } else if segment.chars().all(char::is_whitespace) {
+                symbols = false;
+            } else if symbols {
+                stops.last_mut().unwrap().end = range.end;
+            } else {
+                stops.push(range);
+                symbols = true;
+            }
+        }
+        assert_eq!(paragraph.word_ranges(), stops, "{text:?}");
+    };
+    for text in [
+        "",
+        " ",
+        "___",
+        "__x__ a_b _1",
+        "can't 'twas rock 'n' roll''",
+        "1,000.5 3.14 1;2 1'000 1..2 1.,2 x.1 1.x",
+        "e.g. a:b a::b a..b a.'b",
+        "http://example.com/a_b?c=d&e#f",
+        "\r\n\r\n\t \u{b}\u{c}\r \n",
+        "!!! a!!!b --a-- #1 $2 %3 \"quoted\"",
+        "x\u{0}y\u{1f}z\u{7f}w",
+    ] {
+        check(&Paragraph::plain(text));
+    }
+    check(&Paragraph::plain(
+        &"A short paragraph with ASCII words, 1,000.5 e.g. can't __x__ ___ !? \t".repeat(50),
+    ));
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let ascii: Vec<char> = (0..=127u8).map(char::from).collect();
+    let punctuated: Vec<char> = "aZ09_'.,;:\"-!?/@ \t\u{b}\u{c}\r\n\u{0}\u{1f}\u{7f}"
+        .chars()
+        .collect();
+    let unicode: Vec<char> = "aZ09_'.,: \t\r\néß你ा\u{301}\u{200d}👩💻🇺🇸\u{a0}\u{2028}\u{3000}٣²"
+        .chars()
+        .collect();
+    for alphabet in [&ascii, &punctuated, &unicode] {
+        for _ in 0..10_000 {
+            let text: String = (0..next() % 24)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            check(&Paragraph::plain(&text));
+        }
+    }
+    let mut document = Document::from_text("can't 1,000 e.g. __x__");
+    for _ in 0..500 {
+        let paragraph = document.paragraph(0).unwrap();
+        check(paragraph);
+        let len = paragraph.text().len();
+        let start = next() % (len + 1);
+        let end = (start + next() % 3).min(len);
+        let token = ["a", "0", "_", "'", ".", ",", ":", "-", " ", "\t", "", "x.y"][next() % 12];
+        document
+            .replace(
+                Position::new(0, start)..Position::new(0, end),
+                token,
+                InlineStyle::default(),
+            )
+            .unwrap();
+    }
 }
 
 #[test]
@@ -945,6 +1084,52 @@ fn rich_unicode_run_validation_keeps_navigation_indexes_lazy() {
 }
 
 #[test]
+fn rich_run_ends_match_complete_segmentation_beyond_local_context() {
+    let texts = [
+        "café e\u{301}👨‍👩‍👧‍👦🇺🇸각나".to_owned(),
+        format!("a👩{}‍💻z", "\u{301}".repeat(64)),
+        format!("a{}z", "🇦".repeat(65)),
+        format!("aक{}षz", "\u{94d}\u{301}".repeat(33)),
+        format!("{}\u{1161}\u{11a8}é", "\u{1100}".repeat(40)),
+    ];
+    let styles = [bold(), InlineStyle::default(), bold()];
+    let validate = |text: &str, ends: &[usize]| {
+        let spans = [0]
+            .into_iter()
+            .chain(ends.iter().copied())
+            .zip(ends.iter().copied().chain([text.len()]))
+            .zip(styles)
+            .map(|((start, end), style)| Span {
+                range: start..end,
+                style,
+                link: None,
+            })
+            .collect();
+        Paragraph::new(text, spans, ParagraphKind::Body).is_ok()
+    };
+    for text in texts {
+        let boundaries: Vec<_> = text.grapheme_indices(true).map(|(byte, _)| byte).collect();
+        for byte in 1..text.len() {
+            assert_eq!(
+                validate(&text, &[byte]),
+                boundaries.contains(&byte),
+                "run end {byte} in {text:?}"
+            );
+        }
+        let chars: Vec<_> = text.char_indices().map(|(byte, _)| byte).skip(1).collect();
+        for (index, &first) in chars.iter().enumerate() {
+            for &second in &chars[index + 1..] {
+                assert_eq!(
+                    validate(&text, &[first, second]),
+                    boundaries.contains(&first) && boundaries.contains(&second),
+                    "run ends {first} and {second} in {text:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn document_content_identity_tracks_changes_and_preserves_noops() {
     let mut document = Document::from_text("text");
     let cloned = document.clone();
@@ -973,20 +1158,20 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
 
     let before_kind = Arc::clone(&document.identity);
     let kind = ParagraphKind::Heading { level: 2 };
-    assert!(document.set_kind(0..1, kind).unwrap().is_some());
+    assert!(!document.set_kind(0..1, kind).unwrap().is_empty());
     assert!(!Arc::ptr_eq(&document.identity, &before_kind));
     let before_style = Arc::clone(&document.identity);
-    assert!(document.set_kind(0..1, kind).unwrap().is_none());
+    assert!(document.set_kind(0..1, kind).unwrap().is_empty());
     assert!(Arc::ptr_eq(&document.identity, &before_style));
     let patch = StylePatch {
         bold: Some(true),
         ..StylePatch::default()
     };
     assert!(
-        document
+        !document
             .apply_style(Position::default()..document.end(), patch)
             .unwrap()
-            .is_some()
+            .is_empty()
     );
     assert!(!Arc::ptr_eq(&document.identity, &before_style));
     let styled = Arc::clone(&document.identity);
@@ -994,7 +1179,7 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
         document
             .apply_style(Position::default()..document.end(), patch)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert!(Arc::ptr_eq(&document.identity, &styled));
     document.replay(&noop, true);
@@ -1119,7 +1304,7 @@ fn formatting_merges_runs_and_is_a_noop_when_unchanged() {
         document
             .apply_style(Position::new(0, 2)..Position::new(0, 4), patch)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert_eq!(document.revision(), revision);
     document
@@ -1136,6 +1321,36 @@ fn formatting_merges_runs_and_is_a_noop_when_unchanged() {
     assert_eq!(document.style_at(Position::new(0, 0)), bold());
     assert_eq!(document.style_at(document.end()), bold());
     assert_normalized(&document);
+}
+
+#[test]
+fn span_lookup_skips_empty_ranges_and_runs_that_only_touch() {
+    let mut document = Document::from_text("abcdef\nxy");
+    document
+        .apply_style(
+            Position::new(0, 2)..Position::new(0, 4),
+            StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        )
+        .unwrap();
+    let paragraph = &document.paragraphs()[0];
+    assert_eq!(paragraph.overlapping(3..3), 0..0);
+    assert_eq!(paragraph.overlapping(2..4), 1..2);
+    assert_eq!(paragraph.overlapping(1..5), 0..3);
+    assert_eq!(paragraph.overlapping(4..6), 2..3);
+    let styles = |range: Range<Position>| {
+        document
+            .spans_in(&range)
+            .map(|span| span.style)
+            .collect::<Vec<_>>()
+    };
+    assert!(styles(Position::new(0, 6)..Position::new(1, 0)).is_empty());
+    assert_eq!(
+        styles(Position::new(0, 3)..Position::new(1, 1)),
+        [bold(), InlineStyle::default(), InlineStyle::default()]
+    );
 }
 
 #[test]
@@ -1290,7 +1505,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                 let mut document = source.clone();
                 let delta = document.apply_style(start..end, patch).unwrap();
                 let changed = source.paragraphs() != expected;
-                assert_eq!(delta.is_some(), changed, "{start:?}..{end:?}, {patch:?}");
+                assert_eq!(!delta.is_empty(), changed, "{start:?}..{end:?}, {patch:?}");
                 assert_eq!(document.paragraphs(), expected);
                 assert_eq!(document.revision(), u64::from(changed));
                 assert_eq!(Arc::ptr_eq(&document.identity, &source.identity), !changed);
@@ -1305,12 +1520,10 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                         assert!(Arc::ptr_eq(before, after));
                     }
                 }
-                if let Some(delta) = delta {
-                    document.replay(&delta, false);
-                    assert_eq!(document.paragraphs(), source.paragraphs());
-                    document.replay(&delta, true);
-                    assert_eq!(document.paragraphs(), expected);
-                }
+                document.replay(&delta, false);
+                assert_eq!(document.paragraphs(), source.paragraphs());
+                document.replay(&delta, true);
+                assert_eq!(document.paragraphs(), expected);
             }
         }
     }
@@ -1401,15 +1614,252 @@ fn history_retains_only_changed_paragraphs_and_shares_others() {
 }
 
 #[test]
+fn kind_changes_share_unchanged_paragraphs_inside_the_changed_range() {
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    let mut document = Document::from_paragraphs(
+        [bullet, ParagraphKind::Body, bullet]
+            .map(|kind| Arc::new(Paragraph::plain("item")).with_kind(kind)),
+    );
+    let middle = Arc::clone(&document.paragraphs()[1]);
+    let delta = document.change_list_indent(0..3, true);
+    assert_eq!((delta.start, delta.after.len()), (0, 3));
+    assert!(Arc::ptr_eq(&middle, &document.paragraphs()[1]));
+    let delta = document.set_kind(0..3, ParagraphKind::Body).unwrap();
+    assert_eq!((delta.start, delta.after.len()), (0, 3));
+    assert!(Arc::ptr_eq(&middle, &document.paragraphs()[1]));
+}
+
+#[test]
+fn sparse_changes_retain_only_their_changed_runs() {
+    let changed = [0, 3, 13, 14, 30, 39];
+    let source: Vec<String> = (0..40)
+        .map(|index| {
+            if changed.contains(&index) {
+                format!("match {index}")
+            } else {
+                format!("plain {index}")
+            }
+        })
+        .collect();
+    let mut document = Document::from_text(&source.join("\n"));
+    let original = document.paragraphs.clone();
+    let matches: Vec<_> = changed
+        .iter()
+        .map(|&paragraph| Position::new(paragraph, 0)..Position::new(paragraph, 5))
+        .collect();
+    let (delta, _) = document.replace_matches(&matches, "swap");
+    let splices: Vec<_> = std::iter::once(&delta)
+        .chain(&delta.rest)
+        .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
+        .collect();
+    assert_eq!(splices, [(0, 4, 4), (13, 2, 2), (30, 10, 10)]);
+    let contiguous = Delta {
+        start: 0,
+        before: original.clone(),
+        after: document.paragraphs.clone(),
+        rest: Vec::new(),
+    };
+    assert_eq!(
+        contiguous.retained_bytes() - delta.retained_bytes(),
+        24 * (std::mem::size_of::<Paragraph>() + 2 * std::mem::size_of::<Arc<Paragraph>>())
+            - 2 * std::mem::size_of::<Delta>()
+    );
+    let shared = |expected: &[Arc<Paragraph>], document: &Document| {
+        expected
+            .iter()
+            .zip(&document.paragraphs)
+            .map(|(old, new)| Arc::ptr_eq(old, new))
+            .collect::<Vec<_>>()
+    };
+    let unchanged: Vec<_> = (0..40).map(|index| !changed.contains(&index)).collect();
+    assert_eq!(shared(&original, &document), unchanged);
+    let replaced = document.paragraphs.clone();
+    let revision = document.revision();
+    document.replay(&delta, false);
+    assert_eq!(document.revision(), revision + 1);
+    assert_eq!(shared(&original, &document), [true; 40]);
+    document.replay(&delta, true);
+    assert_eq!(shared(&replaced, &document), [true; 40]);
+    assert_eq!(
+        document.plain_text(),
+        source.join("\n").replace("match", "swap")
+    );
+}
+
+#[test]
+fn sparse_changes_that_shift_paragraphs_retain_only_their_changed_runs() {
+    let identical = |expected: &[Arc<Paragraph>], document: &Document| {
+        expected.len() == document.paragraphs.len()
+            && expected
+                .iter()
+                .zip(&document.paragraphs)
+                .all(|(expected, paragraph)| Arc::ptr_eq(expected, paragraph))
+    };
+    let mut retained = Vec::new();
+    for (first_gap, second_gap) in [(9, 15), (90, 150)] {
+        let split = 2;
+        let joined = split + 1 + first_gap;
+        let expanded = joined + 3 + second_gap;
+        let last = expanded + 1 + 8;
+        let source: Vec<String> = (0..=last)
+            .map(|index| format!("plain {index:03}"))
+            .collect();
+        let mut document = Document::from_text(&source.join("\n"));
+        let original = document.paragraphs.clone();
+        let matches = [
+            Position::new(split, 0)..Position::new(split, 5),
+            Position::new(joined, 6)..Position::new(joined + 2, 5),
+            Position::new(expanded, 0)..Position::new(expanded, 5),
+            Position::new(last, 0)..Position::new(last, 5),
+        ];
+        let (delta, _) = document.replace_matches(&matches, "x\ny");
+        let splices: Vec<_> = std::iter::once(&delta)
+            .chain(&delta.rest)
+            .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
+            .collect();
+        assert_eq!(
+            splices,
+            [(split, 1, 2), (joined + 1, 3, 2), (expanded, 10, 12)]
+        );
+        let mut expected = source.clone();
+        expected[last].replace_range(..5, "x\ny");
+        expected[expanded].replace_range(..5, "x\ny");
+        expected[joined + 2].replace_range(..5, "y");
+        expected.drain(joined + 1..joined + 2);
+        expected[joined].replace_range(6.., "x");
+        expected[split].replace_range(..5, "x\ny");
+        assert_eq!(document.plain_text(), expected.join("\n"));
+        let kept = document
+            .paragraphs
+            .iter()
+            .filter(|paragraph| original.iter().any(|old| Arc::ptr_eq(old, paragraph)))
+            .count();
+        assert_eq!(kept, original.len() - 6);
+        retained.push(delta.retained_bytes());
+        let replaced = document.paragraphs.clone();
+        let revision = document.revision();
+        document.replay(&delta, false);
+        assert_eq!(document.revision(), revision + 1);
+        assert!(identical(&original, &document));
+        document.replay(&delta, true);
+        assert!(identical(&replaced, &document));
+    }
+    assert_eq!(retained[0], retained[1]);
+}
+
+#[test]
+fn shifting_sparse_changes_replay_exactly_with_repeated_paragraphs() {
+    let mut seed = 0x5a1f_7ed0_c0de_d1ffu64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let repeated = Arc::new(Paragraph::plain("same"));
+    let identical = |expected: &[Arc<Paragraph>], document: &Document| {
+        expected.len() == document.paragraphs.len()
+            && expected
+                .iter()
+                .zip(&document.paragraphs)
+                .all(|(expected, paragraph)| Arc::ptr_eq(expected, paragraph))
+    };
+    let mut split = 0;
+    for _ in 0..300 {
+        let count = 12 + next(48);
+        let mut document = Document::from_paragraphs((0..count).map(|index| {
+            if next(4) == 0 {
+                Arc::clone(&repeated)
+            } else {
+                Arc::new(Paragraph::plain(&format!("p{index}")))
+            }
+        }));
+        let mut matches = Vec::new();
+        let mut paragraph = next(4);
+        while paragraph < count {
+            let end = (paragraph + next(3)).min(count - 1);
+            matches.push(Position::new(paragraph, 0)..Position::new(end, 1));
+            paragraph = end + 1 + next(16);
+        }
+        if matches.is_empty() {
+            continue;
+        }
+        let replacement = ["", "r", "r\ns", "r\n\ns"][next(4)];
+        let offset = |position: Position| {
+            document.paragraphs[..position.paragraph]
+                .iter()
+                .map(|paragraph| paragraph.text.len() + 1)
+                .sum::<usize>()
+                + position.byte
+        };
+        let mut expected = document.plain_text();
+        for range in matches.iter().rev() {
+            expected.replace_range(offset(range.start)..offset(range.end), replacement);
+        }
+        let original = document.paragraphs.clone();
+        let (delta, _) = document.replace_matches(&matches, replacement);
+        assert_eq!(document.plain_text(), expected);
+        if delta
+            .rest
+            .iter()
+            .any(|splice| splice.before.len() != splice.after.len())
+        {
+            split += 1;
+        }
+        let replaced = document.paragraphs.clone();
+        document.replay(&delta, false);
+        assert!(
+            identical(&original, &document),
+            "{matches:?} {replacement:?}"
+        );
+        document.replay(&delta, true);
+        assert!(
+            identical(&replaced, &document),
+            "{matches:?} {replacement:?}"
+        );
+    }
+    assert!(split > 50, "{split}");
+}
+
+#[test]
+fn sparse_kind_changes_renumber_lists_through_history() {
+    let ordered = ParagraphKind::Ordered {
+        indent: 0,
+        start: None,
+    };
+    let mut document = Document::from_text(&["item"; 30].join("\n"));
+    document.set_kind(0..30, ordered).unwrap();
+    for index in [3, 20] {
+        document
+            .set_kind(index..index + 1, ParagraphKind::Body)
+            .unwrap();
+    }
+    let interrupted = numbers(&document);
+    let delta = document.set_kind(0..30, ordered).unwrap();
+    assert!(!delta.is_empty());
+    assert_eq!(delta.rest.len(), 1);
+    let expected: Vec<_> = (1..=30).map(Some).collect();
+    assert_eq!(numbers(&document), expected);
+    document.replay(&delta, false);
+    assert_eq!(numbers(&document), interrupted);
+    document.replay(&delta, true);
+    assert_eq!(numbers(&document), expected);
+}
+
+#[test]
 fn history_charges_the_larger_side_without_shared_text_or_runs() {
     let record = std::mem::size_of::<Paragraph>();
     let run = std::mem::size_of::<Span>();
+    let pointer = std::mem::size_of::<Arc<Paragraph>>();
     let text = "word ".repeat(1000);
     let mut document = Document::from_text(&format!("{text}\n{text}"));
     let (typed, _) = document
         .replace(Position::new(0, 0)..Position::new(0, 0), "x", bold())
         .unwrap();
-    assert_eq!(typed.retained_bytes(), record + text.len() + 1 + 2 * run);
+    assert_eq!(
+        typed.retained_bytes(),
+        record + text.len() + 1 + 2 * run + 2 * pointer
+    );
 
     let formatted = document
         .apply_style(
@@ -1419,9 +1869,11 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
                 ..StylePatch::default()
             },
         )
-        .unwrap()
         .unwrap();
-    assert_eq!(formatted.retained_bytes(), 2 * record + 4 * run);
+    assert_eq!(
+        formatted.retained_bytes(),
+        2 * record + 4 * run + 4 * pointer
+    );
 
     let len = document.paragraphs().len();
     let retyped = document
@@ -1432,9 +1884,27 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
                 start: None,
             },
         )
-        .unwrap()
         .unwrap();
-    assert_eq!(retyped.retained_bytes(), 2 * record);
+    assert_eq!(retyped.retained_bytes(), 2 * record + 4 * pointer);
+}
+
+#[test]
+fn sparse_history_charges_the_pointers_and_record_of_each_run() {
+    let record = std::mem::size_of::<Paragraph>();
+    let pointer = std::mem::size_of::<Arc<Paragraph>>();
+    let mut document = Document::from_text(&vec!["text"; 100].join("\n"));
+    document.set_kind(0..100, ParagraphKind::Quote).unwrap();
+    for index in (0..100).step_by(10) {
+        document
+            .set_kind(index..index + 1, ParagraphKind::Body)
+            .unwrap();
+    }
+    let delta = document.set_kind(0..100, ParagraphKind::Quote).unwrap();
+    assert_eq!(delta.rest.len(), 9);
+    assert_eq!(
+        delta.retained_bytes(),
+        10 * (record + 2 * pointer) + 9 * std::mem::size_of::<Delta>()
+    );
 }
 
 fn numbers(document: &Document) -> Vec<Option<u32>> {
@@ -1454,7 +1924,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
             ParagraphKind::Heading { level: 1 },
             ordered(None),
         ]
-        .map(|kind| Paragraph::plain("item").with_kind(kind)),
+        .map(|kind| Arc::new(Paragraph::plain("item")).with_kind(kind)),
     );
     let expected = [Some(7), None, Some(8), None, Some(1)];
     assert_eq!(numbers(&document), expected);
@@ -1468,7 +1938,8 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
         (3, ParagraphKind::Heading { level: 2 }),
     ] {
         let before = document.paragraphs[index].kind;
-        let delta = document.set_kind(index..index + 1, kind).unwrap().unwrap();
+        let delta = document.set_kind(index..index + 1, kind).unwrap();
+        assert!(!delta.is_empty());
         assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
         assert_eq!(numbers(&document), expected);
         document.replay(&delta, false);
@@ -1479,10 +1950,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
         assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
     }
 
-    let delta = document
-        .set_kind(3..4, ParagraphKind::Quote)
-        .unwrap()
-        .unwrap();
+    let delta = document.set_kind(3..4, ParagraphKind::Quote).unwrap();
     assert!(document.numbers.get().is_none());
     assert_eq!(numbers(&document), [Some(7), None, Some(8), None, Some(9)]);
     document.replay(&delta, false);
@@ -1665,13 +2133,13 @@ fn noops_do_not_change_revision_or_allocations() {
         document
             .set_kind(0..1, ParagraphKind::Body)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert!(
         document
             .apply_style(Position::default()..document.end(), StylePatch::default())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     document.replay(&delta, false);
     assert_eq!(document.revision(), 0);

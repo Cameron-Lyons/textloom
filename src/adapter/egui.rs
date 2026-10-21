@@ -22,19 +22,19 @@ mod paint;
 use super::clean_text;
 pub use accessibility::AccessibilityError;
 use composition::CompositionPreview;
-use input::{InputOptions, handle_event};
+use input::{InputOptions, handle_event, reads_layout};
 #[cfg(test)]
 use input::{handle_key, surrounding_position};
 pub use input_routing::install_input_routing;
 #[cfg(test)]
 use layout::paragraph_job;
 use layout::{Appearance, LayoutCache, ParagraphLayouts};
-use navigation::{
-    VerticalNavigation, document_caret_rect, hit_test, link_at_point, pointer_navigation,
-    selection_bounds,
-};
 #[cfg(test)]
-use navigation::{preedit_byte_range, snap_grapheme};
+use navigation::preedit_byte_range;
+use navigation::{
+    VerticalNavigation, document_caret_rect, grapheme_at_point, hit_test, link_at_point,
+    pointer_navigation, selection_bounds,
+};
 use paint::{BackgroundRanges, PaintCache, paint_document};
 
 pub trait RichClipboard {
@@ -212,6 +212,15 @@ impl<'a> RichTextEditor<'a> {
         let old_selection = self.editor.selection();
         let old_composition = self.editor.composition_snapshot();
         let was_focused = cache.interaction.focused;
+        // A focus request or Shift+Tab after this widget ran moved focus before this pass's input.
+        let focus_left = cache.interaction.focus_exit.take().is_some_and(|exit| {
+            ui.memory(|memory| match exit {
+                FocusExit::Request(target) => memory
+                    .focused()
+                    .is_some_and(|focused| focused.accesskit_id() == target),
+                FocusExit::Traversal => !memory.has_focus(id),
+            })
+        });
         let publish_text = ui
             .ctx()
             .accesskit_node_builder(id, |node| {
@@ -224,6 +233,7 @@ impl<'a> RichTextEditor<'a> {
         let mut errors = Vec::new();
         let mut accessibility_errors = Vec::new();
         let mut layouts = cache.layout(ui, self.editor, &appearance);
+        let tab_moves_focus = self.read_only || !cache.selection_contains_list(self.editor);
         cache.validate_navigation(self.editor.selection());
         let old_text = publish_text.then(|| cache.plain_text(self.editor.document()));
         let now = ui.input(|input| input.time);
@@ -241,13 +251,11 @@ impl<'a> RichTextEditor<'a> {
         {
             cache.interaction.cleared_preedit = None;
         }
-        let initial_preview = match cache.layout_preview(ui, self.editor, &appearance) {
-            Ok(layouts) => layouts,
-            Err(error) => {
-                errors.push(error);
-                None
-            }
-        };
+        let initial_preview = record(
+            cache.layout_preview(ui, self.editor, &appearance),
+            &mut errors,
+        )
+        .flatten();
         let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
         let rows = self.min_rows as f32;
         let hint = self.hint_galley(ui, initial_preview.as_ref().unwrap_or(&layouts));
@@ -341,7 +349,7 @@ impl<'a> RichTextEditor<'a> {
                 || !(pressed || clicked || response.has_focus());
             let follows_links = self.read_only || click_modifiers.command;
             let previous_press = cache.interaction.link_press.take();
-            let applied = if was_focused && ends_composition {
+            let applied = if was_focused && ends_composition && !focus_left {
                 apply_queued_ime(
                     self.editor,
                     ui,
@@ -351,6 +359,7 @@ impl<'a> RichTextEditor<'a> {
                     &mut errors,
                     &mut interrupted,
                     &options,
+                    tab_moves_focus,
                 )
             } else {
                 Vec::new()
@@ -374,7 +383,11 @@ impl<'a> RichTextEditor<'a> {
                     if let Some(link) = link {
                         if pressed {
                             let (anchor, _) = hit_test(self.editor, &layouts, pointer - origin);
-                            cache.interaction.link_press = Some(LinkPress { link, anchor });
+                            cache.interaction.link_press = Some(LinkPress {
+                                link,
+                                anchor,
+                                revision: self.editor.document().revision(),
+                            });
                         } else {
                             clicked_link = Some(link);
                         }
@@ -385,7 +398,13 @@ impl<'a> RichTextEditor<'a> {
                         let result = if response.triple_clicked() {
                             self.editor.select_paragraph(position.paragraph)
                         } else if response.double_clicked() {
-                            self.editor.select_word_at(position)
+                            let under_pointer = grapheme_at_point(
+                                self.editor.document(),
+                                &layouts,
+                                pointer - origin,
+                            );
+                            self.editor
+                                .select_word_at(under_pointer.unwrap_or(position))
                         } else {
                             let anchor = if shift {
                                 self.editor.selection().anchor
@@ -409,6 +428,7 @@ impl<'a> RichTextEditor<'a> {
                 && !response.double_clicked()
                 && !response.triple_clicked()
                 && let Some(press) = link_press.take()
+                && press.revision == self.editor.document().revision()
                 && let Some(pointer) = released_pointer
                 && link_at_point(self.editor.document(), &layouts, pointer - origin).as_ref()
                     == Some(&press.link)
@@ -426,6 +446,7 @@ impl<'a> RichTextEditor<'a> {
                 let (position, prefer_next_row) = hit_test(self.editor, &layouts, pointer - origin);
                 let anchor = link_press
                     .take()
+                    .filter(|press| press.revision == self.editor.document().revision())
                     .map_or(self.editor.selection().anchor, |press| press.anchor);
                 record(
                     self.editor.set_selection(Selection::new(anchor, position)),
@@ -465,9 +486,19 @@ impl<'a> RichTextEditor<'a> {
                 Vec::new()
             };
             let mut consumed = Vec::new();
+            let mut layout_stale = false;
+            let mut traversed = false;
             for (index, event) in events.iter().enumerate() {
-                if applied.binary_search(&index).is_ok() {
+                // egui moves focus for Shift+Tab next pass; a later preedit belongs to that widget,
+                // while commits stay here like Text.
+                if applied.binary_search(&index).is_ok()
+                    || (traversed && matches!(event, Event::Ime(ImeEvent::Preedit { .. })))
+                {
                     continue;
+                }
+                if layout_stale && reads_layout(event, &options) {
+                    layouts = cache.layout(ui, self.editor, &appearance);
+                    layout_stale = false;
                 }
                 let revision = self.editor.document().revision();
                 let composition = composition_before_event(self.editor, event);
@@ -501,19 +532,18 @@ impl<'a> RichTextEditor<'a> {
                         &mut accessibility_errors,
                     )
                 } else if response.has_focus() {
-                    is_commit_echo(&mut cache.interaction.commit_echo, event, self.editor)
-                        || handle_event(
-                            self.editor,
-                            ui,
-                            event,
-                            &layouts,
-                            &mut cache.interaction.navigation,
-                            &mut cache.interaction.commit_echo,
-                            &mut errors,
-                            &mut interrupted,
-                            &options,
-                            &mut self.rich_clipboard,
-                        )
+                    handle_event(
+                        self.editor,
+                        ui,
+                        event,
+                        &layouts,
+                        &mut cache.interaction.navigation,
+                        &mut cache.interaction.commit_echo,
+                        &mut errors,
+                        &mut interrupted,
+                        &options,
+                        &mut self.rich_clipboard,
+                    )
                 } else {
                     false
                 };
@@ -528,9 +558,16 @@ impl<'a> RichTextEditor<'a> {
                     now,
                 );
                 if revision != self.editor.document().revision() {
-                    layouts = cache.layout(ui, self.editor, &appearance);
+                    cache.layout.track(self.editor.document());
+                    layout_stale = true;
                 }
                 cache.validate_navigation(self.editor.selection());
+                traversed |= response.has_focus()
+                    && tab_moves_focus
+                    && focus_traversal(event) == Some(egui::FocusDirection::Previous);
+            }
+            if layout_stale {
+                layouts = cache.layout(ui, self.editor, &appearance);
             }
             consumed.extend(applied);
             consumed.sort_unstable();
@@ -549,6 +586,17 @@ impl<'a> RichTextEditor<'a> {
                 });
             }
             if response.has_focus() {
+                // egui applies only the last focus request of a pass.
+                let request = events
+                    .iter()
+                    .rev()
+                    .find_map(input_routing::focus_request_target)
+                    .filter(|&target| target != id.accesskit_id());
+                cache.interaction.focus_exit = if traversed {
+                    Some(FocusExit::Traversal)
+                } else {
+                    request.map(FocusExit::Request)
+                };
                 self.set_focus_filter(ui, id, &cache);
             } else if let Some(committed) = finish_composition(self.editor, &mut errors) {
                 interrupted = true;
@@ -576,13 +624,11 @@ impl<'a> RichTextEditor<'a> {
         if composition_changed {
             ui.ctx().request_repaint();
         }
-        let preview_layouts = match cache.layout_preview(ui, self.editor, &appearance) {
-            Ok(layouts) => layouts,
-            Err(error) => {
-                errors.push(error);
-                None
-            }
-        };
+        let preview_layouts = record(
+            cache.layout_preview(ui, self.editor, &appearance),
+            &mut errors,
+        )
+        .flatten();
         let display_layouts = preview_layouts.as_ref().unwrap_or(&layouts);
         let preview = cache.preview.as_ref();
         let display_document = preview.map_or(self.editor.document(), |preview| &preview.document);
@@ -620,6 +666,7 @@ impl<'a> RichTextEditor<'a> {
                 origin,
                 highlights,
                 display_selection.map(|selection| (selection, ui.visuals().selection.bg_fill)),
+                &appearance.font.family,
                 appearance.color,
                 ui.visuals().weak_text_color(),
             );
@@ -864,6 +911,7 @@ struct InteractionState {
     caret_rect: Option<Rect>,
     scroll_to_caret: bool,
     focused: bool,
+    focus_exit: Option<FocusExit>,
     last_interaction: f64,
     commit_echo: Option<CommitEcho>,
     cleared_preedit: Option<Arc<crate::Composition>>,
@@ -881,10 +929,17 @@ impl InteractionState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FocusExit {
+    Request(egui::accesskit::NodeId),
+    Traversal,
+}
+
 #[derive(Clone)]
 struct LinkPress {
     link: Link,
     anchor: Position,
+    revision: u64,
 }
 
 impl Cache {
@@ -939,10 +994,8 @@ impl Cache {
     }
 }
 
-fn record(result: Result<(), Error>, errors: &mut Vec<Error>) {
-    if let Err(error) = result {
-        errors.push(error);
-    }
+fn record<T>(result: Result<T, Error>, errors: &mut Vec<Error>) -> Option<T> {
+    result.map_err(|error| errors.push(error)).ok()
 }
 
 #[derive(Clone, Copy)]
@@ -1014,19 +1067,18 @@ fn apply_queued_ime(
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
     options: &InputOptions,
+    tab_moves_focus: bool,
 ) -> Vec<usize> {
     let queued: Vec<_> = ui.input(|input| {
-        let press = input.events.iter().position(|event| {
-            matches!(
-                event,
-                Event::PointerButton {
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    ..
-                }
-            )
+        let end = input.events.iter().position(|event| match event {
+            Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } => true,
+            _ => tab_moves_focus && focus_traversal(event).is_some(),
         });
-        input.events[..press.unwrap_or(input.events.len())]
+        input.events[..end.unwrap_or(input.events.len())]
             .iter()
             .enumerate()
             .filter(|(_, event)| matches!(event, Event::Ime(_)))
@@ -1035,31 +1087,50 @@ fn apply_queued_ime(
     });
     let mut applied = Vec::new();
     let now = ui.input(|input| input.time);
+    let revision = editor.document().revision();
     for (index, event) in queued {
-        let revision = editor.document().revision();
         let composition = composition_before_event(editor, &event);
-        if is_commit_echo(&mut cache.interaction.commit_echo, &event, editor)
-            || handle_event(
-                editor,
-                ui,
-                &event,
-                layouts,
-                &mut cache.interaction.navigation,
-                &mut cache.interaction.commit_echo,
-                errors,
-                interrupted,
-                options,
-                &mut None,
-            )
-        {
+        if handle_event(
+            editor,
+            ui,
+            &event,
+            layouts,
+            &mut cache.interaction.navigation,
+            &mut cache.interaction.commit_echo,
+            errors,
+            interrupted,
+            options,
+            &mut None,
+        ) {
             applied.push(index);
         }
         observe_composition_event(&mut cache.interaction, composition, editor, &event, now);
-        if revision != editor.document().revision() {
-            *layouts = cache.layout(ui, editor, appearance);
-        }
+        cache.layout.track(editor.document());
+    }
+    if revision != editor.document().revision() {
+        *layouts = cache.layout(ui, editor, appearance);
     }
     applied
+}
+
+fn focus_traversal(event: &Event) -> Option<egui::FocusDirection> {
+    match event {
+        Event::Key {
+            key: egui::Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } => {
+            if !modifiers.any() {
+                Some(egui::FocusDirection::Next)
+            } else if modifiers.shift_only() {
+                Some(egui::FocusDirection::Previous)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 const COMMIT_ECHO_SECONDS: f64 = 0.5;
@@ -1131,23 +1202,6 @@ fn observe_composition_event(
     }
 }
 
-fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor) -> bool {
-    let Some(pending) = echo else {
-        return false;
-    };
-    match event {
-        Event::Ime(ImeEvent::Commit(text))
-            if !matches!(text.as_str(), "\n" | "\r" | "\r\n")
-                && editor.composition().is_none()
-                && clean_text(text, true) == pending.text =>
-        {
-            *echo = None;
-            true
-        }
-        _ => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn handle_accessibility_action(
     editor: &mut Editor,
@@ -1160,6 +1214,7 @@ fn handle_accessibility_action(
     errors: &mut Vec<Error>,
     accessibility_errors: &mut Vec<AccessibilityError>,
 ) -> bool {
+    use crate::accessibility::{AccessibleAction, apply_action};
     use egui::accesskit::{Action, ActionData};
     if read_only
         && matches!(
@@ -1197,19 +1252,12 @@ fn handle_accessibility_action(
         }
         (Action::SetValue | Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
             *interrupted |= editor.cancel_composition();
-            editor.break_history_group();
-            let result = if request.action == Action::SetValue {
-                let style = editor.document().style_at(Position::default());
-                editor.replace_range_with_style(
-                    Position::default()..editor.document().end(),
-                    value,
-                    style,
-                )
+            let action = if request.action == Action::SetValue {
+                AccessibleAction::ReplaceAllText(value)
             } else {
-                editor.insert_text(value)
+                AccessibleAction::ReplaceSelectedText(value)
             };
-            record(result, errors);
-            editor.break_history_group();
+            record(apply_action(editor, action).map(drop), errors);
         }
         _ => accessibility_errors.push(AccessibilityError::InvalidActionData),
     }

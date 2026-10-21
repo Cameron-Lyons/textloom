@@ -214,7 +214,7 @@ impl WinitAdapter {
         if !self.is_focused() || state != ElementState::Pressed {
             return Ok(InputOutcome::default());
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         if self.read_only {
             editor.cancel_composition();
         }
@@ -240,7 +240,7 @@ impl WinitAdapter {
             shortcut = shortcut_key(key, physical_key).and_then(|name| Shortcut::new(name, shift));
             if shortcut.is_none() && matches!(key, Key::Character(_)) {
                 outcome.handled = false;
-                outcome.changed = before.changed(editor);
+                outcome.changed = before != editor.presentation();
                 return Ok(outcome);
             }
         }
@@ -251,7 +251,7 @@ impl WinitAdapter {
                 editor.cancel_composition();
             }
             outcome.clipboard = self.run_shortcut(shortcut, editor)?;
-            outcome.changed = before.changed(editor);
+            outcome.changed = before != editor.presentation();
             return Ok(outcome);
         }
 
@@ -345,7 +345,7 @@ impl WinitAdapter {
                 _ => outcome.handled = false,
             }
         }
-        outcome.changed = before.changed(editor);
+        outcome.changed = before != editor.presentation();
         Ok(outcome)
     }
 
@@ -354,7 +354,11 @@ impl WinitAdapter {
             return Ok(InputOutcome::default());
         }
         if self.read_only {
-            self.ime.preedit = false;
+            if matches!(event, Ime::Disabled) {
+                // No preedit or commit follows Disabled, so the canceled session is over.
+                self.ime.preedit = false;
+                self.ime.stale = true;
+            }
             let changed = editor.cancel_composition() || self.ime_enabled;
             self.ime_enabled = false;
             return Ok(InputOutcome {
@@ -374,7 +378,7 @@ impl WinitAdapter {
                 ..InputOutcome::default()
             });
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         let was_enabled = self.ime_enabled;
         let mut preedit_changed = false;
         match event {
@@ -425,7 +429,9 @@ impl WinitAdapter {
         }
         Ok(InputOutcome {
             handled: true,
-            changed: before.changed(editor) || preedit_changed || was_enabled != self.ime_enabled,
+            changed: before != editor.presentation()
+                || preedit_changed
+                || was_enabled != self.ime_enabled,
             clipboard: None,
         })
     }
@@ -445,16 +451,14 @@ impl WinitAdapter {
         if clean.is_empty() {
             return Ok(blocked);
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         if !cancel_empty_composition(editor) {
             return Ok(blocked);
         }
-        editor.break_history_group();
-        editor.insert_text(&clean)?;
-        editor.break_history_group();
+        editor.isolated_edit(|editor| editor.insert_text(&clean))?;
         Ok(InputOutcome {
             handled: true,
-            changed: before.changed(editor),
+            changed: before != editor.presentation(),
             clipboard: None,
         })
     }
@@ -474,14 +478,14 @@ impl WinitAdapter {
         if self.read_only {
             return Ok(blocked);
         }
-        let before = EditorState::capture(editor);
+        let before = editor.presentation();
         if !cancel_empty_composition(editor) {
             return Ok(blocked);
         }
         editor.insert_fragment(fragment)?;
         Ok(InputOutcome {
             handled: true,
-            changed: before.changed(editor),
+            changed: before != editor.presentation(),
             clipboard: None,
         })
     }
@@ -695,31 +699,6 @@ fn selection_contains_list(editor: &Editor) -> bool {
                 ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. }
             )
         })
-}
-
-struct EditorState {
-    revision: u64,
-    selection: crate::Selection,
-    style: crate::InlineStyle,
-    composing: bool,
-}
-
-impl EditorState {
-    fn capture(editor: &Editor) -> Self {
-        Self {
-            revision: editor.document().revision(),
-            selection: editor.selection(),
-            style: editor.typing_style(),
-            composing: editor.composition().is_some(),
-        }
-    }
-
-    fn changed(&self, editor: &Editor) -> bool {
-        self.revision != editor.document().revision()
-            || self.selection != editor.selection()
-            || self.style != editor.typing_style()
-            || self.composing != editor.composition().is_some()
-    }
 }
 
 #[cfg(test)]
@@ -2722,6 +2701,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ime_events_while_read_only_keep_the_canceled_preedit_guard() {
+        for event in [
+            None,
+            Some(Ime::Preedit(String::new(), None)),
+            Some(Ime::Preedit("nih".into(), Some((3, 3)))),
+        ] {
+            let mut editor = Editor::from_text("abc");
+            editor
+                .set_selection(Selection::caret(editor.document().end()))
+                .unwrap();
+            let mut adapter = focused(&mut editor);
+            adapter.plan_ime(&editor, false, area(1.0));
+            adapter
+                .handle_ime(&Ime::Preedit("ni".into(), Some((2, 2))), &mut editor)
+                .unwrap();
+            assert!(adapter.set_read_only(true, &mut editor).changed);
+            assert!(editor.composition().is_none());
+            if let Some(event) = event {
+                let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
+                assert!(outcome.handled && !outcome.changed);
+            }
+            adapter.set_read_only(false, &mut editor);
+
+            let commit = adapter
+                .handle_ime(&Ime::Commit("你".into()), &mut editor)
+                .unwrap();
+            assert!(commit.handled && !commit.changed);
+            assert_eq!(editor.document().plain_text(), "abc");
+            assert!(!editor.can_undo());
+            assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+        }
+    }
+
+    #[test]
+    fn ime_disabled_while_read_only_ends_the_canceled_preedit_session() {
+        let mut editor = Editor::from_text("abc");
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let mut adapter = focused(&mut editor);
+        adapter.plan_ime(&editor, false, area(1.0));
+        adapter
+            .handle_ime(&Ime::Preedit("ni".into(), Some((2, 2))), &mut editor)
+            .unwrap();
+        assert!(adapter.set_read_only(true, &mut editor).changed);
+        let disabled = adapter.handle_ime(&Ime::Disabled, &mut editor).unwrap();
+        assert!(disabled.handled && !disabled.changed);
+        adapter.set_read_only(false, &mut editor);
+
+        assert!(
+            adapter
+                .handle_ime(&Ime::Enabled, &mut editor)
+                .unwrap()
+                .changed
+        );
+        adapter
+            .handle_ime(&Ime::Preedit("a".into(), Some((1, 1))), &mut editor)
+            .unwrap();
+        assert_eq!(editor.composition().unwrap().text, "a");
+        let commit = adapter
+            .handle_ime(&Ime::Commit("a".into()), &mut editor)
+            .unwrap();
+        assert!(commit.handled && commit.changed);
+        assert_eq!(editor.document().plain_text(), "abca");
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(1.0)),
+            ImeRequests {
+                interrupt: false,
+                allowed: Some(true),
+                area: Some(area(1.0)),
+            }
+        );
     }
 
     #[test]

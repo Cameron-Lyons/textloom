@@ -6,6 +6,112 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- `apply_numbered_list()` continues a list whose last item is a nested
+  sub-item instead of restarting at 1. `replace_all()` styles a match that
+  starts with a paragraph break as step-by-step replacement does, instead of
+  copying formatting from text an earlier match replaced.
+- Typing, plain-text paste, and Enter over a selection that starts at a
+  paragraph start and crosses a paragraph break give the resulting paragraphs
+  the kinds that deleting the selection first would, also when the inserted
+  text has several lines, and `replace_all()` matches. Accessibility full-value
+  replacement in both adapters keeps the document-start paragraph kind as well
+  as its style.
+- `Editor::set_selection()` keeps a pending caret style when the selection does
+  not change, so a pending Ctrl/Command+B, I, or U survives egui End, Up, Down,
+  PageUp, or PageDown at a boundary, a click on the caret, and an AccessKit
+  selection echo.
+- Replace-all and kind, style, link, or list commands that change a few
+  far-apart paragraphs keep only the changed paragraphs in undo history, also
+  when replacements add or join paragraphs. Such edits in very large documents
+  stay undoable and no longer evict earlier undo steps. `history_bytes()` also
+  charges the paragraph pointers each change keeps and the record of each
+  separately kept run.
+- Egui IME input that arrives after Tab or a routed AccessKit focus request has
+  moved focus to another widget, or in a later input batch than a Shift+Tab
+  that moves focus, reaches that widget, whatever the draw order, instead of
+  being taken or duplicated by the editor. An IME commit in the Shift+Tab batch
+  is still inserted by the editor, like text, because egui moves focus for
+  Shift+Tab only in the next pass. The editor still commits its visible preedit
+  on blur.
+- Egui clicks, drags, Up/Down, and PageUp/PageDown on the right half of a wide
+  grapheme, such as a flag, a skin-toned emoji, or a letter with combining
+  marks, place the caret after it. Double-clicking the right half of a word's
+  last letter selects that word instead of the following space or punctuation.
+- Egui discards a pending link press when an IME commit in the same frame
+  changes the document, so a drag from the link starts at the current selection
+  instead of a stale or invalid position. Ctrl/Command+Shift+V pastes plain
+  text without consulting the rich clipboard.
+- Egui accessibility updates the runs, lines, and bounds of list items that
+  re-wrap when renumbering changes their marker width, such as at item 1000. A
+  collapsed caret at a wrapped-row seam publishes the same position as
+  selection anchor and focus.
+- Winit IME events other than `Ime::Disabled` received in read-only mode no
+  longer end the guard for a composition that read-only mode canceled, so
+  turning read-only mode off before the next `sync_ime` cannot insert its
+  queued commit.
+- Native host: Ctrl/Command+click and read-only clicks on links open the system
+  browser or mail client; eframe's `links` feature was missing. **Restart at 1**
+  and **Continue numbering** no longer turn a body paragraph into a numbered
+  item after an IME commit or a batched caret move. Restoring a snapshot and the
+  QA report's TLFR round trip accept the host's own snapshots beyond the default
+  decode limits. Fill Color and Font Color activated in one frame both apply.
+- Find next/previous and `replace_selected_match()` search outward from the
+  selection for every query that cannot overlap itself, including
+  case-insensitive and whole-word queries, so a press costs time proportional
+  to the distance to the match rather than to the caret's offset in a long
+  paragraph. Whole-word checks restart word segmentation at the nearest earlier
+  space, also in Cyrillic, Greek, and spaced CJK text. Whole-word checks that
+  need Unicode segmentation in text without ASCII spaces before the match, such
+  as unspaced Chinese, Japanese, or Thai, still segment from the paragraph
+  start, so their cost still grows with the caret's offset. Self-overlapping
+  queries such as `test` still scan their paragraph from its start.
+- Queries containing paragraph breaks that cannot overlap themselves are matched
+  paragraph by paragraph by find next/previous, `replace_selected_match()`, and
+  `Document::find()`, instead of copying, lowercasing, and rescanning the whole
+  document for every press. Self-overlapping queries such as `"\n\n"` keep the
+  flattened search.
+- Whole-word search checks match edges with ASCII neighbors directly against the
+  UAX #29 rules instead of word-segmenting the paragraph, and case-insensitive
+  search lowercases ASCII paragraphs without a coordinate map, making whole-word
+  `find()` and `replace_all()` several times faster on mostly ASCII text.
+- Word movement and accessibility word starts segment each paragraph once,
+  using the ASCII word-boundary fast path for ASCII paragraphs, so word stops
+  for long ASCII paragraphs build about three times faster.
+- Decoding TLFR snapshots and fragments checks the span ends of styled
+  non-ASCII paragraphs with local grapheme context instead of segmenting each
+  paragraph from its start, and skips a second scan for line separators, so
+  styled non-ASCII paragraphs load several times faster.
+- Repeated `selection_style()` queries reuse the scan of an unchanged range
+  selection until an edit, undo/redo, transaction rollback, or selection change
+  invalidates it, so toolbars reading it every frame after Select All no longer
+  rescan every span.
+- Egui relays out once per frame instead of after every text-changing event,
+  merging the ranges those edits changed, so key repeat, scanner or synthetic
+  input, and batched IME commits no longer slow each frame as events queue up.
+- Egui structural edits (Enter, joining Backspace, multi-paragraph paste or
+  delete, and their undo) no longer slow down in proportion to document length,
+  and list markers are renumbered only when a list item or heading is added,
+  removed, or changed.
+- Egui preedit updates whose old and new text have no line breaks edit the
+  preview document in place instead of copying it, so composing no longer slows
+  down with document length after the first preedit.
+- Egui keeps its painted text across passes that do not show the editor, such as
+  another viewport's pass or a pass that hides it, instead of re-shaping every
+  visible paragraph on the next frame; real font-atlas recreation still
+  refreshes it. Highlights and selections in a partly visible long paragraph
+  are processed only for its visible rows, so idle frames no longer slow down
+  with the number of search matches.
+- Direct AccessKit updates after typing keep the edited paragraph's node ID and
+  skip restaging quote containers and rebuilding the editor's child list, and
+  typing in a quote no longer republishes its `Blockquote` node. After several
+  edits between updates, such as fast typing, multi-edit transactions, or
+  grouped undo/redo, only the paragraphs between the unchanged ends are rebuilt.
+  Their run locations are patched when the paragraph count is unchanged;
+  otherwise the run-location index is rebuilt on its next lookup, such as an
+  accessibility action or `locate_text_run()`.
+- Egui accessibility updates after structural edits or several edits in one
+  frame rebuild only the changed paragraphs instead of the whole snapshot.
+
 - Word selection expands Unicode word boundaries to whole graphemes, so
   prepend characters joined to emoji or punctuation cannot produce empty selections.
 - Accessibility rejects link clicks from stale document snapshots. Egui full-value
@@ -539,8 +645,9 @@ Update the dependency to `textloom = "1.0"`.
   `Composition`, `DecodeLimits`, `AccessibleParagraph`, `AccessibilityOutcome`,
   `RichTextEditorOutput`, and winit `InputOutcome` cannot be built with struct
   literals. Read accessibility snapshot state using its accessor methods.
-- `AccessKitError::CharacterTooLong` is removed because oversized graphemes are
-  published instead.
+- `AccessKitError::CharacterTooLong` and the egui
+  `AccessibilityError::CharacterTooLong` are removed because oversized graphemes
+  are published instead; drop match arms for them.
 - Pass the physical key to `WinitAdapter::handle_key`: `event.physical_key`, or
   `PhysicalKey::Unidentified(NativeKeyCode::Unidentified)` when unknown.
   `handle_window_event` does this automatically.
