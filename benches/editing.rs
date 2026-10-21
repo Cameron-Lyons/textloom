@@ -988,10 +988,6 @@ fn sparse_replacement() {
         let paragraph = "untouched café 👩‍💻. ".repeat(repeats);
         let source = format!("match\n{}match", format!("{paragraph}\n").repeat(10_000));
         let mut editor = Editor::from_text(&source);
-        editor.set_history_limits(HistoryLimits {
-            max_bytes: 64 * 1024 * 1024,
-            ..HistoryLimits::default()
-        });
         assert_eq!(
             editor
                 .replace_all("match", "replacement", SearchOptions::default())
