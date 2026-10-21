@@ -1019,20 +1019,20 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
 
     let before_kind = Arc::clone(&document.identity);
     let kind = ParagraphKind::Heading { level: 2 };
-    assert!(document.set_kind(0..1, kind).unwrap().is_some());
+    assert!(!document.set_kind(0..1, kind).unwrap().is_empty());
     assert!(!Arc::ptr_eq(&document.identity, &before_kind));
     let before_style = Arc::clone(&document.identity);
-    assert!(document.set_kind(0..1, kind).unwrap().is_none());
+    assert!(document.set_kind(0..1, kind).unwrap().is_empty());
     assert!(Arc::ptr_eq(&document.identity, &before_style));
     let patch = StylePatch {
         bold: Some(true),
         ..StylePatch::default()
     };
     assert!(
-        document
+        !document
             .apply_style(Position::default()..document.end(), patch)
             .unwrap()
-            .is_some()
+            .is_empty()
     );
     assert!(!Arc::ptr_eq(&document.identity, &before_style));
     let styled = Arc::clone(&document.identity);
@@ -1040,7 +1040,7 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
         document
             .apply_style(Position::default()..document.end(), patch)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert!(Arc::ptr_eq(&document.identity, &styled));
     document.replay(&noop, true);
@@ -1165,7 +1165,7 @@ fn formatting_merges_runs_and_is_a_noop_when_unchanged() {
         document
             .apply_style(Position::new(0, 2)..Position::new(0, 4), patch)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert_eq!(document.revision(), revision);
     document
@@ -1336,7 +1336,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                 let mut document = source.clone();
                 let delta = document.apply_style(start..end, patch).unwrap();
                 let changed = source.paragraphs() != expected;
-                assert_eq!(delta.is_some(), changed, "{start:?}..{end:?}, {patch:?}");
+                assert_eq!(!delta.is_empty(), changed, "{start:?}..{end:?}, {patch:?}");
                 assert_eq!(document.paragraphs(), expected);
                 assert_eq!(document.revision(), u64::from(changed));
                 assert_eq!(Arc::ptr_eq(&document.identity, &source.identity), !changed);
@@ -1351,12 +1351,10 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                         assert!(Arc::ptr_eq(before, after));
                     }
                 }
-                if let Some(delta) = delta {
-                    document.replay(&delta, false);
-                    assert_eq!(document.paragraphs(), source.paragraphs());
-                    document.replay(&delta, true);
-                    assert_eq!(document.paragraphs(), expected);
-                }
+                document.replay(&delta, false);
+                assert_eq!(document.paragraphs(), source.paragraphs());
+                document.replay(&delta, true);
+                assert_eq!(document.paragraphs(), expected);
             }
         }
     }
@@ -1516,7 +1514,8 @@ fn sparse_kind_changes_renumber_lists_through_history() {
             .unwrap();
     }
     let interrupted = numbers(&document);
-    let delta = document.set_kind(0..30, ordered).unwrap().unwrap();
+    let delta = document.set_kind(0..30, ordered).unwrap();
+    assert!(!delta.is_empty());
     assert_eq!(delta.rest.len(), 1);
     let expected: Vec<_> = (1..=30).map(Some).collect();
     assert_eq!(numbers(&document), expected);
@@ -1545,7 +1544,6 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
                 ..StylePatch::default()
             },
         )
-        .unwrap()
         .unwrap();
     assert_eq!(formatted.retained_bytes(), 2 * record + 4 * run);
 
@@ -1558,7 +1556,6 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
                 start: None,
             },
         )
-        .unwrap()
         .unwrap();
     assert_eq!(retyped.retained_bytes(), 2 * record);
 }
@@ -1594,7 +1591,8 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
         (3, ParagraphKind::Heading { level: 2 }),
     ] {
         let before = document.paragraphs[index].kind;
-        let delta = document.set_kind(index..index + 1, kind).unwrap().unwrap();
+        let delta = document.set_kind(index..index + 1, kind).unwrap();
+        assert!(!delta.is_empty());
         assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
         assert_eq!(numbers(&document), expected);
         document.replay(&delta, false);
@@ -1605,10 +1603,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
         assert!(Arc::ptr_eq(document.numbers.get().unwrap(), &cached));
     }
 
-    let delta = document
-        .set_kind(3..4, ParagraphKind::Quote)
-        .unwrap()
-        .unwrap();
+    let delta = document.set_kind(3..4, ParagraphKind::Quote).unwrap();
     assert!(document.numbers.get().is_none());
     assert_eq!(numbers(&document), [Some(7), None, Some(8), None, Some(9)]);
     document.replay(&delta, false);
@@ -1791,13 +1786,13 @@ fn noops_do_not_change_revision_or_allocations() {
         document
             .set_kind(0..1, ParagraphKind::Body)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert!(
         document
             .apply_style(Position::default()..document.end(), StylePatch::default())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     document.replay(&delta, false);
     assert_eq!(document.revision(), 0);

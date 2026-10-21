@@ -186,6 +186,15 @@ pub(crate) struct Delta {
 }
 
 impl Delta {
+    pub(super) fn empty(start: usize) -> Self {
+        Self {
+            start,
+            before: Vec::new(),
+            after: Vec::new(),
+            rest: Vec::new(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.before.is_empty() && self.after.is_empty() && self.rest.is_empty()
     }
@@ -404,10 +413,7 @@ mod tests {
         document.set_kind(2..3, heading).unwrap();
         document.set_kind(25..26, heading).unwrap();
         let original = document.content_identity();
-        let delta = document
-            .set_kind(0..31, ParagraphKind::Body)
-            .unwrap()
-            .unwrap();
+        let delta = document.set_kind(0..31, ParagraphKind::Body).unwrap();
         assert_eq!(delta.rest.len(), 1);
         assert_change(&document, &original, 2..26, 24);
         let changed = document.content_identity();

@@ -357,15 +357,7 @@ impl Document {
     ) -> Result<(Delta, Position), Error> {
         self.validate_range(&range)?;
         if range.is_empty() && text.is_empty() {
-            return Ok((
-                Delta {
-                    start: range.start.paragraph,
-                    before: Vec::new(),
-                    after: Vec::new(),
-                    rest: Vec::new(),
-                },
-                range.start,
-            ));
+            return Ok((Delta::empty(range.start.paragraph), range.start));
         }
         let text = normalize_newlines(text);
         let first = &self.paragraphs[range.start.paragraph];
@@ -454,15 +446,7 @@ impl Document {
             && let [paragraph] = fragment.paragraphs()
             && paragraph.text.is_empty()
         {
-            return Ok((
-                Delta {
-                    start: range.start.paragraph,
-                    before: Vec::new(),
-                    after: Vec::new(),
-                    rest: Vec::new(),
-                },
-                range.start,
-            ));
+            return Ok((Delta::empty(range.start.paragraph), range.start));
         }
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
@@ -658,10 +642,10 @@ impl Document {
         &mut self,
         range: Range<Position>,
         patch: StylePatch,
-    ) -> Result<Option<Delta>, Error> {
+    ) -> Result<Delta, Error> {
         self.validate_range(&range)?;
         if range.is_empty() || patch == StylePatch::default() {
-            return Ok(None);
+            return Ok(Delta::empty(range.start.paragraph));
         }
         let after = self
             .slices(&range)
@@ -671,18 +655,17 @@ impl Document {
                     .map_or_else(|| Arc::clone(paragraph), Arc::new)
             })
             .collect();
-        let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
-        Ok((!delta.is_empty()).then_some(delta))
+        Ok(self.change(range.start.paragraph..range.end.paragraph + 1, after))
     }
 
     pub(crate) fn set_link(
         &mut self,
         range: Range<Position>,
         link: Option<&Link>,
-    ) -> Result<Option<Delta>, Error> {
+    ) -> Result<Delta, Error> {
         self.validate_range(&range)?;
         if range.is_empty() {
-            return Ok(None);
+            return Ok(Delta::empty(range.start.paragraph));
         }
         let after = self
             .slices(&range)
@@ -692,15 +675,14 @@ impl Document {
                     .map_or_else(|| Arc::clone(paragraph), Arc::new)
             })
             .collect();
-        let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
-        Ok((!delta.is_empty()).then_some(delta))
+        Ok(self.change(range.start.paragraph..range.end.paragraph + 1, after))
     }
 
     pub(crate) fn set_kind(
         &mut self,
         range: Range<usize>,
         kind: ParagraphKind,
-    ) -> Result<Option<Delta>, Error> {
+    ) -> Result<Delta, Error> {
         if range.start > range.end || range.end > self.paragraphs.len() {
             return Err(Error::InvalidRange);
         }
@@ -721,16 +703,15 @@ impl Document {
                 }
             })
             .collect();
-        let delta = self.change(range, after);
-        Ok((!delta.is_empty()).then_some(delta))
+        Ok(self.change(range, after))
     }
 
-    pub(crate) fn apply_numbered_list(&mut self, range: Range<usize>, indent: u8) -> Option<Delta> {
+    pub(crate) fn apply_numbered_list(&mut self, range: Range<usize>, indent: u8) -> Delta {
         let is_item =
             |kind| matches!(kind, ParagraphKind::Ordered { indent: level, .. } if level == indent);
         let selected = &self.paragraphs[range.clone()];
         if selected.iter().all(|paragraph| is_item(paragraph.kind)) {
-            return None;
+            return Delta::empty(range.start);
         }
         let extends = self.paragraphs[..range.start]
             .iter()
@@ -763,8 +744,7 @@ impl Document {
                 }
             })
             .collect();
-        let delta = self.change(range, after);
-        (!delta.is_empty()).then_some(delta)
+        self.change(range, after)
     }
 }
 

@@ -365,9 +365,7 @@ impl Editor {
         self.typing_style = self.document.style_at(caret);
         self.preferred_column = None;
         self.break_history_group();
-        if !delta.is_empty() {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -444,9 +442,7 @@ impl Editor {
         self.typing_style = self.document.style_at(caret);
         self.preferred_column = None;
         self.break_history_group();
-        if !delta.is_empty() {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
     }
 
     pub fn insert_text(&mut self, text: &str) -> Result<(), Error> {
@@ -465,32 +461,25 @@ impl Editor {
         style: InlineStyle,
     ) -> Result<(), Error> {
         self.ensure_no_composition()?;
-        if range.start > range.end {
-            return Err(Error::InvalidRange);
-        }
-        self.document.validate_position(range.start)?;
-        self.document.validate_position(range.end)?;
-        let before = self.state();
-        self.selection = Selection::new(range.start, range.end);
-        self.typing_style = style;
-        self.replace_selection_with_before(text, Group::None, before)
+        self.replace_range_inner(range, text, style, Group::None)
     }
 
     pub(crate) fn replace_all_text(&mut self, text: &str) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let before = self.state();
         let start = Position::default();
-        self.selection = Selection::new(start, self.document.end());
-        self.typing_style = self.document.style_at(start);
+        let style = self.document.style_at(start);
         let kind = self.document.paragraphs()[0].kind();
-        let result = self.document.replace_with_kind(
-            self.selection.range(),
+        let (delta, caret) = self.document.replace_with_kind(
+            start..self.document.end(),
             text,
-            self.typing_style,
+            style,
             None,
             Some(kind),
-        );
-        self.finish_replacement(result, Group::None, before)
+        )?;
+        self.typing_style = style;
+        self.finish_replacement(delta, caret, Group::None, before);
+        Ok(())
     }
 
     pub fn insert_paragraph(&mut self) -> Result<(), Error> {
@@ -575,9 +564,8 @@ impl Editor {
         } else {
             Group::None
         };
-        let before = self.state();
-        self.selection = Selection::new(focus, target);
-        self.replace_selection_with_before("", group, before)
+        let range = focus.min(target)..focus.max(target);
+        self.replace_range_inner(range, "", self.typing_style, group)
     }
 
     pub fn apply_style(&mut self, patch: StylePatch) -> Result<(), Error> {
@@ -586,9 +574,7 @@ impl Editor {
         let before = self.state();
         let delta = self.document.apply_style(self.selection.range(), patch)?;
         patch.apply(&mut self.typing_style);
-        if let Some(delta) = delta {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -637,9 +623,8 @@ impl Editor {
             self.selection.range()
         };
         let before = self.state();
-        if let Some(delta) = self.document.set_link(range, link.as_ref())? {
-            self.record(delta, before, Group::None);
-        }
+        let delta = self.document.set_link(range, link.as_ref())?;
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -648,15 +633,15 @@ impl Editor {
         let text = if text.is_empty() { link.as_str() } else { text };
         self.break_history_group();
         let before = self.state();
-        let result = self.document.replace_with_link(
+        let (delta, caret) = self.document.replace_with_link(
             self.selection.range(),
             text,
             self.typing_style,
             Some(&link),
-        );
-        let result = self.finish_replacement(result, Group::None, before);
+        )?;
+        self.finish_replacement(delta, caret, Group::None, before);
         self.break_history_group();
-        result
+        Ok(())
     }
 
     pub fn set_paragraph_kind(&mut self, kind: ParagraphKind) -> Result<(), Error> {
@@ -664,9 +649,7 @@ impl Editor {
         let before = self.state();
         let delta = self.document.set_kind(self.selected_paragraphs(), kind)?;
         self.break_history_group();
-        if let Some(delta) = delta {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -677,9 +660,7 @@ impl Editor {
             .document
             .apply_numbered_list(self.selected_paragraphs(), indent);
         self.break_history_group();
-        if let Some(delta) = delta {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -698,9 +679,7 @@ impl Editor {
             .document
             .change_list_indent(self.selected_paragraphs(), increase);
         self.break_history_group();
-        if !delta.is_empty() {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -847,43 +826,39 @@ impl Editor {
     }
 
     fn replace_selection(&mut self, text: &str, group: Group) -> Result<(), Error> {
-        self.replace_selection_with_before(text, group, self.state())
+        self.replace_range_inner(self.selection.range(), text, self.typing_style, group)
     }
 
-    fn replace_selection_with_before(
+    fn replace_range_inner(
         &mut self,
+        range: Range<Position>,
         text: &str,
+        style: InlineStyle,
         group: Group,
-        before: EditState,
     ) -> Result<(), Error> {
-        let result = self
-            .document
-            .replace(self.selection.range(), text, self.typing_style);
-        self.finish_replacement(result, group, before)
+        let before = self.state();
+        let (delta, caret) = self.document.replace(range, text, style)?;
+        self.typing_style = style;
+        self.finish_replacement(delta, caret, group, before);
+        Ok(())
     }
 
     fn finish_replacement(
         &mut self,
-        result: Result<(Delta, Position), Error>,
+        delta: Delta,
+        caret: Position,
         group: Group,
         before: EditState,
-    ) -> Result<(), Error> {
-        let (delta, caret) = match result {
-            Ok(result) => result,
-            Err(error) => {
-                self.restore(before);
-                return Err(error);
-            }
-        };
+    ) {
         self.selection = Selection::caret(caret);
         self.preferred_column = None;
-        if !delta.is_empty() {
-            self.record(delta, before, group);
-        }
-        Ok(())
+        self.record(delta, before, group);
     }
 
     fn record(&mut self, delta: Delta, before: EditState, group: Group) {
+        if delta.is_empty() {
+            return;
+        }
         self.saved.cached_match.take();
         self.history.record(delta, before, self.state(), group);
     }
