@@ -455,9 +455,7 @@ impl WinitAdapter {
         if !cancel_empty_composition(editor) {
             return Ok(blocked);
         }
-        editor.break_history_group();
-        editor.insert_text(&clean)?;
-        editor.break_history_group();
+        editor.isolated_edit(|editor| editor.insert_text(&clean))?;
         Ok(InputOutcome {
             handled: true,
             changed: before != editor.presentation(),

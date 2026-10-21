@@ -250,6 +250,16 @@ impl Editor {
         self.history.break_group();
     }
 
+    pub(crate) fn isolated_edit(
+        &mut self,
+        edit: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.break_history_group();
+        let result = edit(self);
+        self.break_history_group();
+        result
+    }
+
     pub fn transaction<R>(
         &mut self,
         edit: impl FnOnce(&mut Self) -> Result<R, Error>,

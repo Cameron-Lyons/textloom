@@ -154,15 +154,11 @@ pub fn apply_action(
         AccessibleAction::SetSelection(selection) => editor.set_selection(selection)?,
         AccessibleAction::ReplaceSelectedText(text) => {
             editor.cancel_composition();
-            editor.break_history_group();
-            editor.insert_text(text)?;
-            editor.break_history_group();
+            editor.isolated_edit(|editor| editor.insert_text(text))?;
         }
         AccessibleAction::ReplaceAllText(text) => {
             editor.cancel_composition();
-            editor.break_history_group();
-            editor.replace_all_text(text)?;
-            editor.break_history_group();
+            editor.isolated_edit(|editor| editor.replace_all_text(text))?;
         }
     }
     let after = editor.presentation();

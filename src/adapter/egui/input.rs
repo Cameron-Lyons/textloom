@@ -125,9 +125,10 @@ pub(super) fn handle_event(
                 *interrupted |= cancel_empty_composition(editor);
                 *commit_echo = None;
                 copy_selection(editor, ui, clipboard);
-                editor.break_history_group();
-                record(editor.insert_text(""), errors);
-                editor.break_history_group();
+                record(
+                    editor.isolated_edit(|editor| editor.insert_text("")),
+                    errors,
+                );
             }
             true
         }
@@ -139,15 +140,13 @@ pub(super) fn handle_event(
                     .as_deref_mut()
                     .filter(|_| !plain)
                     .and_then(|clipboard| clipboard.paste(text));
-                editor.break_history_group();
                 record(
-                    match fragment {
+                    editor.isolated_edit(|editor| match fragment {
                         Some(fragment) => editor.insert_fragment(&fragment),
                         None => editor.insert_text(clean),
-                    },
+                    }),
                     errors,
                 );
-                editor.break_history_group();
             }
             true
         }
