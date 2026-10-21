@@ -326,18 +326,15 @@ impl NativeEditor {
                         self.commands.push(EditorCommand::Style(patch));
                     }
                 }
-                let mut colored = None;
                 for target in [ColorTarget::Fill, ColorTarget::Font] {
                     let last = match target {
                         ColorTarget::Fill => &mut self.fill_color,
                         ColorTarget::Font => &mut self.font_color,
                     };
                     if let Some(color) = color_control(ui, target, last) {
-                        colored = Some(target.patch(color));
+                        self.commands
+                            .push(EditorCommand::Style(target.patch(color)));
                     }
-                }
-                if let Some(patch) = colored {
-                    self.commands.push(EditorCommand::Style(patch));
                 }
                 if ui.button("Clear formatting").clicked() {
                     self.commands.push(EditorCommand::ClearFormatting);
@@ -2431,6 +2428,38 @@ mod tests {
         assert_eq!(harness.app.font_color, Color::PURPLE);
         assert_eq!(harness.app.fill_color, Color::YELLOW);
         harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn fill_and_font_color_activated_in_one_frame_both_apply() {
+        let mut harness = Harness::new("fill-and-font-color");
+        harness.select(1, 0..6);
+        harness.step(Vec::new());
+        let events = [ColorTarget::Fill, ColorTarget::Font]
+            .map(|target| {
+                let (&node, _) = harness
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == Role::Button && node.label() == Some(target.label())
+                    })
+                    .unwrap();
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target_node: node,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                })
+            })
+            .into_iter()
+            .collect();
+        let undo = harness.app.editor.undo_len();
+        harness.step(events);
+        harness.assert_no_command_errors();
+        let style = harness.app.editor.selection_style();
+        assert_eq!(style.background, Some(Some(Color::YELLOW)));
+        assert_eq!(style.foreground, Some(Some(Color::RED)));
+        assert_eq!(harness.app.editor.undo_len(), undo + 2);
     }
 
     #[test]
