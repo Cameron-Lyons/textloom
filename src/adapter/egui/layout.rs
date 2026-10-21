@@ -608,26 +608,33 @@ mod tests {
         result.unwrap()
     }
 
-    fn other_viewport_pass(context: &egui::Context) {
-        let other = egui::ViewportId::from_hash_of("other");
+    fn unrelated_pass(
+        context: &egui::Context,
+        viewport: egui::ViewportId,
+        add_contents: impl FnMut(&mut Ui),
+    ) {
         let mut input = egui::RawInput {
-            viewport_id: other,
+            viewport_id: viewport,
             ..Default::default()
         };
-        input.viewports.insert(other, egui::ViewportInfo::default());
+        input
+            .viewports
+            .insert(viewport, egui::ViewportInfo::default());
         context
-            .run_ui(input, |ui| {
-                ui.label("other viewport");
-            })
+            .run_ui(input, add_contents)
             .drop_without_applying_deltas();
     }
 
+    fn other_viewport_pass(context: &egui::Context) {
+        unrelated_pass(context, egui::ViewportId::from_hash_of("other"), |ui| {
+            ui.label("other viewport");
+        });
+    }
+
     fn hidden_editor_pass(context: &egui::Context) {
-        context
-            .run_ui(egui::RawInput::default(), |ui| {
-                ui.label("editor hidden");
-            })
-            .drop_without_applying_deltas();
+        unrelated_pass(context, egui::ViewportId::ROOT, |ui| {
+            ui.label("editor hidden");
+        });
     }
 
     fn widget_frame(
@@ -753,6 +760,53 @@ mod tests {
         ));
     }
 
+    fn painted_first(output: &egui::FullOutput) -> Arc<Galley> {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Text(text) if text.galley.job.text == "first" => Some(text.galley.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn uvs(galley: &Galley) -> Vec<([u16; 2], [u16; 2])> {
+        galley
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.glyphs
+                    .iter()
+                    .map(|glyph| (glyph.uv_rect.min, glyph.uv_rect.max))
+            })
+            .collect()
+    }
+
+    fn fresh_uvs(
+        context: &egui::Context,
+        editor: &mut Editor,
+        painted: &Galley,
+    ) -> Vec<([u16; 2], [u16; 2])> {
+        let mut job = (*painted.job).clone();
+        for section in &mut job.sections {
+            section.format.color = Color32::RED;
+        }
+        let mut reference = None;
+        widget_frame(context, editor, vec![], |ui| {
+            reference = Some(ui.fonts_mut(|fonts| fonts.layout_job(job.clone())));
+        });
+        uvs(&reference.unwrap())
+    }
+
+    fn fill_atlas(ui: &mut Ui) -> f32 {
+        let letters: String = ('A'..='Z').chain('a'..='z').collect();
+        for size in [150.0, 170.0, 190.0, 210.0, 230.0, 250.0] {
+            ui.label(egui::RichText::new(&letters).font(FontId::proportional(size)));
+        }
+        ui.fonts(|fonts| fonts.font_atlas_fill_ratio())
+    }
+
     #[test]
     fn atlas_recreation_repaints_current_glyphs_without_relayout() {
         let context = egui::Context::default();
@@ -760,45 +814,83 @@ mod tests {
         widget_frame(&context, &mut editor, vec![], |_| {});
         let before = cached_layouts(&context);
         let mut fill = 0.0;
-        widget_frame(&context, &mut editor, vec![], |ui| {
-            let letters: String = ('A'..='Z').chain('a'..='z').collect();
-            for size in [150.0, 170.0, 190.0, 210.0, 230.0, 250.0] {
-                ui.label(egui::RichText::new(&letters).font(FontId::proportional(size)));
-            }
-            fill = ui.fonts(|fonts| fonts.font_atlas_fill_ratio());
-        });
+        widget_frame(&context, &mut editor, vec![], |ui| fill = fill_atlas(ui));
         assert!(fill > 0.8);
         let output = widget_frame(&context, &mut editor, vec![], |ui| {
             ui.label(egui::RichText::new("WXYZ").font(FontId::proportional(64.0)));
         });
         let after = cached_layouts(&context);
         assert!(before.identity().ptr_eq(&after.identity()));
-        let painted = output
-            .shapes
-            .iter()
-            .find_map(|clipped| match &clipped.shape {
-                Shape::Text(text) if text.galley.job.text == "first" => Some(text.galley.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let mut job = (*painted.job).clone();
-        for section in &mut job.sections {
-            section.format.color = Color32::RED;
+        let painted = painted_first(&output);
+        let reference = fresh_uvs(&context, &mut editor, &painted);
+        assert_ne!(uvs(&after.get(0).unwrap().galley), reference);
+        assert_eq!(uvs(&painted), reference);
+    }
+
+    #[test]
+    fn unrelated_passes_keep_painted_galleys() {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("first\nsecond");
+        widget_frame(&context, &mut editor, vec![], |_| {});
+        let before = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
+        for pass in [other_viewport_pass, hidden_editor_pass] {
+            pass(&context);
+            let after = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
+            assert!(Arc::ptr_eq(&before, &after));
         }
-        let mut reference = None;
-        widget_frame(&context, &mut editor, vec![], |ui| {
-            reference = Some(ui.fonts_mut(|fonts| fonts.layout_job(job.clone())));
-        });
-        let uvs = |galley: &Galley| {
-            galley
-                .rows
-                .iter()
-                .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.uv_rect))
-                .collect::<Vec<_>>()
-        };
-        let reference = reference.unwrap();
-        assert_ne!(uvs(&after.get(0).unwrap().galley), uvs(&reference));
-        assert_eq!(uvs(&painted), uvs(&reference));
+    }
+
+    #[test]
+    fn painting_needs_only_the_editor_font_family() {
+        let context = egui::Context::default();
+        let mut definitions = egui::FontDefinitions::default();
+        let fonts = definitions
+            .families
+            .remove(&FontFamily::Proportional)
+            .unwrap();
+        let family = FontFamily::Name("body".into());
+        definitions.families.insert(family.clone(), fonts);
+        context.set_fonts(definitions);
+        let mut editor = Editor::from_text("first\nsecond");
+        for _ in 0..2 {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                RichTextEditor::new(&mut editor)
+                    .font(FontId::new(16.0, family.clone()))
+                    .show(ui);
+            });
+            output.textures_delta.clear();
+            assert_eq!(
+                painted_first(&output).job.sections[0].format.font_id.family,
+                family
+            );
+        }
+    }
+
+    #[test]
+    fn atlas_recreation_during_unrelated_passes_refreshes_painted_glyphs() {
+        for viewport in [
+            egui::ViewportId::from_hash_of("other"),
+            egui::ViewportId::ROOT,
+        ] {
+            let context = egui::Context::default();
+            let mut editor = Editor::from_text("first\nsecond");
+            widget_frame(&context, &mut editor, vec![], |_| {});
+            let stale = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
+            let recorded = context.fonts(|fonts| fonts.font_atlas_fill_ratio());
+            let mut fill = 0.0;
+            unrelated_pass(&context, viewport, |ui| fill = fill_atlas(ui));
+            assert!(fill > 0.8);
+            unrelated_pass(&context, viewport, |ui| {
+                ui.label(egui::RichText::new("ABCDEFGHIJKLM").font(FontId::proportional(120.0)));
+                fill = ui.fonts(|fonts| fonts.font_atlas_fill_ratio());
+            });
+            assert!((recorded..0.8).contains(&fill), "{fill} vs {recorded}");
+            let painted = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
+            assert!(!Arc::ptr_eq(&stale, &painted));
+            let reference = fresh_uvs(&context, &mut editor, &painted);
+            assert_ne!(uvs(&stale), reference);
+            assert_eq!(uvs(&painted), reference);
+        }
     }
 
     #[test]

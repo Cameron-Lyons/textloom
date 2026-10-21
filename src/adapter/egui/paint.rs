@@ -1,8 +1,8 @@
 use super::layout::{ParagraphLayoutView, ParagraphLayouts};
 use crate::{Document, Position, Selection};
 use egui::{
-    Color32, Galley, Pos2, Rect,
-    epaint::FontsView,
+    Color32, FontFamily, FontId, Galley, Pos2, Rect,
+    epaint::{FontsView, text::Glyph},
     text::{CharIndex, LayoutJob},
 };
 use std::{collections::HashMap, ops::Range, sync::Arc};
@@ -11,8 +11,48 @@ pub(super) type BackgroundRanges<'a> = (&'a [Range<Position>], Color32);
 
 #[derive(Clone, Default)]
 pub(super) struct PaintCache {
-    probe: Option<Arc<Galley>>,
+    probe: Option<Probe>,
     galleys: HashMap<usize, PaintedGalley>,
+}
+
+#[derive(Clone)]
+struct Probe {
+    galley: Arc<Galley>,
+    fill: f32,
+}
+
+impl Probe {
+    fn new(fonts: &mut FontsView<'_>, family: &FontFamily) -> Self {
+        // No other text uses this size, so the glyph gets its own atlas slot.
+        let font = FontId::new(7.0625, family.clone());
+        let galley = fonts.layout_job(LayoutJob::simple_singleline(
+            "g".to_owned(),
+            font,
+            Color32::WHITE,
+        ));
+        Self {
+            galley,
+            fill: fonts.font_atlas_fill_ratio(),
+        }
+    }
+
+    fn glyph(&self) -> Option<&Glyph> {
+        self.galley.rows.first()?.glyphs.first()
+    }
+
+    // Atlas recreation clears egui's galley cache, but so does any pass that skips
+    // this widget, such as another viewport's pass. The fill ratio only grows until
+    // recreation, and recreation also moves the probe's glyph.
+    fn same_atlas(&self, earlier: &Self) -> bool {
+        Arc::ptr_eq(&self.galley, &earlier.galley)
+            || (self.fill >= earlier.fill
+                && self
+                    .glyph()
+                    .zip(earlier.glyph())
+                    .is_some_and(|(glyph, earlier)| {
+                        !glyph.uv_rect.is_nothing() && glyph.uv_rect == earlier.uv_rect
+                    }))
+    }
 }
 
 #[derive(Clone)]
@@ -24,17 +64,14 @@ struct PaintedGalley {
 }
 
 impl PaintCache {
-    fn begin(&mut self, fonts: &mut FontsView<'_>) {
-        let mut job = LayoutJob::default();
-        job.wrap.max_rows = 0;
-        let probe = fonts.layout_job(job);
-        // Atlas recreation clears egui's galley cache. A tiny cached job detects that
-        // without cloning and hashing every visible paragraph on every idle frame.
-        // Cache eviction after a hidden pass also conservatively refreshes the glyphs.
+    fn begin(&mut self, fonts: &mut FontsView<'_>, family: &FontFamily) {
+        // A tiny cached job detects atlas recreation without cloning and hashing
+        // every visible paragraph on every idle frame.
+        let probe = Probe::new(fonts, family);
         if self
             .probe
             .as_ref()
-            .is_none_or(|old| !Arc::ptr_eq(old, &probe))
+            .is_none_or(|earlier| !probe.same_atlas(earlier))
         {
             self.galleys.clear();
         }
@@ -72,6 +109,7 @@ pub(super) fn paint_document(
     origin: Pos2,
     backgrounds: &[BackgroundRanges<'_>],
     selection: Option<(Selection, Color32)>,
+    family: &FontFamily,
     text_color: Color32,
     quote_color: Color32,
 ) {
@@ -89,7 +127,7 @@ pub(super) fn paint_document(
         })
         .collect();
     painter.fonts_mut(|fonts| {
-        cache.begin(fonts);
+        cache.begin(fonts, family);
         for paragraph in &mut visible {
             paragraph.galley = cache.refresh(fonts, paragraph.layout.galley);
             if let Some(marker) = paragraph.layout.marker {

@@ -2704,6 +2704,7 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
                 origin,
                 &[],
                 Some((selection, color)),
+                &FontFamily::Proportional,
                 Color32::WHITE,
                 Color32::GRAY,
             );
@@ -5161,9 +5162,9 @@ fn retained_paint_reuses_galleys_until_the_font_cache_changes() {
     // The paragraph job was not resubmitted during idle frames, so egui evicted it.
     assert!(!Arc::ptr_eq(&first, &refreshed));
     assert_eq!(first, refreshed);
-    // Hiding the editor also evicts its probe; returning safely refreshes the paint cache.
+    // Hiding the editor also evicts its probe, but the atlas is unchanged.
     let returned = painted(&frame(&context, &mut editor, vec![], false));
-    assert!(Arc::ptr_eq(&refreshed, &returned));
+    assert!(Arc::ptr_eq(&first, &returned));
 }
 
 #[test]
@@ -7309,6 +7310,7 @@ fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
                 origin,
                 &[(highlights, color)],
                 selection.map(|selection| (selection, color)),
+                &FontFamily::Proportional,
                 Color32::WHITE,
                 Color32::GRAY,
             );

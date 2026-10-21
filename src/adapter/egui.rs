@@ -643,6 +643,7 @@ impl<'a> RichTextEditor<'a> {
                 origin,
                 highlights,
                 display_selection.map(|selection| (selection, ui.visuals().selection.bg_fill)),
+                &appearance.font.family,
                 appearance.color,
                 ui.visuals().weak_text_color(),
             );
