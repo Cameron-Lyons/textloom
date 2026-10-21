@@ -354,6 +354,11 @@ impl WinitAdapter {
             return Ok(InputOutcome::default());
         }
         if self.read_only {
+            if matches!(event, Ime::Disabled) {
+                // No preedit or commit follows Disabled, so the canceled session is over.
+                self.ime.preedit = false;
+                self.ime.stale = true;
+            }
             let changed = editor.cancel_composition() || self.ime_enabled;
             self.ime_enabled = false;
             return Ok(InputOutcome {
@@ -2755,6 +2760,47 @@ mod tests {
             assert!(!editor.can_undo());
             assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
         }
+    }
+
+    #[test]
+    fn ime_disabled_while_read_only_ends_the_canceled_preedit_session() {
+        let mut editor = Editor::from_text("abc");
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .unwrap();
+        let mut adapter = focused(&mut editor);
+        adapter.plan_ime(&editor, false, area(1.0));
+        adapter
+            .handle_ime(&Ime::Preedit("ni".into(), Some((2, 2))), &mut editor)
+            .unwrap();
+        assert!(adapter.set_read_only(true, &mut editor).changed);
+        let disabled = adapter.handle_ime(&Ime::Disabled, &mut editor).unwrap();
+        assert!(disabled.handled && !disabled.changed);
+        adapter.set_read_only(false, &mut editor);
+
+        assert!(
+            adapter
+                .handle_ime(&Ime::Enabled, &mut editor)
+                .unwrap()
+                .changed
+        );
+        adapter
+            .handle_ime(&Ime::Preedit("a".into(), Some((1, 1))), &mut editor)
+            .unwrap();
+        assert_eq!(editor.composition().unwrap().text, "a");
+        let commit = adapter
+            .handle_ime(&Ime::Commit("a".into()), &mut editor)
+            .unwrap();
+        assert!(commit.handled && commit.changed);
+        assert_eq!(editor.document().plain_text(), "abca");
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(1.0)),
+            ImeRequests {
+                interrupt: false,
+                allowed: Some(true),
+                area: Some(area(1.0)),
+            }
+        );
     }
 
     #[test]
