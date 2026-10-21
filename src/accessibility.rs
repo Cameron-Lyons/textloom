@@ -191,10 +191,126 @@ pub fn apply_action(
     })
 }
 
+#[cfg(any(feature = "accesskit", feature = "egui"))]
+pub(crate) mod node_semantics {
+    use crate::{InlineStyle, Link, ParagraphKind, Span};
+    #[cfg(feature = "accesskit")]
+    use accesskit::{Color, ListStyle, Node, Role, TextDecoration, TextDecorationStyle};
+    #[cfg(not(feature = "accesskit"))]
+    use egui::accesskit::{Color, ListStyle, Node, Role, TextDecoration, TextDecorationStyle};
+
+    pub(crate) fn set_paragraph_semantics(node: &mut Node, kind: ParagraphKind) {
+        node.set_role(match kind {
+            ParagraphKind::Body | ParagraphKind::Quote => Role::Paragraph,
+            ParagraphKind::Heading { .. } => Role::Heading,
+            ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. } => Role::ListItem,
+        });
+        match kind {
+            ParagraphKind::Heading { level } => node.set_level(usize::from(level)),
+            ParagraphKind::Bullet { indent } => {
+                node.set_level(usize::from(indent) + 1);
+                node.set_list_style(ListStyle::Disc);
+            }
+            ParagraphKind::Ordered { indent, .. } => {
+                node.set_level(usize::from(indent) + 1);
+                node.set_list_style(ListStyle::Numeric);
+            }
+            ParagraphKind::Body | ParagraphKind::Quote => {}
+        }
+    }
+
+    pub(crate) fn apply_text_style(node: &mut Node, style: InlineStyle) {
+        let InlineStyle {
+            bold,
+            italic,
+            underline,
+            strikethrough,
+            code,
+            foreground,
+            background,
+        } = style;
+        node.set_font_weight(if bold { 700.0 } else { 400.0 });
+        if italic {
+            node.set_italic();
+        }
+        if code {
+            node.set_font_family("monospace");
+        }
+        let foreground = foreground.map(to_accesskit_color);
+        if let Some(color) = foreground {
+            node.set_foreground_color(color);
+        }
+        if let Some(color) = background {
+            node.set_background_color(to_accesskit_color(color));
+        }
+        let decoration = TextDecoration {
+            style: TextDecorationStyle::Solid,
+            color: foreground.unwrap_or(Color {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            }),
+        };
+        if underline {
+            node.set_underline(decoration);
+        }
+        if strikethrough {
+            node.set_strikethrough(decoration);
+        }
+    }
+
+    fn to_accesskit_color(crate::Color([red, green, blue, alpha]): crate::Color) -> Color {
+        Color {
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    }
+
+    pub(crate) struct SpanCursor<'a> {
+        spans: &'a [Span],
+        index: usize,
+    }
+
+    impl<'a> SpanCursor<'a> {
+        pub(crate) fn new(spans: &'a [Span]) -> Self {
+            Self { spans, index: 0 }
+        }
+
+        #[cfg(feature = "accesskit")]
+        pub(crate) fn index(&self) -> usize {
+            self.index
+        }
+
+        pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'a Link>) {
+            while self
+                .spans
+                .get(self.index)
+                .is_some_and(|span| span.range.end <= byte)
+            {
+                self.index += 1;
+            }
+            self.spans
+                .get(self.index)
+                .map_or((InlineStyle::default(), None), |span| {
+                    (span.style, span.link.as_ref())
+                })
+        }
+    }
+}
+
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
-    use super::{AccessibilityOutcome, AccessibleAction, apply_action};
-    use crate::{Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
+    use super::{
+        AccessibilityOutcome, AccessibleAction, apply_action,
+        node_semantics::{SpanCursor, apply_text_style, set_paragraph_semantics},
+    };
+    use crate::{
+        Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection,
+        document::LINE_SEPARATOR,
+    };
     use accesskit::{
         Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, Tree,
         TreeId, TreeUpdate,
@@ -210,7 +326,6 @@ mod accesskit_bridge {
 
     const MAX_RUN_CHARACTERS: usize = u8::MAX as usize;
     const MAX_CHARACTER_BYTES: usize = u8::MAX as usize;
-    const SOFT_BREAK: &str = "\u{2028}";
 
     #[non_exhaustive]
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,7 +390,7 @@ mod accesskit_bridge {
             let soft_break = self.soft_break.then(|| lengths.len() - 1);
             lengths.iter().enumerate().map(move |(index, length)| {
                 if soft_break == Some(index) {
-                    SOFT_BREAK.len()
+                    LINE_SEPARATOR.len_utf8()
                 } else {
                     usize::from(*length)
                 }
@@ -935,23 +1050,8 @@ mod accesskit_bridge {
             Some(id) => id,
             None => allocate(next_id)?,
         };
-        let mut node = Node::new(match paragraph.kind() {
-            ParagraphKind::Body | ParagraphKind::Quote => Role::Paragraph,
-            ParagraphKind::Heading { .. } => Role::Heading,
-            ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. } => Role::ListItem,
-        });
-        match paragraph.kind() {
-            ParagraphKind::Heading { level } => node.set_level(usize::from(level)),
-            ParagraphKind::Bullet { indent } => {
-                node.set_level(usize::from(indent) + 1);
-                node.set_list_style(accesskit::ListStyle::Disc);
-            }
-            ParagraphKind::Ordered { indent, .. } => {
-                node.set_level(usize::from(indent) + 1);
-                node.set_list_style(accesskit::ListStyle::Numeric);
-            }
-            ParagraphKind::Body | ParagraphKind::Quote => {}
-        }
+        let mut node = Node::default();
+        set_paragraph_semantics(&mut node, paragraph.kind());
         let pieces = split_runs(&paragraph, line_break);
         let ids = pieces
             .iter()
@@ -986,7 +1086,7 @@ mod accesskit_bridge {
             cached.node.set_url(cached.link.as_str());
             cached
                 .node
-                .set_label(paragraph.text()[range].replace(SOFT_BREAK, " "));
+                .set_label(paragraph.text()[range].replace(LINE_SEPARATOR, " "));
             cached.node.add_action(Action::Click);
             cached.node.set_children(ids[cached.runs.clone()].to_vec());
         }
@@ -1002,7 +1102,9 @@ mod accesskit_bridge {
                 let word_starts = run_word_starts(&mut words, &piece);
                 let mut value = String::with_capacity(piece.range.len() + usize::from(line_break));
                 if piece.soft_break {
-                    value.push_str(&text[piece.range.start..piece.range.end - SOFT_BREAK.len()]);
+                    value.push_str(
+                        &text[piece.range.start..piece.range.end - LINE_SEPARATOR.len_utf8()],
+                    );
                     value.push('\n');
                 } else {
                     value.push_str(&text[piece.range.clone()]);
@@ -1025,7 +1127,7 @@ mod accesskit_bridge {
                 if continues_line && let Some(next) = ids.get(index + 1) {
                     run_node.set_next_on_line(*next);
                 }
-                apply_style(&mut run_node, piece.style);
+                apply_text_style(&mut run_node, piece.style);
                 CachedRun {
                     id: ids[index],
                     node: run_node,
@@ -1085,20 +1187,11 @@ mod accesskit_bridge {
                 }
             }
         } else {
-            let mut span = 0;
+            let mut cursor = SpanCursor::new(spans);
             let mut run_span = None;
             for (byte, grapheme) in text.grapheme_indices(true) {
-                while spans
-                    .get(span)
-                    .is_some_and(|current| current.range.end <= byte)
-                {
-                    span += 1;
-                }
-                let (style, link) = spans
-                    .get(span)
-                    .map_or((InlineStyle::default(), None), |span| {
-                        (span.style, span.link.as_ref())
-                    });
+                let (style, link) = cursor.at(byte);
+                let span = cursor.index();
                 let single = u8::try_from(grapheme.len()).ok();
                 let count = if single.is_some() {
                     1
@@ -1113,7 +1206,7 @@ mod accesskit_bridge {
                     runs.push(RunPiece::new(byte, style, link));
                     run_span = Some(span);
                 }
-                if grapheme == SOFT_BREAK {
+                if grapheme.starts_with(LINE_SEPARATOR) {
                     let run = runs.last_mut().expect("a run was created");
                     run.lengths.push(1);
                     run.range.end = byte + grapheme.len();
@@ -1179,50 +1272,6 @@ mod accesskit_bridge {
             }
         }
         starts
-    }
-
-    fn apply_style(node: &mut Node, style: InlineStyle) {
-        node.set_font_weight(if style.bold { 700.0 } else { 400.0 });
-        if style.italic {
-            node.set_italic();
-        }
-        if style.code {
-            node.set_font_family("monospace");
-        }
-        let color = style
-            .foreground
-            .map(|crate::Color([red, green, blue, alpha])| accesskit::Color {
-                red,
-                green,
-                blue,
-                alpha,
-            });
-        if let Some(color) = color {
-            node.set_foreground_color(color);
-        }
-        if let Some(crate::Color([red, green, blue, alpha])) = style.background {
-            node.set_background_color(accesskit::Color {
-                red,
-                green,
-                blue,
-                alpha,
-            });
-        }
-        let decoration = accesskit::TextDecoration {
-            style: accesskit::TextDecorationStyle::Solid,
-            color: color.unwrap_or(accesskit::Color {
-                red: 0,
-                green: 0,
-                blue: 0,
-                alpha: 255,
-            }),
-        };
-        if style.underline {
-            node.set_underline(decoration);
-        }
-        if style.strikethrough {
-            node.set_strikethrough(decoration);
-        }
     }
 
     fn to_text_position(
@@ -1384,10 +1433,10 @@ mod accesskit_bridge {
                         .strip_suffix('\n')
                         .filter(|_| run.line_break)
                         .unwrap_or(value);
-                    assert_eq!(value, text[run.range.clone()].replace(SOFT_BREAK, "\n"));
+                    assert_eq!(value, text[run.range.clone()].replace(LINE_SEPARATOR, "\n"));
                     assert_eq!(
                         run.soft_break,
-                        text[run.range.clone()].ends_with(SOFT_BREAK)
+                        text[run.range.clone()].ends_with(LINE_SEPARATOR)
                     );
                     let starts = run.node.word_starts();
                     assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));

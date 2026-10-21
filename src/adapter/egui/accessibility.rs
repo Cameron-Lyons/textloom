@@ -2,7 +2,11 @@ use super::{
     ParagraphLayouts,
     layout::{LayoutIdentity, is_layout_text},
 };
-use crate::{Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span};
+use crate::{
+    Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span,
+    accessibility::node_semantics::{SpanCursor, apply_text_style, set_paragraph_semantics},
+    document::LINE_SEPARATOR,
+};
 use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, epaint::text::PlacedRow, text::CharIndex};
 use std::{
     collections::HashMap,
@@ -18,7 +22,6 @@ const MAX_CHARACTER_BYTES: usize = 255;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccessibilityError {
-    CharacterTooLong { position: Position, bytes: usize },
     InvalidLayout,
     StaleDocument,
     InvalidTextPosition,
@@ -28,11 +31,6 @@ pub enum AccessibilityError {
 impl fmt::Display for AccessibilityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CharacterTooLong { position, bytes } => write!(
-                f,
-                "grapheme at {}:{} is {bytes} bytes; AccessKit supports at most 255",
-                position.paragraph, position.byte
-            ),
             Self::InvalidLayout => f.write_str("accessibility layout does not match the document"),
             Self::StaleDocument => f.write_str("accessibility action refers to an older document"),
             Self::InvalidTextPosition => f.write_str("invalid accessibility text position"),
@@ -260,35 +258,21 @@ fn build_paragraph_snapshot(
     let limit = MAX_RUN_CHARACTERS - usize::from(line_break);
     let mut words = source.word_starts().into_iter().peekable();
     let mut runs: Vec<RunBuilder> = Vec::new();
-    let mut span_index = 0;
+    let mut spans = SpanCursor::new(source.spans());
     let mut scalar_start = 0;
     let mut shortened = 0;
     for (byte, grapheme) in text.grapheme_indices(true) {
         let end = byte + grapheme.len();
-        let soft_break = grapheme == "\u{2028}";
+        let soft_break = grapheme.starts_with(LINE_SEPARATOR);
         let mut starts_word = false;
         while words.next_if(|word| *word < end).is_some() {
             starts_word = true;
         }
-        while source
-            .spans()
-            .get(span_index)
-            .is_some_and(|span| span.range.end <= byte)
-        {
-            span_index += 1;
-        }
-        let (style, link) = source
-            .spans()
-            .get(span_index)
-            .map_or((InlineStyle::default(), None), |span| {
-                (span.style, span.link.as_ref())
-            });
+        let (style, link) = spans.at(byte);
         let mut piece_start = byte;
         while piece_start < end {
-            let mut piece_end = end.min(piece_start + MAX_CHARACTER_BYTES);
-            while !text.is_char_boundary(piece_end) {
-                piece_end -= 1;
-            }
+            let piece_end =
+                piece_start + text[piece_start..end].floor_char_boundary(MAX_CHARACTER_BYTES);
             let piece = &text[piece_start..piece_end];
             let scalar_end = scalar_start + piece.chars().count();
             let row = rows.containing(scalar_start);
@@ -405,7 +389,7 @@ fn build_paragraph_snapshot(
             .fold(Rect::NOTHING, |bounds, run: &Run| {
                 bounds.union(run.geometry.bounds)
             });
-        link.label = link.label.replace('\u{2028}', " ");
+        link.label = link.label.replace(LINE_SEPARATOR, " ");
     }
     Ok(Arc::new(ParagraphSnapshot {
         source: Arc::clone(source),
@@ -722,27 +706,9 @@ impl Snapshot {
                     .max_rect(paragraph_rect),
             );
             ui.ctx().accesskit_node_builder(paragraph.id, |node| {
-                node.set_role(match kind {
-                    ParagraphKind::Body | ParagraphKind::Quote => accesskit::Role::Paragraph,
-                    ParagraphKind::Heading { .. } => accesskit::Role::Heading,
-                    ParagraphKind::Bullet { .. } | ParagraphKind::Ordered { .. } => {
-                        accesskit::Role::ListItem
-                    }
-                });
+                set_paragraph_semantics(node, kind);
                 node.set_is_line_breaking_object();
                 node.set_bounds(accesskit_rect(to_global * paragraph_rect));
-                match kind {
-                    ParagraphKind::Heading { level } => node.set_level(usize::from(level)),
-                    ParagraphKind::Bullet { indent } => {
-                        node.set_level(usize::from(indent) + 1);
-                        node.set_list_style(accesskit::ListStyle::Disc);
-                    }
-                    ParagraphKind::Ordered { indent, .. } => {
-                        node.set_level(usize::from(indent) + 1);
-                        node.set_list_style(accesskit::ListStyle::Numeric);
-                    }
-                    ParagraphKind::Body | ParagraphKind::Quote => {}
-                }
                 if let Some((position, size)) = list_item {
                     node.set_position_in_set(position);
                     node.set_size_of_set(size);
@@ -976,13 +942,6 @@ fn publish_style(
     byte: usize,
     galley: &Galley,
 ) {
-    node.set_font_weight(if style.bold { 700.0 } else { 400.0 });
-    if style.italic {
-        node.set_italic();
-    }
-    if style.code {
-        node.set_font_family("monospace");
-    }
     let byte = egui::text::ByteIndex(byte);
     let sections = &galley.job.sections;
     let index = sections.partition_point(|section| section.byte_range.end <= byte);
@@ -994,33 +953,16 @@ fn publish_style(
     let rgba = format.map_or([0, 0, 0, 255], |format| {
         format.color.to_srgba_unmultiplied()
     });
-    let color = accesskit::Color {
-        red: rgba[0],
-        green: rgba[1],
-        blue: rgba[2],
-        alpha: rgba[3],
-    };
-    node.set_foreground_color(color);
-    if let Some(crate::Color([red, green, blue, alpha])) = style.background {
-        node.set_background_color(accesskit::Color {
-            red,
-            green,
-            blue,
-            alpha,
-        });
-    }
+    apply_text_style(
+        node,
+        InlineStyle {
+            underline: style.underline || linked,
+            foreground: Some(crate::Color(rgba)),
+            ..style
+        },
+    );
     if let Some(format) = format {
         node.set_font_size(format.font_id.size);
-    }
-    let decoration = accesskit::TextDecoration {
-        style: accesskit::TextDecorationStyle::Solid,
-        color,
-    };
-    if style.underline || linked {
-        node.set_underline(decoration);
-    }
-    if style.strikethrough {
-        node.set_strikethrough(decoration);
     }
 }
 
