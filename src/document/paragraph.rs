@@ -659,7 +659,7 @@ fn word_stops(text: &str) -> Vec<Range<usize>> {
     let mut symbols = false;
     for (start, segment) in text.split_word_bound_indices() {
         let range = start..start + segment.len();
-        if segment.chars().any(char::is_alphanumeric) {
+        if is_word_segment(segment) {
             stops.push(range);
             symbols = false;
         } else if segment.chars().all(char::is_whitespace) {
@@ -672,6 +672,18 @@ fn word_stops(text: &str) -> Vec<Range<usize>> {
         }
     }
     stops
+}
+
+// The std tables follow the compiler's Unicode version; the segmenter's stay pinned.
+fn is_word_segment(segment: &str) -> bool {
+    let (major, minor, update) = char::UNICODE_VERSION;
+    if (u64::from(major), u64::from(minor), u64::from(update))
+        == unicode_segmentation::UNICODE_VERSION
+    {
+        segment.chars().any(char::is_alphanumeric)
+    } else {
+        segment.unicode_words().next().is_some()
+    }
 }
 
 fn ascii_word_stops(text: &str) -> Vec<Range<usize>> {
@@ -779,6 +791,25 @@ mod tests {
                     link: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn word_stops_classify_words_with_the_pinned_segmentation_tables() {
+        for character in '\u{80}'..=char::MAX {
+            let segment = character.to_string();
+            assert_eq!(
+                is_word_segment(&segment),
+                segment.unicode_words().next().is_some(),
+                "U+{:04X} with std Unicode {:?}",
+                u32::from(character),
+                char::UNICODE_VERSION
+            );
+        }
+        // U+0558 is unassigned in the pinned Unicode 17 tables and a letter in Unicode 18.
+        assert_eq!(
+            word_stops("ab \u{558}\u{558}\u{558} cd"),
+            [0..2, 3..9, 10..12]
         );
     }
 }
