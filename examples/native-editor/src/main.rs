@@ -53,7 +53,7 @@ enum EditorCommand {
     ParagraphKind(ParagraphKind),
     Indent,
     Outdent,
-    ItemKind(ParagraphKind),
+    ItemStart(Option<u32>),
     CaptureSnapshot,
     RestoreSnapshot,
     ApplyLink(String),
@@ -208,9 +208,9 @@ impl NativeEditor {
                 let result = self.editor.outdent_list();
                 self.result(result);
             }
-            EditorCommand::ItemKind(kind) => {
+            EditorCommand::ItemStart(start) => {
                 let index = kind_paragraph(self.editor.selection());
-                let result = set_item_kind(&mut self.editor, index, kind);
+                let result = set_item_start(&mut self.editor, index, start);
                 self.result(result);
             }
             EditorCommand::CaptureSnapshot => {
@@ -436,7 +436,7 @@ impl NativeEditor {
                 }
                 let focused = kind_paragraph(self.editor.selection());
                 let document = self.editor.document();
-                if let ParagraphKind::Ordered { indent, start } =
+                if let ParagraphKind::Ordered { start, .. } =
                     document.paragraph(focused).unwrap().kind()
                 {
                     let number = document.list_number(focused).unwrap();
@@ -455,8 +455,7 @@ impl NativeEditor {
                         restart = Some(None);
                     }
                     if let Some(start) = restart {
-                        let kind = ParagraphKind::Ordered { indent, start };
-                        self.commands.push(EditorCommand::ItemKind(kind));
+                        self.commands.push(EditorCommand::ItemStart(start));
                     }
                 }
             });
@@ -831,11 +830,19 @@ fn kind_paragraph(selection: Selection) -> usize {
     }
 }
 
-fn set_item_kind(
+fn set_item_start(
     editor: &mut Editor,
     index: usize,
-    kind: ParagraphKind,
+    start: Option<u32>,
 ) -> Result<(), textloom::Error> {
+    let Some(ParagraphKind::Ordered { indent, .. }) = editor
+        .document()
+        .paragraph(index)
+        .map(|paragraph| paragraph.kind())
+    else {
+        return Ok(());
+    };
+    let kind = ParagraphKind::Ordered { indent, start };
     let selection = editor.selection();
     editor.transaction(|editor| {
         editor.set_selection(Selection::caret(Position::new(index, 0)))?;
@@ -1559,6 +1566,85 @@ mod tests {
                 indent: 2,
                 start: Some(1),
             }]
+        );
+    }
+
+    #[test]
+    fn numbering_commands_leave_body_text_alone_after_ime_merges_the_item_away() {
+        for label in ["Restart at 1", "Continue numbering"] {
+            for accessibility in [false, true] {
+                let mut harness = Harness::new("ime-numbering-merge");
+                harness.app.editor = Editor::from_text("first\nsecond\nthird");
+                let editor = &mut harness.app.editor;
+                editor
+                    .set_selection(Selection::caret(Position::new(2, 0)))
+                    .unwrap();
+                editor
+                    .set_paragraph_kind(ParagraphKind::Ordered {
+                        indent: 2,
+                        start: Some(7),
+                    })
+                    .unwrap();
+                editor
+                    .set_selection(Selection::new(Position::new(0, 2), Position::new(2, 3)))
+                    .unwrap();
+                assert!(harness.has_label("Item 7."));
+                harness.preedit("に");
+                if accessibility {
+                    harness.accessibility_click(label);
+                } else {
+                    harness.click(label, Role::Button);
+                }
+                harness.assert_no_command_errors();
+                assert_eq!(harness.app.editor.document().plain_text(), "fiにrd");
+                assert_eq!(
+                    harness.kinds(0..=0),
+                    [ParagraphKind::Body],
+                    "{label} accessibility={accessibility}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numbering_command_batched_after_a_caret_move_keeps_body_text() {
+        let mut harness = Harness::new("batched-numbering");
+        harness.app.editor = Editor::from_text("first\nsecond");
+        harness
+            .app
+            .editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 1,
+                start: Some(7),
+            })
+            .unwrap();
+        assert!(harness.has_label("Item 7."));
+        assert!(harness.editor_focused());
+        let (&target, _) = harness
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Button && node.label() == Some("Restart at 1"))
+            .unwrap();
+        harness.step(vec![
+            plain_key(egui::Key::ArrowDown),
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_node: target,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                data: None,
+            }),
+        ]);
+        harness.assert_no_command_errors();
+        assert_eq!(harness.app.editor.selection().focus.paragraph, 1);
+        assert_eq!(
+            harness.kinds(0..=1),
+            [
+                ParagraphKind::Ordered {
+                    indent: 1,
+                    start: Some(7)
+                },
+                ParagraphKind::Body
+            ]
         );
     }
 
