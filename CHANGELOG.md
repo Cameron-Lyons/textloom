@@ -105,8 +105,10 @@ First stable release of the native Rust rich-text editing library.
   skip restaging quote containers and rebuilding the editor's child list, and
   typing in a quote no longer republishes its `Blockquote` node. After several
   edits between updates, such as fast typing, multi-edit transactions, or
-  grouped undo/redo, only the paragraphs between the unchanged ends are rebuilt
-  and re-indexed.
+  grouped undo/redo, only the paragraphs between the unchanged ends are rebuilt.
+  Their run locations are patched when the paragraph count is unchanged;
+  otherwise the run-location index is rebuilt on its next lookup, such as an
+  accessibility action or `locate_text_run()`.
 - Egui accessibility updates after structural edits or several edits in one
   frame rebuild only the changed paragraphs instead of the whole snapshot.
 
