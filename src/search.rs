@@ -3,7 +3,7 @@ use std::{
     ops::{ControlFlow, Range},
 };
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
 use crate::document::normalize_newlines;
 use crate::{Document, Position};
@@ -56,7 +56,7 @@ impl Document {
                         options,
                         Some(range.start),
                         false,
-                        is_direct_literal(&needle, options),
+                        ParagraphSearch::new(&needle, options),
                     )
                     .is_some_and(|found| found == *range);
         }
@@ -109,7 +109,7 @@ impl Document {
             return found.or(wrapped);
         }
 
-        let direct_literal = is_direct_literal(&needle, options);
+        let strategy = ParagraphSearch::new(&needle, options);
         let boundary = if backward {
             selection.start
         } else {
@@ -124,7 +124,7 @@ impl Document {
                 options,
                 bounded.then_some(boundary),
                 backward,
-                direct_literal,
+                strategy,
             )
         };
         if backward {
@@ -156,50 +156,112 @@ impl Document {
         options: SearchOptions,
         boundary: Option<Position>,
         backward: bool,
-        direct_literal: bool,
+        strategy: ParagraphSearch,
     ) -> Option<Range<Position>> {
+        let text = self.paragraphs()[index].text();
         if boundary.is_some_and(|position| {
             if backward {
                 position.byte == 0
             } else {
-                position.byte == self.paragraphs()[index].text().len()
+                position.byte == text.len()
             }
         }) {
             return None;
         }
-        if direct_literal {
-            let text = self.paragraphs()[index].text();
-            let edge = boundary.map_or(if backward { text.len() } else { 0 }, |position| {
-                position.byte
-            });
-            let valid_match = |start| {
-                let range = Position::new(index, start)..Position::new(index, start + needle.len());
-                self.is_grapheme_range(&range).then_some(range)
-            };
-            return if backward {
-                text[..edge]
-                    .rmatch_indices(needle)
-                    .find_map(|(start, _)| valid_match(start))
-            } else {
-                text[edge..]
-                    .match_indices(needle)
-                    .find_map(|(start, _)| valid_match(edge + start))
-            };
-        }
-        let mut found = None;
-        let _ = self.visit_paragraph_matches(index, needle, options, |range| {
-            if backward {
-                if boundary.is_some_and(|position| range.end > position) {
-                    return ControlFlow::Break(());
-                }
-                found = Some(range);
-            } else if boundary.is_none_or(|position| range.start >= position) {
-                found = Some(range);
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
+        let edge = boundary.map_or(if backward { text.len() } else { 0 }, |position| {
+            position.byte
         });
-        found
+        match strategy {
+            ParagraphSearch::Literal => {
+                let window = if backward { 0..edge } else { edge..text.len() };
+                find_literal(&text[window.clone()], needle, backward, |bytes| {
+                    let range = Position::new(index, window.start + bytes.start)
+                        ..Position::new(index, window.start + bytes.end);
+                    self.is_grapheme_range(&range).then_some(range)
+                })
+            }
+            ParagraphSearch::Nearest => {
+                self.find_nearest_match(index, needle, options, edge, backward)
+            }
+            ParagraphSearch::Scan => {
+                let mut found = None;
+                let _ = self.visit_paragraph_matches(index, needle, options, |range| {
+                    if backward {
+                        if boundary.is_some_and(|position| range.end > position) {
+                            return ControlFlow::Break(());
+                        }
+                        found = Some(range);
+                    } else if boundary.is_none_or(|position| range.start >= position) {
+                        found = Some(range);
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                });
+                found
+            }
+        }
+    }
+
+    fn find_nearest_match(
+        &self,
+        index: usize,
+        needle: &str,
+        options: SearchOptions,
+        edge: usize,
+        backward: bool,
+    ) -> Option<Range<Position>> {
+        let text = self.paragraphs()[index].text();
+        // A character spans at most four bytes and lowercases to at least one,
+        // so windows sharing this many bytes keep candidates crossing an edge.
+        let overlap = needle.len().saturating_mul(4);
+        let mut width = overlap.saturating_mul(2).max(NEAREST_WINDOW);
+        let mut window = edge..edge;
+        let mut words: Option<WordBoundaries<'_>> = None;
+        loop {
+            window = if backward {
+                let end = text
+                    .ceil_char_boundary(window.start.saturating_add(overlap))
+                    .min(edge);
+                text.floor_char_boundary(end.saturating_sub(width))..end
+            } else {
+                let start = text
+                    .floor_char_boundary(window.end.saturating_sub(overlap))
+                    .max(edge);
+                start..text.ceil_char_boundary(start.saturating_add(width))
+            };
+            let source = &text[window.clone()];
+            let searched = if options.case_sensitive {
+                Cow::Borrowed(source)
+            } else {
+                Cow::Owned(lowercase(source))
+            };
+            let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive);
+            let found = find_literal(&searched, needle, backward, |bytes| {
+                let start = window.start + offsets.original(bytes.start)?;
+                let end = window.start + offsets.original(bytes.end)?;
+                if options.whole_word {
+                    let words = match &mut words {
+                        Some(words) if words.start <= start => words,
+                        words => words
+                            .insert(WordBoundaries::new(text, word_restart(text, window.start))),
+                    };
+                    if !words.contains(end) || !words.contains(start) {
+                        return None;
+                    }
+                }
+                let range = Position::new(index, start)..Position::new(index, end);
+                self.is_grapheme_range(&range).then_some(range)
+            });
+            let exhausted = if backward {
+                window.start == 0
+            } else {
+                window.end == text.len()
+            };
+            if found.is_some() || exhausted {
+                return found;
+            }
+            width = width.saturating_mul(2);
+        }
     }
 
     fn visit_paragraph_matches(
@@ -289,8 +351,143 @@ fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
     }
 }
 
-fn is_direct_literal(needle: &str, options: SearchOptions) -> bool {
-    options.case_sensitive && !options.whole_word && has_unique_start(needle)
+const NEAREST_WINDOW: usize = 1024;
+
+#[derive(Clone, Copy)]
+enum ParagraphSearch {
+    Literal,
+    Nearest,
+    Scan,
+}
+
+impl ParagraphSearch {
+    // Occurrences of a query without a nonempty border never overlap, so every
+    // occurrence belongs to the forward match stream and can be found locally.
+    fn new(needle: &str, options: SearchOptions) -> Self {
+        if !has_unique_start(needle) && literal_prefixes(needle.as_bytes()).last() != Some(&0) {
+            Self::Scan
+        } else if options.case_sensitive && !options.whole_word {
+            Self::Literal
+        } else {
+            Self::Nearest
+        }
+    }
+}
+
+// Word segmentation restarted after a space that precedes an ASCII character
+// other than a space reports the same boundaries as segmentation from byte 0.
+fn word_restart(text: &str, byte: usize) -> usize {
+    let bytes = text.as_bytes();
+    (1..=byte.min(bytes.len().saturating_sub(1)))
+        .rev()
+        .find(|&start| bytes[start - 1] == b' ' && bytes[start] != b' ' && bytes[start].is_ascii())
+        .unwrap_or(0)
+}
+
+struct WordBoundaries<'a> {
+    start: usize,
+    end: usize,
+    boundaries: Vec<usize>,
+    remaining: UWordBoundIndices<'a>,
+}
+
+impl<'a> WordBoundaries<'a> {
+    fn new(text: &'a str, start: usize) -> Self {
+        Self {
+            start,
+            end: text.len(),
+            boundaries: Vec::new(),
+            remaining: text[start..].split_word_bound_indices(),
+        }
+    }
+
+    fn contains(&mut self, byte: usize) -> bool {
+        debug_assert!(byte >= self.start);
+        if byte == self.end {
+            return true;
+        }
+        while self
+            .boundaries
+            .last()
+            .is_none_or(|boundary| *boundary < byte)
+        {
+            let Some((boundary, _)) = self.remaining.next() else {
+                return false;
+            };
+            self.boundaries.push(self.start + boundary);
+        }
+        self.boundaries.binary_search(&byte).is_ok()
+    }
+}
+
+struct LowercaseOffsets<'a> {
+    source: &'a str,
+    folded: bool,
+    changes: Option<Vec<(Range<usize>, Range<usize>)>>,
+}
+
+impl<'a> LowercaseOffsets<'a> {
+    fn new(source: &'a str, folded: bool) -> Self {
+        Self {
+            source,
+            folded,
+            changes: None,
+        }
+    }
+
+    fn original(&mut self, byte: usize) -> Option<usize> {
+        let source = self.source;
+        let folded = self.folded;
+        let changes = self.changes.get_or_insert_with(|| {
+            let mut changes = Vec::new();
+            if folded && !source.is_ascii() {
+                let mut lower_byte = 0;
+                for (byte, character) in source.char_indices() {
+                    let lowered_len = if character.is_ascii() {
+                        1
+                    } else {
+                        character.to_lowercase().map(char::len_utf8).sum::<usize>()
+                    };
+                    if lowered_len != character.len_utf8() {
+                        changes.push((
+                            lower_byte..lower_byte + lowered_len,
+                            byte..byte + character.len_utf8(),
+                        ));
+                    }
+                    lower_byte += lowered_len;
+                }
+            }
+            changes
+        });
+        let index = changes.partition_point(|(lowered, _)| lowered.end <= byte);
+        if let Some((lowered, original)) = changes.get(index)
+            && byte >= lowered.start
+        {
+            return (byte == lowered.start).then_some(original.start);
+        }
+        let original = index.checked_sub(1).map_or(byte, |index| {
+            let (lowered, original) = &changes[index];
+            byte - lowered.end + original.end
+        });
+        source.is_char_boundary(original).then_some(original)
+    }
+}
+
+fn find_literal<T>(
+    source: &str,
+    needle: &str,
+    backward: bool,
+    mut accept: impl FnMut(Range<usize>) -> Option<T>,
+) -> Option<T> {
+    if backward {
+        source
+            .rmatch_indices(needle)
+            .find_map(|(start, _)| accept(start..start + needle.len()))
+    } else {
+        source
+            .match_indices(needle)
+            .find_map(|(start, _)| accept(start..start + needle.len()))
+    }
 }
 
 fn has_unique_start(needle: &str) -> bool {
@@ -327,45 +524,11 @@ fn visit_text_matches(
         return ControlFlow::Continue(());
     }
     let mut word_boundaries = None;
-    let mut lowercase_changes = None;
-    let mut original_byte = |byte: usize| -> Option<usize> {
-        let lowercase_changes = lowercase_changes.get_or_insert_with(|| {
-            let mut changes = Vec::new();
-            if !options.case_sensitive && !source.is_ascii() {
-                let mut lower_byte = 0;
-                for (byte, character) in source.char_indices() {
-                    let lowered_len = if character.is_ascii() {
-                        1
-                    } else {
-                        character.to_lowercase().map(char::len_utf8).sum::<usize>()
-                    };
-                    if lowered_len != character.len_utf8() {
-                        changes.push((
-                            lower_byte..lower_byte + lowered_len,
-                            byte..byte + character.len_utf8(),
-                        ));
-                    }
-                    lower_byte += lowered_len;
-                }
-                debug_assert_eq!(lower_byte, searched.len());
-            }
-            changes
-        });
-        let index = lowercase_changes.partition_point(|(lowered, _)| lowered.end <= byte);
-        if let Some((lowered, original)) = lowercase_changes.get(index)
-            && byte >= lowered.start
-        {
-            return (byte == lowered.start).then_some(original.start);
-        }
-        let original = index.checked_sub(1).map_or(byte, |index| {
-            let (lowered, original) = &lowercase_changes[index];
-            byte - lowered.end + original.end
-        });
-        source.is_char_boundary(original).then_some(original)
-    };
+    let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive);
     visit_literals(&searched, needle, |bytes| {
-        let range = original_byte(bytes.start)
-            .zip(original_byte(bytes.end))
+        let range = offsets
+            .original(bytes.start)
+            .zip(offsets.original(bytes.end))
             .and_then(|(start, end)| {
                 if options.whole_word {
                     let (boundaries, remaining) = word_boundaries.get_or_insert_with(|| {

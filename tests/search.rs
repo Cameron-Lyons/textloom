@@ -809,6 +809,215 @@ fn navigation_matches_global_results_for_sparse_paragraphs_and_crossing_selectio
 }
 
 #[test]
+fn nearby_navigation_in_long_paragraphs_matches_the_forward_match_stream() {
+    let mut text = String::new();
+    for index in 0..420 {
+        text.push_str(match index % 7 {
+            0 => "\u{212A}elvin İ matches ",
+            1 => "café 👩‍💻 ",
+            2 => "e\u{301}xmatch\u{2028}",
+            3 => "ΣΟΣ, ",
+            4 => "aab\u{3000}",
+            _ => "filler ",
+        });
+        if index % 97 == 0 {
+            text.push_str("Match. ");
+        }
+    }
+    let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+    let mut selections = Vec::new();
+    for index in 0..2 {
+        let paragraph = editor.document().paragraph(index).unwrap();
+        for grapheme in (0..=paragraph.grapheme_count()).step_by(53) {
+            let byte = paragraph.byte_from_grapheme(grapheme).unwrap();
+            selections.push(Selection::caret(Position::new(index, byte)));
+        }
+    }
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in ["match", "kelvin", "σος", "i\u{307}", "aab", "missing"] {
+                let matches = editor.document().find(query, options);
+                let mut selections = selections.clone();
+                for range in &matches {
+                    selections.push(Selection::new(range.start, range.end));
+                    let paragraph = editor.document().paragraph(range.start.paragraph).unwrap();
+                    let offsets = if matches.len() <= 16 {
+                        1020..1030
+                    } else {
+                        0..0
+                    };
+                    for offset in offsets {
+                        for byte in [
+                            range.start.byte.checked_sub(offset),
+                            Some(range.end.byte + offset),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let byte = paragraph.boundary_at_or_before(byte);
+                            selections
+                                .push(Selection::caret(Position::new(range.start.paragraph, byte)));
+                        }
+                    }
+                    let mut copy = editor.clone();
+                    copy.set_selection(Selection::new(range.start, range.end))
+                        .unwrap();
+                    assert!(copy.replace_selected_match(query, "x", options).unwrap());
+                }
+                for &selection in &selections {
+                    let range = selection.range();
+                    for backward in [false, true] {
+                        let expected = if backward {
+                            matches.iter().rev().find(|item| item.end <= range.start)
+                        } else {
+                            matches.iter().find(|item| item.start >= range.end)
+                        };
+                        editor.set_selection(selection).unwrap();
+                        let found = if backward {
+                            editor.find_previous(query, options, false).unwrap()
+                        } else {
+                            editor.find_next(query, options, false).unwrap()
+                        };
+                        assert_eq!(found, expected.is_some());
+                        assert_eq!(
+                            editor.selection(),
+                            expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nearby_navigation_keeps_shrinking_lowercase_and_joined_space_candidates_at_every_caret() {
+    let padding = "x ".repeat(520);
+    let mut editor = Editor::from_text(&format!(
+        "{padding}a\u{212A}\u{212A}\u{212A} x \u{3000}aab  aab \u{AD}aab{padding}"
+    ));
+    let paragraph = editor.document().paragraph(0).unwrap();
+    let carets: Vec<_> = (0..=paragraph.grapheme_count())
+        .map(|grapheme| {
+            Selection::caret(Position::new(
+                0,
+                paragraph.byte_from_grapheme(grapheme).unwrap(),
+            ))
+        })
+        .collect();
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in [
+                "a\u{212A}\u{212A}\u{212A}",
+                "\u{3000}aab",
+                " aab",
+                "\u{AD}aab",
+            ] {
+                let matches = editor.document().find(query, options);
+                for &selection in &carets {
+                    let range = selection.range();
+                    for backward in [false, true] {
+                        let expected = if backward {
+                            matches.iter().rev().find(|item| item.end <= range.start)
+                        } else {
+                            matches.iter().find(|item| item.start >= range.end)
+                        };
+                        editor.set_selection(selection).unwrap();
+                        let found = if backward {
+                            editor.find_previous(query, options, false).unwrap()
+                        } else {
+                            editor.find_next(query, options, false).unwrap()
+                        };
+                        assert_eq!(found, expected.is_some());
+                        assert_eq!(
+                            editor.selection(),
+                            expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn navigation_after_edits_between_presses_matches_document_search() {
+    let text = "Match matches aab ΣΟΣ café 👩‍💻 \u{212A}elvin. ".repeat(80);
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in ["match", "aab", "kelvin"] {
+                let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+                let mut presses = 0;
+                loop {
+                    let selection = editor.selection();
+                    let range = selection.range();
+                    let matches = editor.document().find(query, options);
+                    let previous = matches.iter().rev().find(|item| item.end <= range.start);
+                    let mut copy = editor.clone();
+                    assert_eq!(
+                        copy.find_previous(query, options, false).unwrap(),
+                        previous.is_some()
+                    );
+                    assert_eq!(
+                        copy.selection(),
+                        previous.map_or(selection, |item| Selection::new(item.start, item.end)),
+                        "query={query:?}, options={options:?}, selection={selection:?}"
+                    );
+                    let Some(next) = matches.iter().find(|item| item.start >= range.end) else {
+                        assert!(!editor.find_next(query, options, false).unwrap());
+                        assert_eq!(editor.selection(), selection);
+                        break;
+                    };
+                    assert!(editor.find_next(query, options, false).unwrap());
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(next.start, next.end),
+                        "query={query:?}, options={options:?}, selection={selection:?}"
+                    );
+                    let revision = editor.document().revision();
+                    match presses % 4 {
+                        0 => assert!(editor.replace_selected_match(query, "x", options).unwrap()),
+                        1 => editor.replace_range(next.end..next.end, "s").unwrap(),
+                        2 => {
+                            let start = Position::new(next.start.paragraph, 0);
+                            let inserted = "MATCH \u{212A}ELVIN aab ";
+                            editor.replace_range(start..start, inserted).unwrap();
+                            let shift = |position: Position| {
+                                Position::new(position.paragraph, position.byte + inserted.len())
+                            };
+                            editor
+                                .set_selection(Selection::new(shift(next.start), shift(next.end)))
+                                .unwrap();
+                        }
+                        _ => assert!(editor.undo()),
+                    }
+                    assert!(editor.document().revision() > revision);
+                    presses += 1;
+                }
+                assert!(
+                    presses > 0 || (case_sensitive && query != "aab"),
+                    "query={query:?}, options={options:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn case_insensitive_search_finds_case_sensitive_sigma_matches_in_any_context() {
     let insensitive = SearchOptions {
         case_sensitive: false,
