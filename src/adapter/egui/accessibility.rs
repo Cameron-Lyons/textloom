@@ -412,6 +412,13 @@ pub(super) fn update_cached(
                 &previous.environment_identity,
                 &layouts.environment_identity(),
             )
+            && layouts
+                .views_range(0..layouts.len())
+                .zip(&previous.paragraphs)
+                .enumerate()
+                .all(|(index, (layout, paragraph))| {
+                    index == change.range.start || Arc::ptr_eq(layout.galley, &paragraph.galley)
+                })
         {
             let index = change.range.start;
             let source = &editor.document().paragraphs()[index];
@@ -594,10 +601,13 @@ impl Snapshot {
                 if read_only {
                     node.set_read_only();
                 }
-                if let (Some(anchor), Some(focus)) = (
-                    self.position(selection.anchor),
-                    self.focus_position(selection.focus, focus_prefer_next_row),
-                ) {
+                let focus = self.focus_position(selection.focus, focus_prefer_next_row);
+                let anchor = if selection.is_caret() {
+                    focus
+                } else {
+                    self.position(selection.anchor)
+                };
+                if let (Some(anchor), Some(focus)) = (anchor, focus) {
                     node.set_text_selection(accesskit::TextSelection { anchor, focus });
                 }
                 if ui.is_enabled() {
@@ -2029,6 +2039,49 @@ mod tests {
     }
 
     #[test]
+    fn renumbered_list_items_follow_rewraps_from_wider_markers() {
+        let context = egui::Context::default();
+        let mut cache = super::super::Cache::default();
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi \
+                    omicron pi rho sigma tau upsilon phi chi psi omega alpha beta gamma delta";
+        let mut editor = Editor::from_text(&format!("a\n{long}"));
+        editor.select_all();
+        editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            })
+            .unwrap();
+        let widget_id = Id::new("editor");
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 400.0);
+        let mut snapshot = None;
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        let before = Arc::clone(&snapshot.as_ref().unwrap().paragraphs[1]);
+
+        select(&mut editor, (0, 0), (0, 0));
+        editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 0,
+                start: Some(1_000_000),
+            })
+            .unwrap();
+        assert_eq!(editor.document().list_number(1), Some(1_000_001));
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 400.0);
+        assert!(!Arc::ptr_eq(
+            &before.galley,
+            &layouts.get(1).unwrap().galley
+        ));
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        let renumbered = snapshot.as_ref().unwrap();
+        assert_eq!(renumbered.paragraphs[1].id, before.id);
+        assert_matches_fresh(renumbered, &editor, &layouts, widget_id);
+
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 400.0);
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+    }
+
+    #[test]
     fn row_index_carets_match_galley_cursor_queries() {
         let texts = [
             String::new(),
@@ -2486,6 +2539,24 @@ mod tests {
                 selection.anchor,
                 snapshot.position(Position::default()).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn collapsed_caret_at_a_wrap_seam_publishes_one_position() {
+        let mut editor = Editor::from_text("first second third fourth fifth sixth");
+        let (layouts, snapshot) = snapshot_for(&editor, 65.0);
+        let runs = &snapshot.paragraphs[0].runs;
+        assert_ne!(runs[0].row, runs[1].row);
+        let seam = Position::new(0, runs[1].range.start);
+        editor.set_selection(crate::Selection::caret(seam)).unwrap();
+        for prefer_next_row in [true, false] {
+            let nodes = published_nodes(&editor, &snapshot, &layouts, prefer_next_row);
+            let selection = nodes[&Id::new("editor").accesskit_id()]
+                .text_selection()
+                .unwrap();
+            let caret = snapshot.focus_position(seam, prefer_next_row).unwrap();
+            assert_eq!((selection.anchor, selection.focus), (caret, caret));
         }
     }
 
