@@ -45,6 +45,29 @@ pub(super) struct InputOptions {
     pub(super) heading_shortcuts: bool,
 }
 
+pub(super) fn reads_layout(event: &Event) -> bool {
+    match event {
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => match key {
+            Key::ArrowUp
+            | Key::ArrowDown
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Home
+            | Key::End
+            | Key::Tab => true,
+            Key::ArrowLeft | Key::ArrowRight => modifiers.mac_cmd,
+            _ => false,
+        },
+        Event::AccessKitActionRequest(_) => true,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_event(
     editor: &mut Editor,

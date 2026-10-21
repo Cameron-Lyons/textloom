@@ -2930,6 +2930,73 @@ fn enter_then_movement_in_same_frame_uses_current_layout() {
 }
 
 #[test]
+fn typing_then_row_boundary_in_same_frame_uses_current_layout() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("");
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::Text("hello".into()),
+            key(Key::Home, Modifiers::NONE),
+            Event::Text("say ".into()),
+            key(Key::End, Modifiers::NONE),
+        ],
+        true,
+    );
+    assert_eq!(editor.document().plain_text(), "say hello");
+    assert_eq!(editor.selection(), Selection::caret(Position::new(0, 9)));
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            key(Key::Home, Modifiers::NONE),
+            Event::Text("ok ".into()),
+            key(Key::ArrowRight, Modifiers::MAC_CMD | Modifiers::COMMAND),
+        ],
+        true,
+    );
+    assert_eq!(editor.document().plain_text(), "ok say hello");
+    assert_eq!(editor.selection(), Selection::caret(Position::new(0, 12)));
+}
+
+#[test]
+fn enter_then_tab_in_a_list_in_same_frame_indents_the_new_item() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("item");
+    editor
+        .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
+        .unwrap();
+    editor
+        .set_selection(Selection::caret(Position::new(0, 4)))
+        .unwrap();
+    frame(&context, &mut editor, vec![], true);
+    frame(&context, &mut editor, vec![], true);
+    frame(
+        &context,
+        &mut editor,
+        vec![
+            key(Key::Enter, Modifiers::NONE),
+            key(Key::Tab, Modifiers::NONE),
+        ],
+        true,
+    );
+    let kinds: Vec<_> = editor
+        .document()
+        .paragraphs()
+        .iter()
+        .map(|paragraph| paragraph.kind())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ParagraphKind::Bullet { indent: 0 },
+            ParagraphKind::Bullet { indent: 1 }
+        ]
+    );
+}
+
+#[test]
 fn vertical_navigation_keeps_the_column_across_short_paragraphs() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("aaaaaaaaa\nx\naaaaaaaaa");
@@ -5350,6 +5417,26 @@ fn ime_events_queued_before_a_click_apply_before_the_click_commits() {
     let text = editor.document().plain_text();
     assert!(text.starts_with("ni") && text.contains('x'), "{text}");
     assert_eq!(text.len(), "niabcx".len());
+}
+
+#[test]
+fn a_click_after_queued_ime_commits_hit_tests_the_committed_text() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    let rect = composing_frame(&context, &mut editor, "ni");
+    let row = caret_point(&context, rect, &editor, Position::default()).y;
+    let point = Pos2::new(rect.right() - PADDING - 1.0, row);
+    let mut events = candidate_commit("你").to_vec();
+    events.extend([
+        Event::PointerMoved(point),
+        primary(point, true, Modifiers::NONE),
+    ]);
+    widget_frame(&context, &mut editor, events, Some(0.2), true, unchanged);
+    assert_eq!(editor.document().plain_text(), "你abc");
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(editor.document().end())
+    );
 }
 
 #[test]

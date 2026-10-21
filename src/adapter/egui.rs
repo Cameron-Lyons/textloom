@@ -22,7 +22,7 @@ mod paint;
 use super::clean_text;
 pub use accessibility::AccessibilityError;
 use composition::CompositionPreview;
-use input::{InputOptions, handle_event};
+use input::{InputOptions, handle_event, reads_layout};
 #[cfg(test)]
 use input::{handle_key, surrounding_position};
 pub use input_routing::install_input_routing;
@@ -480,9 +480,14 @@ impl<'a> RichTextEditor<'a> {
                 Vec::new()
             };
             let mut consumed = Vec::new();
+            let mut layout_stale = false;
             for (index, event) in events.iter().enumerate() {
                 if applied.binary_search(&index).is_ok() {
                     continue;
+                }
+                if layout_stale && reads_layout(event) {
+                    layouts = cache.layout(ui, self.editor, &appearance);
+                    layout_stale = false;
                 }
                 let revision = self.editor.document().revision();
                 let composition = composition_before_event(self.editor, event);
@@ -542,10 +547,11 @@ impl<'a> RichTextEditor<'a> {
                     event,
                     now,
                 );
-                if revision != self.editor.document().revision() {
-                    layouts = cache.layout(ui, self.editor, &appearance);
-                }
+                layout_stale |= revision != self.editor.document().revision();
                 cache.validate_navigation(self.editor.selection());
+            }
+            if layout_stale {
+                layouts = cache.layout(ui, self.editor, &appearance);
             }
             consumed.extend(applied);
             consumed.sort_unstable();
@@ -1059,8 +1065,8 @@ fn apply_queued_ime(
     });
     let mut applied = Vec::new();
     let now = ui.input(|input| input.time);
+    let revision = editor.document().revision();
     for (index, event) in queued {
-        let revision = editor.document().revision();
         let composition = composition_before_event(editor, &event);
         if is_commit_echo(&mut cache.interaction.commit_echo, &event, editor)
             || handle_event(
@@ -1079,9 +1085,9 @@ fn apply_queued_ime(
             applied.push(index);
         }
         observe_composition_event(&mut cache.interaction, composition, editor, &event, now);
-        if revision != editor.document().revision() {
-            *layouts = cache.layout(ui, editor, appearance);
-        }
+    }
+    if revision != editor.document().revision() {
+        *layouts = cache.layout(ui, editor, appearance);
     }
     applied
 }
