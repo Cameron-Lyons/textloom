@@ -5,7 +5,11 @@ use egui::{
     epaint::{FontsView, text::Glyph},
     text::{CharIndex, LayoutJob},
 };
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+};
 
 pub(super) type BackgroundRanges<'a> = (&'a [Range<Position>], Color32);
 
@@ -60,6 +64,7 @@ struct PaintedGalley {
     // Retaining the source prevents its address from being reused by another layout.
     source: Arc<Galley>,
     current: Arc<Galley>,
+    row_starts: Arc<[usize]>,
     used: bool,
 }
 
@@ -81,18 +86,23 @@ impl PaintCache {
         }
     }
 
-    fn refresh(&mut self, fonts: &mut FontsView<'_>, source: &Arc<Galley>) -> Arc<Galley> {
+    fn refresh(
+        &mut self,
+        fonts: &mut FontsView<'_>,
+        source: &Arc<Galley>,
+    ) -> (Arc<Galley>, Arc<[usize]>) {
         let cached = self
             .galleys
             .entry(Arc::as_ptr(source) as usize)
             .or_insert_with(|| PaintedGalley {
                 source: source.clone(),
                 current: fonts.layout_job((*source.job).clone()),
+                row_starts: row_starts(source),
                 used: true,
             });
         debug_assert!(Arc::ptr_eq(&cached.source, source));
         cached.used = true;
-        cached.current.clone()
+        (cached.current.clone(), cached.row_starts.clone())
     }
 
     fn end(&mut self) {
@@ -113,27 +123,30 @@ pub(super) fn paint_document(
     text_color: Color32,
     quote_color: Color32,
 ) {
-    let top = painter.clip_rect().top() - origin.y;
-    let bottom = painter.clip_rect().bottom() - origin.y;
+    let clip = painter.clip_rect();
+    let top = clip.top() - origin.y;
+    let bottom = clip.bottom() - origin.y;
     let first = layouts.first_bottom_at_least(top - 5.0);
     let last = layouts.first_top_after(bottom + 5.0).max(first);
-    let mut visible: Vec<_> = layouts
-        .views_range(first..last)
-        .map(|layout| VisibleParagraph {
-            galley: layout.galley.clone(),
-            marker: layout.marker.cloned(),
-            layout,
-            row_starts: None,
-        })
-        .collect();
+    let mut visible = Vec::with_capacity(last - first);
     painter.fonts_mut(|fonts| {
         cache.begin(fonts, family);
-        for paragraph in &mut visible {
-            paragraph.galley = cache.refresh(fonts, paragraph.layout.galley);
-            if let Some(marker) = paragraph.layout.marker {
-                paragraph.marker = Some(cache.refresh(fonts, marker));
+        visible.extend(layouts.views_range(first..last).map(|layout| {
+            let (galley, row_starts) = cache.refresh(fonts, layout.galley);
+            let marker = layout.marker.map(|marker| cache.refresh(fonts, marker).0);
+            let offset = origin.y + layout.rect.min.y;
+            let (top, bottom) = (clip.top() - offset - 5.0, clip.bottom() - offset + 5.0);
+            let rows = &layout.galley.rows;
+            let start = rows.partition_point(|row| row.rect().bottom() < top);
+            let end = rows.partition_point(|row| row.rect().top() <= bottom);
+            VisibleParagraph {
+                layout,
+                galley,
+                marker,
+                row_starts,
+                rows: start..end.max(start),
             }
-        }
+        }));
         cache.end();
     });
     let mut bar: Option<Rect> = None;
@@ -157,9 +170,9 @@ pub(super) fn paint_document(
             .as_ref()
             .map(|(range, color)| (std::slice::from_ref(range), *color)),
     );
+    let window = visible_window(document, &visible, first);
     for (ranges, color) in layers {
-        let window = visible_ranges(ranges, first..last);
-        for range in window {
+        for range in visible_ranges(ranges, window.as_ref()) {
             if range.start >= range.end
                 || !fits(document, range.start)
                 || !fits(document, range.end)
@@ -219,11 +232,52 @@ fn fits(document: &Document, position: Position) -> bool {
         .is_some_and(|paragraph| paragraph.text().is_char_boundary(position.byte))
 }
 
-fn visible_ranges(ranges: &[Range<Position>], visible: Range<usize>) -> &[Range<Position>] {
-    let first = Position::new(visible.start, 0);
-    let after = Position::new(visible.end, 0);
-    let end = ranges.partition_point(|range| range.start < after);
-    let start = ranges[..end].partition_point(|range| range.end <= first);
+fn row_starts(galley: &Galley) -> Arc<[usize]> {
+    let mut start = 0;
+    let mut starts = Vec::with_capacity(galley.rows.len() + 1);
+    starts.push(start);
+    for row in &galley.rows {
+        start += row.char_count_including_newline().0;
+        starts.push(start);
+    }
+    starts.into()
+}
+
+fn visible_window(
+    document: &Document,
+    visible: &[VisibleParagraph<'_>],
+    first: usize,
+) -> Option<RangeInclusive<Position>> {
+    let (head, tail) = (visible.first()?, visible.last()?);
+    let last = first + visible.len() - 1;
+    let start = document
+        .paragraph(first)
+        .and_then(|paragraph| paragraph.byte_from_scalar(head.row_starts[head.rows.start]))
+        .unwrap_or(0);
+    let end = match tail.rows.end.checked_sub(1) {
+        None => Some(0),
+        Some(row) => {
+            let count = tail.layout.galley.rows[row]
+                .char_count_excluding_newline()
+                .0;
+            document
+                .paragraph(last)
+                .and_then(|paragraph| paragraph.byte_from_scalar(tail.row_starts[row] + count))
+        }
+    }
+    .unwrap_or(usize::MAX);
+    Some(Position::new(first, start)..=Position::new(last, end))
+}
+
+fn visible_ranges<'a>(
+    ranges: &'a [Range<Position>],
+    window: Option<&RangeInclusive<Position>>,
+) -> &'a [Range<Position>] {
+    let Some(window) = window else {
+        return &[];
+    };
+    let end = ranges.partition_point(|range| range.start <= *window.end());
+    let start = ranges[..end].partition_point(|range| range.end <= *window.start());
     &ranges[start..end]
 }
 
@@ -231,7 +285,8 @@ struct VisibleParagraph<'a> {
     layout: ParagraphLayoutView<'a>,
     galley: Arc<Galley>,
     marker: Option<Arc<Galley>>,
-    row_starts: Option<Vec<usize>>,
+    row_starts: Arc<[usize]>,
+    rows: Range<usize>,
 }
 
 impl VisibleParagraph<'_> {
@@ -244,22 +299,14 @@ impl VisibleParagraph<'_> {
         color: Color32,
     ) {
         let offset = origin.to_vec2() + self.layout.rect.min.to_vec2();
-        let top = painter.clip_rect().top() - offset.y - 5.0;
-        let bottom = painter.clip_rect().bottom() - offset.y + 5.0;
         let rows = &self.layout.galley.rows;
-        let starts = self.row_starts.get_or_insert_with(|| {
-            rows.iter()
-                .scan(0, |start, row| {
-                    let row_start = *start;
-                    *start += row.char_count_including_newline().0;
-                    Some(row_start)
-                })
-                .collect()
-        });
+        let starts = &self.row_starts[..rows.len()];
         let first = starts
             .partition_point(|&start| start <= chars.start)
-            .saturating_sub(1);
-        for (row_index, row) in rows.iter().enumerate().skip(first) {
+            .saturating_sub(1)
+            .max(self.rows.start);
+        for row_index in first..self.rows.end {
+            let row = &rows[row_index];
             let row_start = starts[row_index];
             if row_start > chars.end {
                 break;
@@ -272,10 +319,7 @@ impl VisibleParagraph<'_> {
             } else {
                 includes_break && row_index + 1 == rows.len()
             };
-            if !(local_start < local_end || row_break)
-                || row.rect().bottom() < top
-                || row.rect().top() > bottom
-            {
+            if !(local_start < local_end || row_break) {
                 continue;
             }
             let left = row.x_offset(CharIndex(local_start));

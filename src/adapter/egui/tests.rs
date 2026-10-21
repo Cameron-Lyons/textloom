@@ -7351,6 +7351,112 @@ fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
 }
 
 #[test]
+fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text(&format!(
+        "{}\nmatch tail\n\nmatch",
+        "café 👩‍💻 match नमस्ते 🇺🇸 \u{2028}".repeat(16)
+    ));
+    let mut cache = Cache::default();
+    let mut appearance = appearance();
+    appearance.width = 120.0;
+    let mut retained = PaintCache::default();
+    let colors = [
+        Color32::from_rgb(1, 2, 3),
+        Color32::from_rgb(4, 5, 6),
+        Color32::from_rgb(7, 8, 9),
+        Color32::from_rgb(10, 11, 12),
+    ];
+    let origin = Pos2::new(10.0, 30.0);
+    for edit in [false, true] {
+        if edit {
+            editor
+                .set_selection(Selection::caret(Position::new(0, 1)))
+                .unwrap();
+            editor.insert_text("inserted words ").unwrap();
+        }
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        let document = editor.document();
+        let rows = layouts.get(0).unwrap().galley.rows.len();
+        assert!(rows > 30, "rows={rows}");
+        let found = document.find("match", crate::SearchOptions::default());
+        let tail = document.paragraph(1).unwrap().text().len();
+        let spans = [
+            found[found.len() / 2].start..Position::new(1, 2),
+            Position::new(1, tail)..Position::new(2, 0),
+            Position::new(2, 0)..Position::new(3, 3),
+        ];
+        let scalars: Vec<_> = document
+            .paragraph(0)
+            .unwrap()
+            .text()
+            .char_indices()
+            .map(|(byte, scalar)| {
+                Position::new(0, byte)..Position::new(0, byte + scalar.len_utf8())
+            })
+            .collect();
+        let paint = |paint_cache: &mut PaintCache, clip: Rect, selection: Selection| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                paint_document(
+                    &ui.painter().with_clip_rect(clip),
+                    paint_cache,
+                    document,
+                    &layouts,
+                    origin,
+                    &[
+                        (&found, colors[0]),
+                        (&spans, colors[1]),
+                        (&scalars, colors[3]),
+                    ],
+                    Some((selection, colors[2])),
+                    &FontFamily::Proportional,
+                    Color32::WHITE,
+                    Color32::GRAY,
+                );
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::epaint::Shape::Rect(rectangle) if colors.contains(&rectangle.fill) => {
+                        Some((rectangle.fill, rectangle.rect))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let bottom = origin.y + layouts.content_height().unwrap() + 20.0;
+        for selection in [
+            Selection::new(found[3].end, found[found.len() - 4].start),
+            Selection::new(Position::default(), document.end()),
+        ] {
+            let full = paint(&mut PaintCache::default(), Rect::EVERYTHING, selection);
+            assert!(full.len() > rows, "edit={edit}");
+            let mut top = 0.5;
+            while top < bottom {
+                for height in [0.5, 6.0, 23.0, 80.0] {
+                    let clip = Rect::from_min_size(Pos2::new(0.0, top), Vec2::new(1000.0, height));
+                    let expected: Vec<_> = full
+                        .iter()
+                        .copied()
+                        .filter(|(_, rect)| {
+                            rect.bottom() >= clip.top() - 5.0 && rect.top() <= clip.bottom() + 5.0
+                        })
+                        .collect();
+                    assert_eq!(
+                        paint(&mut retained, clip, selection),
+                        expected,
+                        "edit={edit}, clip={clip:?}"
+                    );
+                }
+                top += 9.0;
+            }
+        }
+    }
+}
+
+#[test]
 fn ime_preview_lays_out_soft_line_breaks_in_its_preedit() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("a\u{2028}b");
