@@ -1055,6 +1055,51 @@ mod tests {
     }
 
     #[test]
+    fn case_insensitive_middle_lines_must_fill_their_paragraphs() {
+        for (text, query) in [
+            ("Σ\nfoo\nk", "σ\n\nk"),
+            ("Σ\nfoo\nk", "Σ\n\nK"),
+            ("x\nABC\ny", "x\nab\ny"),
+            ("x\nABC\ny", "X\nAB\nY"),
+            ("x\nABC\n\ny", "x\nab\n\ny"),
+            ("x\nABC\nDEF\ny", "x\nabc\nde\ny"),
+            ("x\nΟΣΑ\ny", "x\nοσ\ny"),
+            ("x\n\u{212A}\u{212A}\ny", "x\nk\ny"),
+        ] {
+            let document = Document::from_text(text);
+            for whole_word in [false, true] {
+                for case_sensitive in [false, true] {
+                    let options = SearchOptions {
+                        case_sensitive,
+                        whole_word,
+                    };
+                    assert_eq!(
+                        assert_matches_flattened_stream(&document, query, options),
+                        Some(0),
+                        "{text:?} {query:?} {options:?}"
+                    );
+                }
+            }
+        }
+        let insensitive = SearchOptions {
+            case_sensitive: false,
+            whole_word: false,
+        };
+        for (text, query) in [
+            ("Σ\n\nk", "σ\n\nk"),
+            ("x\nABC\ny", "x\nabc\ny"),
+            ("x\nΟΣ\ny", "X\nος\nY"),
+        ] {
+            let document = Document::from_text(text);
+            assert_eq!(
+                assert_matches_flattened_stream(&document, query, insensitive),
+                Some(1),
+                "{text:?} {query:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ascii_word_boundaries_agree_with_unicode_segmentation() {
         let tokens = [
             "a", "Z", "q", "0", "7", ":", ".", "'", ",", ";", "_", " ", "  ", "\t", "\"", "-", "!",

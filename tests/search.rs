@@ -237,6 +237,41 @@ fn matches_beside_ascii_punctuation_and_digits_follow_word_segmentation() {
 }
 
 #[test]
+fn case_insensitive_cross_paragraph_middle_lines_must_fill_their_paragraphs() {
+    let insensitive = SearchOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+    for (text, query) in [("Σ\nfoo\nk", "σ\n\nk"), ("x\nABC\ny", "x\nab\ny")] {
+        let document = Document::from_text(text);
+        assert!(document.find(query, insensitive).is_empty(), "{text:?}");
+        let mut editor = Editor::new(document);
+        let prefix_match = Selection::new(Position::new(0, 0), Position::new(2, 1));
+        editor.set_selection(prefix_match).unwrap();
+        assert!(
+            !editor
+                .replace_selected_match(query, "_", insensitive)
+                .unwrap()
+        );
+        assert_eq!(editor.document().plain_text(), text);
+        for wrap in [false, true] {
+            for caret in [Position::new(0, 0), editor.document().end()] {
+                editor.set_selection(Selection::caret(caret)).unwrap();
+                assert!(!editor.find_next(query, insensitive, wrap).unwrap());
+                assert!(!editor.find_previous(query, insensitive, wrap).unwrap());
+                assert_eq!(editor.selection(), Selection::caret(caret));
+            }
+        }
+    }
+    let mut editor = Editor::from_text("x\nABC\ny");
+    assert!(editor.find_next("X\nabc\nY", insensitive, false).unwrap());
+    assert_eq!(
+        editor.selection(),
+        Selection::new(Position::new(0, 0), Position::new(2, 1))
+    );
+}
+
+#[test]
 fn case_insensitive_cross_paragraph_queries_map_original_coordinates() {
     let document = Document::from_text("İ\nCAFÉ");
     let matches = document.find(
