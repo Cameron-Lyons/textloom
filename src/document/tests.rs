@@ -945,6 +945,52 @@ fn rich_unicode_run_validation_keeps_navigation_indexes_lazy() {
 }
 
 #[test]
+fn rich_run_ends_match_complete_segmentation_beyond_local_context() {
+    let texts = [
+        "café e\u{301}👨‍👩‍👧‍👦🇺🇸각나".to_owned(),
+        format!("a👩{}‍💻z", "\u{301}".repeat(64)),
+        format!("a{}z", "🇦".repeat(65)),
+        format!("aक{}षz", "\u{94d}\u{301}".repeat(33)),
+        format!("{}\u{1161}\u{11a8}é", "\u{1100}".repeat(40)),
+    ];
+    let styles = [bold(), InlineStyle::default(), bold()];
+    let validate = |text: &str, ends: &[usize]| {
+        let spans = [0]
+            .into_iter()
+            .chain(ends.iter().copied())
+            .zip(ends.iter().copied().chain([text.len()]))
+            .zip(styles)
+            .map(|((start, end), style)| Span {
+                range: start..end,
+                style,
+                link: None,
+            })
+            .collect();
+        Paragraph::new(text, spans, ParagraphKind::Body).is_ok()
+    };
+    for text in texts {
+        let boundaries: Vec<_> = text.grapheme_indices(true).map(|(byte, _)| byte).collect();
+        for byte in 1..text.len() {
+            assert_eq!(
+                validate(&text, &[byte]),
+                boundaries.contains(&byte),
+                "run end {byte} in {text:?}"
+            );
+        }
+        let chars: Vec<_> = text.char_indices().map(|(byte, _)| byte).skip(1).collect();
+        for (index, &first) in chars.iter().enumerate() {
+            for &second in &chars[index + 1..] {
+                assert_eq!(
+                    validate(&text, &[first, second]),
+                    boundaries.contains(&first) && boundaries.contains(&second),
+                    "run ends {first} and {second} in {text:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn document_content_identity_tracks_changes_and_preserves_noops() {
     let mut document = Document::from_text("text");
     let cloned = document.clone();

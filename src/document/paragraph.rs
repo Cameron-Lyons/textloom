@@ -58,7 +58,11 @@ impl fmt::Debug for Paragraph {
 
 impl Paragraph {
     pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
-        Self::from_parts(text, spans, kind)
+        let paragraph = Self::from_parts(text, spans, kind)?;
+        if text.contains(['\r', '\n', '\u{2029}']) {
+            return Err(Error::InvalidFragment);
+        }
+        Ok(paragraph)
     }
 
     pub fn text(&self) -> &str {
@@ -438,19 +442,28 @@ impl Paragraph {
         {
             return Err(Error::InvalidHeadingLevel(level));
         }
-        if text.contains(['\r', '\n', '\u{2029}']) {
-            return Err(Error::InvalidFragment);
-        }
         let ascii = text.is_ascii();
         let mut end = 0;
-        let mut boundaries = text.grapheme_indices(true).map(|(byte, _)| byte);
+        let mut boundaries = None;
+        let mut is_boundary = |byte: usize| {
+            if !text.is_char_boundary(byte) {
+                return false;
+            }
+            let (chunk, start) = grapheme_context(text, byte);
+            GraphemeCursor::new(byte, text.len(), true)
+                .is_boundary(chunk, start)
+                .unwrap_or_else(|_| {
+                    boundaries
+                        .get_or_insert_with(|| text.grapheme_indices(true).map(|(byte, _)| byte))
+                        .find(|boundary| *boundary >= byte)
+                        == Some(byte)
+                })
+        };
         for span in &spans {
             if span.range.start != end
                 || span.range.start >= span.range.end
                 || span.range.end > text.len()
-                || (!ascii
-                    && span.range.end < text.len()
-                    && boundaries.find(|byte| *byte >= span.range.end) != Some(span.range.end))
+                || (!ascii && span.range.end < text.len() && !is_boundary(span.range.end))
             {
                 return Err(Error::InvalidFragment);
             }
