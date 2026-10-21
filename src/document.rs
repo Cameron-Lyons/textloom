@@ -15,6 +15,8 @@ mod paragraph;
 mod words;
 
 pub(crate) use change::Delta;
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+pub(crate) use change::take_sparse_coverage;
 pub(crate) use numbering::{Levels, same_effect as same_numbering_effect};
 #[cfg(any(feature = "accesskit", feature = "egui"))]
 pub(crate) use paragraph::SpanCursor;

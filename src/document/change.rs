@@ -26,6 +26,9 @@ impl Document {
         if delta.is_empty() {
             return;
         }
+        if !delta.rest.is_empty() {
+            count_sparse(1);
+        }
         let (old_len, new_len) = delta.extent();
         self.apply(delta, forward);
         if forward {
@@ -57,6 +60,7 @@ impl Document {
             }
             return;
         }
+        count_sparse(2);
         // Splicing each run in place would shift the tail once per run.
         let mut tail = self.paragraphs.split_off(delta.start).into_iter();
         let mut end = delta.start;
@@ -102,6 +106,7 @@ impl Document {
         let new_len = after.len();
         let runs = changed_runs(&self.paragraphs[start..end], &after);
         let delta = if runs.len() > 1 {
+            count_sparse(0);
             let mut splices = runs.into_iter().map(|(old, new)| Delta {
                 start: start + new.start,
                 before: self.paragraphs[start + old.start..start + old.end].to_vec(),
@@ -172,6 +177,29 @@ impl Document {
 }
 
 const SHARED_GAP: usize = 8;
+
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+thread_local! {
+    static SPARSE_COVERAGE: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+// Sparse deltas recorded, sparse deltas replayed, and sparse applies that shift the tail.
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+pub(crate) fn take_sparse_coverage() -> [usize; 3] {
+    SPARSE_COVERAGE.take()
+}
+
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+fn count_sparse(kind: usize) {
+    SPARSE_COVERAGE.with(|coverage| {
+        let mut counts = coverage.get();
+        counts[kind] += 1;
+        coverage.set(counts);
+    });
+}
+
+#[cfg(not(all(test, any(feature = "egui", feature = "accesskit"))))]
+fn count_sparse(_: usize) {}
 
 // Pairs each changed run of `before` with the run of `after` replacing it. Paragraphs kept by
 // pointer separate the runs once more than SHARED_GAP of them sit together. A kept paragraph

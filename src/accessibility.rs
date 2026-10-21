@@ -2562,17 +2562,45 @@ mod accesskit_bridge {
 
         #[test]
         fn several_edits_between_updates_match_fresh_trees() {
-            let mut random = random_edits::seeded(0x9e37_79b9_7f4a_7c15);
-            for _ in 0..30 {
-                let mut editor = random_edits::editor();
+            random_updates_match_fresh_trees(
+                random_edits::seeded(0x9e37_79b9_7f4a_7c15),
+                30,
+                4,
+                random_edits::editor,
+                random_edits::apply,
+            );
+        }
+
+        #[test]
+        fn sparse_edits_between_updates_match_fresh_trees() {
+            crate::document::take_sparse_coverage();
+            random_updates_match_fresh_trees(
+                random_edits::seeded(0x2545_f491_4f6c_dd1d),
+                8,
+                2,
+                random_edits::sparse_editor,
+                random_edits::apply_sparse,
+            );
+            random_edits::assert_sparse_coverage([40, 20, 20]);
+        }
+
+        fn random_updates_match_fresh_trees<R: FnMut(usize) -> usize>(
+            mut random: R,
+            editors: usize,
+            batch: usize,
+            editor: fn() -> Editor,
+            apply: fn(&mut Editor, &mut R),
+        ) {
+            for _ in 0..editors {
+                let mut editor = editor();
                 let mut adapter = AccessKitAdapter::default();
                 let mut tree = accesskit_consumer::Tree::new(
                     adapter.update(&editor, "Notes", true).unwrap(),
                     true,
                 );
                 for _ in 0..50 {
-                    for _ in 0..1 + random(4) {
-                        random_edits::apply(&mut editor, &mut random);
+                    for _ in 0..1 + random(batch) {
+                        apply(&mut editor, &mut random);
                     }
                     if random(25) == 0 {
                         adapter.invalidate();
@@ -2630,7 +2658,9 @@ pub use accesskit_bridge::{AccessKitAdapter, AccessKitError};
 
 #[cfg(all(test, any(feature = "accesskit", feature = "egui")))]
 pub(crate) mod random_edits {
-    use crate::{Editor, Link, ParagraphKind, Position, Selection, StylePatch};
+    use std::ops::Range;
+
+    use crate::{Editor, Link, ParagraphKind, Position, SearchOptions, Selection, StylePatch};
 
     pub(crate) fn seeded(mut seed: u64) -> impl FnMut(usize) -> usize {
         move |limit| {
@@ -2649,30 +2679,73 @@ pub(crate) mod random_edits {
             "intro é 👩‍💻 text\n{}\nquoted one\nquoted two\nlast",
             items.join("\n")
         ));
-        for (paragraphs, kind) in [
-            (
-                1..12,
-                ParagraphKind::Ordered {
-                    indent: 0,
-                    start: None,
-                },
-            ),
-            (
-                1..2,
-                ParagraphKind::Ordered {
-                    indent: 0,
-                    start: Some(995),
-                },
-            ),
-            (
-                4..7,
-                ParagraphKind::Ordered {
-                    indent: 1,
-                    start: None,
-                },
-            ),
-            (12..14, ParagraphKind::Quote),
-        ] {
+        set_kinds(
+            &mut editor,
+            [
+                (
+                    1..12,
+                    ParagraphKind::Ordered {
+                        indent: 0,
+                        start: None,
+                    },
+                ),
+                (
+                    1..2,
+                    ParagraphKind::Ordered {
+                        indent: 0,
+                        start: Some(995),
+                    },
+                ),
+                (
+                    4..7,
+                    ParagraphKind::Ordered {
+                        indent: 1,
+                        start: None,
+                    },
+                ),
+                (12..14, ParagraphKind::Quote),
+            ],
+        );
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+            .unwrap();
+        editor
+            .set_link(Some(Link::new("https://a.example").unwrap()))
+            .unwrap();
+        editor
+    }
+
+    pub(crate) fn sparse_editor() -> Editor {
+        let text: Vec<_> = (0..48)
+            .map(|index| {
+                if index % 12 == 5 {
+                    format!("tok {index} é")
+                } else {
+                    format!("plain {index} words")
+                }
+            })
+            .collect();
+        let mut editor = Editor::from_text(&text.join("\n"));
+        let ordered = |indent, start| ParagraphKind::Ordered { indent, start };
+        set_kinds(
+            &mut editor,
+            [
+                (0..16, ordered(0, None)),
+                (6..10, ordered(1, None)),
+                (16..17, ordered(0, Some(7))),
+                (20..28, ParagraphKind::Bullet { indent: 0 }),
+                (30..38, ParagraphKind::Quote),
+                (42..43, ParagraphKind::Heading { level: 2 }),
+            ],
+        );
+        editor
+    }
+
+    fn set_kinds(
+        editor: &mut Editor,
+        kinds: impl IntoIterator<Item = (Range<usize>, ParagraphKind)>,
+    ) {
+        for (paragraphs, kind) in kinds {
             editor
                 .set_selection(Selection::new(
                     Position::new(paragraphs.start, 0),
@@ -2681,13 +2754,6 @@ pub(crate) mod random_edits {
                 .unwrap();
             editor.set_paragraph_kind(kind).unwrap();
         }
-        editor
-            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
-            .unwrap();
-        editor
-            .set_link(Some(Link::new("https://a.example").unwrap()))
-            .unwrap();
-        editor
     }
 
     fn position(editor: &Editor, random: &mut impl FnMut(usize) -> usize) -> Position {
@@ -2797,6 +2863,108 @@ pub(crate) mod random_edits {
             let selection = Selection::new(position(editor, random), position(editor, random));
             let _ = editor.set_selection(selection);
         }
+    }
+
+    // Edits far-apart token paragraphs so that most changes, and their undo and redo, record
+    // several runs, some of which add or join paragraphs.
+    pub(crate) fn apply_sparse(editor: &mut Editor, random: &mut impl FnMut(usize) -> usize) {
+        let kinds = [
+            ParagraphKind::Body,
+            ParagraphKind::Quote,
+            ParagraphKind::Bullet { indent: 0 },
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            },
+        ];
+        let kind = kinds[random(kinds.len())];
+        let bold = StylePatch {
+            bold: Some(random(2) == 0),
+            ..StylePatch::default()
+        };
+        let options = SearchOptions::default();
+        let tokens = |editor: &Editor| -> Vec<usize> {
+            let paragraphs = editor.document().paragraphs().iter();
+            paragraphs
+                .enumerate()
+                .filter(|(_, paragraph)| paragraph.text().contains("tok"))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let _ = match random(14) {
+            0 | 1 => editor.replace_all("tok", "tok\nnew", options).map(drop),
+            2 | 3 => editor.replace_all("tok\nnew", "tok", options).map(drop),
+            4 => editor.replace_all("new", "", options).map(drop),
+            5 | 6 => {
+                let marked = tokens(editor);
+                editor.transaction(|editor| {
+                    for index in marked {
+                        let end = editor.document().paragraphs()[index].text().len();
+                        editor.set_selection(Selection::new(
+                            Position::new(index, 0),
+                            Position::new(index, end),
+                        ))?;
+                        editor.set_paragraph_kind(kind)?;
+                        editor.apply_style(bold)?;
+                    }
+                    Ok(())
+                })
+            }
+            7 => {
+                editor.select_all();
+                editor.set_paragraph_kind(kind)
+            }
+            8 => {
+                editor.select_all();
+                editor.apply_style(bold)
+            }
+            9 => {
+                editor.select_all();
+                match random(3) {
+                    0 => editor.indent_list(),
+                    1 => editor.outdent_list(),
+                    _ => editor.apply_numbered_list(0),
+                }
+            }
+            10 | 11 => {
+                editor.undo();
+                Ok(())
+            }
+            12 => {
+                editor.redo();
+                Ok(())
+            }
+            _ => {
+                apply(editor, random);
+                Ok(())
+            }
+        };
+        if tokens(editor).len() < 3 {
+            let paragraphs = editor.document().paragraphs().len();
+            let _ = editor.transaction(|editor| {
+                for index in (5..paragraphs).step_by(12) {
+                    editor.set_selection(Selection::caret(Position::new(index, 0)))?;
+                    editor.insert_text("tok ")?;
+                }
+                Ok(())
+            });
+        }
+        let missing = 40usize.saturating_sub(editor.document().paragraphs().len());
+        if missing > 0 {
+            let _ = editor.set_selection(Selection::caret(editor.document().end()));
+            let _ = editor.insert_text(&"\nfiller words".repeat(missing));
+        }
+    }
+
+    pub(crate) fn assert_sparse_coverage(minimum: [usize; 3]) {
+        let coverage = crate::document::take_sparse_coverage();
+        assert!(
+            coverage
+                .iter()
+                .zip(minimum)
+                .all(|(count, minimum)| *count >= minimum),
+            "sparse deltas recorded, replayed, and applied with a shifted tail: {coverage:?}"
+        );
     }
 }
 

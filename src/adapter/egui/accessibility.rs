@@ -2080,17 +2080,45 @@ mod tests {
 
     #[test]
     fn random_edit_frames_and_rewraps_match_fresh_snapshots() {
+        random_frames_match_fresh_snapshots(
+            random_edits::seeded(0x0dd5_eed5_ba5e_ba11),
+            12,
+            false,
+            random_edits::editor,
+            random_edits::apply,
+        );
+    }
+
+    #[test]
+    fn sparse_edit_frames_match_fresh_snapshots_and_layouts() {
+        crate::document::take_sparse_coverage();
+        random_frames_match_fresh_snapshots(
+            random_edits::seeded(0x5851_f42d_4c95_7f2d),
+            3,
+            true,
+            random_edits::sparse_editor,
+            random_edits::apply_sparse,
+        );
+        random_edits::assert_sparse_coverage([20, 10, 10]);
+    }
+
+    fn random_frames_match_fresh_snapshots<R: FnMut(usize) -> usize>(
+        mut random: R,
+        editors: usize,
+        fresh_layouts: bool,
+        editor: fn() -> Editor,
+        apply: fn(&mut Editor, &mut R),
+    ) {
         let context = egui::Context::default();
         let widget_id = Id::new("editor");
-        let mut random = random_edits::seeded(0x0dd5_eed5_ba5e_ba11);
-        for _ in 0..12 {
+        for _ in 0..editors {
             let mut cache = super::super::Cache::default();
-            let mut editor = random_edits::editor();
+            let mut editor = editor();
             let mut width = 400.0;
             let mut snapshot = None;
             for _ in 0..50 {
                 for _ in 0..random(3) {
-                    random_edits::apply(&mut editor, &mut random);
+                    apply(&mut editor, &mut random);
                 }
                 if random(4) == 0 {
                     width = [400.0, 160.0, 70.0][random(3)];
@@ -2099,7 +2127,36 @@ mod tests {
                 let _retained = (random(4) == 0).then(|| snapshot.clone());
                 update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
                 assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+                if fresh_layouts {
+                    assert_layouts_match_fresh(&context, &editor, &layouts, width);
+                }
             }
+        }
+    }
+
+    fn assert_layouts_match_fresh(
+        context: &egui::Context,
+        editor: &Editor,
+        layouts: &ParagraphLayouts,
+        width: f32,
+    ) {
+        let mut cache = super::super::Cache::default();
+        let fresh = cached_layout_frame(context, &mut cache, editor, width);
+        assert_eq!(layouts.len(), fresh.len());
+        assert_eq!(layouts.content_height(), fresh.content_height());
+        let marker =
+            |layout: &ParagraphLayout| layout.marker.as_ref().map(|marker| marker.job.text.clone());
+        for (index, (actual, expected)) in layouts.iter().zip(fresh.iter()).enumerate() {
+            assert_eq!(actual.galley.job, expected.galley.job);
+            assert_eq!(actual.rect, expected.rect);
+            assert_eq!(marker(&actual), marker(&expected));
+            assert_eq!(actual.marker_position, expected.marker_position);
+            assert_eq!(actual.quote_bar, expected.quote_bar);
+            assert_eq!(layouts.char_offset(index), fresh.char_offset(index));
+            assert_eq!(
+                layouts.contains_list(index..layouts.len()),
+                fresh.contains_list(index..fresh.len())
+            );
         }
     }
 
