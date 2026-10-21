@@ -60,8 +60,19 @@ impl Document {
                     )
                     .is_some_and(|found| found == *range);
         }
+        if let Some(lines) = paragraph_lines(&needle) {
+            return self
+                .find_lines_match(
+                    range.start.paragraph,
+                    &lines,
+                    options,
+                    Some(range.start),
+                    false,
+                )
+                .is_some_and(|found| found == *range);
+        }
         let mut found = false;
-        let _ = self.visit_normalized_matches(&needle, options, |candidate| {
+        let _ = self.visit_flattened_matches(&needle, options, |candidate| {
             if candidate.start < range.start {
                 return ControlFlow::Continue(());
             }
@@ -83,10 +94,11 @@ impl Document {
             return None;
         }
         let needle = search_needle(query, options);
-        if needle.contains('\n') {
+        let lines = paragraph_lines(&needle);
+        if lines.is_none() && needle.contains('\n') {
             let mut found = None;
             let mut wrapped = None;
-            let _ = self.visit_normalized_matches(&needle, options, |range| {
+            let _ = self.visit_flattened_matches(&needle, options, |range| {
                 if backward {
                     if range.end <= selection.start {
                         found = Some(range);
@@ -118,14 +130,12 @@ impl Document {
         let len = self.paragraphs().len();
         let start = boundary.paragraph;
         let search = |index: usize, bounded: bool| {
-            self.find_paragraph_match(
-                index,
-                &needle,
-                options,
-                bounded.then_some(boundary),
-                backward,
-                strategy,
-            )
+            let boundary = bounded.then_some(boundary);
+            if let Some(lines) = &lines {
+                self.find_lines_match(index, lines, options, boundary, backward)
+            } else {
+                self.find_paragraph_match(index, &needle, options, boundary, backward, strategy)
+            }
         };
         if backward {
             (0..=start)
@@ -264,6 +274,59 @@ impl Document {
         }
     }
 
+    fn find_lines_match(
+        &self,
+        index: usize,
+        lines: &[&str],
+        options: SearchOptions,
+        boundary: Option<Position>,
+        backward: bool,
+    ) -> Option<Range<Position>> {
+        let [first_line, middle_lines @ .., last_line] = lines else {
+            return None;
+        };
+        let breaks = middle_lines.len() + 1;
+        let first_index = if backward {
+            index.checked_sub(breaks)?
+        } else {
+            index
+        };
+        let [first, middle @ .., last] = self
+            .paragraphs()
+            .get(first_index..=first_index.checked_add(breaks)?)?
+        else {
+            return None;
+        };
+        let (first, last) = (first.text(), last.text());
+        let mut middle = middle
+            .iter()
+            .map(|paragraph| paragraph.text())
+            .zip(middle_lines);
+        let (start, end) = if options.case_sensitive {
+            (first.ends_with(first_line)
+                && last.starts_with(last_line)
+                && middle.all(|(text, line)| text == *line))
+            .then(|| (first.len() - first_line.len(), last_line.len()))?
+        } else {
+            let start = lowered_suffix_start(first, first_line)?;
+            let end = lowered_prefix_end(last, last_line)?;
+            middle
+                .all(|(text, line)| lowered_prefix_end(text, line) == Some(text.len()))
+                .then_some((start, end))?
+        };
+        let range = Position::new(first_index, start)..Position::new(first_index + breaks, end);
+        (boundary.is_none_or(|boundary| {
+            if backward {
+                range.end <= boundary
+            } else {
+                range.start >= boundary
+            }
+        }) && self.is_grapheme_range(&range)
+            && (!options.whole_word
+                || (is_word_boundary(first, start) && is_word_boundary(last, end))))
+        .then_some(range)
+    }
+
     fn visit_paragraph_matches(
         &self,
         index: usize,
@@ -304,6 +367,23 @@ impl Document {
             }
             return ControlFlow::Continue(());
         }
+        if let Some(lines) = paragraph_lines(needle) {
+            for index in 0..self.paragraphs().len() {
+                if let Some(range) = self.find_lines_match(index, &lines, options, None, false) {
+                    accept(range)?;
+                }
+            }
+            return ControlFlow::Continue(());
+        }
+        self.visit_flattened_matches(needle, options, accept)
+    }
+
+    fn visit_flattened_matches(
+        &self,
+        needle: &str,
+        options: SearchOptions,
+        mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         let source = if let [paragraph] = self.paragraphs() {
             Cow::Borrowed(paragraph.text())
         } else {
@@ -361,10 +441,8 @@ enum ParagraphSearch {
 }
 
 impl ParagraphSearch {
-    // Occurrences of a query without a nonempty border never overlap, so every
-    // occurrence belongs to the forward match stream and can be found locally.
     fn new(needle: &str, options: SearchOptions) -> Self {
-        if !has_unique_start(needle) && literal_prefixes(needle.as_bytes()).last() != Some(&0) {
+        if !never_overlaps(needle) {
             Self::Scan
         } else if options.case_sensitive && !options.whole_word {
             Self::Literal
@@ -372,6 +450,61 @@ impl ParagraphSearch {
             Self::Nearest
         }
     }
+}
+
+// Occurrences of a query without a nonempty border never overlap, so every
+// occurrence belongs to the forward match stream and can be found locally.
+fn never_overlaps(needle: &str) -> bool {
+    has_unique_start(needle) || literal_prefixes(needle.as_bytes()).last() == Some(&0)
+}
+
+// A line of such a query must end, fill, or start the paragraph it matches.
+fn paragraph_lines(needle: &str) -> Option<Vec<&str>> {
+    (needle.contains('\n') && never_overlaps(needle)).then(|| needle.split('\n').collect())
+}
+
+fn lowercase_char(character: char) -> impl DoubleEndedIterator<Item = char> {
+    character
+        .to_lowercase()
+        .map(|lowered| if lowered == 'ς' { 'σ' } else { lowered })
+}
+
+fn lowered_prefix_end(text: &str, prefix: &str) -> Option<usize> {
+    let mut remaining = prefix.chars();
+    let mut end = 0;
+    for character in text.chars() {
+        if remaining.as_str().is_empty() {
+            break;
+        }
+        for lowered in lowercase_char(character) {
+            if remaining.next() != Some(lowered) {
+                return None;
+            }
+        }
+        end += character.len_utf8();
+    }
+    remaining.as_str().is_empty().then_some(end)
+}
+
+fn lowered_suffix_start(text: &str, suffix: &str) -> Option<usize> {
+    let mut remaining = suffix.chars();
+    let mut start = text.len();
+    for character in text.chars().rev() {
+        if remaining.as_str().is_empty() {
+            break;
+        }
+        for lowered in lowercase_char(character).rev() {
+            if remaining.next_back() != Some(lowered) {
+                return None;
+            }
+        }
+        start -= character.len_utf8();
+    }
+    remaining.as_str().is_empty().then_some(start)
+}
+
+fn is_word_boundary(text: &str, byte: usize) -> bool {
+    WordBoundaries::new(text, word_restart(text, byte)).contains(byte)
 }
 
 // Word segmentation restarted after a space that precedes an ASCII character
@@ -663,4 +796,209 @@ fn visit_overlapping_literals(
         }
     }
     ControlFlow::Continue(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Editor;
+
+    fn assert_matches_flattened_stream(
+        document: &Document,
+        query: &str,
+        options: SearchOptions,
+    ) -> Option<usize> {
+        let needle = search_needle(query, options);
+        paragraph_lines(&needle)?;
+        let mut matches = Vec::new();
+        let _ = document.visit_flattened_matches(&needle, options, |range| {
+            matches.push(range);
+            ControlFlow::Continue(())
+        });
+        let context = format!("{query:?} {options:?} {:?}", document.plain_text());
+        assert_eq!(document.find(query, options), matches, "{context}");
+        let positions: Vec<_> = document
+            .paragraphs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, paragraph)| {
+                (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                    Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+                })
+            })
+            .collect();
+        let mut ranges: Vec<_> = positions
+            .iter()
+            .map(|&position| position..position)
+            .collect();
+        for (index, &position) in positions.iter().enumerate() {
+            let other = positions[(index * 7 + 3) % positions.len()];
+            ranges.push(position.min(other)..position.max(other));
+        }
+        ranges.extend(matches.iter().cloned());
+        for range in ranges {
+            assert_eq!(
+                document.is_match(query, options, &range),
+                matches.iter().find(|item| item.start >= range.start) == Some(&range),
+                "{range:?} {context}"
+            );
+            for wrap in [false, true] {
+                for backward in [false, true] {
+                    let expected = if backward {
+                        matches
+                            .iter()
+                            .rev()
+                            .find(|item| item.end <= range.start)
+                            .or_else(|| wrap.then(|| matches.last()).flatten())
+                    } else {
+                        matches
+                            .iter()
+                            .find(|item| item.start >= range.end)
+                            .or_else(|| wrap.then(|| matches.first()).flatten())
+                    };
+                    assert_eq!(
+                        document.find_relative(query, options, range.clone(), wrap, backward),
+                        expected.cloned(),
+                        "{range:?} wrap={wrap} backward={backward} {context}"
+                    );
+                }
+            }
+        }
+        Some(matches.len())
+    }
+
+    #[test]
+    fn paragraph_wise_cross_paragraph_queries_agree_with_the_flattened_match_stream() {
+        let tokens = [
+            "a",
+            "A",
+            "aa",
+            " ",
+            "-",
+            "'",
+            ".",
+            "\n",
+            "\n\n",
+            "İ",
+            "i\u{307}",
+            "\u{307}",
+            "\u{212A}",
+            "K",
+            "k",
+            "Σ",
+            "σ",
+            "ς",
+            "ΟΣ",
+            "e\u{301}",
+            "\u{301}",
+            "é",
+            "🇨🇺",
+            "🇺",
+            "👩‍💻",
+            "\u{200d}",
+            "\u{2028}",
+            "word",
+            "Word",
+            "你好",
+            "\u{0600}",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let (mut checked, mut matched) = (0, 0);
+        for _ in 0..40 {
+            let mut source = String::new();
+            for _ in 0..next() % 40 {
+                source.push_str(tokens[next() % tokens.len()]);
+            }
+            let mut editor = Editor::from_text(&source);
+            for round in 0..4 {
+                let positions: Vec<_> = editor
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, paragraph)| {
+                        (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                            Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+                        })
+                    })
+                    .collect();
+                match round {
+                    0 => {}
+                    3 => {
+                        editor.undo();
+                    }
+                    _ => {
+                        let start = positions[next() % positions.len()];
+                        let end = positions[next() % positions.len()];
+                        editor
+                            .replace_range(
+                                start.min(end)..start.max(end),
+                                tokens[next() % tokens.len()],
+                            )
+                            .unwrap();
+                    }
+                }
+                let document = editor.document();
+                let text = document
+                    .paragraphs()
+                    .iter()
+                    .map(|paragraph| paragraph.text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let chars: Vec<_> = text
+                    .char_indices()
+                    .map(|(byte, _)| byte)
+                    .chain([text.len()])
+                    .collect();
+                let mut queries: Vec<String> = [
+                    "\n",
+                    "a\n",
+                    "\na",
+                    "\n\na",
+                    "\r\n",
+                    "a\u{2029}",
+                    "ς\n",
+                    "Σ\n\nk",
+                ]
+                .map(String::from)
+                .into();
+                for _ in 0..8 {
+                    let start = chars[next() % chars.len()];
+                    let end = chars[next() % chars.len()];
+                    let slice = &text[start.min(end)..start.max(end)];
+                    queries.extend([slice.to_string(), slice.to_uppercase()]);
+                }
+                for _ in 0..4 {
+                    queries.push(
+                        (0..=next() % 4)
+                            .map(|_| tokens[next() % tokens.len()])
+                            .collect(),
+                    );
+                }
+                for query in &queries {
+                    for case_sensitive in [true, false] {
+                        for whole_word in [false, true] {
+                            let options = SearchOptions {
+                                case_sensitive,
+                                whole_word,
+                            };
+                            if let Some(count) =
+                                assert_matches_flattened_stream(document, query, options)
+                            {
+                                checked += 1;
+                                matched += usize::from(count > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000 && matched > 1_000, "{checked} {matched}");
+    }
 }

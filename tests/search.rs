@@ -1018,6 +1018,110 @@ fn navigation_after_edits_between_presses_matches_document_search() {
 }
 
 #[test]
+fn cross_paragraph_navigation_after_edits_between_presses_matches_document_search() {
+    let text = "Match café 👩‍💻\nΣΟΣ matches \u{212A}elvin.\naab ΣΟΣ\n".repeat(12);
+    let mut total = 0;
+    for case_sensitive in [false, true] {
+        for whole_word in [false, true] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            for query in [
+                "café 👩‍💻\r\nΣΟΣ",
+                "\u{212A}elvin.\naab",
+                "👩‍💻\nΣΟΣ matches \u{212A}elvin.\naab",
+                "οσ\nmatch",
+                "\n",
+                "\nΣΟΣ matches \u{212A}elvin.\n",
+            ] {
+                let mut editor = Editor::from_text(&text);
+                let mut presses = 0;
+                loop {
+                    let selection = editor.selection();
+                    let range = selection.range();
+                    let matches = editor.document().find(query, options);
+                    let context = format!("query={query:?}, options={options:?}, {selection:?}");
+                    let mut copy = editor.clone();
+                    assert_eq!(
+                        copy.replace_selected_match(query, "x", options).unwrap(),
+                        matches.contains(&range),
+                        "{context}"
+                    );
+                    for wrap in [false, true] {
+                        let previous = matches
+                            .iter()
+                            .rev()
+                            .find(|item| item.end <= range.start)
+                            .or_else(|| wrap.then(|| matches.last()).flatten());
+                        let mut copy = editor.clone();
+                        assert_eq!(
+                            copy.find_previous(query, options, wrap).unwrap(),
+                            previous.is_some()
+                        );
+                        assert_eq!(
+                            copy.selection(),
+                            previous.map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "wrap={wrap}, {context}"
+                        );
+                    }
+                    let Some(next) = matches.iter().find(|item| item.start >= range.end) else {
+                        assert!(!editor.find_next(query, options, false).unwrap());
+                        assert_eq!(editor.selection(), selection);
+                        assert_eq!(
+                            editor.find_next(query, options, true).unwrap(),
+                            !matches.is_empty()
+                        );
+                        assert_eq!(
+                            editor.selection(),
+                            matches
+                                .first()
+                                .map_or(selection, |item| Selection::new(item.start, item.end)),
+                            "{context}"
+                        );
+                        break;
+                    };
+                    assert!(editor.find_next(query, options, false).unwrap());
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(next.start, next.end),
+                        "{context}"
+                    );
+                    let revision = editor.document().revision();
+                    match presses % 4 {
+                        0 => assert!(editor.replace_selected_match(query, "x", options).unwrap()),
+                        1 => editor.replace_range(next.end..next.end, "s").unwrap(),
+                        2 => {
+                            let start = Position::new(next.start.paragraph, 0);
+                            let inserted = "MATCH ";
+                            editor
+                                .replace_range(start..start, &format!("aab ΣΟΣ\n{inserted}"))
+                                .unwrap();
+                            let shift = |position: Position| {
+                                let byte = if position.paragraph == start.paragraph {
+                                    position.byte + inserted.len()
+                                } else {
+                                    position.byte
+                                };
+                                Position::new(position.paragraph + 1, byte)
+                            };
+                            editor
+                                .set_selection(Selection::new(shift(next.start), shift(next.end)))
+                                .unwrap();
+                        }
+                        _ => assert!(editor.undo()),
+                    }
+                    assert!(editor.document().revision() > revision);
+                    presses += 1;
+                }
+                total += presses;
+            }
+        }
+    }
+    assert!(total > 300, "{total}");
+}
+
+#[test]
 fn case_insensitive_search_finds_case_sensitive_sigma_matches_in_any_context() {
     let insensitive = SearchOptions {
         case_sensitive: false,
