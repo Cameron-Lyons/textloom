@@ -204,7 +204,6 @@ impl Document {
         self.revision
     }
 
-    #[cfg(any(feature = "egui", feature = "accesskit"))]
     pub(crate) fn content_identity(&self) -> Arc<()> {
         Arc::clone(&self.identity)
     }

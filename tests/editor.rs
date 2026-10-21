@@ -440,6 +440,73 @@ fn selection_style_all_mixed_attributes_remain_mixed_after_later_matching_runs()
 }
 
 #[test]
+fn repeated_selection_style_queries_follow_edits_history_rollbacks_and_clones() {
+    fn uncached(editor: &Editor) -> SelectionStyle {
+        let mut fresh = Editor::new(editor.document().clone());
+        fresh.set_selection(editor.selection()).unwrap();
+        fresh.selection_style()
+    }
+
+    let mut editor = Editor::from_text("plain text\n\nsecond");
+    editor.select_all();
+    let all = editor.selection();
+    assert_eq!(editor.selection_style().bold, Some(false));
+    editor.toggle_style(InlineAttribute::Bold).unwrap();
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(true));
+    assert_eq!(editor.selection_style(), uncached(&editor));
+
+    let mut clone = editor.clone();
+    assert_eq!(clone.selection_style().bold, Some(true));
+    assert!(editor.undo());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(false));
+    assert_eq!(editor.selection_style(), uncached(&editor));
+    assert_eq!(clone.selection_style().bold, Some(true));
+    assert!(editor.redo());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(true));
+
+    let result: Result<(), Error> = editor.transaction(|editor| {
+        editor.toggle_style(InlineAttribute::Bold)?;
+        assert_eq!(editor.selection_style().bold, Some(false));
+        editor.set_selection(Selection::caret(Position::new(9, 0)))
+    });
+    assert!(result.is_err());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(true));
+    assert_eq!(editor.selection_style(), uncached(&editor));
+
+    clone
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+        .unwrap();
+    clone.toggle_style(InlineAttribute::Bold).unwrap();
+    clone.select_all();
+    assert_eq!(clone.selection_style().bold, None);
+    assert_eq!(clone.selection_style(), uncached(&clone));
+    assert_eq!(editor.selection_style().bold, Some(true));
+
+    editor
+        .set_selection(Selection::new(Position::new(0, 10), Position::new(2, 0)))
+        .unwrap();
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(editor.typing_style())
+    );
+    editor
+        .apply_style(StylePatch {
+            underline: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(editor.selection_style().underline, Some(true));
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(editor.typing_style())
+    );
+}
+
+#[test]
 fn clear_formatting_resets_every_attribute_and_restores_rich_state_on_undo() {
     let mut editor = Editor::from_text("left\ncafe\u{301}\nkeep");
     editor.select_all();

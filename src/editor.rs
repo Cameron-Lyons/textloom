@@ -1,7 +1,7 @@
 use std::{
     fmt,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 mod composition;
@@ -25,6 +25,7 @@ pub struct Editor {
     preferred_column: Option<usize>,
     composition: Option<Arc<Composition>>,
     saved: SavePoint,
+    style_cache: Mutex<Option<StyleCache>>,
 }
 
 impl Default for Editor {
@@ -45,6 +46,12 @@ impl Clone for Editor {
             preferred_column: self.preferred_column,
             composition: self.composition.clone(),
             saved: self.saved.clone(),
+            style_cache: Mutex::new(
+                self.style_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
         }
     }
 }
@@ -92,6 +99,13 @@ impl SavePoint {
     }
 }
 
+#[derive(Clone)]
+struct StyleCache {
+    identity: Arc<()>,
+    selection: Selection,
+    style: Option<SelectionStyle>,
+}
+
 impl Editor {
     pub fn new(document: Document) -> Self {
         Self {
@@ -102,6 +116,7 @@ impl Editor {
             history: History::default(),
             preferred_column: None,
             composition: None,
+            style_cache: Mutex::new(None),
         }
     }
 
@@ -122,6 +137,31 @@ impl Editor {
         if self.selection.is_caret() {
             return self.typing_style.into();
         }
+        let identity = self.document.content_identity();
+        let mut cache = self
+            .style_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let style = match cache.as_ref() {
+            Some(cached)
+                if Arc::ptr_eq(&cached.identity, &identity)
+                    && cached.selection == self.selection =>
+            {
+                cached.style
+            }
+            _ => {
+                let style = self.scan_selection_style();
+                *cache = Some(StyleCache {
+                    identity,
+                    selection: self.selection,
+                    style,
+                });
+                style
+            }
+        };
+        style.unwrap_or_else(|| self.typing_style.into())
+    }
+    fn scan_selection_style(&self) -> Option<SelectionStyle> {
         let range = self.selection.range();
         let mut result: Option<SelectionStyle> = None;
         for index in range.start.paragraph..=range.end.paragraph {
@@ -148,14 +188,14 @@ impl Editor {
                 if let Some(style) = &mut result {
                     style.include(span.style);
                     if style.is_fully_mixed() {
-                        return *style;
+                        return result;
                     }
                 } else {
                     result = Some(span.style.into());
                 }
             }
         }
-        result.unwrap_or_else(|| self.typing_style.into())
+        result
     }
     #[must_use]
     pub fn selected_link(&self) -> Option<Link> {
