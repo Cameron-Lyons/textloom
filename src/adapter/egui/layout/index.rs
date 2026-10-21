@@ -281,6 +281,7 @@ impl ParagraphLayouts {
         LayoutIdentity(self.version.as_ref().map_or_else(Weak::new, Arc::downgrade))
     }
 
+    #[cfg(test)]
     pub(crate) fn environment_identity(&self) -> Arc<()> {
         self.version
             .as_ref()
