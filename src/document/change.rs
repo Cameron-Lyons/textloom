@@ -1,6 +1,6 @@
 use std::{
     cell::OnceCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::{Arc, OnceLock},
 };
@@ -27,36 +27,56 @@ impl Document {
             return;
         }
         let (old_len, new_len) = delta.extent();
+        self.apply(delta, forward);
         if forward {
-            for splice in delta.splices() {
-                self.replay_splice(splice, true);
-            }
             self.record_change(delta.start, old_len, new_len);
         } else {
-            for splice in delta.splices().rev() {
-                self.replay_splice(splice, false);
-            }
             self.record_change(delta.start, new_len, old_len);
         }
     }
 
-    fn replay_splice(&mut self, splice: &Delta, forward: bool) {
-        let (remove, insert) = if forward {
-            (&splice.before, &splice.after)
-        } else {
-            (&splice.after, &splice.before)
-        };
-        debug_assert_eq!(
+    fn apply(&mut self, delta: &Delta, forward: bool) {
+        if delta.rest.is_empty()
+            || delta
+                .splices()
+                .all(|splice| splice.before.len() == splice.after.len())
+        {
+            for splice in delta.splices() {
+                let (remove, insert) = splice.sides(forward);
+                debug_assert_eq!(
+                    self.paragraphs
+                        .get(splice.start..splice.start + remove.len()),
+                    Some(remove),
+                    "history must be replayed against its corresponding document state"
+                );
+                self.paragraphs.splice(
+                    splice.start..splice.start + remove.len(),
+                    insert.iter().cloned(),
+                );
+                self.retain_numbers(remove, insert);
+            }
+            return;
+        }
+        // Splicing each run in place would shift the tail once per run.
+        let mut tail = self.paragraphs.split_off(delta.start).into_iter();
+        let mut end = delta.start;
+        for splice in delta.splices() {
+            let (remove, insert) = splice.sides(forward);
             self.paragraphs
-                .get(splice.start..splice.start + remove.len()),
-            Some(remove.as_slice()),
-            "history must be replayed against its corresponding document state"
-        );
-        self.paragraphs.splice(
-            splice.start..splice.start + remove.len(),
-            insert.iter().cloned(),
-        );
-        self.retain_numbers(remove, insert);
+                .extend(tail.by_ref().take(splice.start - end));
+            for expected in remove {
+                let removed = tail.next();
+                debug_assert_eq!(
+                    removed.as_ref(),
+                    Some(expected),
+                    "history must be replayed against its corresponding document state"
+                );
+            }
+            self.paragraphs.extend(insert.iter().cloned());
+            self.retain_numbers(remove, insert);
+            end = splice.start + splice.after.len();
+        }
+        self.paragraphs.extend(tail);
     }
 
     pub(super) fn change(&mut self, range: Range<usize>, mut after: Vec<Arc<Paragraph>>) -> Delta {
@@ -80,16 +100,12 @@ impl Document {
             after.pop();
         }
         let new_len = after.len();
-        let runs = if end - start == new_len {
-            self.changed_runs(start, &after)
-        } else {
-            Vec::new()
-        };
+        let runs = changed_runs(&self.paragraphs[start..end], &after);
         let delta = if runs.len() > 1 {
-            let mut splices = runs.into_iter().map(|run| Delta {
-                start: start + run.start,
-                before: self.paragraphs[start + run.start..start + run.end].to_vec(),
-                after: after[run].to_vec(),
+            let mut splices = runs.into_iter().map(|(old, new)| Delta {
+                start: start + new.start,
+                before: self.paragraphs[start + old.start..start + old.end].to_vec(),
+                after: after[new].to_vec(),
                 rest: Vec::new(),
             });
             let mut delta = splices.next().expect("several runs");
@@ -104,29 +120,10 @@ impl Document {
             }
         };
         if !delta.is_empty() {
-            for splice in delta.splices() {
-                self.replay_splice(splice, true);
-            }
+            self.apply(&delta, true);
             self.record_change(start, end - start, new_len);
         }
         delta
-    }
-
-    fn changed_runs(&self, start: usize, after: &[Arc<Paragraph>]) -> Vec<Range<usize>> {
-        let mut runs: Vec<Range<usize>> = Vec::new();
-        if after.len() <= SHARED_GAP + 2 {
-            return runs;
-        }
-        for (index, (old, new)) in self.paragraphs[start..].iter().zip(after).enumerate() {
-            if Arc::ptr_eq(old, new) {
-                continue;
-            }
-            match runs.last_mut() {
-                Some(run) if index - run.end <= SHARED_GAP => run.end = index + 1,
-                _ => runs.push(index..index + 1),
-            }
-        }
-        runs
     }
 
     fn retain_numbers(&mut self, before: &[Arc<Paragraph>], after: &[Arc<Paragraph>]) {
@@ -176,6 +173,73 @@ impl Document {
 
 const SHARED_GAP: usize = 8;
 
+// Pairs each changed run of `before` with the run of `after` replacing it. Paragraphs kept by
+// pointer separate the runs once more than SHARED_GAP of them sit together. A kept paragraph
+// stays aligned unless an earlier run changed the paragraph count; then it is found by
+// pointer. A kept paragraph is also owned by `before`, so one with a single owner is new.
+fn changed_runs(
+    before: &[Arc<Paragraph>],
+    after: &[Arc<Paragraph>],
+) -> Vec<(Range<usize>, Range<usize>)> {
+    let mut runs: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+    if before.len().min(after.len()) <= SHARED_GAP {
+        return runs;
+    }
+    let mut positions: Option<HashMap<usize, usize>> = None;
+    let (mut old, mut new) = (0, 0);
+    while old < before.len() || new < after.len() {
+        if before
+            .get(old)
+            .zip(after.get(new))
+            .is_some_and(|(before, after)| Arc::ptr_eq(before, after))
+        {
+            old += 1;
+            new += 1;
+            continue;
+        }
+        let (next_old, next_new) = (new..after.len())
+            .find_map(|index| {
+                let aligned = old + index - new;
+                let paragraph = &after[index];
+                if index > new
+                    && before
+                        .get(aligned)
+                        .is_some_and(|kept| Arc::ptr_eq(kept, paragraph))
+                {
+                    return Some((aligned, index));
+                }
+                if Arc::strong_count(paragraph) < 2 {
+                    return None;
+                }
+                positions
+                    .get_or_insert_with(|| positions_by_pointer(before))
+                    .get(&Arc::as_ptr(paragraph).addr())
+                    .filter(|kept| **kept >= old)
+                    .map(|kept| (*kept, index))
+            })
+            .unwrap_or((before.len(), after.len()));
+        match runs.last_mut() {
+            Some((before_run, after_run)) if old - before_run.end <= SHARED_GAP => {
+                before_run.end = next_old;
+                after_run.end = next_new;
+            }
+            _ => runs.push((old..next_old, new..next_new)),
+        }
+        (old, new) = (next_old, next_new);
+    }
+    runs
+}
+
+fn positions_by_pointer(paragraphs: &[Arc<Paragraph>]) -> HashMap<usize, usize> {
+    let mut positions = HashMap::with_capacity(paragraphs.len());
+    for (position, paragraph) in paragraphs.iter().enumerate() {
+        positions
+            .entry(Arc::as_ptr(paragraph).addr())
+            .or_insert(position);
+    }
+    positions
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Delta {
     pub start: usize,
@@ -208,8 +272,16 @@ impl Delta {
             .fold(0, usize::saturating_add)
     }
 
-    fn splices(&self) -> impl DoubleEndedIterator<Item = &Delta> {
+    fn splices(&self) -> impl Iterator<Item = &Delta> {
         std::iter::once(self).chain(&self.rest)
+    }
+
+    fn sides(&self, forward: bool) -> (&[Arc<Paragraph>], &[Arc<Paragraph>]) {
+        if forward {
+            (&self.before, &self.after)
+        } else {
+            (&self.after, &self.before)
+        }
     }
 
     fn extent(&self) -> (usize, usize) {

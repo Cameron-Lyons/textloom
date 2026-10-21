@@ -1105,18 +1105,19 @@ fn history_limits_discard_farthest_redo_and_preserve_the_next_steps() {
     assert_eq!(editor.history_bytes(), 0);
 }
 
+fn identical(editor: &Editor, document: &Document) -> bool {
+    let paragraphs = editor.document().paragraphs();
+    paragraphs.len() == document.paragraphs().len()
+        && paragraphs
+            .iter()
+            .zip(document.paragraphs())
+            .all(|(paragraph, expected)| Arc::ptr_eq(paragraph, expected))
+}
+
 #[test]
 fn sparse_document_wide_edits_stay_undoable_and_keep_earlier_history() {
     use textloom::SearchOptions;
 
-    let identical = |editor: &Editor, document: &Document| {
-        let paragraphs = editor.document().paragraphs();
-        paragraphs.len() == document.paragraphs().len()
-            && paragraphs
-                .iter()
-                .zip(document.paragraphs())
-                .all(|(paragraph, expected)| Arc::ptr_eq(paragraph, expected))
-    };
     let mut editor = Editor::from_text(&format!(
         "match\n{}match",
         "untouched café\n".repeat(20_000)
@@ -1171,6 +1172,53 @@ fn sparse_document_wide_edits_stay_undoable_and_keep_earlier_history() {
     assert_eq!(result, Err(Error::InvalidRange));
     assert!(identical(&editor, &flattened));
     assert_eq!(editor.undo_len(), 5);
+}
+
+#[test]
+fn sparse_replacements_that_add_or_join_paragraphs_keep_earlier_history() {
+    use textloom::SearchOptions;
+
+    let mut editor = Editor::from_text(&format!(
+        "match\n{}match",
+        "untouched café\n".repeat(20_000)
+    ));
+    editor.set_history_limits(HistoryLimits {
+        max_entries: 256,
+        max_bytes: 64 * 1024,
+    });
+    let original = editor.document().clone();
+    caret(&mut editor, 1, 0);
+    editor.insert_text("x").unwrap();
+    let typed = editor.document().clone();
+    let bytes = editor.history_bytes();
+    assert_eq!(
+        editor
+            .replace_all("match", "re\nplacement", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(editor.document().paragraphs().len(), 20_004);
+    assert_eq!(editor.undo_len(), 2);
+    assert!(editor.history_bytes() < bytes + 1024);
+    let split = editor.document().clone();
+    assert_eq!(
+        editor
+            .replace_all("re\nplacement", "match", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(editor.document().plain_text(), typed.plain_text());
+    assert_eq!(editor.undo_len(), 3);
+    assert!(editor.history_bytes() < bytes + 2048);
+    let joined = editor.document().clone();
+    assert!(editor.undo());
+    assert!(identical(&editor, &split));
+    assert!(editor.undo());
+    assert!(identical(&editor, &typed));
+    assert!(editor.undo());
+    assert!(identical(&editor, &original));
+    while editor.redo() {}
+    assert!(identical(&editor, &joined));
 }
 
 #[test]

@@ -1596,6 +1596,141 @@ fn sparse_changes_retain_only_their_changed_runs() {
 }
 
 #[test]
+fn sparse_changes_that_shift_paragraphs_retain_only_their_changed_runs() {
+    let identical = |expected: &[Arc<Paragraph>], document: &Document| {
+        expected.len() == document.paragraphs.len()
+            && expected
+                .iter()
+                .zip(&document.paragraphs)
+                .all(|(expected, paragraph)| Arc::ptr_eq(expected, paragraph))
+    };
+    let mut retained = Vec::new();
+    for (first_gap, second_gap) in [(9, 15), (90, 150)] {
+        let split = 2;
+        let joined = split + 1 + first_gap;
+        let expanded = joined + 3 + second_gap;
+        let last = expanded + 1 + 8;
+        let source: Vec<String> = (0..=last)
+            .map(|index| format!("plain {index:03}"))
+            .collect();
+        let mut document = Document::from_text(&source.join("\n"));
+        let original = document.paragraphs.clone();
+        let matches = [
+            Position::new(split, 0)..Position::new(split, 5),
+            Position::new(joined, 6)..Position::new(joined + 2, 5),
+            Position::new(expanded, 0)..Position::new(expanded, 5),
+            Position::new(last, 0)..Position::new(last, 5),
+        ];
+        let (delta, _) = document.replace_matches(&matches, "x\ny");
+        let splices: Vec<_> = std::iter::once(&delta)
+            .chain(&delta.rest)
+            .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
+            .collect();
+        assert_eq!(
+            splices,
+            [(split, 1, 2), (joined + 1, 3, 2), (expanded, 10, 12)]
+        );
+        let mut expected = source.clone();
+        expected[last].replace_range(..5, "x\ny");
+        expected[expanded].replace_range(..5, "x\ny");
+        expected[joined + 2].replace_range(..5, "y");
+        expected.drain(joined + 1..joined + 2);
+        expected[joined].replace_range(6.., "x");
+        expected[split].replace_range(..5, "x\ny");
+        assert_eq!(document.plain_text(), expected.join("\n"));
+        let kept = document
+            .paragraphs
+            .iter()
+            .filter(|paragraph| original.iter().any(|old| Arc::ptr_eq(old, paragraph)))
+            .count();
+        assert_eq!(kept, original.len() - 6);
+        retained.push(delta.retained_bytes());
+        let replaced = document.paragraphs.clone();
+        let revision = document.revision();
+        document.replay(&delta, false);
+        assert_eq!(document.revision(), revision + 1);
+        assert!(identical(&original, &document));
+        document.replay(&delta, true);
+        assert!(identical(&replaced, &document));
+    }
+    assert_eq!(retained[0], retained[1]);
+}
+
+#[test]
+fn shifting_sparse_changes_replay_exactly_with_repeated_paragraphs() {
+    let mut seed = 0x5a1f_7ed0_c0de_d1ffu64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let repeated = Arc::new(Paragraph::plain("same"));
+    let identical = |expected: &[Arc<Paragraph>], document: &Document| {
+        expected.len() == document.paragraphs.len()
+            && expected
+                .iter()
+                .zip(&document.paragraphs)
+                .all(|(expected, paragraph)| Arc::ptr_eq(expected, paragraph))
+    };
+    let mut split = 0;
+    for _ in 0..300 {
+        let count = 12 + next(48);
+        let mut document = Document::from_paragraphs((0..count).map(|index| {
+            if next(4) == 0 {
+                Arc::clone(&repeated)
+            } else {
+                Arc::new(Paragraph::plain(&format!("p{index}")))
+            }
+        }));
+        let mut matches = Vec::new();
+        let mut paragraph = next(4);
+        while paragraph < count {
+            let end = (paragraph + next(3)).min(count - 1);
+            matches.push(Position::new(paragraph, 0)..Position::new(end, 1));
+            paragraph = end + 1 + next(16);
+        }
+        if matches.is_empty() {
+            continue;
+        }
+        let replacement = ["", "r", "r\ns", "r\n\ns"][next(4)];
+        let offset = |position: Position| {
+            document.paragraphs[..position.paragraph]
+                .iter()
+                .map(|paragraph| paragraph.text.len() + 1)
+                .sum::<usize>()
+                + position.byte
+        };
+        let mut expected = document.plain_text();
+        for range in matches.iter().rev() {
+            expected.replace_range(offset(range.start)..offset(range.end), replacement);
+        }
+        let original = document.paragraphs.clone();
+        let (delta, _) = document.replace_matches(&matches, replacement);
+        assert_eq!(document.plain_text(), expected);
+        if delta
+            .rest
+            .iter()
+            .any(|splice| splice.before.len() != splice.after.len())
+        {
+            split += 1;
+        }
+        let replaced = document.paragraphs.clone();
+        document.replay(&delta, false);
+        assert!(
+            identical(&original, &document),
+            "{matches:?} {replacement:?}"
+        );
+        document.replay(&delta, true);
+        assert!(
+            identical(&replaced, &document),
+            "{matches:?} {replacement:?}"
+        );
+    }
+    assert!(split > 50, "{split}");
+}
+
+#[test]
 fn sparse_kind_changes_renumber_lists_through_history() {
     let ordered = ParagraphKind::Ordered {
         indent: 0,
