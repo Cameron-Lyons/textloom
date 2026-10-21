@@ -141,11 +141,7 @@ impl Document {
                 }
                 levels.push(paragraph.kind);
                 if slice == (0..paragraph.text.len()) {
-                    if kind == paragraph.kind {
-                        Arc::clone(paragraph)
-                    } else {
-                        Arc::new(paragraph.with_kind(kind))
-                    }
+                    paragraph.with_kind(kind)
                 } else {
                     let mut text = String::with_capacity(slice.len());
                     let mut spans = Vec::new();
@@ -243,6 +239,11 @@ impl Document {
             };
             (index, paragraph, from..to)
         })
+    }
+
+    pub(crate) fn spans_in(&self, range: &Range<Position>) -> impl Iterator<Item = &Span> {
+        self.slices(range)
+            .flat_map(|(_, paragraph, slice)| &paragraph.spans[paragraph.overlapping(slice)])
     }
 
     pub fn validate_position(&self, position: Position) -> Result<(), Error> {
@@ -384,19 +385,11 @@ impl Document {
                 continuation_kind(base, index)
             };
             if chunk.is_empty() && !is_last && is_first && range.start.byte == first.text.len() {
-                after.push(if kind == first.kind {
-                    Arc::clone(first)
-                } else {
-                    Arc::new(first.with_kind(kind))
-                });
+                after.push(first.with_kind(kind));
                 continue;
             }
             if chunk.is_empty() && is_last && !is_first && range.end.byte == 0 {
-                after.push(if kind == last.kind {
-                    Arc::clone(last)
-                } else {
-                    Arc::new(last.with_kind(kind))
-                });
+                after.push(last.with_kind(kind));
                 continue;
             }
             let capacity = chunk
@@ -543,11 +536,7 @@ impl Document {
                     }
                     kind => kind,
                 };
-                if kind == paragraph.kind {
-                    Arc::clone(paragraph)
-                } else {
-                    Arc::new(paragraph.with_kind(kind))
-                }
+                paragraph.with_kind(kind)
             })
             .collect();
         self.change(range, after)
@@ -694,14 +683,7 @@ impl Document {
         let after = self.paragraphs[range.clone()]
             .iter()
             .enumerate()
-            .map(|(offset, paragraph)| {
-                let kind = numbered_kind(kind, offset);
-                if paragraph.kind == kind {
-                    Arc::clone(paragraph)
-                } else {
-                    Arc::new(paragraph.with_kind(kind))
-                }
-            })
+            .map(|(offset, paragraph)| paragraph.with_kind(numbered_kind(kind, offset)))
             .collect();
         Ok(self.change(range, after))
     }
@@ -736,12 +718,7 @@ impl Document {
                     _ if extends => None,
                     _ => Some(1),
                 };
-                let kind = ParagraphKind::Ordered { indent, start };
-                if paragraph.kind == kind {
-                    Arc::clone(paragraph)
-                } else {
-                    Arc::new(paragraph.with_kind(kind))
-                }
+                paragraph.with_kind(ParagraphKind::Ordered { indent, start })
             })
             .collect();
         self.change(range, after)
@@ -805,11 +782,7 @@ impl ReplacementBuilder {
 
     fn finish_paragraph(&mut self) {
         if let Some(paragraph) = self.candidate.take() {
-            self.paragraphs.push(if paragraph.kind == self.kind {
-                paragraph
-            } else {
-                Arc::new(paragraph.with_kind(self.kind))
-            });
+            self.paragraphs.push(paragraph.with_kind(self.kind));
         } else {
             self.paragraphs.push(Arc::new(Paragraph::styled(
                 std::mem::take(&mut self.text),

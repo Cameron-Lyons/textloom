@@ -162,37 +162,15 @@ impl Editor {
         style.unwrap_or_else(|| self.typing_style.into())
     }
     fn scan_selection_style(&self) -> Option<SelectionStyle> {
-        let range = self.selection.range();
         let mut result: Option<SelectionStyle> = None;
-        for index in range.start.paragraph..=range.end.paragraph {
-            let paragraph = &self.document.paragraphs()[index];
-            let start = if index == range.start.paragraph {
-                range.start.byte
-            } else {
-                0
-            };
-            let end = if index == range.end.paragraph {
-                range.end.byte
-            } else {
-                paragraph.text().len()
-            };
-            if start == end {
-                continue;
-            }
-            let spans = paragraph.spans();
-            let first = spans.partition_point(|span| span.range.end <= start);
-            for span in &spans[first..] {
-                if span.range.start >= end {
-                    break;
+        for span in self.document.spans_in(&self.selection.range()) {
+            if let Some(style) = &mut result {
+                style.include(span.style);
+                if style.is_fully_mixed() {
+                    return result;
                 }
-                if let Some(style) = &mut result {
-                    style.include(span.style);
-                    if style.is_fully_mixed() {
-                        return result;
-                    }
-                } else {
-                    result = Some(span.style.into());
-                }
+            } else {
+                result = Some(span.style.into());
             }
         }
         result
@@ -202,32 +180,13 @@ impl Editor {
         if self.selection.is_caret() {
             return self.document.caret_link(self.selection.focus).cloned();
         }
-        let range = self.selection.range();
         let mut shared: Option<&Link> = None;
-        for index in range.start.paragraph..=range.end.paragraph {
-            let paragraph = &self.document.paragraphs()[index];
-            let start = if index == range.start.paragraph {
-                range.start.byte
-            } else {
-                0
-            };
-            let end = if index == range.end.paragraph {
-                range.end.byte
-            } else {
-                paragraph.text().len()
-            };
-            let spans = paragraph.spans();
-            let first = spans.partition_point(|span| span.range.end <= start);
-            for span in spans[first..]
-                .iter()
-                .take_while(|span| span.range.start < end)
-            {
-                let link = span.link.as_ref()?;
-                if shared.is_some_and(|shared| shared != link) {
-                    return None;
-                }
-                shared = Some(link);
+        for span in self.document.spans_in(&self.selection.range()) {
+            let link = span.link.as_ref()?;
+            if shared.is_some_and(|shared| shared != link) {
+                return None;
             }
+            shared = Some(link);
         }
         shared.cloned()
     }
@@ -802,25 +761,10 @@ impl Editor {
     }
 
     fn selection_typing_style(&self, selection: Selection) -> InlineStyle {
-        let range = selection.range();
-        if !selection.is_caret() {
-            for index in range.start.paragraph..=range.end.paragraph {
-                let paragraph = &self.document.paragraphs()[index];
-                let start = if index == range.start.paragraph {
-                    range.start.byte
-                } else {
-                    0
-                };
-                let end = if index == range.end.paragraph {
-                    range.end.byte
-                } else {
-                    paragraph.text().len()
-                };
-                if start < end {
-                    let spans = paragraph.spans();
-                    return spans[spans.partition_point(|span| span.range.end <= start)].style;
-                }
-            }
+        if !selection.is_caret()
+            && let Some(span) = self.document.spans_in(&selection.range()).next()
+        {
+            return span.style;
         }
         self.document.style_at(selection.focus)
     }

@@ -300,15 +300,18 @@ impl Paragraph {
         }
     }
 
-    pub(super) fn with_kind(&self, kind: ParagraphKind) -> Self {
-        Self {
+    pub(super) fn with_kind(self: &Arc<Self>, kind: ParagraphKind) -> Arc<Self> {
+        if self.kind == kind {
+            return Arc::clone(self);
+        }
+        Arc::new(Self {
             text: Arc::clone(&self.text),
             spans: Arc::clone(&self.spans),
             kind,
             ascii: self.ascii,
             linked: self.linked,
             indices: self.shared_indices(),
-        }
+        })
     }
 
     fn shared_indices(&self) -> OnceLock<Arc<TextIndices>> {
@@ -335,12 +338,10 @@ impl Paragraph {
         if range.is_empty() {
             return None;
         }
-        let first = self
-            .spans
-            .partition_point(|span| span.range.end <= range.start);
-        let last = self
-            .spans
-            .partition_point(|span| span.range.start < range.end);
+        let Range {
+            start: first,
+            end: last,
+        } = self.overlapping(range.clone());
         fn patched<'a>(
             span: &'a Span,
             patch: StylePatch,
@@ -490,6 +491,16 @@ impl Paragraph {
         })
     }
 
+    pub(super) fn overlapping(&self, range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            return 0..0;
+        }
+        let first = self
+            .spans
+            .partition_point(|span| span.range.end <= range.start);
+        first..first + self.spans[first..].partition_point(|span| span.range.start < range.end)
+    }
+
     pub(super) fn style_for_byte(&self, byte: usize) -> InlineStyle {
         let index = self.spans.partition_point(|span| span.range.end <= byte);
         self.spans
@@ -528,22 +539,15 @@ pub(super) fn append_slice(
 ) {
     let offset = text.len();
     text.push_str(&paragraph.text[range.clone()]);
-    let first = paragraph
-        .spans
-        .partition_point(|span| span.range.end <= range.start);
-    let last = paragraph
-        .spans
-        .partition_point(|span| span.range.start < range.end);
-    if first >= last {
+    let [head, rest @ ..] = &paragraph.spans[paragraph.overlapping(range.clone())] else {
         return;
-    }
+    };
     let clip = |span: &Span| {
         span.range.start.max(range.start) - range.start + offset
             ..span.range.end.min(range.end) - range.start + offset
     };
-    let head = &paragraph.spans[first];
     push_span(spans, clip(head), head.style, head.link.as_ref());
-    spans.extend(paragraph.spans[first + 1..last].iter().map(|span| Span {
+    spans.extend(rest.iter().map(|span| Span {
         range: clip(span),
         style: span.style,
         link: span.link.clone(),

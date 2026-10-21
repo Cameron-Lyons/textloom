@@ -1185,6 +1185,36 @@ fn formatting_merges_runs_and_is_a_noop_when_unchanged() {
 }
 
 #[test]
+fn span_lookup_skips_empty_ranges_and_runs_that_only_touch() {
+    let mut document = Document::from_text("abcdef\nxy");
+    document
+        .apply_style(
+            Position::new(0, 2)..Position::new(0, 4),
+            StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        )
+        .unwrap();
+    let paragraph = &document.paragraphs()[0];
+    assert_eq!(paragraph.overlapping(3..3), 0..0);
+    assert_eq!(paragraph.overlapping(2..4), 1..2);
+    assert_eq!(paragraph.overlapping(1..5), 0..3);
+    assert_eq!(paragraph.overlapping(4..6), 2..3);
+    let styles = |range: Range<Position>| {
+        document
+            .spans_in(&range)
+            .map(|span| span.style)
+            .collect::<Vec<_>>()
+    };
+    assert!(styles(Position::new(0, 6)..Position::new(1, 0)).is_empty());
+    assert_eq!(
+        styles(Position::new(0, 3)..Position::new(1, 1)),
+        [bold(), InlineStyle::default(), InlineStyle::default()]
+    );
+}
+
+#[test]
 fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
     let red = crate::Color([255, 0, 0, 255]);
     let blue = crate::Color([0, 0, 255, 255]);
@@ -1445,6 +1475,22 @@ fn history_retains_only_changed_paragraphs_and_shares_others() {
 }
 
 #[test]
+fn kind_changes_share_unchanged_paragraphs_inside_the_changed_range() {
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    let mut document = Document::from_paragraphs(
+        [bullet, ParagraphKind::Body, bullet]
+            .map(|kind| Arc::new(Paragraph::plain("item")).with_kind(kind)),
+    );
+    let middle = Arc::clone(&document.paragraphs()[1]);
+    let delta = document.change_list_indent(0..3, true);
+    assert_eq!((delta.start, delta.after.len()), (0, 3));
+    assert!(Arc::ptr_eq(&middle, &document.paragraphs()[1]));
+    let delta = document.set_kind(0..3, ParagraphKind::Body).unwrap();
+    assert_eq!((delta.start, delta.after.len()), (0, 3));
+    assert!(Arc::ptr_eq(&middle, &document.paragraphs()[1]));
+}
+
+#[test]
 fn sparse_changes_retain_only_their_changed_runs() {
     let changed = [0, 3, 13, 14, 30, 39];
     let source: Vec<String> = (0..40)
@@ -1577,7 +1623,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
             ParagraphKind::Heading { level: 1 },
             ordered(None),
         ]
-        .map(|kind| Paragraph::plain("item").with_kind(kind)),
+        .map(|kind| Arc::new(Paragraph::plain("item")).with_kind(kind)),
     );
     let expected = [Some(7), None, Some(8), None, Some(1)];
     assert_eq!(numbers(&document), expected);
