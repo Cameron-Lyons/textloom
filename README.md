@@ -322,9 +322,15 @@ recreation refreshes only painted texture coordinates. Accessibility validates
 text and layout snapshots with shared identity tokens and locates text runs
 through an index. Egui paragraph node IDs stay stable across structural edits,
 shifted and renumbered paragraphs reuse their runs, and at a wrapped-row seam
-the published caret follows the painted caret's affinity. A uniquely owned egui
-accessibility snapshot patches a single changed paragraph and its run locations;
-retained snapshots and broader invalidation use validated rebuilds. Publication
+the published caret follows the painted caret's affinity. Egui accessibility
+updates rebuild only the paragraphs between the unchanged prefix and suffix,
+also after structural edits or several edits per frame. A single in-place
+paragraph edit that keeps list numbering and the layout environment rebuilds
+that paragraph without comparing the others' layouts. A uniquely owned
+snapshot is patched in place; retained snapshots get a validated copy that
+shares the unchanged paragraphs. Its run-location index is patched when the
+paragraph count is unchanged and otherwise rebuilt when an accessibility action
+next needs it. Publication
 still registers the complete tree required by egui, cloning cached run
 properties and applying current coordinate transforms. Direct AccessKit
 selection/label changes reuse paragraph nodes; precise single-paragraph edits

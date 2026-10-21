@@ -1213,6 +1213,7 @@ fn handle_accessibility_action(
     errors: &mut Vec<Error>,
     accessibility_errors: &mut Vec<AccessibilityError>,
 ) -> bool {
+    use crate::accessibility::{AccessibleAction, apply_action};
     use egui::accesskit::{Action, ActionData};
     if read_only
         && matches!(
@@ -1250,14 +1251,12 @@ fn handle_accessibility_action(
         }
         (Action::SetValue | Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
             *interrupted |= editor.cancel_composition();
-            editor.break_history_group();
-            let result = if request.action == Action::SetValue {
-                editor.replace_all_text(value)
+            let action = if request.action == Action::SetValue {
+                AccessibleAction::ReplaceAllText(value)
             } else {
-                editor.insert_text(value)
+                AccessibleAction::ReplaceSelectedText(value)
             };
-            record(result, errors);
-            editor.break_history_group();
+            record(apply_action(editor, action).map(drop), errors);
         }
         _ => accessibility_errors.push(AccessibilityError::InvalidActionData),
     }

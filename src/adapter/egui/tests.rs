@@ -4203,6 +4203,56 @@ fn accessibility_set_value_uses_the_document_start_style() {
 }
 
 #[test]
+fn accessibility_value_actions_interrupt_composition_and_undo_in_one_step() {
+    use egui::accesskit::{Action, ActionData, ActionRequest, TreeId};
+    for (action, expected) in [
+        (Action::SetValue, "x"),
+        (Action::ReplaceSelectedText, "xabc"),
+    ] {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut editor = Editor::from_text("abc");
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::Ime(ImeEvent::Preedit {
+                text: "한".into(),
+                active_range_chars: Some(1..1),
+            })],
+            true,
+        );
+        assert!(editor.composition().is_some());
+        let id = context.memory(|memory| memory.focused()).unwrap();
+        let output = frame(
+            &context,
+            &mut editor,
+            vec![Event::AccessKitActionRequest(ActionRequest {
+                action,
+                target_node: id.accesskit_id(),
+                target_tree: TreeId::ROOT,
+                data: Some(ActionData::Value("x".into())),
+            })],
+            true,
+        );
+        assert!(
+            output
+                .platform_output
+                .ime
+                .unwrap()
+                .should_interrupt_composition,
+            "{action:?}"
+        );
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), expected);
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), "abc");
+        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 0)));
+        assert!(!editor.can_undo());
+    }
+}
+
+#[test]
 fn malformed_and_stale_accessibility_actions_are_consumed_without_edits() {
     use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
     let context = egui::Context::default();
