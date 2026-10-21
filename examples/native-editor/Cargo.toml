@@ -11,7 +11,7 @@ publish = false
 accesskit_unix = { path = "vendor/accesskit_unix" }
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
 textloom = { path = "../..", version = "1.0", features = ["egui"] }
 raw-window-handle = "0.6.2"
 
