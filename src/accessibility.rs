@@ -1331,6 +1331,17 @@ mod accesskit_bridge {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::accessibility::random_edits;
+        use accesskit_consumer::{Node as PublishedNode, TreeChangeHandler};
+
+        struct Ignore;
+
+        impl TreeChangeHandler for Ignore {
+            fn node_added(&mut self, _: &PublishedNode) {}
+            fn node_updated(&mut self, _: &PublishedNode, _: &PublishedNode) {}
+            fn focus_moved(&mut self, _: Option<&PublishedNode>, _: Option<&PublishedNode>) {}
+            fn node_removed(&mut self, _: &PublishedNode) {}
+        }
 
         fn request(
             adapter: &AccessKitAdapter,
@@ -1415,6 +1426,59 @@ mod accesskit_bridge {
                     );
                     assert_eq!(run.node.word_starts(), expected.node.word_starts());
                 }
+            }
+        }
+
+        fn assert_published_tree_matches_fresh(tree: &accesskit_consumer::Tree, editor: &Editor) {
+            let mut fresh = AccessKitAdapter::default();
+            let expected: HashMap<_, _> = fresh
+                .update(editor, "Notes", true)
+                .unwrap()
+                .nodes
+                .into_iter()
+                .collect();
+            let state = tree.state();
+            let published = |id: NodeId| {
+                state
+                    .node_by_tree_local_id(id, TreeId::ROOT)
+                    .unwrap()
+                    .data()
+            };
+            let mut ids = HashMap::from([(fresh.root_node(), fresh.root_node())]);
+            let mut pending = vec![fresh.root_node()];
+            while let Some(id) = pending.pop() {
+                let children = published(id).children();
+                let expected_children = expected[&ids[&id]].children();
+                assert_eq!(children.len(), expected_children.len());
+                for (child, expected_child) in children.iter().zip(expected_children) {
+                    assert!(ids.insert(*child, *expected_child).is_none());
+                    pending.push(*child);
+                }
+            }
+            assert_eq!(ids.len(), expected.len());
+            let map = |position: TextPosition| TextPosition {
+                node: ids[&position.node],
+                ..position
+            };
+            for (id, expected_id) in &ids {
+                let mut node = published(*id).clone();
+                if !node.children().is_empty() {
+                    let children: Vec<_> = node.children().iter().map(|child| ids[child]).collect();
+                    node.set_children(children);
+                }
+                if let Some(previous) = node.previous_on_line() {
+                    node.set_previous_on_line(ids[&previous]);
+                }
+                if let Some(next) = node.next_on_line() {
+                    node.set_next_on_line(ids[&next]);
+                }
+                if let Some(selection) = node.text_selection().copied() {
+                    node.set_text_selection(TextSelection {
+                        anchor: map(selection.anchor),
+                        focus: map(selection.focus),
+                    });
+                }
+                assert_eq!(node, expected[expected_id]);
             }
         }
 
@@ -2549,98 +2613,36 @@ mod accesskit_bridge {
 
         #[test]
         fn several_edits_between_updates_match_fresh_trees() {
-            fn random_position(
-                editor: &Editor,
-                random: &mut impl FnMut(usize) -> usize,
-            ) -> Position {
-                let paragraphs = editor.document().paragraphs();
-                let index = random(paragraphs.len());
-                let paragraph = &paragraphs[index];
-                let byte = paragraph
-                    .byte_from_grapheme(random(paragraph.grapheme_count() + 1))
-                    .unwrap();
-                Position::new(index, byte)
-            }
-            let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-            let mut random = move |limit: usize| {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                (seed % limit as u64) as usize
-            };
-            let kinds = [
-                ParagraphKind::Quote,
-                ParagraphKind::Body,
-                ParagraphKind::Bullet { indent: 0 },
-            ];
-            for _ in 0..40 {
-                let mut editor = Editor::from_text("zero\none é\ntwo\nthree");
+            let mut random = random_edits::seeded(0x9e37_79b9_7f4a_7c15);
+            for _ in 0..30 {
+                let mut editor = random_edits::editor();
                 let mut adapter = AccessKitAdapter::default();
-                adapter.update(&editor, "Notes", true).unwrap();
-                for _ in 0..60 {
-                    for _ in 0..2 + random(3) {
-                        let caret = random_position(&editor, &mut random);
-                        let _ = editor.set_selection(Selection::caret(caret));
-                        let _ = match random(12) {
-                            0 => editor.insert_text(["x", "é", "ab cd", "x\ny"][random(4)]),
-                            1 => editor.insert_paragraph(),
-                            2 => editor.insert_line_break(),
-                            3 => editor.delete_backward(),
-                            4 => editor.delete_forward(),
-                            5 => editor.set_paragraph_kind(kinds[random(3)]),
-                            6 => {
-                                editor.undo();
-                                Ok(())
-                            }
-                            7 => {
-                                editor.redo();
-                                Ok(())
-                            }
-                            8 => editor.transaction(|editor| {
-                                editor.insert_paragraph()?;
-                                editor.insert_text("t")?;
-                                editor.set_paragraph_kind(ParagraphKind::Quote)
-                            }),
-                            9 => {
-                                let _ =
-                                    editor.set_selection(Selection::caret(editor.document().end()));
-                                editor.insert_paragraph()
-                            }
-                            10 => {
-                                let paragraph = random(editor.document().paragraphs().len());
-                                let end = editor.document().paragraphs()[paragraph].text().len();
-                                let fragment = editor
-                                    .document()
-                                    .fragment(
-                                        Position::new(paragraph, 0)..Position::new(paragraph, end),
-                                    )
-                                    .unwrap();
-                                editor.insert_fragment(&fragment)
-                            }
-                            _ => {
-                                let focus = random_position(&editor, &mut random);
-                                editor.break_history_group();
-                                let _ = editor.set_selection(Selection::new(caret, focus));
-                                editor.delete_backward()
-                            }
-                        };
+                let mut tree = accesskit_consumer::Tree::new(
+                    adapter.update(&editor, "Notes", true).unwrap(),
+                    true,
+                );
+                for _ in 0..50 {
+                    for _ in 0..1 + random(4) {
+                        random_edits::apply(&mut editor, &mut random);
                     }
-                    adapter.update(&editor, "Notes", true).unwrap();
+                    if random(25) == 0 {
+                        adapter.invalidate();
+                    }
+                    tree.update_and_process_changes(
+                        adapter.update(&editor, "Notes", true).unwrap(),
+                        &mut Ignore,
+                    );
                     assert_matches_fresh_tree(&adapter, &editor);
+                    assert_published_tree_matches_fresh(&tree, &editor);
                     assert_positions_roundtrip(&adapter, &editor);
-                    let mut ids = std::collections::HashSet::from([
-                        adapter.root_node(),
-                        adapter.editor_node(),
-                    ]);
-                    assert!(adapter.quotes.iter().all(|quote| ids.insert(quote.id)));
-                    for (index, paragraph) in adapter.paragraphs.iter().enumerate() {
-                        assert!(ids.insert(paragraph.id));
-                        for run in &paragraph.runs {
-                            assert!(ids.insert(run.id));
-                            assert_eq!(
-                                adapter.locate_text_run(run.id),
-                                Some((index, run.range.clone()))
-                            );
+                    if random(2) == 0 {
+                        for (index, paragraph) in adapter.paragraphs.iter().enumerate() {
+                            for run in &paragraph.runs {
+                                assert_eq!(
+                                    adapter.locate_text_run(run.id),
+                                    Some((index, run.range.clone()))
+                                );
+                            }
                         }
                     }
                 }
@@ -2676,6 +2678,178 @@ mod accesskit_bridge {
 }
 #[cfg(feature = "accesskit")]
 pub use accesskit_bridge::{AccessKitAdapter, AccessKitError};
+
+#[cfg(all(test, any(feature = "accesskit", feature = "egui")))]
+pub(crate) mod random_edits {
+    use crate::{Editor, Link, ParagraphKind, Position, Selection, StylePatch};
+
+    pub(crate) fn seeded(mut seed: u64) -> impl FnMut(usize) -> usize {
+        move |limit| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % limit as u64) as usize
+        }
+    }
+
+    pub(crate) fn editor() -> Editor {
+        let items: Vec<_> = (1..=11)
+            .map(|item| format!("item {item} alpha beta\u{2028}gamma delta epsilon"))
+            .collect();
+        let mut editor = Editor::from_text(&format!(
+            "intro é 👩‍💻 text\n{}\nquoted one\nquoted two\nlast",
+            items.join("\n")
+        ));
+        for (paragraphs, kind) in [
+            (
+                1..12,
+                ParagraphKind::Ordered {
+                    indent: 0,
+                    start: None,
+                },
+            ),
+            (
+                1..2,
+                ParagraphKind::Ordered {
+                    indent: 0,
+                    start: Some(995),
+                },
+            ),
+            (
+                4..7,
+                ParagraphKind::Ordered {
+                    indent: 1,
+                    start: None,
+                },
+            ),
+            (12..14, ParagraphKind::Quote),
+        ] {
+            editor
+                .set_selection(Selection::new(
+                    Position::new(paragraphs.start, 0),
+                    Position::new(paragraphs.end - 1, 1),
+                ))
+                .unwrap();
+            editor.set_paragraph_kind(kind).unwrap();
+        }
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+            .unwrap();
+        editor
+            .set_link(Some(Link::new("https://a.example").unwrap()))
+            .unwrap();
+        editor
+    }
+
+    fn position(editor: &Editor, random: &mut impl FnMut(usize) -> usize) -> Position {
+        let paragraphs = editor.document().paragraphs();
+        let index = random(paragraphs.len());
+        let paragraph = &paragraphs[index];
+        let byte = paragraph
+            .byte_from_grapheme(random(paragraph.grapheme_count() + 1))
+            .unwrap();
+        Position::new(index, byte)
+    }
+
+    pub(crate) fn apply(editor: &mut Editor, random: &mut impl FnMut(usize) -> usize) {
+        let kinds = [
+            ParagraphKind::Body,
+            ParagraphKind::Quote,
+            ParagraphKind::Heading { level: 2 },
+            ParagraphKind::Bullet { indent: 1 },
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            },
+            ParagraphKind::Ordered {
+                indent: 1,
+                start: None,
+            },
+            ParagraphKind::Ordered {
+                indent: 2,
+                start: Some(9),
+            },
+            ParagraphKind::Ordered {
+                indent: 0,
+                start: Some(998),
+            },
+        ];
+        let kind = kinds[random(kinds.len())];
+        let link = Link::new(["https://a.example", "https://b.example"][random(2)]).unwrap();
+        let anchor = position(editor, random);
+        let focus = position(editor, random);
+        let range = Selection::new(anchor, focus);
+        let _ = editor.set_selection(Selection::caret(focus));
+        let _ = match random(16) {
+            0 => editor.insert_text(["x", "é", "ab cd", "👩‍💻", "x\ny", "a\u{2028}b"][random(6)]),
+            1 => editor.insert_paragraph(),
+            2 => editor.insert_line_break(),
+            3 => editor.delete_backward(),
+            4 => editor.delete_forward(),
+            5 => {
+                if random(2) == 0 {
+                    let _ = editor.set_selection(range);
+                }
+                editor.set_paragraph_kind(kind)
+            }
+            6 => {
+                let _ = editor.set_selection(range);
+                match random(3) {
+                    0 => editor.indent_list(),
+                    1 => editor.outdent_list(),
+                    _ => editor.apply_numbered_list(0),
+                }
+            }
+            7 => {
+                editor.undo();
+                Ok(())
+            }
+            8 => {
+                editor.redo();
+                Ok(())
+            }
+            9 => {
+                let _ = editor.set_selection(range);
+                editor.set_link((random(3) != 0).then_some(link))
+            }
+            10 => editor.insert_link("site", link),
+            11 => {
+                let _ = editor.set_selection(range);
+                editor.apply_style(StylePatch {
+                    bold: Some(random(2) == 0),
+                    ..StylePatch::default()
+                })
+            }
+            12 => editor.transaction(|editor| {
+                editor.insert_paragraph()?;
+                editor.insert_text("t")?;
+                editor.set_paragraph_kind(kind)
+            }),
+            13 => {
+                let paragraph = &editor.document().paragraphs()[focus.paragraph];
+                let end = Position::new(focus.paragraph, paragraph.text().len());
+                let fragment = editor
+                    .document()
+                    .fragment(Position::new(focus.paragraph, 0)..end)
+                    .unwrap();
+                editor.insert_fragment(&fragment)
+            }
+            14 => {
+                let _ = editor.set_selection(Selection::caret(editor.document().end()));
+                editor.insert_paragraph()
+            }
+            _ => {
+                editor.break_history_group();
+                let _ = editor.set_selection(range);
+                editor.delete_backward()
+            }
+        };
+        if random(3) == 0 {
+            let selection = Selection::new(position(editor, random), position(editor, random));
+            let _ = editor.set_selection(selection);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

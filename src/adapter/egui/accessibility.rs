@@ -970,6 +970,7 @@ fn publish_style(
 mod tests {
     use super::super::layout::ParagraphLayout;
     use super::*;
+    use crate::accessibility::random_edits;
     use std::collections::HashSet;
 
     fn make_snapshot(text: &str, width: f32) -> (Editor, Snapshot) {
@@ -1080,10 +1081,14 @@ mod tests {
             assert!(serials.insert(actual.serial));
             assert!(actual.serial < snapshot.next_serial);
             assert_eq!(actual.id, paragraph_id(widget_id, actual.serial));
+            assert!(Arc::ptr_eq(&actual.source, &expected.source));
+            assert!(Arc::ptr_eq(&actual.galley, &expected.galley));
+            assert_eq!(actual.line_break, expected.line_break);
             assert_eq!(actual.runs.len(), expected.runs.len());
             for (run_index, (actual_run, expected_run)) in
                 actual.runs.iter().zip(expected.runs.iter()).enumerate()
             {
+                assert_eq!(actual_run.id, actual.id.with(("grapheme_run", run_index)));
                 assert_eq!(
                     snapshot.run_locations()[&actual_run.id.accesskit_id()],
                     (index, run_index)
@@ -1092,6 +1097,8 @@ mod tests {
                     normalized_node(actual, actual_run),
                     normalized_node(expected, expected_run)
                 );
+                assert_eq!(actual_run.range, expected_run.range);
+                assert_eq!(actual_run.line_break, expected_run.line_break);
                 assert_eq!(actual_run.offsets, expected_run.offsets);
                 assert_eq!(actual_run.row, expected_run.row);
                 assert_eq!(actual_run.soft_break, expected_run.soft_break);
@@ -1101,6 +1108,16 @@ mod tests {
                     expected_run.geometry.positions
                 );
                 assert_eq!(actual_run.geometry.widths, expected_run.geometry.widths);
+            }
+            assert_eq!(actual.links.len(), expected.links.len());
+            for (link_index, (actual_link, expected_link)) in
+                actual.links.iter().zip(expected.links.iter()).enumerate()
+            {
+                assert_eq!(actual_link.id, actual.id.with(("link", link_index)));
+                assert_eq!(actual_link.link, expected_link.link);
+                assert_eq!(actual_link.runs, expected_link.runs);
+                assert_eq!(actual_link.bounds, expected_link.bounds);
+                assert_eq!(actual_link.label, expected_link.label);
             }
         }
         for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
@@ -2008,6 +2025,31 @@ mod tests {
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
         assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+    }
+
+    #[test]
+    fn random_edit_frames_and_rewraps_match_fresh_snapshots() {
+        let context = egui::Context::default();
+        let widget_id = Id::new("editor");
+        let mut random = random_edits::seeded(0x0dd5_eed5_ba5e_ba11);
+        for _ in 0..12 {
+            let mut cache = super::super::Cache::default();
+            let mut editor = random_edits::editor();
+            let mut width = 400.0;
+            let mut snapshot = None;
+            for _ in 0..50 {
+                for _ in 0..random(3) {
+                    random_edits::apply(&mut editor, &mut random);
+                }
+                if random(4) == 0 {
+                    width = [400.0, 160.0, 70.0][random(3)];
+                }
+                let layouts = cached_layout_frame(&context, &mut cache, &editor, width);
+                let _retained = (random(4) == 0).then(|| snapshot.clone());
+                update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+                assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+            }
+        }
     }
 
     #[test]
