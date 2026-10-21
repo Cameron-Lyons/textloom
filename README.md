@@ -324,7 +324,9 @@ through an index. Egui paragraph node IDs stay stable across structural edits,
 shifted and renumbered paragraphs reuse their runs, and at a wrapped-row seam
 the published caret follows the painted caret's affinity. Egui accessibility
 updates rebuild only the paragraphs between the unchanged prefix and suffix,
-also after structural edits or several edits per frame. A uniquely owned
+also after structural edits or several edits per frame. A single in-place
+paragraph edit that keeps list numbering and the layout environment rebuilds
+that paragraph without comparing the others' layouts. A uniquely owned
 snapshot is patched in place; retained snapshots get a validated copy that
 shares the unchanged paragraphs. Its run-location index is patched when the
 paragraph count is unchanged and otherwise rebuilt when an accessibility action

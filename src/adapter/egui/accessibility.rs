@@ -5,7 +5,7 @@ use super::{
 use crate::{
     Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span,
     accessibility::node_semantics::{SpanCursor, apply_text_style, set_paragraph_semantics},
-    document::LINE_SEPARATOR,
+    document::{LINE_SEPARATOR, same_numbering_effect},
 };
 use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, epaint::text::PlacedRow, text::CharIndex};
 use std::{
@@ -107,6 +107,7 @@ pub(super) struct Snapshot {
     paragraphs: Vec<Arc<ParagraphSnapshot>>,
     document_identity: Arc<()>,
     layout_identity: LayoutIdentity,
+    environment_identity: Arc<()>,
     widget_id: Id,
     run_locations: OnceLock<HashMap<accesskit::NodeId, (usize, usize)>>,
     next_serial: u64,
@@ -140,8 +141,7 @@ pub(super) fn build_cached(
 ) -> Result<Snapshot, AccessibilityError> {
     let previous = previous.filter(|snapshot| snapshot.widget_id == widget_id);
     let old = previous.map_or(&[][..], |snapshot| snapshot.paragraphs.as_slice());
-    let next_serial = previous.map_or(0, |snapshot| snapshot.next_serial);
-    let splice = changed_paragraphs(editor, layouts, widget_id, old, next_serial)?;
+    let splice = changes_since(editor, layouts, widget_id, previous)?;
     let mut paragraphs = Vec::with_capacity(layouts.len());
     paragraphs.extend(old[..splice.replaced.start].iter().cloned());
     paragraphs.extend(splice.paragraphs);
@@ -150,22 +150,40 @@ pub(super) fn build_cached(
         paragraphs,
         document_identity: editor.document().content_identity(),
         layout_identity: layouts.identity(),
+        environment_identity: layouts.environment_identity(),
         widget_id,
         run_locations: OnceLock::new(),
         next_serial: splice.next_serial,
     })
 }
 
-fn changed_paragraphs(
+fn changes_since(
     editor: &Editor,
     layouts: &ParagraphLayouts,
     widget_id: Id,
-    old: &[Arc<ParagraphSnapshot>],
-    mut next_serial: u64,
+    previous: Option<&Snapshot>,
 ) -> Result<Splice, AccessibilityError> {
     let sources = editor.document().paragraphs();
     if layouts.len() != sources.len() {
         return Err(AccessibilityError::InvalidLayout);
+    }
+    let old = previous.map_or(&[][..], |snapshot| snapshot.paragraphs.as_slice());
+    let next_serial = previous.map_or(0, |snapshot| snapshot.next_serial);
+    if let Some(index) = previous.and_then(|snapshot| snapshot.edited_paragraph(editor, layouts)) {
+        let layout = layouts
+            .views_range(index..index + 1)
+            .next()
+            .ok_or(AccessibilityError::InvalidLayout)?;
+        let edited = index..index + 1;
+        return rebuild_window(
+            sources,
+            &[layout.galley],
+            widget_id,
+            old,
+            edited.clone(),
+            edited,
+            next_serial,
+        );
     }
     let galleys: Vec<_> = layouts
         .views_range(0..layouts.len())
@@ -184,8 +202,28 @@ fn changed_paragraphs(
     let suffix = (0..shared - prefix)
         .take_while(|&offset| unchanged(old.len() - 1 - offset, sources.len() - 1 - offset))
         .count();
-    let replaced = prefix..old.len() - suffix;
     let window = prefix..sources.len() - suffix;
+    rebuild_window(
+        sources,
+        &galleys[window.clone()],
+        widget_id,
+        old,
+        prefix..old.len() - suffix,
+        window,
+        next_serial,
+    )
+}
+
+fn rebuild_window(
+    sources: &[Arc<Paragraph>],
+    galleys: &[&Arc<Galley>],
+    widget_id: Id,
+    old: &[Arc<ParagraphSnapshot>],
+    replaced: Range<usize>,
+    window: Range<usize>,
+    mut next_serial: u64,
+) -> Result<Splice, AccessibilityError> {
+    let prefix = window.start;
     let mut cached: HashMap<RunsKey, Vec<usize>> = HashMap::new();
     for index in replaced.clone().rev() {
         let paragraph = &old[index];
@@ -196,7 +234,11 @@ fn changed_paragraphs(
     let reused: Vec<_> = window
         .clone()
         .map(|index| {
-            let key = runs_key(&sources[index], galleys[index], index + 1 < sources.len());
+            let key = runs_key(
+                &sources[index],
+                galleys[index - prefix],
+                index + 1 < sources.len(),
+            );
             let reused = cached.get_mut(&key)?.pop()?;
             claimed[reused - prefix] = true;
             Some(reused)
@@ -229,7 +271,7 @@ fn changed_paragraphs(
         };
         paragraphs.push(build_paragraph_snapshot(
             &sources[index],
-            galleys[index],
+            galleys[index - prefix],
             serial,
             widget_id,
             index + 1 < sources.len(),
@@ -419,16 +461,11 @@ pub(super) fn update_cached(
             return Ok(());
         }
         if let Some(previous) = Arc::get_mut(previous) {
-            let splice = changed_paragraphs(
-                editor,
-                layouts,
-                widget_id,
-                &previous.paragraphs,
-                previous.next_serial,
-            )?;
+            let splice = changes_since(editor, layouts, widget_id, Some(previous))?;
             previous.splice(splice);
             previous.document_identity = editor.document().content_identity();
             previous.layout_identity = layouts.identity();
+            previous.environment_identity = layouts.environment_identity();
             return Ok(());
         }
     }
@@ -503,6 +540,20 @@ impl Snapshot {
                 })
                 .collect()
         })
+    }
+
+    fn edited_paragraph(&self, editor: &Editor, layouts: &ParagraphLayouts) -> Option<usize> {
+        let change = editor.document().change_since(&self.document_identity)?;
+        if change.range.len() != 1 || change.new_len != 1 {
+            return None;
+        }
+        let index = change.range.start;
+        let before = self.paragraphs.get(index)?.source.kind();
+        let after = editor.document().paragraphs().get(index)?.kind();
+        (self.paragraphs.len() == layouts.len()
+            && Arc::ptr_eq(&self.environment_identity, &layouts.environment_identity())
+            && same_numbering_effect(before, after))
+        .then_some(index)
     }
 
     fn splice(&mut self, splice: Splice) {
@@ -2218,6 +2269,122 @@ mod tests {
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 400.0);
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
         assert_matches_fresh(snapshot.as_deref().unwrap(), &editor, &layouts, widget_id);
+    }
+
+    #[test]
+    fn single_paragraph_edits_skip_the_scan_unless_other_paragraphs_can_rewrap() {
+        type Edit = fn(&mut Editor);
+        let context = egui::Context::default();
+        let mut cache = super::super::Cache::default();
+        let mut editor = Editor::from_text("title\none\ntwo\nquoted\nlast words");
+        select(&mut editor, (0, 0), (0, 0));
+        editor
+            .set_paragraph_kind(ParagraphKind::Heading { level: 4 })
+            .unwrap();
+        select(&mut editor, (1, 0), (2, 3));
+        editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 0,
+                start: None,
+            })
+            .unwrap();
+        let widget_id = Id::new("editor");
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
+        let mut snapshot = None;
+        update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+        let identity = Arc::as_ptr(snapshot.as_ref().unwrap());
+        let edits: [(Edit, f32, Option<usize>); 8] = [
+            (
+                |editor| {
+                    select(editor, (1, 3), (1, 3));
+                    editor.insert_text(" more").unwrap();
+                },
+                500.0,
+                Some(1),
+            ),
+            (
+                |editor| {
+                    select(editor, (0, 0), (0, 0));
+                    editor
+                        .set_paragraph_kind(ParagraphKind::Heading { level: 5 })
+                        .unwrap();
+                },
+                500.0,
+                Some(0),
+            ),
+            (
+                |editor| {
+                    select(editor, (3, 0), (3, 0));
+                    editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+                },
+                500.0,
+                Some(3),
+            ),
+            (
+                |editor| {
+                    select(editor, (1, 0), (1, 0));
+                    editor
+                        .set_paragraph_kind(ParagraphKind::Ordered {
+                            indent: 0,
+                            start: Some(1_000_000),
+                        })
+                        .unwrap();
+                },
+                500.0,
+                None,
+            ),
+            (
+                |editor| {
+                    select(editor, (2, 0), (2, 0));
+                    editor.set_paragraph_kind(ParagraphKind::Body).unwrap();
+                },
+                500.0,
+                None,
+            ),
+            (
+                |editor| {
+                    select(editor, (4, 4), (4, 4));
+                    editor.insert_paragraph().unwrap();
+                },
+                500.0,
+                None,
+            ),
+            (
+                |editor| {
+                    select(editor, (0, 0), (0, 0));
+                    editor.insert_text("a").unwrap();
+                    select(editor, (2, 0), (2, 0));
+                    editor.insert_text("b").unwrap();
+                },
+                500.0,
+                None,
+            ),
+            (
+                |editor| {
+                    select(editor, (2, 0), (2, 0));
+                    editor.insert_text("c").unwrap();
+                },
+                65.0,
+                None,
+            ),
+        ];
+        for (edit, width, expected) in edits {
+            let before = snapshot.as_ref().unwrap().paragraphs.clone();
+            edit(&mut editor);
+            let layouts = cached_layout_frame(&context, &mut cache, &editor, width);
+            let previous = snapshot.as_ref().unwrap();
+            assert_eq!(previous.edited_paragraph(&editor, &layouts), expected);
+            update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
+            let after = snapshot.as_ref().unwrap();
+            assert_eq!(identity, Arc::as_ptr(after));
+            if let Some(index) = expected {
+                assert_eq!(after.paragraphs[index].id, before[index].id);
+                for (other, (old, new)) in before.iter().zip(&after.paragraphs).enumerate() {
+                    assert_eq!(Arc::ptr_eq(old, new), other != index);
+                }
+            }
+            assert_matches_fresh(after, &editor, &layouts, widget_id);
+        }
     }
 
     #[test]
