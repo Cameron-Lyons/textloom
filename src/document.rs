@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::{Error, Fragment, InlineStyle, Link, ParagraphKind, Position, StylePatch};
 
@@ -731,6 +731,9 @@ struct ReplacementBuilder {
     spans: Vec<Span>,
     kind: ParagraphKind,
     candidate: Option<Arc<Paragraph>>,
+    // Start of the last grapheme cluster of `text[..scanned]`.
+    tail: usize,
+    scanned: usize,
 }
 
 impl ReplacementBuilder {
@@ -741,6 +744,8 @@ impl ReplacementBuilder {
             spans: Vec::new(),
             kind,
             candidate: None,
+            tail: 0,
+            scanned: 0,
         }
     }
 
@@ -754,16 +759,15 @@ impl ReplacementBuilder {
         self.text_len() == 0
     }
 
-    fn last_style(&self) -> InlineStyle {
+    fn last_style(&mut self) -> InlineStyle {
         if let Some(paragraph) = &self.candidate {
             return paragraph.style_for_byte(paragraph.text.len().saturating_sub(1));
         }
-        let start = self
-            .text
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(start, _)| start);
-        let index = self.spans.partition_point(|span| span.range.end <= start);
+        self.tail = last_grapheme_start(&self.text, self.tail, self.scanned);
+        self.scanned = self.text.len();
+        let index = self
+            .spans
+            .partition_point(|span| span.range.end <= self.tail);
         self.spans
             .get(index)
             .map_or_else(InlineStyle::default, |span| span.style)
@@ -781,6 +785,8 @@ impl ReplacementBuilder {
     }
 
     fn finish_paragraph(&mut self) {
+        self.tail = 0;
+        self.scanned = 0;
         if let Some(paragraph) = self.candidate.take() {
             self.paragraphs.push(paragraph.with_kind(self.kind));
         } else {
@@ -831,6 +837,37 @@ impl ReplacementBuilder {
                 push_span(&mut self.spans, start..self.text.len(), style, link);
             }
         }
+    }
+}
+
+// Start of the last grapheme cluster of `text`, given the start `tail` of the last
+// cluster of `text[..scanned]`. Appending cannot move a boundary before `scanned`, so
+// segmentation resumes at `tail` and walks forward over the appended bytes only.
+// Searching back from the end would rescan a cluster that keeps growing.
+fn last_grapheme_start(text: &str, tail: usize, scanned: usize) -> usize {
+    let last_start = |text: &str| {
+        text.grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start)
+    };
+    if scanned == text.len() {
+        return tail;
+    }
+    let first = match text[..scanned].chars().next_back() {
+        None => 0,
+        Some(previous) => {
+            let rest = &text[tail..];
+            let offset = scanned - previous.len_utf8() - tail;
+            match GraphemeCursor::new(offset, rest.len(), true).next_boundary(rest, 0) {
+                Ok(Some(boundary)) => tail + boundary,
+                _ => return last_start(text),
+            }
+        }
+    };
+    if first == text.len() {
+        tail
+    } else {
+        first + last_start(&text[first..])
     }
 }
 

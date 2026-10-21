@@ -295,6 +295,55 @@ fn local_grapheme_checks_and_snapping_match_complete_segmentation() {
 }
 
 #[test]
+fn trailing_grapheme_tracking_matches_complete_segmentation_while_text_grows() {
+    let pieces = [
+        "a", " ", "\t", "é", "\u{301}", "\u{300}", "🇦", "🇧", "\u{200d}", "👩", "💻", "🏽", "क",
+        "\u{94d}", "ष", "\u{600}", "\u{1100}", "\u{1161}", "\u{11a8}", "\u{903}",
+    ];
+    let mut seed = 0x7a11_c105_7e25_0b5eu64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    for _ in 0..400 {
+        let mut text = String::new();
+        let (mut tail, mut scanned) = (0, 0);
+        for _ in 0..24 {
+            for _ in 0..=next(3) {
+                text.push_str(pieces[next(pieces.len())]);
+            }
+            if next(3) == 0 {
+                continue;
+            }
+            tail = last_grapheme_start(&text, tail, scanned);
+            scanned = text.len();
+            assert_eq!(
+                tail,
+                text.grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(start, _)| start),
+                "{text:?}"
+            );
+        }
+    }
+
+    for (prefix, appended, expected) in [("🇦🇧", "🇨", 8), ("🇦", "🇨", 0), ("🇦", "🇨🇩", 8)]
+    {
+        assert_eq!(
+            last_grapheme_start(&format!("{prefix}{appended}"), 0, prefix.len()),
+            expected,
+            "{prefix:?} + {appended:?}"
+        );
+    }
+    // The cached start is trusted rather than recomputed, so a growing cluster is never rescanned.
+    assert_eq!(last_grapheme_start("ab\u{301}", 0, 2), 0);
+    assert_eq!(last_grapheme_start("ab\u{301}c", 0, 2), 4);
+    assert_eq!(last_grapheme_start("abcd", 0, 2), 3);
+}
+
+#[test]
 fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
     use crate::{Editor, Movement, Selection};
 

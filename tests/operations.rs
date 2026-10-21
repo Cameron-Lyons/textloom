@@ -2037,6 +2037,58 @@ fn replace_all_matches_at_paragraph_ends_take_styles_like_sequential_replacement
 }
 
 #[test]
+fn replace_all_joining_many_paragraphs_into_growing_clusters_styles_like_sequential() {
+    let bold = StylePatch {
+        bold: Some(true),
+        ..Default::default()
+    };
+    let options = SearchOptions::default();
+    for count in [6, 1 << 14] {
+        for (unit, replacement, bold_bytes) in [("\u{301}", "\u{300}", None), ("🇦", "🇧", Some(8))]
+        {
+            let mut batch = Editor::from_text(&vec![unit; count].join("\n"));
+            style(&mut batch, 0, 0, unit.len(), bold);
+            let mut sequential = Editor::new(batch.document().clone());
+            assert_eq!(
+                batch.replace_all("\n", replacement, options).unwrap(),
+                count - 1
+            );
+            let [paragraph] = batch.document().paragraphs() else {
+                panic!("matches join every paragraph");
+            };
+            let text = format!("{unit}{}", format!("{replacement}{unit}").repeat(count - 1));
+            assert_eq!(paragraph.text(), text);
+            let bold_end = bold_bytes.unwrap_or(text.len());
+            let mut expected = vec![(0..bold_end, true)];
+            if bold_end < text.len() {
+                expected.push((bold_end..text.len(), false));
+            }
+            let spans: Vec<_> = paragraph
+                .spans()
+                .iter()
+                .map(|span| (span.range.clone(), span.style.bold))
+                .collect();
+            assert_eq!(spans, expected, "{unit:?}");
+            if count < 16 {
+                caret(&mut sequential, 0, 0);
+                while sequential.find_next("\n", options, false).unwrap() {
+                    assert!(
+                        sequential
+                            .replace_selected_match("\n", replacement, options)
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    batch.document().paragraphs(),
+                    sequential.document().paragraphs(),
+                    "{unit:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn edits_in_long_nested_lists_follow_distant_parents() {
     let mut text = String::from("parent");
     for _ in 0..200 {
