@@ -297,8 +297,11 @@ impl Session {
     fn report(&self, editor: &Editor, source_revision: Option<&str>) -> String {
         let document = editor.document();
         let snapshot = document.to_bytes();
-        let round_trip = textloom::Document::from_bytes(&snapshot)
-            .is_ok_and(|restored| restored.to_bytes() == snapshot);
+        let round_trip = textloom::Document::from_bytes_with_limits(
+            &snapshot,
+            textloom::DecodeLimits::UNLIMITED,
+        )
+        .is_ok_and(|restored| restored.to_bytes() == snapshot);
         let text_bytes: usize = document.paragraphs().iter().map(|p| p.text().len()).sum();
         let selection = editor.selection();
         let style = editor.typing_style();
@@ -570,6 +573,15 @@ mod tests {
         assert!(!report.contains("PRIVATE"));
         assert!(!report.contains("秘密"));
         assert_eq!(json_number(Some(f32::NAN)), "null");
+    }
+
+    #[test]
+    fn report_round_trips_documents_over_the_default_decode_limits() {
+        let editor = Editor::from_text(&"\n".repeat(1_000_000));
+        let session = unwritten_session(&["--qa-report", "unused.json"], &editor);
+        let report = session.report(&editor, None);
+        assert!(report.contains("\"paragraphs\": 1000001"));
+        assert!(report.contains("\"tlfr_round_trip_equal\": true"));
     }
 
     #[test]

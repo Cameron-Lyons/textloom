@@ -53,7 +53,7 @@ enum EditorCommand {
     ParagraphKind(ParagraphKind),
     Indent,
     Outdent,
-    ItemKind(ParagraphKind),
+    ItemStart(Option<u32>),
     CaptureSnapshot,
     RestoreSnapshot,
     ApplyLink(String),
@@ -208,9 +208,9 @@ impl NativeEditor {
                 let result = self.editor.outdent_list();
                 self.result(result);
             }
-            EditorCommand::ItemKind(kind) => {
+            EditorCommand::ItemStart(start) => {
                 let index = kind_paragraph(self.editor.selection());
-                let result = set_item_kind(&mut self.editor, index, kind);
+                let result = set_item_start(&mut self.editor, index, start);
                 self.result(result);
             }
             EditorCommand::CaptureSnapshot => {
@@ -222,7 +222,7 @@ impl NativeEditor {
                 let Some(bytes) = &self.snapshot else {
                     return;
                 };
-                match textloom::Document::from_bytes(bytes) {
+                match Document::from_bytes_with_limits(bytes, textloom::DecodeLimits::UNLIMITED) {
                     Ok(document) => {
                         self.editor = Editor::new(document);
                         if let Some(qa) = &mut self.qa {
@@ -326,18 +326,15 @@ impl NativeEditor {
                         self.commands.push(EditorCommand::Style(patch));
                     }
                 }
-                let mut colored = None;
                 for target in [ColorTarget::Fill, ColorTarget::Font] {
                     let last = match target {
                         ColorTarget::Fill => &mut self.fill_color,
                         ColorTarget::Font => &mut self.font_color,
                     };
                     if let Some(color) = color_control(ui, target, last) {
-                        colored = Some(target.patch(color));
+                        self.commands
+                            .push(EditorCommand::Style(target.patch(color)));
                     }
-                }
-                if let Some(patch) = colored {
-                    self.commands.push(EditorCommand::Style(patch));
                 }
                 if ui.button("Clear formatting").clicked() {
                     self.commands.push(EditorCommand::ClearFormatting);
@@ -436,7 +433,7 @@ impl NativeEditor {
                 }
                 let focused = kind_paragraph(self.editor.selection());
                 let document = self.editor.document();
-                if let ParagraphKind::Ordered { indent, start } =
+                if let ParagraphKind::Ordered { start, .. } =
                     document.paragraph(focused).unwrap().kind()
                 {
                     let number = document.list_number(focused).unwrap();
@@ -455,8 +452,7 @@ impl NativeEditor {
                         restart = Some(None);
                     }
                     if let Some(start) = restart {
-                        let kind = ParagraphKind::Ordered { indent, start };
-                        self.commands.push(EditorCommand::ItemKind(kind));
+                        self.commands.push(EditorCommand::ItemStart(start));
                     }
                 }
             });
@@ -831,11 +827,19 @@ fn kind_paragraph(selection: Selection) -> usize {
     }
 }
 
-fn set_item_kind(
+fn set_item_start(
     editor: &mut Editor,
     index: usize,
-    kind: ParagraphKind,
+    start: Option<u32>,
 ) -> Result<(), textloom::Error> {
+    let Some(ParagraphKind::Ordered { indent, .. }) = editor
+        .document()
+        .paragraph(index)
+        .map(|paragraph| paragraph.kind())
+    else {
+        return Ok(());
+    };
+    let kind = ParagraphKind::Ordered { indent, start };
     let selection = editor.selection();
     editor.transaction(|editor| {
         editor.set_selection(Selection::caret(Position::new(index, 0)))?;
@@ -1563,6 +1567,85 @@ mod tests {
     }
 
     #[test]
+    fn numbering_commands_leave_body_text_alone_after_ime_merges_the_item_away() {
+        for label in ["Restart at 1", "Continue numbering"] {
+            for accessibility in [false, true] {
+                let mut harness = Harness::new("ime-numbering-merge");
+                harness.app.editor = Editor::from_text("first\nsecond\nthird");
+                let editor = &mut harness.app.editor;
+                editor
+                    .set_selection(Selection::caret(Position::new(2, 0)))
+                    .unwrap();
+                editor
+                    .set_paragraph_kind(ParagraphKind::Ordered {
+                        indent: 2,
+                        start: Some(7),
+                    })
+                    .unwrap();
+                editor
+                    .set_selection(Selection::new(Position::new(0, 2), Position::new(2, 3)))
+                    .unwrap();
+                assert!(harness.has_label("Item 7."));
+                harness.preedit("に");
+                if accessibility {
+                    harness.accessibility_click(label);
+                } else {
+                    harness.click(label, Role::Button);
+                }
+                harness.assert_no_command_errors();
+                assert_eq!(harness.app.editor.document().plain_text(), "fiにrd");
+                assert_eq!(
+                    harness.kinds(0..=0),
+                    [ParagraphKind::Body],
+                    "{label} accessibility={accessibility}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numbering_command_batched_after_a_caret_move_keeps_body_text() {
+        let mut harness = Harness::new("batched-numbering");
+        harness.app.editor = Editor::from_text("first\nsecond");
+        harness
+            .app
+            .editor
+            .set_paragraph_kind(ParagraphKind::Ordered {
+                indent: 1,
+                start: Some(7),
+            })
+            .unwrap();
+        assert!(harness.has_label("Item 7."));
+        assert!(harness.editor_focused());
+        let (&target, _) = harness
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Button && node.label() == Some("Restart at 1"))
+            .unwrap();
+        harness.step(vec![
+            plain_key(egui::Key::ArrowDown),
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_node: target,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                data: None,
+            }),
+        ]);
+        harness.assert_no_command_errors();
+        assert_eq!(harness.app.editor.selection().focus.paragraph, 1);
+        assert_eq!(
+            harness.kinds(0..=1),
+            [
+                ParagraphKind::Ordered {
+                    indent: 1,
+                    start: Some(7)
+                },
+                ParagraphKind::Body
+            ]
+        );
+    }
+
+    #[test]
     fn redo_during_ime_composition_commits_it_before_changing_history() {
         let mut harness = Harness::new("ime-redo");
         harness.step(vec![egui::Event::Text("undone ".into())]);
@@ -1595,6 +1678,25 @@ mod tests {
             harness.app.editor.document().plain_text()
         );
         assert!(captured.plain_text().starts_with("TextLoom\nにほんSelect"));
+    }
+
+    #[test]
+    fn restoring_a_snapshot_reopens_documents_over_the_default_decode_limits() {
+        let mut harness = Harness::new("large-snapshot");
+        harness.app.editor = Editor::from_text(&"\n".repeat(1_000_000));
+        let (app, context) = (&mut harness.app, &harness.context);
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            app.apply_command(ui, EditorCommand::CaptureSnapshot);
+            app.editor = Editor::from_text("edited");
+            app.apply_command(ui, EditorCommand::RestoreSnapshot);
+        });
+        output.drop_without_applying_deltas();
+        harness.assert_no_command_errors();
+        assert_eq!(
+            harness.app.status,
+            "Snapshot restored; editing history cleared"
+        );
+        assert_eq!(harness.app.editor.document().paragraphs().len(), 1_000_001);
     }
 
     #[test]
@@ -2326,6 +2428,38 @@ mod tests {
         assert_eq!(harness.app.font_color, Color::PURPLE);
         assert_eq!(harness.app.fill_color, Color::YELLOW);
         harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn fill_and_font_color_activated_in_one_frame_both_apply() {
+        let mut harness = Harness::new("fill-and-font-color");
+        harness.select(1, 0..6);
+        harness.step(Vec::new());
+        let events = [ColorTarget::Fill, ColorTarget::Font]
+            .map(|target| {
+                let (&node, _) = harness
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == Role::Button && node.label() == Some(target.label())
+                    })
+                    .unwrap();
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target_node: node,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                })
+            })
+            .into_iter()
+            .collect();
+        let undo = harness.app.editor.undo_len();
+        harness.step(events);
+        harness.assert_no_command_errors();
+        let style = harness.app.editor.selection_style();
+        assert_eq!(style.background, Some(Some(Color::YELLOW)));
+        assert_eq!(style.foreground, Some(Some(Color::RED)));
+        assert_eq!(harness.app.editor.undo_len(), undo + 2);
     }
 
     #[test]
