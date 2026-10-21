@@ -270,8 +270,10 @@ impl Editor {
         self.document.validate_position(selection.focus)?;
         self.normalize_history();
         self.composition = None;
-        self.selection = selection;
-        self.typing_style = self.selection_typing_style(selection);
+        if selection != self.selection {
+            self.selection = selection;
+            self.typing_style = self.selection_typing_style(selection);
+        }
         self.preferred_column = None;
         self.break_history_group();
         Ok(())

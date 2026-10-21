@@ -1468,6 +1468,20 @@ fn no_op_moves_keep_a_pending_caret_style() {
 }
 
 #[test]
+fn setting_an_unchanged_selection_keeps_a_pending_caret_style() {
+    let mut editor = Editor::from_text("plain");
+    caret(&mut editor, 0, 5);
+    editor.apply_style(bold()).unwrap();
+    caret(&mut editor, 0, 5);
+    assert!(editor.typing_style().bold);
+    assert_eq!(editor.selection_style().bold, Some(true));
+    editor.insert_text("!").unwrap();
+    assert_eq!(span_bold(&editor), [(0..5, false), (5..6, true)]);
+    caret(&mut editor, 0, 0);
+    assert!(!editor.typing_style().bold);
+}
+
+#[test]
 fn ime_commits_join_adjacent_typing_and_selection_or_break_commits_do_not() {
     let mut editor = Editor::default();
     for text in ["a", "b", "c"] {

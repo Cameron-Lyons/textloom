@@ -5,6 +5,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::{Error, Fragment, InlineStyle, Link, ParagraphKind, Position, StylePatch};
 
 mod change;
@@ -585,8 +587,11 @@ impl Document {
             builder.append_document(self, cursor..range.start);
             let source = &self.paragraphs[range.start.paragraph];
             let end = &self.paragraphs[range.end.paragraph];
-            let style =
-                source.style_for_byte(range.start.byte.min(source.text.len().saturating_sub(1)));
+            let style = if range.start.byte < source.text.len() {
+                source.style_for_byte(range.start.byte)
+            } else {
+                builder.last_style()
+            };
             let link = source.link_for_byte(range.start.byte);
             let multiple = range.start.paragraph != range.end.paragraph;
             if builder.is_empty() && multiple && !multiline {
@@ -707,6 +712,16 @@ impl Document {
         if selected.iter().all(|paragraph| is_item(paragraph.kind)) {
             return None;
         }
+        let extends = self.paragraphs[..range.start]
+            .iter()
+            .rev()
+            .map(|paragraph| paragraph.kind)
+            .find(|kind| match *kind {
+                ParagraphKind::Ordered { indent: level, .. }
+                | ParagraphKind::Bullet { indent: level } => level <= indent,
+                _ => true,
+            })
+            .is_some_and(is_item);
         let after = selected
             .iter()
             .enumerate()
@@ -717,13 +732,7 @@ impl Document {
                         indent: level,
                         start,
                     } if level == indent => start,
-                    _ if range
-                        .start
-                        .checked_sub(1)
-                        .is_some_and(|previous| is_item(self.paragraphs[previous].kind)) =>
-                    {
-                        None
-                    }
+                    _ if extends => None,
                     _ => Some(1),
                 };
                 let kind = ParagraphKind::Ordered { indent, start };
@@ -766,6 +775,21 @@ impl ReplacementBuilder {
 
     fn is_empty(&self) -> bool {
         self.text_len() == 0
+    }
+
+    fn last_style(&self) -> InlineStyle {
+        if let Some(paragraph) = &self.candidate {
+            return paragraph.style_for_byte(paragraph.text.len().saturating_sub(1));
+        }
+        let start = self
+            .text
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start);
+        let index = self.spans.partition_point(|span| span.range.end <= start);
+        self.spans
+            .get(index)
+            .map_or_else(InlineStyle::default, |span| span.style)
     }
 
     fn materialize_candidate(&mut self) {

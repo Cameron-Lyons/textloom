@@ -1784,6 +1784,70 @@ fn replace_all_adjacent_matches_take_kinds_like_sequential_replacement() {
 }
 
 #[test]
+fn replace_all_matches_at_paragraph_ends_take_styles_like_sequential_replacement() {
+    let bold = StylePatch {
+        bold: Some(true),
+        ..Default::default()
+    };
+    let italic = StylePatch {
+        italic: Some(true),
+        ..Default::default()
+    };
+    let options = SearchOptions::default();
+    let cases: [(&str, &[_], &str, &str, &[_]); 3] = [
+        (
+            "b\na\na",
+            &[(1, 1, bold)],
+            "\na",
+            "X",
+            &[(0..3, false, false)],
+        ),
+        (
+            "x\n\ny",
+            &[(0, 1, bold)],
+            "\n",
+            "-",
+            &[(0..3, true, false), (3..4, false, false)],
+        ),
+        (
+            "a\n\u{301}\nc",
+            &[(0, 1, italic), (1, 2, bold)],
+            "\n",
+            "-",
+            &[(0..5, false, true), (5..6, false, false)],
+        ),
+    ];
+    for (text, styles, query, replacement, expected) in cases {
+        let mut batch = Editor::from_text(text);
+        for &(paragraph, end, patch) in styles {
+            style(&mut batch, paragraph, 0, end, patch);
+        }
+        let mut sequential = Editor::new(batch.document().clone());
+        caret(&mut sequential, 0, 0);
+        assert_eq!(batch.replace_all(query, replacement, options).unwrap(), 2);
+        for _ in 0..2 {
+            assert!(sequential.find_next(query, options, false).unwrap());
+            assert!(
+                sequential
+                    .replace_selected_match(query, replacement, options)
+                    .unwrap()
+            );
+        }
+        let spans: Vec<_> = batch.document().paragraphs()[0]
+            .spans()
+            .iter()
+            .map(|span| (span.range.clone(), span.style.bold, span.style.italic))
+            .collect();
+        assert_eq!(spans, expected, "{text:?}");
+        assert_eq!(
+            batch.document().paragraphs(),
+            sequential.document().paragraphs(),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
 fn edits_in_long_nested_lists_follow_distant_parents() {
     let mut text = String::from("parent");
     for _ in 0..200 {
@@ -2217,4 +2281,40 @@ fn numbered_list_command_extends_a_list_right_before_it_or_starts_one() {
     assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(1, 1)]);
     editor.update_composition("x", None).unwrap();
     assert_eq!(editor.apply_numbered_list(0), Err(Error::CompositionActive));
+}
+
+#[test]
+fn numbered_list_command_extends_a_list_whose_last_item_is_nested() {
+    let continuing = |indent| ParagraphKind::Ordered {
+        indent,
+        start: None,
+    };
+    for nested in [ord(1, 1), ParagraphKind::Bullet { indent: 1 }] {
+        let mut editor = with_kinds("one\nsub\ntwo", &[ord(0, 1), nested, BODY]);
+        caret(&mut editor, 2, 0);
+        editor.apply_numbered_list(0).unwrap();
+        assert_eq!(stored_kinds(&editor)[2], continuing(0), "{nested:?}");
+        assert_eq!(kinds(&editor), [ord(0, 1), nested, ord(0, 2)]);
+    }
+    let mut editor = with_kinds(
+        "a\nb\nc\nd",
+        &[
+            ord(0, 1),
+            ord(1, 1),
+            ParagraphKind::Bullet { indent: 2 },
+            BODY,
+        ],
+    );
+    caret(&mut editor, 3, 0);
+    editor.apply_numbered_list(1).unwrap();
+    assert_eq!(stored_kinds(&editor)[3], continuing(1));
+    assert_eq!(kinds(&editor)[3], ord(1, 2));
+
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    for before in [bullet, H1] {
+        let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), before, ord(1, 1), BODY]);
+        caret(&mut editor, 3, 0);
+        editor.apply_numbered_list(0).unwrap();
+        assert_eq!(stored_kinds(&editor)[3], ord(0, 1), "{before:?}");
+    }
 }
