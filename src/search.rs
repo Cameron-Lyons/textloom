@@ -516,16 +516,17 @@ fn is_word_boundary(text: &str, byte: usize) -> bool {
 // space, so segmentation restarted there matches segmentation from byte 0.
 fn word_restart(text: &str, byte: usize) -> usize {
     let bytes = text.as_bytes();
-    (1..=byte.min(bytes.len().saturating_sub(1)))
-        .rev()
+    let last = text.floor_char_boundary(byte.min(bytes.len().saturating_sub(1)));
+    text[..last]
+        .rmatch_indices(' ')
+        .map(|(space, _)| space + 1)
         .find(|&start| {
-            bytes[start - 1] == b' '
-                && if bytes[start].is_ascii() {
-                    bytes[start] != b' '
-                } else {
-                    let pair = &text[start - 1..text.ceil_char_boundary(start + 1)];
-                    pair.split_word_bounds().next() == Some(" ")
-                }
+            if bytes[start].is_ascii() {
+                bytes[start] != b' '
+            } else {
+                let pair = &text[start - 1..text.ceil_char_boundary(start + 1)];
+                pair.split_word_bounds().next() == Some(" ")
+            }
         })
         .unwrap_or(0)
 }

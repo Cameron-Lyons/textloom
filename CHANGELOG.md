@@ -57,8 +57,11 @@ First stable release of the native Rust rich-text editing library.
   case-insensitive and whole-word queries, so a press costs time proportional
   to the distance to the match rather than to the caret's offset in a long
   paragraph. Whole-word checks restart word segmentation at the nearest earlier
-  space, also in Cyrillic, Greek, and spaced CJK text. Self-overlapping queries
-  such as `test` still scan their paragraph from its start.
+  space, also in Cyrillic, Greek, and spaced CJK text. Whole-word checks that
+  need Unicode segmentation in text without ASCII spaces before the match, such
+  as unspaced Chinese, Japanese, or Thai, still segment from the paragraph
+  start, so their cost still grows with the caret's offset. Self-overlapping
+  queries such as `test` still scan their paragraph from its start.
 - Queries containing paragraph breaks that cannot overlap themselves are matched
   paragraph by paragraph by find next/previous, `replace_selected_match()`, and
   `Document::find()`, instead of copying, lowercasing, and rescanning the whole

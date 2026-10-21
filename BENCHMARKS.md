@@ -959,9 +959,11 @@ long paragraph repeats `café 👩‍💻 नमस्ते 🇺🇸 `, and the
 
 Some costs remain or grew. Missing queries that wrap through 100,000 short
 paragraphs took 2–4% longer. Self-overlapping queries such as `test` still scan
-their paragraph, about 0.27 ms per press in the 1.1 MB paragraph. The first
-preedit frame and the commit frame still copy the document, about 2.9 and 2.3 ms
-at 100,000 paragraphs. After a change in paragraph count, the first egui
+their paragraph, about 0.27 ms per press in the 1.1 MB paragraph. Whole-word
+presses in text without ASCII spaces, such as unspaced Japanese, still segment
+from the paragraph start, about 7.5 ms near the end of a 1 MB paragraph. The
+first preedit frame and the commit frame still copy the document, about 2.9 and
+2.3 ms at 100,000 paragraphs. After a change in paragraph count, the first egui
 accessibility action builds its run-location index, about 0.35 ms at 10,000
 paragraphs and 10 ms at 100,000, instead of every structural frame paying for
 it. Enter in a fully numbered list still renumbers every later item.
