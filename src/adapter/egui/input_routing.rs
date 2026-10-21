@@ -38,7 +38,7 @@ struct InputBatch {
     focused: bool,
 }
 
-fn requests_focus(event: &Event) -> bool {
+pub(super) fn requests_focus(event: &Event) -> bool {
     matches!(event, Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
         action: egui::accesskit::Action::Focus,
         target_tree,

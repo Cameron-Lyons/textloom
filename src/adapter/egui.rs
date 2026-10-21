@@ -212,6 +212,9 @@ impl<'a> RichTextEditor<'a> {
         let old_selection = self.editor.selection();
         let old_composition = self.editor.composition_snapshot();
         let was_focused = cache.interaction.focused;
+        // A focus request delivered after this widget ran moved focus before this pass's input.
+        let focus_moved_by_request = std::mem::take(&mut cache.interaction.focus_requested)
+            && !ui.memory(|memory| memory.had_focus_last_frame(id));
         let publish_text = ui
             .ctx()
             .accesskit_node_builder(id, |node| {
@@ -341,7 +344,7 @@ impl<'a> RichTextEditor<'a> {
                 || !(pressed || clicked || response.has_focus());
             let follows_links = self.read_only || click_modifiers.command;
             let previous_press = cache.interaction.link_press.take();
-            let applied = if was_focused && ends_composition {
+            let applied = if was_focused && ends_composition && !focus_moved_by_request {
                 apply_queued_ime(
                     self.editor,
                     ui,
@@ -549,6 +552,8 @@ impl<'a> RichTextEditor<'a> {
                 });
             }
             if response.has_focus() {
+                cache.interaction.focus_requested =
+                    events.iter().any(input_routing::requests_focus);
                 self.set_focus_filter(ui, id, &cache);
             } else if let Some(committed) = finish_composition(self.editor, &mut errors) {
                 interrupted = true;
@@ -864,6 +869,7 @@ struct InteractionState {
     caret_rect: Option<Rect>,
     scroll_to_caret: bool,
     focused: bool,
+    focus_requested: bool,
     last_interaction: f64,
     commit_echo: Option<CommitEcho>,
     cleared_preedit: Option<Arc<crate::Composition>>,
@@ -1015,18 +1021,23 @@ fn apply_queued_ime(
     interrupted: &mut bool,
     options: &InputOptions,
 ) -> Vec<usize> {
+    let tab_moves_focus = options.read_only || !cache.selection_contains_list(editor);
     let queued: Vec<_> = ui.input(|input| {
-        let press = input.events.iter().position(|event| {
-            matches!(
-                event,
-                Event::PointerButton {
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    ..
-                }
-            )
+        let end = input.events.iter().position(|event| match event {
+            Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } => true,
+            Event::Key {
+                key: egui::Key::Tab,
+                pressed: true,
+                modifiers,
+                ..
+            } => tab_moves_focus && (!modifiers.any() || modifiers.shift_only()),
+            _ => false,
         });
-        input.events[..press.unwrap_or(input.events.len())]
+        input.events[..end.unwrap_or(input.events.len())]
             .iter()
             .enumerate()
             .filter(|(_, event)| matches!(event, Event::Ime(_)))
