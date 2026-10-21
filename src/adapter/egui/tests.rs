@@ -3273,6 +3273,47 @@ fn ignored_keys_and_pending_style_shortcuts_preserve_the_navigation_column() {
 }
 
 #[test]
+fn moves_and_edits_that_keep_the_selection_reset_the_navigation_column() {
+    for stationary in [
+        key(Key::ArrowRight, Modifiers::NONE),
+        key(Key::ArrowDown, Modifiers::COMMAND),
+        key(Key::End, Modifiers::NONE),
+        key(Key::Delete, Modifiers::NONE),
+    ] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("aaaaaaaaa\nx");
+        editor
+            .set_selection(Selection::caret(Position::new(0, 8)))
+            .unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowDown, Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(editor.selection().focus, Position::new(1, 1));
+        frame(&context, &mut editor, vec![stationary.clone()], true);
+        assert_eq!(editor.document().plain_text(), "aaaaaaaaa\nx");
+        assert_eq!(
+            editor.selection().focus,
+            Position::new(1, 1),
+            "{stationary:?}"
+        );
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::ArrowUp, Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(
+            editor.selection().focus,
+            Position::new(0, 1),
+            "{stationary:?}"
+        );
+    }
+}
+
+#[test]
 fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("aaaaaaaaa x aaaaaaaaa");
@@ -5943,9 +5984,13 @@ fn ordinary_input_cancels_a_cleared_preedit_and_rejects_its_late_commit() {
         (Event::Cut, ""),
         (key(Key::ArrowRight, Modifiers::NONE), "abc"),
         (key(Key::Home, Modifiers::NONE), "abc"),
+        (key(Key::End, Modifiers::NONE), "abc"),
         (key(Key::ArrowDown, Modifiers::NONE), "abc"),
+        (key(Key::PageDown, Modifiers::NONE), "abc"),
         (key(Key::Backspace, Modifiers::NONE), ""),
+        (key(Key::Delete, Modifiers::NONE), ""),
         (key(Key::Enter, Modifiers::NONE), "\n"),
+        (key(Key::Enter, Modifiers::SHIFT), "\n"),
         (key(Key::B, Modifiers::COMMAND), "abc"),
     ] {
         for separate_frame in [false, true] {

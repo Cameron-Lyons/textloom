@@ -244,13 +244,11 @@ impl<'a> RichTextEditor<'a> {
         {
             cache.interaction.cleared_preedit = None;
         }
-        let initial_preview = match cache.layout_preview(ui, self.editor, &appearance) {
-            Ok(layouts) => layouts,
-            Err(error) => {
-                errors.push(error);
-                None
-            }
-        };
+        let initial_preview = record(
+            cache.layout_preview(ui, self.editor, &appearance),
+            &mut errors,
+        )
+        .flatten();
         let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
         let rows = self.min_rows as f32;
         let hint = self.hint_galley(ui, initial_preview.as_ref().unwrap_or(&layouts));
@@ -521,19 +519,18 @@ impl<'a> RichTextEditor<'a> {
                         &mut accessibility_errors,
                     )
                 } else if response.has_focus() {
-                    is_commit_echo(&mut cache.interaction.commit_echo, event, self.editor)
-                        || handle_event(
-                            self.editor,
-                            ui,
-                            event,
-                            &layouts,
-                            &mut cache.interaction.navigation,
-                            &mut cache.interaction.commit_echo,
-                            &mut errors,
-                            &mut interrupted,
-                            &options,
-                            &mut self.rich_clipboard,
-                        )
+                    handle_event(
+                        self.editor,
+                        ui,
+                        event,
+                        &layouts,
+                        &mut cache.interaction.navigation,
+                        &mut cache.interaction.commit_echo,
+                        &mut errors,
+                        &mut interrupted,
+                        &options,
+                        &mut self.rich_clipboard,
+                    )
                 } else {
                     false
                 };
@@ -599,13 +596,11 @@ impl<'a> RichTextEditor<'a> {
         if composition_changed {
             ui.ctx().request_repaint();
         }
-        let preview_layouts = match cache.layout_preview(ui, self.editor, &appearance) {
-            Ok(layouts) => layouts,
-            Err(error) => {
-                errors.push(error);
-                None
-            }
-        };
+        let preview_layouts = record(
+            cache.layout_preview(ui, self.editor, &appearance),
+            &mut errors,
+        )
+        .flatten();
         let display_layouts = preview_layouts.as_ref().unwrap_or(&layouts);
         let preview = cache.preview.as_ref();
         let display_document = preview.map_or(self.editor.document(), |preview| &preview.document);
@@ -965,10 +960,8 @@ impl Cache {
     }
 }
 
-fn record(result: Result<(), Error>, errors: &mut Vec<Error>) {
-    if let Err(error) = result {
-        errors.push(error);
-    }
+fn record<T>(result: Result<T, Error>, errors: &mut Vec<Error>) -> Option<T> {
+    result.map_err(|error| errors.push(error)).ok()
 }
 
 #[derive(Clone, Copy)]
@@ -1069,20 +1062,18 @@ fn apply_queued_ime(
     let revision = editor.document().revision();
     for (index, event) in queued {
         let composition = composition_before_event(editor, &event);
-        if is_commit_echo(&mut cache.interaction.commit_echo, &event, editor)
-            || handle_event(
-                editor,
-                ui,
-                &event,
-                layouts,
-                &mut cache.interaction.navigation,
-                &mut cache.interaction.commit_echo,
-                errors,
-                interrupted,
-                options,
-                &mut None,
-            )
-        {
+        if handle_event(
+            editor,
+            ui,
+            &event,
+            layouts,
+            &mut cache.interaction.navigation,
+            &mut cache.interaction.commit_echo,
+            errors,
+            interrupted,
+            options,
+            &mut None,
+        ) {
             applied.push(index);
         }
         observe_composition_event(&mut cache.interaction, composition, editor, &event, now);
@@ -1159,23 +1150,6 @@ fn observe_composition_event(
     }
     if !empty {
         interaction.cleared_preedit = None;
-    }
-}
-
-fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor) -> bool {
-    let Some(pending) = echo else {
-        return false;
-    };
-    match event {
-        Event::Ime(ImeEvent::Commit(text))
-            if !matches!(text.as_str(), "\n" | "\r" | "\r\n")
-                && editor.composition().is_none()
-                && clean_text(text, true) == pending.text =>
-        {
-            *echo = None;
-            true
-        }
-        _ => false,
     }
 }
 
