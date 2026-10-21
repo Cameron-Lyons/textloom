@@ -36,12 +36,8 @@ pub(super) struct Appearance {
 pub(super) struct ParagraphCache {
     pub(super) paragraph: Arc<Paragraph>,
     pub(super) number: Option<u32>,
-    pub(super) galley: Arc<Galley>,
-    pub(super) marker: Option<Arc<Galley>>,
     pub(super) chars: usize,
-    pub(super) indent: f32,
-    pub(super) marker_x: f32,
-    pub(super) quote_bar: Option<Rect>,
+    pub(super) layout: ParagraphLayout,
 }
 
 #[derive(Clone)]
@@ -125,7 +121,6 @@ pub(super) struct LayoutCache {
     pub(super) appearance: Option<Appearance>,
     font_environment: Option<FontEnvironment>,
     pub(super) document_identity: Option<Arc<()>>,
-    pub(super) paragraphs: Vec<ParagraphCache>,
     pub(super) layouts: ParagraphLayouts,
 }
 
@@ -173,18 +168,15 @@ impl LayoutCache {
             };
 
             if appearance_changed || environment_changed {
-                self.paragraphs.clear();
-                self.paragraphs
-                    .extend(
-                        document
-                            .paragraphs()
-                            .iter()
-                            .enumerate()
-                            .map(|(index, paragraph)| {
-                                shaper.create(paragraph, document.list_number(index), None)
-                            }),
-                    );
-                self.layouts.rebuild(&self.paragraphs);
+                let caches: Vec<_> = document
+                    .paragraphs()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, paragraph)| {
+                        shaper.create(paragraph, document.list_number(index), None)
+                    })
+                    .collect();
+                self.layouts.rebuild(&caches);
             } else {
                 let source = document.paragraphs();
                 let (old, new) = if let Some(change) = self
@@ -195,25 +187,15 @@ impl LayoutCache {
                     let new = change.range.start..change.range.start + change.new_len;
                     (change.range, new)
                 } else {
-                    let prefix = self
-                        .paragraphs
-                        .iter()
-                        .zip(source)
-                        .take_while(|(cache, paragraph)| Arc::ptr_eq(&cache.paragraph, paragraph))
-                        .count();
-                    let suffix = self.paragraphs[prefix..]
-                        .iter()
-                        .rev()
-                        .zip(source[prefix..].iter().rev())
-                        .take_while(|(cache, paragraph)| Arc::ptr_eq(&cache.paragraph, paragraph))
-                        .count();
+                    let (prefix, suffix) = self.layouts.shared_edges(source);
                     (
-                        prefix..self.paragraphs.len() - suffix,
+                        prefix..self.layouts.len() - suffix,
                         prefix..source.len() - suffix,
                     )
                 };
-                let renumbered = old.len() != new.len()
-                    || self.paragraphs[old.clone()]
+                let previous: Vec<_> = self.layouts.caches(old.clone()).collect();
+                let renumbered = if old.len() == new.len() {
+                    previous
                         .iter()
                         .zip(&source[new.clone()])
                         .any(|(cache, paragraph)| {
@@ -221,30 +203,40 @@ impl LayoutCache {
                                 cache.paragraph.kind(),
                                 paragraph.kind(),
                             )
-                        });
-                if old.len() == new.len() {
-                    for ((cache, paragraph), index) in self.paragraphs[old.clone()]
-                        .iter_mut()
+                        })
+                } else {
+                    previous
+                        .iter()
+                        .map(|cache| cache.paragraph.kind())
+                        .chain(source[new.clone()].iter().map(|paragraph| paragraph.kind()))
+                        .any(|kind| {
+                            !crate::document::same_numbering_effect(kind, ParagraphKind::Body)
+                        })
+                };
+                let replacement: Vec<_> = if old.len() == new.len() {
+                    previous
+                        .iter()
                         .zip(&source[new.clone()])
                         .zip(new.clone())
-                    {
-                        let number = document.list_number(index);
-                        if !Arc::ptr_eq(&cache.paragraph, paragraph) || cache.number != number {
-                            let replacement = shaper.create(paragraph, number, Some(cache));
-                            *cache = replacement;
-                        }
-                    }
+                        .map(|((cache, paragraph), index)| {
+                            let number = document.list_number(index);
+                            if Arc::ptr_eq(&cache.paragraph, paragraph) && cache.number == number {
+                                (*cache).clone()
+                            } else {
+                                shaper.create(paragraph, number, Some(cache))
+                            }
+                        })
+                        .collect()
                 } else {
-                    let previous: Vec<_> = self.paragraphs.drain(old.clone()).collect();
                     let by_paragraph: HashMap<_, _> = previous
                         .iter()
-                        .map(|cache| (Arc::as_ptr(&cache.paragraph), cache))
+                        .map(|&cache| (Arc::as_ptr(&cache.paragraph), cache))
                         .collect();
                     let by_content: HashMap<_, _> = previous
                         .iter()
-                        .map(|cache| (content_key(&cache.paragraph), cache))
+                        .map(|&cache| (content_key(&cache.paragraph), cache))
                         .collect();
-                    let replacement: Vec<_> = source[new.clone()]
+                    source[new.clone()]
                         .iter()
                         .zip(new.clone())
                         .map(|(paragraph, index)| {
@@ -259,13 +251,14 @@ impl LayoutCache {
                                 ),
                             }
                         })
-                        .collect();
-                    self.paragraphs.splice(old.start..old.start, replacement);
-                }
-                let mut end = new.end;
+                        .collect()
+                };
+                self.layouts.replace(old, &replacement);
                 if renumbered {
+                    let items = document.numbered_items_from(new.end);
+                    let mut visited = items.len();
                     let mut affected = [u64::MAX; 4];
-                    for &(index, number) in document.numbered_items_from(new.end) {
+                    for (position, &(index, _)) in items.iter().enumerate() {
                         let ParagraphKind::Ordered { indent, start } = source[index].kind() else {
                             unreachable!("numbered items are ordered");
                         };
@@ -282,21 +275,16 @@ impl LayoutCache {
                         if follows && start.is_none() {
                             affected[level / 64] |= 1 << (level % 64);
                         }
-                        let cache = &self.paragraphs[index];
-                        if cache.number != Some(number) {
-                            let paragraph = &source[index];
-                            self.paragraphs[index] =
-                                shaper.create(paragraph, Some(number), Some(cache));
-                            end = index + 1;
-                        }
                         if affected == [0; 4] {
+                            visited = position + 1;
                             break;
                         }
                     }
+                    self.layouts
+                        .renumber(&items[..visited], |index, cache, number| {
+                            shaper.create(&source[index], Some(number), Some(cache))
+                        });
                 }
-                let shift = end - new.end;
-                self.layouts
-                    .replace(old.start..old.end + shift, &self.paragraphs[new.start..end]);
             }
             self.appearance = Some(appearance.clone());
             self.document_identity = Some(document_identity);
@@ -354,44 +342,39 @@ impl Shaper<'_, '_> {
             (0.0, 0.0)
         };
         let scale = size_scale(paragraph.kind());
-        if let Some(previous) = previous
-            && previous.indent == indent
+        let (galley, chars) = if let Some(previous) = previous
+            && previous.layout.rect.left() == indent
             && size_scale(previous.paragraph.kind()) == scale
             && std::ptr::eq(previous.paragraph.text(), paragraph.text())
             && std::ptr::eq(previous.paragraph.spans(), paragraph.spans())
         {
-            return ParagraphCache {
-                paragraph: Arc::clone(paragraph),
-                number,
-                quote_bar: quote_bar(paragraph.kind(), em, indent, &previous.galley),
-                galley: Arc::clone(&previous.galley),
-                marker,
-                chars: previous.chars,
-                indent,
-                marker_x,
-            };
-        }
-        let job = paragraph_job_with(
-            paragraph,
-            appearance,
-            &self.families,
-            scale,
-            (appearance.width - indent).max(8.0),
-        );
-        let chars = paragraph.text().chars().count();
-        let mut galley = self.fonts.layout_job(job);
-        if galley.end().index.0 != chars {
-            galley = self.fonts.layout_job(scalar_layout_job(&galley.job));
-        }
+            (Arc::clone(&previous.layout.galley), previous.chars)
+        } else {
+            let job = paragraph_job_with(
+                paragraph,
+                appearance,
+                &self.families,
+                scale,
+                (appearance.width - indent).max(8.0),
+            );
+            let chars = paragraph.text().chars().count();
+            let mut galley = self.fonts.layout_job(job);
+            if galley.end().index.0 != chars {
+                galley = self.fonts.layout_job(scalar_layout_job(&galley.job));
+            }
+            (galley, chars)
+        };
         ParagraphCache {
             paragraph: Arc::clone(paragraph),
             number,
-            quote_bar: quote_bar(paragraph.kind(), em, indent, &galley),
-            galley,
-            marker,
             chars,
-            indent,
-            marker_x,
+            layout: ParagraphLayout {
+                rect: Rect::from_min_size(Pos2::new(indent, 0.0), galley.size()),
+                marker_position: Pos2::new(marker_x, 0.0),
+                quote_bar: quote_bar(paragraph.kind(), em, indent, &galley),
+                galley,
+                marker,
+            },
         }
     }
 
@@ -833,12 +816,9 @@ mod tests {
         let mut offset = 0;
         for (index, paragraph) in document.paragraphs().iter().enumerate() {
             assert_eq!(layouts.char_offset(index), offset);
-            assert_eq!(
-                cache.paragraphs[index].chars,
-                paragraph.text().chars().count()
-            );
             offset += paragraph.text().chars().count() + 1;
         }
+        assert_eq!(layouts.char_offset(document.paragraphs().len()), offset);
     }
 
     #[test]
@@ -1225,6 +1205,104 @@ mod tests {
             }
         }
         assert_eq!(editor.document().list_number(0), Some(1));
+    }
+
+    #[test]
+    fn structural_edits_around_lists_match_a_fresh_layout() {
+        let context = egui::Context::default();
+        let appearance = appearance(16.0);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let kind = |choice: usize, indent: u8| match choice {
+            0 | 1 => ParagraphKind::Body,
+            2 => ParagraphKind::Quote,
+            3 => ParagraphKind::Heading { level: 1 },
+            4 => ParagraphKind::Bullet { indent },
+            5 => ParagraphKind::Ordered {
+                indent,
+                start: Some(5),
+            },
+            _ => ParagraphKind::Ordered {
+                indent,
+                start: None,
+            },
+        };
+        for _ in 0..60 {
+            let text: Vec<_> = (0..40).map(|index| format!("p{index}")).collect();
+            let mut editor = Editor::from_text(&text.join("\n"));
+            for index in 0..40 {
+                select(&mut editor, (index, 0), (index, 0));
+                editor
+                    .set_paragraph_kind(kind(next(8), next(2) as u8))
+                    .unwrap();
+            }
+            let mut cache = LayoutCache::default();
+            layout_frame(&context, &mut cache, editor.document(), &appearance);
+            for step in 0..40 {
+                for _ in 0..1 + usize::from(next(4) == 0) {
+                    let count = editor.document().paragraphs().len();
+                    let paragraph = next(count);
+                    let len = editor.document().paragraph(paragraph).unwrap().text().len();
+                    let byte = if len == 0 { 0 } else { next(len + 1) };
+                    select(&mut editor, (paragraph, byte), (paragraph, byte));
+                    match next(9) {
+                        0 | 1 => editor.insert_paragraph().unwrap(),
+                        2 => {
+                            select(&mut editor, (paragraph, 0), (paragraph, 0));
+                            editor.delete_backward().unwrap();
+                        }
+                        3 => {
+                            let end = (paragraph + 1 + next(3)).min(count - 1);
+                            select(&mut editor, (paragraph, 0), (end, 0));
+                            editor
+                                .insert_text(["", "x\ny", "a\nb\nc"][next(3)])
+                                .unwrap();
+                        }
+                        4 => {
+                            editor.undo();
+                        }
+                        5 => {
+                            editor.redo();
+                        }
+                        6 => editor
+                            .set_paragraph_kind(kind(next(8), next(2) as u8))
+                            .unwrap(),
+                        _ => editor.insert_text("q").unwrap(),
+                    }
+                }
+                let (actual, _) =
+                    layout_frame(&context, &mut cache, editor.document(), &appearance);
+                let mut fresh = LayoutCache::default();
+                let (expected, _) =
+                    layout_frame(&context, &mut fresh, editor.document(), &appearance);
+                let document = editor.document();
+                assert_eq!(actual.len(), document.paragraphs().len());
+                assert_eq!(actual.content_height(), expected.content_height());
+                let cached = cache.layouts.caches(0..actual.len());
+                for (index, cached) in cached.enumerate() {
+                    assert!(Arc::ptr_eq(
+                        &cached.paragraph,
+                        &document.paragraphs()[index]
+                    ));
+                    assert_eq!(cached.number, document.list_number(index), "step {step}");
+                    let (actual, expected) =
+                        (actual.get(index).unwrap(), expected.get(index).unwrap());
+                    let marker = |layout: &ParagraphLayout| {
+                        layout.marker.as_ref().map(|marker| marker.job.text.clone())
+                    };
+                    assert_eq!(marker(&actual), marker(&expected), "step {step}, {index}");
+                    assert_eq!(actual.rect, expected.rect, "step {step}, {index}");
+                    assert_eq!(actual.marker_position, expected.marker_position);
+                    assert_eq!(actual.quote_bar, expected.quote_bar);
+                    assert_eq!(actual.galley.job, expected.galley.job);
+                }
+            }
+        }
     }
 
     #[test]

@@ -866,7 +866,7 @@ fn cached_preview_frame(
 }
 
 #[test]
-fn successive_preedits_reuse_paragraph_storage_and_unchanged_galleys() {
+fn successive_preedits_reuse_unchanged_galleys() {
     let context = egui::Context::default();
     let mut cache = Cache::default();
     let mut editor = Editor::from_text("first\nOLD\nlast");
@@ -876,33 +876,9 @@ fn successive_preedits_reuse_paragraph_storage_and_unchanged_galleys() {
         .unwrap();
     editor.update_composition("あ", None).unwrap();
     let first = cached_preview_frame(&context, &mut cache, &editor, &appearance);
-    let paragraphs = &mut cache.preview.as_mut().unwrap().render_cache.paragraphs;
-    paragraphs.reserve(32);
-    let storage = paragraphs.as_ptr();
-    let capacity = paragraphs.capacity();
 
     editor.update_composition("あい", None).unwrap();
     let second = cached_preview_frame(&context, &mut cache, &editor, &appearance);
-    assert_eq!(
-        storage,
-        cache
-            .preview
-            .as_ref()
-            .unwrap()
-            .render_cache
-            .paragraphs
-            .as_ptr()
-    );
-    assert_eq!(
-        capacity,
-        cache
-            .preview
-            .as_ref()
-            .unwrap()
-            .render_cache
-            .paragraphs
-            .capacity()
-    );
     assert!(Arc::ptr_eq(
         &first.get(0).unwrap().galley,
         &second.get(0).unwrap().galley
@@ -1325,11 +1301,8 @@ fn structural_layout_updates_retain_edges_and_match_a_fresh_cache() {
         .set_selection(Selection::caret(Position::new(1, 3)))
         .unwrap();
     let original = cached_layout_frame(&context, &mut cache, &editor, &appearance);
-    cache.layout.paragraphs.reserve(16);
-    let storage = cache.layout.paragraphs.as_ptr();
     editor.insert_paragraph().unwrap();
     let split = cached_layout_frame(&context, &mut cache, &editor, &appearance);
-    assert_eq!(storage, cache.layout.paragraphs.as_ptr());
     for (before, after) in [(0, 0), (2, 3), (3, 4)] {
         assert!(Arc::ptr_eq(
             &original.get(before).unwrap().galley,
@@ -2821,7 +2794,7 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
             navigation.selection.focus.byte,
             row.char_count_including_newline().0
         );
-        let source = cache.layout.paragraphs[0].paragraph.as_ref();
+        let source = &cache.layout.layouts.caches(0..1).next().unwrap().paragraph;
         assert_eq!(
             cache
                 .layout
@@ -2865,7 +2838,7 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
         run_frame(vec![key(Key::ArrowDown, Modifiers::NONE)]);
         let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
         let navigation = cache.interaction.navigation.as_ref().unwrap();
-        let source = cache.layout.paragraphs[0].paragraph.as_ref();
+        let source = &cache.layout.layouts.caches(0..1).next().unwrap().paragraph;
         assert_eq!(
             cache
                 .layout
@@ -3715,7 +3688,11 @@ fn ime_preview_replaces_selected_text_reflows_and_reuses_document() {
     assert_eq!(editor.document().revision(), revision);
     assert!(!editor.can_undo());
     assert!(
-        preview.render_cache.paragraphs[0]
+        preview
+            .render_cache
+            .layouts
+            .get(0)
+            .unwrap()
             .galley
             .job
             .sections

@@ -37,15 +37,18 @@ impl Fixture {
         let quote_bar = (id % 4 == 1).then(|| {
             egui::Rect::from_min_size(egui::pos2(1.0, 0.0), egui::vec2(2.0, galley.rect.height()))
         });
+        let marker_x = indent - marker.as_ref().map_or(0.0, |marker| marker.size().x) - 8.0;
         ParagraphCache {
             paragraph: self.paragraph.clone(),
             number: None,
-            quote_bar,
-            galley: Arc::new(galley),
-            marker_x: indent - marker.as_ref().map_or(0.0, |marker| marker.size().x) - 8.0,
-            marker,
             chars: id + 1,
-            indent,
+            layout: ParagraphLayout {
+                rect: egui::Rect::from_min_size(egui::pos2(indent, 0.0), galley.rect.size()),
+                marker_position: egui::pos2(marker_x, 0.0),
+                quote_bar,
+                galley: Arc::new(galley),
+                marker,
+            },
         }
     }
 
@@ -62,10 +65,10 @@ fn assert_tree(node: &Node) -> (usize, f64, usize, usize, u16) {
             (
                 entries.len(),
                 entries.iter().map(|entry| entry.height).sum(),
-                entries.iter().map(|entry| entry.chars).sum(),
+                entries.iter().map(Entry::chars).sum(),
                 entries
                     .iter()
-                    .filter(|entry| entry.layout.marker.is_some())
+                    .filter(|entry| entry.layout().marker.is_some())
                     .count(),
                 1,
             )
@@ -88,9 +91,9 @@ fn assert_tree(node: &Node) -> (usize, f64, usize, usize, u16) {
     );
     let expected_tail = match &node.children {
         Children::Leaf(entries) => {
-            assert!(entries.iter().all(|entry| entry.layout.rect.top() == 0.0));
+            assert!(entries.iter().all(|entry| entry.layout().rect.top() == 0.0));
             let tail = entries.last().unwrap();
-            (tail.height, tail.layout.rect.bottom())
+            (tail.height, tail.layout().rect.bottom())
         }
         Children::Branch(_, right) => (right.tail_height, right.tail_bottom),
     };
@@ -134,7 +137,7 @@ fn assert_layout_sequence(actual: &[ParagraphLayout], expected: &[ParagraphLayou
 fn entry_counts(root: Option<&Node>) -> Vec<usize> {
     fn append(node: &Node, result: &mut Vec<usize>) {
         match &node.children {
-            Children::Leaf(entries) => result.extend(entries.iter().map(|entry| entry.chars)),
+            Children::Leaf(entries) => result.extend(entries.iter().map(Entry::chars)),
             Children::Branch(left, right) => {
                 append(left, result);
                 append(right, result);
@@ -165,24 +168,23 @@ fn assert_layouts(layouts: &ParagraphLayouts, expected: &[ParagraphCache]) {
         assert_eq!(layouts.char_offset(index), chars);
         chars += cache.chars + 1;
         let layout = layouts.get(index).unwrap();
-        assert!(Arc::ptr_eq(&layout.galley, &cache.galley));
+        let offset = egui::vec2(0.0, y as f32);
+        assert!(Arc::ptr_eq(&layout.galley, &cache.layout.galley));
+        assert_eq!(layout.rect, cache.layout.rect.translate(offset));
         assert_eq!(
-            layout.rect,
-            egui::Rect::from_min_size(egui::pos2(cache.indent, y as f32), cache.galley.size())
+            layout.marker_position,
+            cache.layout.marker_position + offset
         );
-        assert_eq!(layout.marker_position, egui::pos2(cache.marker_x, y as f32));
         assert_eq!(
             layout.quote_bar,
-            cache
-                .quote_bar
-                .map(|bar| bar.translate(egui::vec2(0.0, y as f32)))
+            cache.layout.quote_bar.map(|bar| bar.translate(offset))
         );
-        match (&layout.marker, &cache.marker) {
+        match (&layout.marker, &cache.layout.marker) {
             (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
             (None, None) => (),
             _ => panic!("list marker changed"),
         }
-        y += f64::from(cache.galley.size().y + PARAGRAPH_GAP);
+        y += f64::from(cache.layout.galley.size().y + PARAGRAPH_GAP);
         flat.push(layout);
     }
     assert_eq!(layouts.char_offset(expected.len()), chars);
@@ -232,7 +234,7 @@ fn assert_layouts(layouts: &ParagraphLayouts, expected: &[ParagraphCache]) {
                 layouts.contains_list(start..end),
                 expected[start..end]
                     .iter()
-                    .any(|cache| cache.marker.is_some())
+                    .any(|cache| cache.layout.marker.is_some())
             );
         }
     }
@@ -330,7 +332,8 @@ fn y_partitions_match_rectangle_predicates_at_every_edge_and_gap_midpoint() {
         for large_first_paragraph in [false, true] {
             let mut caches = fixture.caches(0, len);
             if large_first_paragraph && let Some(first) = caches.first_mut() {
-                Arc::make_mut(&mut first.galley).rect.max.y = 16_777_216.0;
+                Arc::make_mut(&mut first.layout.galley).rect.max.y = 16_777_216.0;
+                first.layout.rect.max.y = 16_777_216.0;
             }
             let mut layouts = ParagraphLayouts::default();
             layouts.rebuild(&caches);
@@ -338,19 +341,15 @@ fn y_partitions_match_rectangle_predicates_at_every_edge_and_gap_midpoint() {
             let flat: Vec<_> = caches
                 .iter()
                 .map(|cache| {
+                    let offset = egui::vec2(0.0, y as f32);
                     let layout = ParagraphLayout {
-                        galley: cache.galley.clone(),
-                        rect: egui::Rect::from_min_size(
-                            egui::pos2(cache.indent, y as f32),
-                            cache.galley.size(),
-                        ),
-                        marker: cache.marker.clone(),
-                        marker_position: egui::pos2(cache.marker_x, y as f32),
-                        quote_bar: cache
-                            .quote_bar
-                            .map(|bar| bar.translate(egui::vec2(0.0, y as f32))),
+                        galley: cache.layout.galley.clone(),
+                        rect: cache.layout.rect.translate(offset),
+                        marker: cache.layout.marker.clone(),
+                        marker_position: cache.layout.marker_position + offset,
+                        quote_bar: cache.layout.quote_bar.map(|bar| bar.translate(offset)),
                     };
-                    y += f64::from(cache.galley.size().y + PARAGRAPH_GAP);
+                    y += f64::from(cache.layout.galley.size().y + PARAGRAPH_GAP);
                     layout
                 })
                 .collect();
@@ -433,7 +432,7 @@ fn every_split_boundary_and_rejoin_matches_a_flat_sequence() {
         1, 2, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 255, 256, 257, 513,
     ] {
         let caches = fixture.caches(0, len);
-        let root = build(caches.iter().map(Entry::from_cache)).unwrap();
+        let root = build(caches.iter().cloned().map(Entry::new)).unwrap();
         let counts: Vec<_> = caches.iter().map(|cache| cache.chars + 1).collect();
         for boundary in 0..=len {
             let (before, after) = split(root.clone(), boundary);
@@ -571,4 +570,99 @@ fn equal_count_updates_share_every_untouched_leaf_across_tree_seams() {
         snapshot.root().unwrap()
     ));
     assert!(layouts.identity().ptr_eq(&snapshot.identity()));
+}
+
+#[test]
+fn renumbering_rebuilds_only_the_leaves_whose_numbers_change() {
+    let fixture = Fixture::new();
+    let mut original = fixture.caches(0, 2048);
+    for (index, cache) in original.iter_mut().enumerate() {
+        cache.number = Some(index as u32);
+    }
+    let mut layouts = ParagraphLayouts::default();
+    layouts.rebuild(&original);
+    let snapshot = layouts.clone();
+    let current: Vec<_> = (0..2048)
+        .step_by(7)
+        .map(|index| (index, index as u32))
+        .collect();
+    layouts.renumber(&current, |_, _, _| unreachable!("numbers are current"));
+    layouts.renumber(&[], |_, _, _| unreachable!("nothing to renumber"));
+    assert!(layouts.identity().ptr_eq(&snapshot.identity()));
+
+    let mut expected = original.clone();
+    let mut created = Vec::new();
+    layouts.renumber(
+        &[(3, 3), (5, 50), (6, 60), (900, 900), (1500, 7)],
+        |index, cache, number| {
+            created.push(index);
+            assert!(Arc::ptr_eq(
+                &cache.layout.galley,
+                &original[index].layout.galley
+            ));
+            assert_eq!(cache.number, Some(index as u32));
+            let mut replacement = fixture.cache(3000 + index);
+            replacement.number = Some(number);
+            expected[index] = replacement.clone();
+            replacement
+        },
+    );
+    assert_eq!(created, [5, 6, 1500]);
+    let before = leaf_addresses(snapshot.root().unwrap());
+    let after = leaf_addresses(layouts.root().unwrap());
+    assert_eq!(before.intersection(&after).count(), before.len() - 2);
+    assert_layouts(&layouts, &expected);
+    assert_layouts(&snapshot, &original);
+    for (actual, expected) in layouts.caches(0..2048).zip(&expected) {
+        assert!(Arc::ptr_eq(&actual.paragraph, &expected.paragraph));
+        assert!(Arc::ptr_eq(&actual.layout.galley, &expected.layout.galley));
+        assert_eq!(actual.number, expected.number);
+        assert_eq!(actual.chars, expected.chars);
+        assert_eq!(actual.layout.rect, expected.layout.rect);
+        assert_eq!(
+            actual.layout.marker_position,
+            expected.layout.marker_position
+        );
+        assert_eq!(actual.layout.quote_bar, expected.layout.quote_bar);
+    }
+    assert_eq!(layouts.caches(2040..2100).count(), 8);
+}
+
+#[test]
+fn shared_edges_match_a_flat_comparison_across_leaf_seams() {
+    let fixture = Fixture::new();
+    let paragraph = || Arc::new((*fixture.paragraph).clone());
+    let mut caches = fixture.caches(0, 300);
+    for cache in &mut caches {
+        cache.paragraph = paragraph();
+    }
+    let cached: Vec<_> = caches.iter().map(|cache| cache.paragraph.clone()).collect();
+    let mut layouts = ParagraphLayouts::default();
+    assert_eq!(layouts.shared_edges(&cached), (0, 0));
+    layouts.rebuild(&caches);
+    for start in [0, 1, 31, 32, 33, 150, 255, 256, 299, 300] {
+        for removed in [0, 1, 2, 40, 300] {
+            for inserted in [0, 1, 3] {
+                let end = (start + removed).min(cached.len());
+                let mut source = cached.clone();
+                source.splice(start..end, (0..inserted).map(|_| paragraph()));
+                let prefix = cached
+                    .iter()
+                    .zip(&source)
+                    .take_while(|(cached, source)| Arc::ptr_eq(cached, source))
+                    .count();
+                let suffix = cached[prefix..]
+                    .iter()
+                    .rev()
+                    .zip(source[prefix..].iter().rev())
+                    .take_while(|(cached, source)| Arc::ptr_eq(cached, source))
+                    .count();
+                assert_eq!(
+                    layouts.shared_edges(&source),
+                    (prefix, suffix),
+                    "{start}, {removed}, {inserted}"
+                );
+            }
+        }
+    }
 }

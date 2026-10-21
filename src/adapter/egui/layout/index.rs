@@ -2,6 +2,7 @@
 mod tests;
 
 use super::{PARAGRAPH_GAP, ParagraphCache, ParagraphLayout, ParagraphLayoutView};
+use crate::Paragraph;
 use std::{
     ops::Range,
     sync::{Arc, Weak},
@@ -11,30 +12,28 @@ const LEAF_CAPACITY: usize = 32;
 
 #[derive(Clone)]
 struct Entry {
-    layout: ParagraphLayout,
+    cache: ParagraphCache,
     height: f64,
-    chars: usize,
 }
 
 impl Entry {
-    fn from_cache(cache: &ParagraphCache) -> Self {
-        let rect =
-            egui::Rect::from_min_size(egui::Pos2::new(cache.indent, 0.0), cache.galley.size());
+    fn new(cache: ParagraphCache) -> Self {
         Self {
-            layout: ParagraphLayout {
-                galley: cache.galley.clone(),
-                rect,
-                marker: cache.marker.clone(),
-                marker_position: egui::Pos2::new(cache.marker_x, 0.0),
-                quote_bar: cache.quote_bar,
-            },
-            height: f64::from(cache.galley.size().y + PARAGRAPH_GAP),
-            chars: cache.chars + 1,
+            height: f64::from(cache.layout.galley.size().y + PARAGRAPH_GAP),
+            cache,
         }
     }
 
+    fn layout(&self) -> &ParagraphLayout {
+        &self.cache.layout
+    }
+
+    fn chars(&self) -> usize {
+        self.cache.chars + 1
+    }
+
     fn at(&self, y: f64) -> ParagraphLayout {
-        let mut layout = self.layout.clone();
+        let mut layout = self.layout().clone();
         let offset = egui::vec2(0.0, y as f32);
         layout.rect = layout.rect.translate(offset);
         layout.marker_position += offset;
@@ -43,13 +42,14 @@ impl Entry {
     }
 
     fn view(&self, y: f64) -> ParagraphLayoutView<'_> {
+        let layout = self.layout();
         let offset = egui::vec2(0.0, y as f32);
         ParagraphLayoutView {
-            galley: &self.layout.galley,
-            rect: self.layout.rect.translate(offset),
-            marker: self.layout.marker.as_ref(),
-            marker_position: self.layout.marker_position + offset,
-            quote_bar: self.layout.quote_bar.map(|bar| bar.translate(offset)),
+            galley: &layout.galley,
+            rect: layout.rect.translate(offset),
+            marker: layout.marker.as_ref(),
+            marker_position: layout.marker_position + offset,
+            quote_bar: layout.quote_bar.map(|bar| bar.translate(offset)),
         }
     }
 }
@@ -72,19 +72,19 @@ struct Node {
 
 fn leaf(entries: Vec<Entry>) -> Arc<Node> {
     debug_assert!(!entries.is_empty() && entries.len() <= LEAF_CAPACITY);
-    debug_assert!(entries.iter().all(|entry| entry.layout.rect.top() == 0.0));
+    debug_assert!(entries.iter().all(|entry| entry.layout().rect.top() == 0.0));
     let tail = entries.last().expect("nonempty layout leaf");
     Arc::new(Node {
         len: entries.len(),
         height: entries.iter().map(|entry| entry.height).sum(),
-        chars: entries.iter().map(|entry| entry.chars).sum(),
+        chars: entries.iter().map(Entry::chars).sum(),
         lists: entries
             .iter()
-            .filter(|entry| entry.layout.marker.is_some())
+            .filter(|entry| entry.layout().marker.is_some())
             .count(),
         depth: 1,
         tail_height: tail.height,
-        tail_bottom: tail.layout.rect.bottom(),
+        tail_bottom: tail.layout().rect.bottom(),
         children: Children::Leaf(entries.into_boxed_slice()),
     })
 }
@@ -216,7 +216,7 @@ fn update(node: &Arc<Node>, at: usize, paragraphs: &[ParagraphCache]) -> Arc<Nod
                 .iter_mut()
                 .zip(paragraphs)
             {
-                *entry = Entry::from_cache(cache);
+                *entry = Entry::new(cache.clone());
             }
             leaf(entries)
         }
@@ -237,6 +237,85 @@ fn update(node: &Arc<Node>, at: usize, paragraphs: &[ParagraphCache]) -> Arc<Nod
                 )
             };
             branch(next_left, next_right)
+        }
+    }
+}
+
+fn renumber(
+    node: &Arc<Node>,
+    offset: usize,
+    items: &[(usize, u32)],
+    create: &mut impl FnMut(usize, &ParagraphCache, u32) -> ParagraphCache,
+) -> Option<Arc<Node>> {
+    if items.is_empty() {
+        return None;
+    }
+    match &node.children {
+        Children::Leaf(entries) => {
+            let mut changed = items
+                .iter()
+                .filter(|&&(index, number)| entries[index - offset].cache.number != Some(number))
+                .peekable();
+            changed.peek()?;
+            let entries = entries
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| {
+                    match changed.next_if(|&&(index, _)| index == offset + position) {
+                        Some(&(index, number)) => Entry::new(create(index, &entry.cache, number)),
+                        None => entry.clone(),
+                    }
+                })
+                .collect();
+            Some(leaf(entries))
+        }
+        Children::Branch(left, right) => {
+            let split = items.partition_point(|&(index, _)| index < offset + left.len);
+            let next_left = renumber(left, offset, &items[..split], create);
+            let next_right = renumber(right, offset + left.len, &items[split..], create);
+            (next_left.is_some() || next_right.is_some()).then(|| {
+                branch(
+                    next_left.unwrap_or_else(|| left.clone()),
+                    next_right.unwrap_or_else(|| right.clone()),
+                )
+            })
+        }
+    }
+}
+
+fn shared_prefix(node: &Node, source: &[Arc<Paragraph>]) -> usize {
+    match &node.children {
+        Children::Leaf(entries) => entries
+            .iter()
+            .zip(source)
+            .take_while(|(entry, paragraph)| Arc::ptr_eq(&entry.cache.paragraph, paragraph))
+            .count(),
+        Children::Branch(left, right) => {
+            let shared = shared_prefix(left, source);
+            if shared == left.len {
+                shared + shared_prefix(right, &source[shared..])
+            } else {
+                shared
+            }
+        }
+    }
+}
+
+fn shared_suffix(node: &Node, source: &[Arc<Paragraph>]) -> usize {
+    match &node.children {
+        Children::Leaf(entries) => entries
+            .iter()
+            .rev()
+            .zip(source.iter().rev())
+            .take_while(|(entry, paragraph)| Arc::ptr_eq(&entry.cache.paragraph, paragraph))
+            .count(),
+        Children::Branch(left, right) => {
+            let shared = shared_suffix(right, source);
+            if shared == right.len {
+                shared + shared_suffix(left, &source[..source.len() - shared])
+            } else {
+                shared
+            }
         }
     }
 }
@@ -369,7 +448,7 @@ impl ParagraphLayouts {
                     for entry in entries {
                         let edge = offset as f32
                             + if bottom {
-                                entry.layout.rect.bottom()
+                                entry.layout().rect.bottom()
                             } else {
                                 0.0
                             }
@@ -412,9 +491,9 @@ impl ParagraphLayouts {
                             .iter()
                             .map(|e| {
                                 if lists {
-                                    usize::from(e.layout.marker.is_some())
+                                    usize::from(e.layout().marker.is_some())
                                 } else {
-                                    e.chars
+                                    e.chars()
                                 }
                             })
                             .sum::<usize>();
@@ -442,7 +521,7 @@ impl ParagraphLayouts {
 
     pub(super) fn rebuild(&mut self, paragraphs: &[ParagraphCache]) {
         self.version = Some(Arc::new(LayoutVersion {
-            root: build(paragraphs.iter().map(Entry::from_cache)),
+            root: build(paragraphs.iter().cloned().map(Entry::new)),
             environment: Arc::new(()),
         }));
     }
@@ -475,8 +554,34 @@ impl ParagraphLayouts {
         } else {
             (None, None)
         };
-        let replacement = build(paragraphs.iter().map(Entry::from_cache));
+        let replacement = build(paragraphs.iter().cloned().map(Entry::new));
         self.publish_root(concat(concat(before, replacement), after));
+    }
+
+    pub(super) fn renumber(
+        &mut self,
+        items: &[(usize, u32)],
+        mut create: impl FnMut(usize, &ParagraphCache, u32) -> ParagraphCache,
+    ) {
+        if let Some(root) = self
+            .root()
+            .and_then(|root| renumber(root, 0, items, &mut create))
+        {
+            self.publish_root(Some(root));
+        }
+    }
+
+    pub(super) fn shared_edges(&self, source: &[Arc<Paragraph>]) -> (usize, usize) {
+        let Some(root) = self.root() else {
+            return (0, 0);
+        };
+        let prefix = shared_prefix(root, source);
+        let tail = root.len.min(source.len()) - prefix;
+        (prefix, shared_suffix(root, &source[source.len() - tail..]))
+    }
+
+    pub(crate) fn caches(&self, range: Range<usize>) -> impl Iterator<Item = &ParagraphCache> + '_ {
+        self.entries_range(range).map(|(entry, _)| &entry.cache)
     }
 
     #[cfg(test)]
@@ -537,21 +642,22 @@ impl ParagraphLayouts {
 
     #[cfg(test)]
     pub(crate) fn from_test_layouts(layouts: Vec<ParagraphLayout>) -> Self {
+        let paragraph = crate::Document::new().paragraphs()[0].clone();
         let entries: Vec<_> = layouts
             .into_iter()
             .map(|mut layout| {
-                let height = f64::from(layout.galley.size().y + PARAGRAPH_GAP);
                 let top = layout.rect.top();
                 layout.rect = layout.rect.translate(egui::vec2(0.0, -top));
                 layout.marker_position.y -= top;
                 layout.quote_bar = layout
                     .quote_bar
                     .map(|bar| bar.translate(egui::vec2(0.0, -top)));
-                Entry {
-                    chars: layout.galley.end().index.0 + 1,
+                Entry::new(ParagraphCache {
+                    paragraph: paragraph.clone(),
+                    number: None,
+                    chars: layout.galley.end().index.0,
                     layout,
-                    height,
-                }
+                })
             })
             .collect();
         Self {

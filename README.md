@@ -299,9 +299,9 @@ preview. It retains galleys and paints visible paragraphs. Committed edits carry
 a compact description of the replaced paragraph range to the adapters. Ordinary
 local edits update the affected cache entries and paths in a persistent layout
 index, which tracks paragraph heights, scalar totals, and list membership.
-Retained layout snapshots keep their original geometry. Structural edits also
-shift later paragraph-cache references; after changes that affect numbering or
-the paragraph count, only markers whose computed number changed are rebuilt,
+Retained layout snapshots keep their original geometry. Structural edits split
+and rejoin the same index without shifting later entries; after changes that
+affect numbering, only markers whose computed number changed are rebuilt,
 reusing their items' shaped text. Actual changes to font definitions, text
 options, DPI, or appearance still rebuild all layouts. If an adapter misses an edit or receives
 an unrelated document, it compares paragraph identities to recover safely.
