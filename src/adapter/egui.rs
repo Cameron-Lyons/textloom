@@ -29,12 +29,12 @@ pub use input_routing::install_input_routing;
 #[cfg(test)]
 use layout::paragraph_job;
 use layout::{Appearance, LayoutCache, ParagraphLayouts};
-use navigation::{
-    VerticalNavigation, document_caret_rect, hit_test, link_at_point, pointer_navigation,
-    selection_bounds,
-};
 #[cfg(test)]
-use navigation::{preedit_byte_range, snap_grapheme};
+use navigation::preedit_byte_range;
+use navigation::{
+    VerticalNavigation, document_caret_rect, grapheme_at_point, hit_test, link_at_point,
+    pointer_navigation, selection_bounds,
+};
 use paint::{BackgroundRanges, PaintCache, paint_document};
 
 pub trait RichClipboard {
@@ -388,7 +388,13 @@ impl<'a> RichTextEditor<'a> {
                         let result = if response.triple_clicked() {
                             self.editor.select_paragraph(position.paragraph)
                         } else if response.double_clicked() {
-                            self.editor.select_word_at(position)
+                            let under_pointer = grapheme_at_point(
+                                self.editor.document(),
+                                &layouts,
+                                pointer - origin,
+                            );
+                            self.editor
+                                .select_word_at(under_pointer.unwrap_or(position))
                         } else {
                             let anchor = if shift {
                                 self.editor.selection().anchor

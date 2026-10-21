@@ -2362,24 +2362,56 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
 
 #[test]
 fn character_hit_positions_snap_to_whole_graphemes() {
+    let context = egui::Context::default();
     for text in ["", "plain", "a👨‍👩‍👧‍👦e\u{301} 🇺🇸", "\u{600}a b"] {
         let editor = Editor::from_text(text);
-        let paragraph = editor.document().paragraph(0).unwrap();
+        let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
+        let layout = layouts.get(0).unwrap();
         let boundaries: Vec<_> = text
             .grapheme_indices(true)
             .map(|(byte, _)| byte)
             .chain([text.len()])
             .collect();
-        for byte in 0..=text.len() {
-            let expected = boundaries
-                .iter()
-                .copied()
-                .min_by_key(|boundary| (boundary.abs_diff(byte), *boundary))
-                .unwrap();
+        let mut previous = 0;
+        let mut x = layout.rect.left() - 4.0;
+        while x < layout.rect.left() + layout.galley.rect.right() + 4.0 {
+            let (position, _) = hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y));
+            assert!(
+                boundaries.contains(&position.byte) && position.byte >= previous,
+                "text={text:?}, x={x}, byte={}",
+                position.byte
+            );
+            previous = position.byte;
+            x += 0.25;
+        }
+    }
+}
+
+#[test]
+fn clicks_inside_multi_scalar_graphemes_snap_to_the_visually_nearer_edge() {
+    let context = egui::Context::default();
+    for cluster in ["🇺🇸", "👍🏽", "e\u{301}"] {
+        let text = format!("a{cluster}b");
+        let end = 1 + cluster.len();
+        let editor = Editor::from_text(&text);
+        let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
+        let caret = |byte| {
+            document_caret_rect(
+                editor.document(),
+                &layouts,
+                Pos2::ZERO,
+                Position::new(0, byte),
+                true,
+            )
+            .center()
+        };
+        let (left, right) = (caret(1), caret(end));
+        for (fraction, expected) in [(0.25, 1), (0.75, end)] {
+            let point = left.to_vec2() + (right - left) * fraction;
             assert_eq!(
-                snap_grapheme(paragraph, byte),
-                expected,
-                "text={text:?}, byte={byte}"
+                hit_test(&editor, &layouts, point).0,
+                Position::new(0, expected),
+                "text={text:?}, fraction={fraction}"
             );
         }
     }
@@ -3036,6 +3068,61 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
         );
     }
     assert!(errors.is_empty());
+}
+
+#[test]
+fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_edge() {
+    let context = egui::Context::default();
+    let narrow = "i".repeat(16);
+    let mut editor = Editor::from_text(&format!("{narrow}\na🇺🇸b\n{narrow}"));
+    let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
+    let x = |paragraph, byte| {
+        document_caret_rect(
+            editor.document(),
+            &layouts,
+            Pos2::ZERO,
+            Position::new(paragraph, byte),
+            true,
+        )
+        .center()
+        .x
+    };
+    let (left, right) = (x(1, 1), x(1, 9));
+    let mut moves = Vec::new();
+    for (paragraph, key) in [(0, Key::ArrowDown), (2, Key::ArrowUp)] {
+        for (from, to, expected) in [(0.1, 0.4, 1), (0.6, 0.9, 9)] {
+            let column = (0..=narrow.len())
+                .find(|&byte| {
+                    let x = x(paragraph, byte);
+                    x > left + from * (right - left) && x < left + to * (right - left)
+                })
+                .expect("a narrow column over the flag");
+            moves.push((paragraph, column, key, expected));
+        }
+    }
+    for (paragraph, column, key, expected) in moves {
+        editor
+            .set_selection(Selection::caret(Position::new(paragraph, column)))
+            .unwrap();
+        let mut navigation = None;
+        let mut errors = Vec::new();
+        assert!(handle_key(
+            &mut editor,
+            key,
+            None,
+            Modifiers::NONE,
+            &layouts,
+            &mut navigation,
+            &mut errors,
+            &input_options(false),
+        ));
+        assert!(errors.is_empty());
+        assert_eq!(
+            editor.selection().focus,
+            Position::new(1, expected),
+            "{key:?} from column {column}"
+        );
+    }
 }
 
 #[test]
@@ -6705,6 +6792,42 @@ fn double_and_triple_clicks_select_the_word_and_paragraph_on_release() {
     assert_eq!(editor.selection(), Selection::caret(Position::new(0, 8)));
     assert_eq!(click(&mut editor), "second");
     assert_eq!(click(&mut editor), "first second third");
+}
+
+#[test]
+fn double_clicking_the_right_half_of_a_character_selects_its_word() {
+    for (text, end, expected) in [
+        ("hello world", 5, "hello"),
+        ("hello, world", 5, "hello"),
+        ("first second third", 12, "second"),
+        ("hello world", 6, " "),
+    ] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text(text);
+        let (_, widget) = widget_frame(&context, &mut editor, vec![], Some(0.0), false, unchanged);
+        let rect = widget.response.rect;
+        let left = caret_point(&context, rect, &editor, Position::new(0, end - 1));
+        let right = caret_point(&context, rect, &editor, Position::new(0, end));
+        let point = left + (right - left) * 0.75 - Vec2::new(1.0, 0.0);
+        let mut time = 0.1;
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                widget_frame(
+                    &context,
+                    &mut editor,
+                    vec![
+                        Event::PointerMoved(point),
+                        primary(point, pressed, Modifiers::NONE),
+                    ],
+                    Some(time),
+                    false,
+                    unchanged,
+                );
+                time += 0.05;
+            }
+        }
+        assert_eq!(editor.selected_text(), expected, "text={text:?}, end={end}");
+    }
 }
 
 #[test]
