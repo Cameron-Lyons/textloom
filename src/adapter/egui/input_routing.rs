@@ -38,13 +38,20 @@ struct InputBatch {
     focused: bool,
 }
 
-pub(super) fn requests_focus(event: &Event) -> bool {
-    matches!(event, Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-        action: egui::accesskit::Action::Focus,
-        target_tree,
-        data: None,
-        ..
-    }) if *target_tree == egui::accesskit::TreeId::ROOT)
+fn requests_focus(event: &Event) -> bool {
+    focus_request_target(event).is_some()
+}
+
+pub(super) fn focus_request_target(event: &Event) -> Option<egui::accesskit::NodeId> {
+    match event {
+        Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Focus,
+            target_node,
+            target_tree,
+            data: None,
+        }) if *target_tree == egui::accesskit::TreeId::ROOT => Some(*target_node),
+        _ => None,
+    }
 }
 
 impl Plugin for InputRouting {

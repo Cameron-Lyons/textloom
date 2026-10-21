@@ -255,6 +255,72 @@ fn ime_input_after_tab_reaches_the_next_field() {
 }
 
 #[test]
+fn ime_input_after_shift_tab_reaches_the_previous_field() {
+    let shift_tab = || Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    };
+    for list in [false, true] {
+        for reversed in [false, true] {
+            for batches in [
+                [
+                    vec![commit("x"), shift_tab(), preedit("n")],
+                    vec![preedit(""), commit("n")],
+                ],
+                [
+                    vec![commit("x"), shift_tab()],
+                    vec![preedit("n"), commit("n")],
+                ],
+            ] {
+                let ctx = context(1);
+                let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+                fields.fields = [
+                    Field::new(FieldKind::Rich, "abc"),
+                    Field::new(FieldKind::Native, ""),
+                ];
+                if list {
+                    fields.fields[0]
+                        .rich
+                        .set_paragraph_kind(crate::ParagraphKind::Bullet { indent: 1 })
+                        .unwrap();
+                }
+                fields.reversed = reversed;
+                fields.warm(&ctx);
+                for batch in batches {
+                    fields.frame(&ctx, batch).drop_without_applying_deltas();
+                }
+                fields.flush(&ctx);
+                let (focused, texts) = if list {
+                    ("first", ["xnabc", ""])
+                } else {
+                    ("second", ["xabc", "n"])
+                };
+                assert_eq!(
+                    ctx.memory(|memory| memory.focused()),
+                    Some(Id::new(focused)),
+                    "list={list}, reversed={reversed}"
+                );
+                assert!(fields.fields[0].rich.composition().is_none());
+                assert_eq!(
+                    fields.fields.each_ref().map(Field::text),
+                    texts,
+                    "list={list}, reversed={reversed}"
+                );
+                if list {
+                    assert_eq!(
+                        fields.fields[0].rich.document().paragraphs()[0].kind(),
+                        crate::ParagraphKind::Bullet { indent: 0 }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn rejected_focus_requests_keep_the_original_composition_and_input() {
     for rejected in 0..4 {
         let ctx = context(1);

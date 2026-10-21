@@ -212,9 +212,15 @@ impl<'a> RichTextEditor<'a> {
         let old_selection = self.editor.selection();
         let old_composition = self.editor.composition_snapshot();
         let was_focused = cache.interaction.focused;
-        // A focus request delivered after this widget ran moved focus before this pass's input.
-        let focus_moved_by_request = std::mem::take(&mut cache.interaction.focus_requested)
-            && !ui.memory(|memory| memory.had_focus_last_frame(id));
+        // A focus request or Shift+Tab after this widget ran moved focus before this pass's input.
+        let focus_left = cache.interaction.focus_exit.take().is_some_and(|exit| {
+            ui.memory(|memory| match exit {
+                FocusExit::Request(target) => memory
+                    .focused()
+                    .is_some_and(|focused| focused.accesskit_id() == target),
+                FocusExit::Traversal => !memory.has_focus(id),
+            })
+        });
         let publish_text = ui
             .ctx()
             .accesskit_node_builder(id, |node| {
@@ -227,6 +233,7 @@ impl<'a> RichTextEditor<'a> {
         let mut errors = Vec::new();
         let mut accessibility_errors = Vec::new();
         let mut layouts = cache.layout(ui, self.editor, &appearance);
+        let tab_moves_focus = self.read_only || !cache.selection_contains_list(self.editor);
         cache.validate_navigation(self.editor.selection());
         let old_text = publish_text.then(|| cache.plain_text(self.editor.document()));
         let now = ui.input(|input| input.time);
@@ -342,7 +349,7 @@ impl<'a> RichTextEditor<'a> {
                 || !(pressed || clicked || response.has_focus());
             let follows_links = self.read_only || click_modifiers.command;
             let previous_press = cache.interaction.link_press.take();
-            let applied = if was_focused && ends_composition && !focus_moved_by_request {
+            let applied = if was_focused && ends_composition && !focus_left {
                 apply_queued_ime(
                     self.editor,
                     ui,
@@ -352,6 +359,7 @@ impl<'a> RichTextEditor<'a> {
                     &mut errors,
                     &mut interrupted,
                     &options,
+                    tab_moves_focus,
                 )
             } else {
                 Vec::new()
@@ -479,8 +487,12 @@ impl<'a> RichTextEditor<'a> {
             };
             let mut consumed = Vec::new();
             let mut layout_stale = false;
+            let mut traversed = false;
             for (index, event) in events.iter().enumerate() {
-                if applied.binary_search(&index).is_ok() {
+                // egui moves focus for Shift+Tab next pass; later IME input belongs to that widget.
+                if applied.binary_search(&index).is_ok()
+                    || (traversed && matches!(event, Event::Ime(_)))
+                {
                     continue;
                 }
                 if layout_stale && reads_layout(event) {
@@ -546,6 +558,9 @@ impl<'a> RichTextEditor<'a> {
                 );
                 layout_stale |= revision != self.editor.document().revision();
                 cache.validate_navigation(self.editor.selection());
+                traversed |= response.has_focus()
+                    && tab_moves_focus
+                    && focus_traversal(event) == Some(egui::FocusDirection::Previous);
             }
             if layout_stale {
                 layouts = cache.layout(ui, self.editor, &appearance);
@@ -567,8 +582,17 @@ impl<'a> RichTextEditor<'a> {
                 });
             }
             if response.has_focus() {
-                cache.interaction.focus_requested =
-                    events.iter().any(input_routing::requests_focus);
+                // egui applies only the last focus request of a pass.
+                let request = events
+                    .iter()
+                    .rev()
+                    .find_map(input_routing::focus_request_target)
+                    .filter(|&target| target != id.accesskit_id());
+                cache.interaction.focus_exit = if traversed {
+                    Some(FocusExit::Traversal)
+                } else {
+                    request.map(FocusExit::Request)
+                };
                 self.set_focus_filter(ui, id, &cache);
             } else if let Some(committed) = finish_composition(self.editor, &mut errors) {
                 interrupted = true;
@@ -883,7 +907,7 @@ struct InteractionState {
     caret_rect: Option<Rect>,
     scroll_to_caret: bool,
     focused: bool,
-    focus_requested: bool,
+    focus_exit: Option<FocusExit>,
     last_interaction: f64,
     commit_echo: Option<CommitEcho>,
     cleared_preedit: Option<Arc<crate::Composition>>,
@@ -899,6 +923,12 @@ impl InteractionState {
         }
         self.commit_echo = CommitEcho::new(text, time);
     }
+}
+
+#[derive(Clone, Copy)]
+enum FocusExit {
+    Request(egui::accesskit::NodeId),
+    Traversal,
 }
 
 #[derive(Clone)]
@@ -1033,8 +1063,8 @@ fn apply_queued_ime(
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
     options: &InputOptions,
+    tab_moves_focus: bool,
 ) -> Vec<usize> {
-    let tab_moves_focus = options.read_only || !cache.selection_contains_list(editor);
     let queued: Vec<_> = ui.input(|input| {
         let end = input.events.iter().position(|event| match event {
             Event::PointerButton {
@@ -1042,13 +1072,7 @@ fn apply_queued_ime(
                 pressed: true,
                 ..
             } => true,
-            Event::Key {
-                key: egui::Key::Tab,
-                pressed: true,
-                modifiers,
-                ..
-            } => tab_moves_focus && (!modifiers.any() || modifiers.shift_only()),
-            _ => false,
+            _ => tab_moves_focus && focus_traversal(event).is_some(),
         });
         input.events[..end.unwrap_or(input.events.len())]
             .iter()
@@ -1082,6 +1106,26 @@ fn apply_queued_ime(
         *layouts = cache.layout(ui, editor, appearance);
     }
     applied
+}
+
+fn focus_traversal(event: &Event) -> Option<egui::FocusDirection> {
+    match event {
+        Event::Key {
+            key: egui::Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } => {
+            if !modifiers.any() {
+                Some(egui::FocusDirection::Next)
+            } else if modifiers.shift_only() {
+                Some(egui::FocusDirection::Previous)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 const COMMIT_ECHO_SECONDS: f64 = 0.5;

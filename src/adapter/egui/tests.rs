@@ -5716,6 +5716,42 @@ fn ime_events_queued_with_a_focus_change_apply_before_blur_commits() {
 }
 
 #[test]
+fn focus_requests_that_leave_focus_in_place_keep_queued_ime_before_a_host_focus_change() {
+    for target in [WIDGET_ID, "missing widget"] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("abc");
+        composing_frame(&context, &mut editor, "ni");
+        let request = Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Focus,
+            target_node: Id::new(target).accesskit_id(),
+            target_tree: egui::accesskit::TreeId::ROOT,
+            data: None,
+        });
+        widget_frame(
+            &context,
+            &mut editor,
+            vec![request],
+            Some(0.15),
+            true,
+            unchanged,
+        );
+        assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+        context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+        widget_frame(
+            &context,
+            &mut editor,
+            candidate_commit("你").to_vec(),
+            Some(0.2),
+            false,
+            unchanged,
+        );
+        assert_eq!(editor.document().plain_text(), "你abc", "{target}");
+        assert!(editor.composition().is_none());
+        assert!(context.input(|input| input.events.is_empty()));
+    }
+}
+
+#[test]
 fn an_input_method_echoing_a_click_commit_is_inserted_once() {
     let click_commit = |context: &egui::Context, editor: &mut Editor| {
         let rect = composing_frame(context, editor, "한");
