@@ -65,7 +65,9 @@ impl HistoryEntry {
 }
 
 fn extends(previous: &Delta, delta: &Delta) -> bool {
-    previous.start == delta.start
+    previous.rest.is_empty()
+        && delta.rest.is_empty()
+        && previous.start == delta.start
         && previous.after.len() == 1
         && delta.before.len() == 1
         && delta.after.len() == 1

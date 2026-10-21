@@ -440,6 +440,73 @@ fn selection_style_all_mixed_attributes_remain_mixed_after_later_matching_runs()
 }
 
 #[test]
+fn repeated_selection_style_queries_follow_edits_history_rollbacks_and_clones() {
+    fn uncached(editor: &Editor) -> SelectionStyle {
+        let mut fresh = Editor::new(editor.document().clone());
+        fresh.set_selection(editor.selection()).unwrap();
+        fresh.selection_style()
+    }
+
+    let mut editor = Editor::from_text("plain text\n\nsecond");
+    editor.select_all();
+    let all = editor.selection();
+    assert_eq!(editor.selection_style().bold, Some(false));
+    editor.toggle_style(InlineAttribute::Bold).unwrap();
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(true));
+    assert_eq!(editor.selection_style(), uncached(&editor));
+
+    let mut clone = editor.clone();
+    assert_eq!(clone.selection_style().bold, Some(true));
+    assert!(editor.undo());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(false));
+    assert_eq!(editor.selection_style(), uncached(&editor));
+    assert_eq!(clone.selection_style().bold, Some(true));
+    assert!(editor.redo());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(true));
+
+    let result: Result<(), Error> = editor.transaction(|editor| {
+        editor.toggle_style(InlineAttribute::Bold)?;
+        assert_eq!(editor.selection_style().bold, Some(false));
+        editor.set_selection(Selection::caret(Position::new(9, 0)))
+    });
+    assert!(result.is_err());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_style().bold, Some(true));
+    assert_eq!(editor.selection_style(), uncached(&editor));
+
+    clone
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+        .unwrap();
+    clone.toggle_style(InlineAttribute::Bold).unwrap();
+    clone.select_all();
+    assert_eq!(clone.selection_style().bold, None);
+    assert_eq!(clone.selection_style(), uncached(&clone));
+    assert_eq!(editor.selection_style().bold, Some(true));
+
+    editor
+        .set_selection(Selection::new(Position::new(0, 10), Position::new(2, 0)))
+        .unwrap();
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(editor.typing_style())
+    );
+    editor
+        .apply_style(StylePatch {
+            underline: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(editor.selection_style().underline, Some(true));
+    assert_eq!(
+        editor.selection_style(),
+        SelectionStyle::from(editor.typing_style())
+    );
+}
+
+#[test]
 fn clear_formatting_resets_every_attribute_and_restores_rich_state_on_undo() {
     let mut editor = Editor::from_text("left\ncafe\u{301}\nkeep");
     editor.select_all();
@@ -791,6 +858,67 @@ fn heading_enter_returns_to_body() {
 }
 
 #[test]
+fn accessible_full_value_replacement_keeps_the_document_start_kind_and_style() {
+    use textloom::accessibility::{AccessibleAction, apply_action};
+    let heading = ParagraphKind::Heading { level: 1 };
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    let started = ParagraphKind::Ordered {
+        indent: 0,
+        start: Some(3),
+    };
+    let continued = ParagraphKind::Ordered {
+        indent: 0,
+        start: None,
+    };
+    for (start_kind, text, expected) in [
+        (heading, "x", vec![heading]),
+        (heading, "brand new\ncontent", vec![heading, BODY]),
+        (bullet, "a\nb", vec![bullet, bullet]),
+        (started, "a\nb\n", vec![started, continued, continued]),
+    ] {
+        let mut editor = Editor::from_text("Title\nbody bold");
+        editor.set_paragraph_kind(start_kind).unwrap();
+        editor
+            .set_selection(Selection::new(Position::new(1, 5), Position::new(1, 9)))
+            .unwrap();
+        editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let selection = Selection::caret(Position::new(1, 9));
+        editor.set_selection(selection).unwrap();
+        let typing_style = editor.typing_style();
+        assert!(typing_style.bold);
+        let original = editor.document().paragraphs().to_vec();
+        let steps = editor.undo_len();
+
+        apply_action(&mut editor, AccessibleAction::ReplaceAllText(text)).unwrap();
+        assert_eq!(editor.document().plain_text(), text);
+        assert_eq!(kinds(&editor), expected, "{start_kind:?} {text:?}");
+        assert!(
+            editor
+                .document()
+                .paragraphs()
+                .iter()
+                .flat_map(|paragraph| paragraph.spans())
+                .all(|span| !span.style.bold)
+        );
+        assert!(!editor.typing_style().bold);
+        assert_eq!(editor.undo_len(), steps + 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().paragraphs(), original);
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.typing_style(), typing_style);
+
+        editor.select_all();
+        editor.insert_text(text).unwrap();
+        assert!(kinds(&editor).iter().all(|kind| *kind == BODY));
+    }
+}
+
+#[test]
 fn paragraph_formatting_excludes_end_at_next_paragraph_start() {
     let mut editor = Editor::from_text("one\ntwo\nthree");
     editor
@@ -975,6 +1103,122 @@ fn history_limits_discard_farthest_redo_and_preserve_the_next_steps() {
     });
     assert_eq!(editor.redo_len(), 0);
     assert_eq!(editor.history_bytes(), 0);
+}
+
+fn identical(editor: &Editor, document: &Document) -> bool {
+    let paragraphs = editor.document().paragraphs();
+    paragraphs.len() == document.paragraphs().len()
+        && paragraphs
+            .iter()
+            .zip(document.paragraphs())
+            .all(|(paragraph, expected)| Arc::ptr_eq(paragraph, expected))
+}
+
+#[test]
+fn sparse_document_wide_edits_stay_undoable_and_keep_earlier_history() {
+    use textloom::SearchOptions;
+
+    let mut editor = Editor::from_text(&format!(
+        "match\n{}match",
+        "untouched café\n".repeat(20_000)
+    ));
+    editor.set_history_limits(HistoryLimits {
+        max_entries: 256,
+        max_bytes: 64 * 1024,
+    });
+    let original = editor.document().clone();
+    caret(&mut editor, 1, 0);
+    editor.insert_text("x").unwrap();
+    let typed = editor.document().clone();
+    let bytes = editor.history_bytes();
+    assert_eq!(
+        editor
+            .replace_all("match", "replacement", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(editor.undo_len(), 2);
+    assert!(editor.history_bytes() < bytes + 1024);
+    let replaced = editor.document().clone();
+    let heading = ParagraphKind::Heading { level: 2 };
+    caret(&mut editor, 0, 0);
+    editor.set_paragraph_kind(heading).unwrap();
+    caret(&mut editor, 20_001, 0);
+    editor.set_paragraph_kind(heading).unwrap();
+    let headed = editor.document().clone();
+    let bytes = editor.history_bytes();
+    editor.select_all();
+    editor.set_paragraph_kind(ParagraphKind::Body).unwrap();
+    assert_eq!(editor.undo_len(), 5);
+    assert!(editor.history_bytes() < bytes + 1024);
+    let flattened = editor.document().clone();
+    assert!(editor.undo());
+    assert!(identical(&editor, &headed));
+    assert!(editor.undo());
+    assert!(editor.undo());
+    assert!(identical(&editor, &replaced));
+    assert!(editor.undo());
+    assert!(identical(&editor, &typed));
+    assert!(editor.undo());
+    assert!(identical(&editor, &original));
+    while editor.redo() {}
+    assert!(identical(&editor, &flattened));
+    let result: Result<(), Error> = editor.transaction(|editor| {
+        editor.replace_all("replacement", "match", SearchOptions::default())?;
+        editor.select_all();
+        editor.set_paragraph_kind(heading)?;
+        Err(Error::InvalidRange)
+    });
+    assert_eq!(result, Err(Error::InvalidRange));
+    assert!(identical(&editor, &flattened));
+    assert_eq!(editor.undo_len(), 5);
+}
+
+#[test]
+fn sparse_replacements_that_add_or_join_paragraphs_keep_earlier_history() {
+    use textloom::SearchOptions;
+
+    let mut editor = Editor::from_text(&format!(
+        "match\n{}match",
+        "untouched café\n".repeat(20_000)
+    ));
+    editor.set_history_limits(HistoryLimits {
+        max_entries: 256,
+        max_bytes: 64 * 1024,
+    });
+    let original = editor.document().clone();
+    caret(&mut editor, 1, 0);
+    editor.insert_text("x").unwrap();
+    let typed = editor.document().clone();
+    let bytes = editor.history_bytes();
+    assert_eq!(
+        editor
+            .replace_all("match", "re\nplacement", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(editor.document().paragraphs().len(), 20_004);
+    assert_eq!(editor.undo_len(), 2);
+    assert!(editor.history_bytes() < bytes + 1024);
+    let split = editor.document().clone();
+    assert_eq!(
+        editor
+            .replace_all("re\nplacement", "match", SearchOptions::default())
+            .unwrap(),
+        2
+    );
+    assert_eq!(editor.document().plain_text(), typed.plain_text());
+    assert_eq!(editor.undo_len(), 3);
+    assert!(editor.history_bytes() < bytes + 2048);
+    let joined = editor.document().clone();
+    assert!(editor.undo());
+    assert!(identical(&editor, &split));
+    assert!(editor.undo());
+    assert!(identical(&editor, &typed));
+    assert!(editor.undo());
+    assert!(identical(&editor, &original));
+    while editor.redo() {}
+    assert!(identical(&editor, &joined));
 }
 
 #[test]
@@ -1464,6 +1708,20 @@ fn no_op_moves_keep_a_pending_caret_style() {
     editor.insert_text("!").unwrap();
     assert_eq!(span_bold(&editor), [(0..5, false), (5..6, true)]);
     editor.move_cursor(Movement::DocumentStart, false).unwrap();
+    assert!(!editor.typing_style().bold);
+}
+
+#[test]
+fn setting_an_unchanged_selection_keeps_a_pending_caret_style() {
+    let mut editor = Editor::from_text("plain");
+    caret(&mut editor, 0, 5);
+    editor.apply_style(bold()).unwrap();
+    caret(&mut editor, 0, 5);
+    assert!(editor.typing_style().bold);
+    assert_eq!(editor.selection_style().bold, Some(true));
+    editor.insert_text("!").unwrap();
+    assert_eq!(span_bold(&editor), [(0..5, false), (5..6, true)]);
+    caret(&mut editor, 0, 0);
     assert!(!editor.typing_style().bold);
 }
 

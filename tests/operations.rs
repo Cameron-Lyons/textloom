@@ -1142,6 +1142,195 @@ fn typing_over_a_selection_from_a_paragraph_start_matches_deleting_it_first() {
 }
 
 #[test]
+fn pasting_lines_over_a_selection_from_a_paragraph_start_matches_deleting_it_first() {
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    for (text, paragraph_kinds, end, inserted, expected) in [
+        (
+            "Title\nbody",
+            vec![H1, BODY],
+            Position::new(1, 2),
+            "x\ny",
+            vec![line("x", BODY), line("ydy", BODY)],
+        ),
+        (
+            "Title\nbody",
+            vec![H1, BODY],
+            Position::new(1, 0),
+            "a\nb\n",
+            vec![line("a", BODY), line("b", BODY), line("body", BODY)],
+        ),
+        (
+            "Title\nbody text",
+            vec![H1, BODY],
+            Position::new(1, 4),
+            "\n",
+            vec![line("", BODY), line(" text", BODY)],
+        ),
+        (
+            "item\nTitle",
+            vec![bullet, H1],
+            Position::new(1, 5),
+            "x\ny",
+            vec![line("x", H1), line("y", BODY)],
+        ),
+        (
+            "a\nb\nc",
+            vec![ord(0, 1), ord(0, 5), ord(0, 6)],
+            Position::new(1, 0),
+            "x\ny",
+            vec![
+                line("x", ord(0, 5)),
+                line("yb", ord(0, 6)),
+                line("c", ord(0, 7)),
+            ],
+        ),
+    ] {
+        let selection = Selection::new(Position::default(), end);
+        let mut pasted = with_kinds(text, &paragraph_kinds);
+        pasted.set_selection(selection).unwrap();
+        pasted.insert_text(inserted).unwrap();
+        assert_eq!(lines(&pasted), expected, "{text:?} {end:?} {inserted:?}");
+
+        let mut deleted = with_kinds(text, &paragraph_kinds);
+        deleted.set_selection(selection).unwrap();
+        deleted.delete_backward().unwrap();
+        deleted.insert_text(inserted).unwrap();
+        assert_eq!(
+            deleted.document().paragraphs(),
+            pasted.document().paragraphs(),
+            "{text:?} {end:?} {inserted:?}"
+        );
+
+        let mut replaced = with_kinds(text, &paragraph_kinds);
+        let query = replaced.document().text(selection.range()).unwrap();
+        replaced
+            .replace_all(&query, inserted, SearchOptions::default())
+            .unwrap();
+        assert_eq!(
+            replaced.document().paragraphs(),
+            pasted.document().paragraphs(),
+            "{text:?} {end:?} {inserted:?}"
+        );
+    }
+
+    let mut entered = with_kinds("Title\nbody text", &[H1, BODY]);
+    entered
+        .set_selection(Selection::new(Position::default(), Position::new(1, 4)))
+        .unwrap();
+    entered.insert_paragraph().unwrap();
+    assert_eq!(lines(&entered), [line("", BODY), line(" text", BODY)]);
+}
+
+#[test]
+fn seeded_documents_replace_selections_like_deleting_them_first() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let paragraph_kinds = [
+        BODY,
+        H1,
+        ParagraphKind::Quote,
+        ParagraphKind::Bullet { indent: 0 },
+        ParagraphKind::Bullet { indent: 1 },
+        ParagraphKind::Ordered {
+            indent: 0,
+            start: None,
+        },
+        ParagraphKind::Ordered {
+            indent: 0,
+            start: Some(4),
+        },
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: None,
+        },
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: Some(2),
+        },
+    ];
+    let styles = [
+        InlineStyle::default(),
+        InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        },
+    ];
+    for case in 0..300 {
+        let document = Document::from_paragraphs((0..1 + next(4)).map(|_| {
+            let mut text = String::new();
+            let mut spans = Vec::new();
+            for _ in 0..next(3) {
+                let start = text.len();
+                text.push_str(["a", "bc", "e\u{301}"][next(3)]);
+                spans.push(Span {
+                    range: start..text.len(),
+                    style: styles[next(styles.len())],
+                    link: None,
+                });
+            }
+            Paragraph::new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
+        }));
+        let positions: Vec<_> = document
+            .paragraphs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, paragraph)| {
+                (0..=paragraph.grapheme_count()).map(move |grapheme| {
+                    Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap())
+                })
+            })
+            .collect();
+        for (index, &start) in positions.iter().enumerate() {
+            for &end in &positions[index..] {
+                for text in ["", "x", "x\ny", "\n", "a\n\nb", "x\n"] {
+                    let selection = Selection::new(start, end);
+                    let mut replaced = Editor::new(document.clone());
+                    replaced.set_selection(selection).unwrap();
+                    replaced.insert_text(text).unwrap();
+                    let mut deleted = Editor::new(document.clone());
+                    deleted.set_selection(selection).unwrap();
+                    if !selection.is_caret() {
+                        deleted.delete_backward().unwrap();
+                    }
+                    deleted.insert_text(text).unwrap();
+                    // The rule covers selections from a paragraph start. After a later
+                    // start, text following a selection across a break keeps its own
+                    // paragraph's kind on the last inserted line, as with rich paste.
+                    let tail = (start.byte > 0 && start.paragraph < end.paragraph)
+                        .then(|| start.paragraph + text.matches('\n').count())
+                        .filter(|&tail| tail > start.paragraph);
+                    let paragraphs = |editor: &Editor| -> Vec<_> {
+                        editor
+                            .document()
+                            .paragraphs()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, paragraph)| {
+                                (
+                                    paragraph.text().to_owned(),
+                                    paragraph.spans().to_vec(),
+                                    (Some(index) != tail).then(|| paragraph.kind()),
+                                )
+                            })
+                            .collect()
+                    };
+                    assert_eq!(
+                        (paragraphs(&replaced), replaced.selection()),
+                        (paragraphs(&deleted), deleted.selection()),
+                        "case {case}: {document:?} {start:?}..{end:?} {text:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn rich_paste_without_a_copied_paragraph_break_keeps_the_destination_kind() {
     let mut source = Editor::from_text("some word here");
     source
@@ -1784,6 +1973,122 @@ fn replace_all_adjacent_matches_take_kinds_like_sequential_replacement() {
 }
 
 #[test]
+fn replace_all_matches_at_paragraph_ends_take_styles_like_sequential_replacement() {
+    let bold = StylePatch {
+        bold: Some(true),
+        ..Default::default()
+    };
+    let italic = StylePatch {
+        italic: Some(true),
+        ..Default::default()
+    };
+    let options = SearchOptions::default();
+    let cases: [(&str, &[_], &str, &str, &[_]); 3] = [
+        (
+            "b\na\na",
+            &[(1, 1, bold)],
+            "\na",
+            "X",
+            &[(0..3, false, false)],
+        ),
+        (
+            "x\n\ny",
+            &[(0, 1, bold)],
+            "\n",
+            "-",
+            &[(0..3, true, false), (3..4, false, false)],
+        ),
+        (
+            "a\n\u{301}\nc",
+            &[(0, 1, italic), (1, 2, bold)],
+            "\n",
+            "-",
+            &[(0..5, false, true), (5..6, false, false)],
+        ),
+    ];
+    for (text, styles, query, replacement, expected) in cases {
+        let mut batch = Editor::from_text(text);
+        for &(paragraph, end, patch) in styles {
+            style(&mut batch, paragraph, 0, end, patch);
+        }
+        let mut sequential = Editor::new(batch.document().clone());
+        caret(&mut sequential, 0, 0);
+        assert_eq!(batch.replace_all(query, replacement, options).unwrap(), 2);
+        for _ in 0..2 {
+            assert!(sequential.find_next(query, options, false).unwrap());
+            assert!(
+                sequential
+                    .replace_selected_match(query, replacement, options)
+                    .unwrap()
+            );
+        }
+        let spans: Vec<_> = batch.document().paragraphs()[0]
+            .spans()
+            .iter()
+            .map(|span| (span.range.clone(), span.style.bold, span.style.italic))
+            .collect();
+        assert_eq!(spans, expected, "{text:?}");
+        assert_eq!(
+            batch.document().paragraphs(),
+            sequential.document().paragraphs(),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn replace_all_joining_many_paragraphs_into_growing_clusters_styles_like_sequential() {
+    let bold = StylePatch {
+        bold: Some(true),
+        ..Default::default()
+    };
+    let options = SearchOptions::default();
+    for count in [6, 1 << 14] {
+        for (unit, replacement, bold_bytes) in [("\u{301}", "\u{300}", None), ("🇦", "🇧", Some(8))]
+        {
+            let mut batch = Editor::from_text(&vec![unit; count].join("\n"));
+            style(&mut batch, 0, 0, unit.len(), bold);
+            let mut sequential = Editor::new(batch.document().clone());
+            assert_eq!(
+                batch.replace_all("\n", replacement, options).unwrap(),
+                count - 1
+            );
+            let [paragraph] = batch.document().paragraphs() else {
+                panic!("matches join every paragraph");
+            };
+            let text = format!("{unit}{}", format!("{replacement}{unit}").repeat(count - 1));
+            assert_eq!(paragraph.text(), text);
+            let bold_end = bold_bytes.unwrap_or(text.len());
+            let mut expected = vec![(0..bold_end, true)];
+            if bold_end < text.len() {
+                expected.push((bold_end..text.len(), false));
+            }
+            let spans: Vec<_> = paragraph
+                .spans()
+                .iter()
+                .map(|span| (span.range.clone(), span.style.bold))
+                .collect();
+            assert_eq!(spans, expected, "{unit:?}");
+            if count < 16 {
+                caret(&mut sequential, 0, 0);
+                while sequential.find_next("\n", options, false).unwrap() {
+                    assert!(
+                        sequential
+                            .replace_selected_match("\n", replacement, options)
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    batch.document().paragraphs(),
+                    sequential.document().paragraphs(),
+                    "{unit:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn edits_in_long_nested_lists_follow_distant_parents() {
     let mut text = String::from("parent");
     for _ in 0..200 {
@@ -2217,4 +2522,40 @@ fn numbered_list_command_extends_a_list_right_before_it_or_starts_one() {
     assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(1, 1)]);
     editor.update_composition("x", None).unwrap();
     assert_eq!(editor.apply_numbered_list(0), Err(Error::CompositionActive));
+}
+
+#[test]
+fn numbered_list_command_extends_a_list_whose_last_item_is_nested() {
+    let continuing = |indent| ParagraphKind::Ordered {
+        indent,
+        start: None,
+    };
+    for nested in [ord(1, 1), ParagraphKind::Bullet { indent: 1 }] {
+        let mut editor = with_kinds("one\nsub\ntwo", &[ord(0, 1), nested, BODY]);
+        caret(&mut editor, 2, 0);
+        editor.apply_numbered_list(0).unwrap();
+        assert_eq!(stored_kinds(&editor)[2], continuing(0), "{nested:?}");
+        assert_eq!(kinds(&editor), [ord(0, 1), nested, ord(0, 2)]);
+    }
+    let mut editor = with_kinds(
+        "a\nb\nc\nd",
+        &[
+            ord(0, 1),
+            ord(1, 1),
+            ParagraphKind::Bullet { indent: 2 },
+            BODY,
+        ],
+    );
+    caret(&mut editor, 3, 0);
+    editor.apply_numbered_list(1).unwrap();
+    assert_eq!(stored_kinds(&editor)[3], continuing(1));
+    assert_eq!(kinds(&editor)[3], ord(1, 2));
+
+    let bullet = ParagraphKind::Bullet { indent: 0 };
+    for before in [bullet, H1] {
+        let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), before, ord(1, 1), BODY]);
+        caret(&mut editor, 3, 0);
+        editor.apply_numbered_list(0).unwrap();
+        assert_eq!(stored_kinds(&editor)[3], ord(0, 1), "{before:?}");
+    }
 }

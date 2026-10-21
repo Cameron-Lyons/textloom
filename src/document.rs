@@ -5,6 +5,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
+
 use crate::{Error, Fragment, InlineStyle, Link, ParagraphKind, Position, StylePatch};
 
 mod change;
@@ -139,11 +141,7 @@ impl Document {
                 }
                 levels.push(paragraph.kind);
                 if slice == (0..paragraph.text.len()) {
-                    if kind == paragraph.kind {
-                        Arc::clone(paragraph)
-                    } else {
-                        Arc::new(paragraph.with_kind(kind))
-                    }
+                    paragraph.with_kind(kind)
                 } else {
                     let mut text = String::with_capacity(slice.len());
                     let mut spans = Vec::new();
@@ -202,7 +200,6 @@ impl Document {
         self.revision
     }
 
-    #[cfg(any(feature = "egui", feature = "accesskit"))]
     pub(crate) fn content_identity(&self) -> Arc<()> {
         Arc::clone(&self.identity)
     }
@@ -242,6 +239,11 @@ impl Document {
             };
             (index, paragraph, from..to)
         })
+    }
+
+    pub(crate) fn spans_in(&self, range: &Range<Position>) -> impl Iterator<Item = &Span> {
+        self.slices(range)
+            .flat_map(|(_, paragraph, slice)| &paragraph.spans[paragraph.overlapping(slice)])
     }
 
     pub fn validate_position(&self, position: Position) -> Result<(), Error> {
@@ -343,48 +345,51 @@ impl Document {
         style: InlineStyle,
         link: Option<&Link>,
     ) -> Result<(Delta, Position), Error> {
+        self.replace_with_kind(range, text, style, link, None)
+    }
+
+    pub(crate) fn replace_with_kind(
+        &mut self,
+        range: Range<Position>,
+        text: &str,
+        style: InlineStyle,
+        link: Option<&Link>,
+        kind: Option<ParagraphKind>,
+    ) -> Result<(Delta, Position), Error> {
         self.validate_range(&range)?;
         if range.is_empty() && text.is_empty() {
-            return Ok((
-                Delta {
-                    start: range.start.paragraph,
-                    before: Vec::new(),
-                    after: Vec::new(),
-                },
-                range.start,
-            ));
+            return Ok((Delta::empty(range.start.paragraph), range.start));
         }
         let text = normalize_newlines(text);
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
         let chunks: Vec<&str> = text.split('\n').collect();
-        let leading = removes_leading_paragraph(&range, chunks.len() == 1);
+        let leading = removes_leading_paragraph(&range);
+        let base = kind.unwrap_or_else(|| {
+            if leading {
+                self.surviving_kind(range.start.paragraph..range.end.paragraph, last.kind)
+            } else {
+                first.kind
+            }
+        });
         let mut after = Vec::with_capacity(chunks.len());
         let mut insertion_end = 0;
         for (index, chunk) in chunks.iter().enumerate() {
             let is_first = index == 0;
             let is_last = index + 1 == chunks.len();
             let kind = if is_first {
-                if leading {
-                    self.surviving_kind(range.start.paragraph..range.end.paragraph, last.kind)
-                } else {
-                    first.kind
-                }
+                base
             } else if is_last {
-                suffix_kind(first, last, &range, index)
+                suffix_kind(base, last, &range, leading, index)
             } else {
-                continuation_kind(first.kind, index)
+                continuation_kind(base, index)
             };
             if chunk.is_empty() && !is_last && is_first && range.start.byte == first.text.len() {
-                after.push(Arc::clone(first));
+                after.push(first.with_kind(kind));
                 continue;
             }
             if chunk.is_empty() && is_last && !is_first && range.end.byte == 0 {
-                after.push(if kind == last.kind {
-                    Arc::clone(last)
-                } else {
-                    Arc::new(last.with_kind(kind))
-                });
+                after.push(last.with_kind(kind));
                 continue;
             }
             let capacity = chunk
@@ -434,14 +439,7 @@ impl Document {
             && let [paragraph] = fragment.paragraphs()
             && paragraph.text.is_empty()
         {
-            return Ok((
-                Delta {
-                    start: range.start.paragraph,
-                    before: Vec::new(),
-                    after: Vec::new(),
-                },
-                range.start,
-            ));
+            return Ok((Delta::empty(range.start.paragraph), range.start));
         }
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
@@ -450,7 +448,7 @@ impl Document {
         let prefix = range.start.byte > 0;
         let suffix = range.end.byte < last.text.len();
         let inline = count == 1 && (prefix || suffix || fragment.paragraphs()[0].text.is_empty());
-        let leading = inline && removes_leading_paragraph(&range, true);
+        let leading = inline && removes_leading_paragraph(&range);
         let mut after: Vec<Arc<Paragraph>> = Vec::with_capacity(count);
         let mut insertion_end = 0;
         for (index, source) in fragment.paragraphs().iter().enumerate() {
@@ -538,11 +536,7 @@ impl Document {
                     }
                     kind => kind,
                 };
-                if kind == paragraph.kind {
-                    Arc::clone(paragraph)
-                } else {
-                    Arc::new(paragraph.with_kind(kind))
-                }
+                paragraph.with_kind(kind)
             })
             .collect();
         self.change(range, after)
@@ -585,11 +579,15 @@ impl Document {
             builder.append_document(self, cursor..range.start);
             let source = &self.paragraphs[range.start.paragraph];
             let end = &self.paragraphs[range.end.paragraph];
-            let style =
-                source.style_for_byte(range.start.byte.min(source.text.len().saturating_sub(1)));
+            let style = if range.start.byte < source.text.len() {
+                source.style_for_byte(range.start.byte)
+            } else {
+                builder.last_style()
+            };
             let link = source.link_for_byte(range.start.byte);
             let multiple = range.start.paragraph != range.end.paragraph;
-            if builder.is_empty() && multiple && !multiline {
+            let leading = builder.is_empty() && multiple;
+            if leading {
                 let removed = self.paragraphs[range.start.paragraph + 1..range.end.paragraph]
                     .iter()
                     .map(|paragraph| paragraph.kind);
@@ -604,7 +602,7 @@ impl Document {
                 link,
                 range.end.byte < end.text.len(),
             );
-            if multiple && multiline {
+            if multiple && multiline && !leading {
                 builder.kind = end.kind;
             }
             caret = Position::new(
@@ -633,10 +631,10 @@ impl Document {
         &mut self,
         range: Range<Position>,
         patch: StylePatch,
-    ) -> Result<Option<Delta>, Error> {
+    ) -> Result<Delta, Error> {
         self.validate_range(&range)?;
         if range.is_empty() || patch == StylePatch::default() {
-            return Ok(None);
+            return Ok(Delta::empty(range.start.paragraph));
         }
         let after = self
             .slices(&range)
@@ -646,18 +644,17 @@ impl Document {
                     .map_or_else(|| Arc::clone(paragraph), Arc::new)
             })
             .collect();
-        let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
-        Ok((!delta.is_empty()).then_some(delta))
+        Ok(self.change(range.start.paragraph..range.end.paragraph + 1, after))
     }
 
     pub(crate) fn set_link(
         &mut self,
         range: Range<Position>,
         link: Option<&Link>,
-    ) -> Result<Option<Delta>, Error> {
+    ) -> Result<Delta, Error> {
         self.validate_range(&range)?;
         if range.is_empty() {
-            return Ok(None);
+            return Ok(Delta::empty(range.start.paragraph));
         }
         let after = self
             .slices(&range)
@@ -667,15 +664,14 @@ impl Document {
                     .map_or_else(|| Arc::clone(paragraph), Arc::new)
             })
             .collect();
-        let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
-        Ok((!delta.is_empty()).then_some(delta))
+        Ok(self.change(range.start.paragraph..range.end.paragraph + 1, after))
     }
 
     pub(crate) fn set_kind(
         &mut self,
         range: Range<usize>,
         kind: ParagraphKind,
-    ) -> Result<Option<Delta>, Error> {
+    ) -> Result<Delta, Error> {
         if range.start > range.end || range.end > self.paragraphs.len() {
             return Err(Error::InvalidRange);
         }
@@ -687,26 +683,28 @@ impl Document {
         let after = self.paragraphs[range.clone()]
             .iter()
             .enumerate()
-            .map(|(offset, paragraph)| {
-                let kind = numbered_kind(kind, offset);
-                if paragraph.kind == kind {
-                    Arc::clone(paragraph)
-                } else {
-                    Arc::new(paragraph.with_kind(kind))
-                }
-            })
+            .map(|(offset, paragraph)| paragraph.with_kind(numbered_kind(kind, offset)))
             .collect();
-        let delta = self.change(range, after);
-        Ok((!delta.is_empty()).then_some(delta))
+        Ok(self.change(range, after))
     }
 
-    pub(crate) fn apply_numbered_list(&mut self, range: Range<usize>, indent: u8) -> Option<Delta> {
+    pub(crate) fn apply_numbered_list(&mut self, range: Range<usize>, indent: u8) -> Delta {
         let is_item =
             |kind| matches!(kind, ParagraphKind::Ordered { indent: level, .. } if level == indent);
         let selected = &self.paragraphs[range.clone()];
         if selected.iter().all(|paragraph| is_item(paragraph.kind)) {
-            return None;
+            return Delta::empty(range.start);
         }
+        let extends = self.paragraphs[..range.start]
+            .iter()
+            .rev()
+            .map(|paragraph| paragraph.kind)
+            .find(|kind| match *kind {
+                ParagraphKind::Ordered { indent: level, .. }
+                | ParagraphKind::Bullet { indent: level } => level <= indent,
+                _ => true,
+            })
+            .is_some_and(is_item);
         let after = selected
             .iter()
             .enumerate()
@@ -717,25 +715,13 @@ impl Document {
                         indent: level,
                         start,
                     } if level == indent => start,
-                    _ if range
-                        .start
-                        .checked_sub(1)
-                        .is_some_and(|previous| is_item(self.paragraphs[previous].kind)) =>
-                    {
-                        None
-                    }
+                    _ if extends => None,
                     _ => Some(1),
                 };
-                let kind = ParagraphKind::Ordered { indent, start };
-                if paragraph.kind == kind {
-                    Arc::clone(paragraph)
-                } else {
-                    Arc::new(paragraph.with_kind(kind))
-                }
+                paragraph.with_kind(ParagraphKind::Ordered { indent, start })
             })
             .collect();
-        let delta = self.change(range, after);
-        (!delta.is_empty()).then_some(delta)
+        self.change(range, after)
     }
 }
 
@@ -745,6 +731,9 @@ struct ReplacementBuilder {
     spans: Vec<Span>,
     kind: ParagraphKind,
     candidate: Option<Arc<Paragraph>>,
+    // Start of the last grapheme cluster of `text[..scanned]`.
+    tail: usize,
+    scanned: usize,
 }
 
 impl ReplacementBuilder {
@@ -755,6 +744,8 @@ impl ReplacementBuilder {
             spans: Vec::new(),
             kind,
             candidate: None,
+            tail: 0,
+            scanned: 0,
         }
     }
 
@@ -766,6 +757,20 @@ impl ReplacementBuilder {
 
     fn is_empty(&self) -> bool {
         self.text_len() == 0
+    }
+
+    fn last_style(&mut self) -> InlineStyle {
+        if let Some(paragraph) = &self.candidate {
+            return paragraph.style_for_byte(paragraph.text.len().saturating_sub(1));
+        }
+        self.tail = last_grapheme_start(&self.text, self.tail, self.scanned);
+        self.scanned = self.text.len();
+        let index = self
+            .spans
+            .partition_point(|span| span.range.end <= self.tail);
+        self.spans
+            .get(index)
+            .map_or_else(InlineStyle::default, |span| span.style)
     }
 
     fn materialize_candidate(&mut self) {
@@ -780,12 +785,10 @@ impl ReplacementBuilder {
     }
 
     fn finish_paragraph(&mut self) {
+        self.tail = 0;
+        self.scanned = 0;
         if let Some(paragraph) = self.candidate.take() {
-            self.paragraphs.push(if paragraph.kind == self.kind {
-                paragraph
-            } else {
-                Arc::new(paragraph.with_kind(self.kind))
-            });
+            self.paragraphs.push(paragraph.with_kind(self.kind));
         } else {
             self.paragraphs.push(Arc::new(Paragraph::styled(
                 std::mem::take(&mut self.text),
@@ -837,6 +840,37 @@ impl ReplacementBuilder {
     }
 }
 
+// Start of the last grapheme cluster of `text`, given the start `tail` of the last
+// cluster of `text[..scanned]`. Appending cannot move a boundary before `scanned`, so
+// segmentation resumes at `tail` and walks forward over the appended bytes only.
+// Searching back from the end would rescan a cluster that keeps growing.
+fn last_grapheme_start(text: &str, tail: usize, scanned: usize) -> usize {
+    let last_start = |text: &str| {
+        text.grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start)
+    };
+    if scanned == text.len() {
+        return tail;
+    }
+    let first = match text[..scanned].chars().next_back() {
+        None => 0,
+        Some(previous) => {
+            let rest = &text[tail..];
+            let offset = scanned - previous.len_utf8() - tail;
+            match GraphemeCursor::new(offset, rest.len(), true).next_boundary(rest, 0) {
+                Ok(Some(boundary)) => tail + boundary,
+                _ => return last_start(text),
+            }
+        }
+    };
+    if first == text.len() {
+        tail
+    } else {
+        first + last_start(&text[first..])
+    }
+}
+
 pub(crate) const LINE_SEPARATOR: char = '\u{2028}';
 const PARAGRAPH_SEPARATOR: char = '\u{2029}';
 
@@ -857,22 +891,23 @@ pub(crate) fn normalize_newlines(text: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-fn removes_leading_paragraph(range: &Range<Position>, single_paragraph: bool) -> bool {
-    single_paragraph && range.start.paragraph != range.end.paragraph && range.start.byte == 0
+fn removes_leading_paragraph(range: &Range<Position>) -> bool {
+    range.start.paragraph != range.end.paragraph && range.start.byte == 0
 }
 
 fn suffix_kind(
-    first: &Paragraph,
+    base: ParagraphKind,
     last: &Paragraph,
     range: &Range<Position>,
+    leading: bool,
     index: usize,
 ) -> ParagraphKind {
-    if range.start.paragraph != range.end.paragraph {
+    if range.start.paragraph != range.end.paragraph && !leading {
         last.kind
     } else if range.end.byte < last.text.len() {
-        numbered_kind(first.kind, index)
+        numbered_kind(base, index)
     } else {
-        continuation_kind(first.kind, index)
+        continuation_kind(base, index)
     }
 }
 

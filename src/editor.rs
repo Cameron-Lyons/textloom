@@ -1,7 +1,7 @@
 use std::{
     fmt,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 mod composition;
@@ -25,6 +25,7 @@ pub struct Editor {
     preferred_column: Option<usize>,
     composition: Option<Arc<Composition>>,
     saved: SavePoint,
+    style_cache: Mutex<Option<StyleCache>>,
 }
 
 impl Default for Editor {
@@ -45,6 +46,12 @@ impl Clone for Editor {
             preferred_column: self.preferred_column,
             composition: self.composition.clone(),
             saved: self.saved.clone(),
+            style_cache: Mutex::new(
+                self.style_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
         }
     }
 }
@@ -92,6 +99,13 @@ impl SavePoint {
     }
 }
 
+#[derive(Clone)]
+struct StyleCache {
+    identity: Arc<()>,
+    selection: Selection,
+    style: Option<SelectionStyle>,
+}
+
 impl Editor {
     pub fn new(document: Document) -> Self {
         Self {
@@ -102,6 +116,7 @@ impl Editor {
             history: History::default(),
             preferred_column: None,
             composition: None,
+            style_cache: Mutex::new(None),
         }
     }
 
@@ -122,72 +137,56 @@ impl Editor {
         if self.selection.is_caret() {
             return self.typing_style.into();
         }
-        let range = self.selection.range();
-        let mut result: Option<SelectionStyle> = None;
-        for index in range.start.paragraph..=range.end.paragraph {
-            let paragraph = &self.document.paragraphs()[index];
-            let start = if index == range.start.paragraph {
-                range.start.byte
-            } else {
-                0
-            };
-            let end = if index == range.end.paragraph {
-                range.end.byte
-            } else {
-                paragraph.text().len()
-            };
-            if start == end {
-                continue;
+        let identity = self.document.content_identity();
+        let mut cache = self
+            .style_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let style = match cache.as_ref() {
+            Some(cached)
+                if Arc::ptr_eq(&cached.identity, &identity)
+                    && cached.selection == self.selection =>
+            {
+                cached.style
             }
-            let spans = paragraph.spans();
-            let first = spans.partition_point(|span| span.range.end <= start);
-            for span in &spans[first..] {
-                if span.range.start >= end {
-                    break;
+            _ => {
+                let style = self.scan_selection_style();
+                *cache = Some(StyleCache {
+                    identity,
+                    selection: self.selection,
+                    style,
+                });
+                style
+            }
+        };
+        style.unwrap_or_else(|| self.typing_style.into())
+    }
+    fn scan_selection_style(&self) -> Option<SelectionStyle> {
+        let mut result: Option<SelectionStyle> = None;
+        for span in self.document.spans_in(&self.selection.range()) {
+            if let Some(style) = &mut result {
+                style.include(span.style);
+                if style.is_fully_mixed() {
+                    return result;
                 }
-                if let Some(style) = &mut result {
-                    style.include(span.style);
-                    if style.is_fully_mixed() {
-                        return *style;
-                    }
-                } else {
-                    result = Some(span.style.into());
-                }
+            } else {
+                result = Some(span.style.into());
             }
         }
-        result.unwrap_or_else(|| self.typing_style.into())
+        result
     }
     #[must_use]
     pub fn selected_link(&self) -> Option<Link> {
         if self.selection.is_caret() {
             return self.document.caret_link(self.selection.focus).cloned();
         }
-        let range = self.selection.range();
         let mut shared: Option<&Link> = None;
-        for index in range.start.paragraph..=range.end.paragraph {
-            let paragraph = &self.document.paragraphs()[index];
-            let start = if index == range.start.paragraph {
-                range.start.byte
-            } else {
-                0
-            };
-            let end = if index == range.end.paragraph {
-                range.end.byte
-            } else {
-                paragraph.text().len()
-            };
-            let spans = paragraph.spans();
-            let first = spans.partition_point(|span| span.range.end <= start);
-            for span in spans[first..]
-                .iter()
-                .take_while(|span| span.range.start < end)
-            {
-                let link = span.link.as_ref()?;
-                if shared.is_some_and(|shared| shared != link) {
-                    return None;
-                }
-                shared = Some(link);
+        for span in self.document.spans_in(&self.selection.range()) {
+            let link = span.link.as_ref()?;
+            if shared.is_some_and(|shared| shared != link) {
+                return None;
             }
+            shared = Some(link);
         }
         shared.cloned()
     }
@@ -270,8 +269,10 @@ impl Editor {
         self.document.validate_position(selection.focus)?;
         self.normalize_history();
         self.composition = None;
-        self.selection = selection;
-        self.typing_style = self.selection_typing_style(selection);
+        if selection != self.selection {
+            self.selection = selection;
+            self.typing_style = self.selection_typing_style(selection);
+        }
         self.preferred_column = None;
         self.break_history_group();
         Ok(())
@@ -323,9 +324,7 @@ impl Editor {
         self.typing_style = self.document.style_at(caret);
         self.preferred_column = None;
         self.break_history_group();
-        if !delta.is_empty() {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -402,9 +401,7 @@ impl Editor {
         self.typing_style = self.document.style_at(caret);
         self.preferred_column = None;
         self.break_history_group();
-        if !delta.is_empty() {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
     }
 
     pub fn insert_text(&mut self, text: &str) -> Result<(), Error> {
@@ -423,15 +420,25 @@ impl Editor {
         style: InlineStyle,
     ) -> Result<(), Error> {
         self.ensure_no_composition()?;
-        if range.start > range.end {
-            return Err(Error::InvalidRange);
-        }
-        self.document.validate_position(range.start)?;
-        self.document.validate_position(range.end)?;
+        self.replace_range_inner(range, text, style, Group::None)
+    }
+
+    pub(crate) fn replace_all_text(&mut self, text: &str) -> Result<(), Error> {
+        self.ensure_no_composition()?;
         let before = self.state();
-        self.selection = Selection::new(range.start, range.end);
+        let start = Position::default();
+        let style = self.document.style_at(start);
+        let kind = self.document.paragraphs()[0].kind();
+        let (delta, caret) = self.document.replace_with_kind(
+            start..self.document.end(),
+            text,
+            style,
+            None,
+            Some(kind),
+        )?;
         self.typing_style = style;
-        self.replace_selection_with_before(text, Group::None, before)
+        self.finish_replacement(delta, caret, Group::None, before);
+        Ok(())
     }
 
     pub fn insert_paragraph(&mut self) -> Result<(), Error> {
@@ -516,9 +523,8 @@ impl Editor {
         } else {
             Group::None
         };
-        let before = self.state();
-        self.selection = Selection::new(focus, target);
-        self.replace_selection_with_before("", group, before)
+        let range = focus.min(target)..focus.max(target);
+        self.replace_range_inner(range, "", self.typing_style, group)
     }
 
     pub fn apply_style(&mut self, patch: StylePatch) -> Result<(), Error> {
@@ -527,9 +533,7 @@ impl Editor {
         let before = self.state();
         let delta = self.document.apply_style(self.selection.range(), patch)?;
         patch.apply(&mut self.typing_style);
-        if let Some(delta) = delta {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -578,9 +582,8 @@ impl Editor {
             self.selection.range()
         };
         let before = self.state();
-        if let Some(delta) = self.document.set_link(range, link.as_ref())? {
-            self.record(delta, before, Group::None);
-        }
+        let delta = self.document.set_link(range, link.as_ref())?;
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -589,15 +592,15 @@ impl Editor {
         let text = if text.is_empty() { link.as_str() } else { text };
         self.break_history_group();
         let before = self.state();
-        let result = self.document.replace_with_link(
+        let (delta, caret) = self.document.replace_with_link(
             self.selection.range(),
             text,
             self.typing_style,
             Some(&link),
-        );
-        let result = self.finish_replacement(result, Group::None, before);
+        )?;
+        self.finish_replacement(delta, caret, Group::None, before);
         self.break_history_group();
-        result
+        Ok(())
     }
 
     pub fn set_paragraph_kind(&mut self, kind: ParagraphKind) -> Result<(), Error> {
@@ -605,9 +608,7 @@ impl Editor {
         let before = self.state();
         let delta = self.document.set_kind(self.selected_paragraphs(), kind)?;
         self.break_history_group();
-        if let Some(delta) = delta {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -618,9 +619,7 @@ impl Editor {
             .document
             .apply_numbered_list(self.selected_paragraphs(), indent);
         self.break_history_group();
-        if let Some(delta) = delta {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -639,9 +638,7 @@ impl Editor {
             .document
             .change_list_indent(self.selected_paragraphs(), increase);
         self.break_history_group();
-        if !delta.is_empty() {
-            self.record(delta, before, Group::None);
-        }
+        self.record(delta, before, Group::None);
         Ok(())
     }
 
@@ -764,67 +761,48 @@ impl Editor {
     }
 
     fn selection_typing_style(&self, selection: Selection) -> InlineStyle {
-        let range = selection.range();
-        if !selection.is_caret() {
-            for index in range.start.paragraph..=range.end.paragraph {
-                let paragraph = &self.document.paragraphs()[index];
-                let start = if index == range.start.paragraph {
-                    range.start.byte
-                } else {
-                    0
-                };
-                let end = if index == range.end.paragraph {
-                    range.end.byte
-                } else {
-                    paragraph.text().len()
-                };
-                if start < end {
-                    let spans = paragraph.spans();
-                    return spans[spans.partition_point(|span| span.range.end <= start)].style;
-                }
-            }
+        if !selection.is_caret()
+            && let Some(span) = self.document.spans_in(&selection.range()).next()
+        {
+            return span.style;
         }
         self.document.style_at(selection.focus)
     }
 
     fn replace_selection(&mut self, text: &str, group: Group) -> Result<(), Error> {
-        self.replace_selection_with_before(text, group, self.state())
+        self.replace_range_inner(self.selection.range(), text, self.typing_style, group)
     }
 
-    fn replace_selection_with_before(
+    fn replace_range_inner(
         &mut self,
+        range: Range<Position>,
         text: &str,
+        style: InlineStyle,
         group: Group,
-        before: EditState,
     ) -> Result<(), Error> {
-        let result = self
-            .document
-            .replace(self.selection.range(), text, self.typing_style);
-        self.finish_replacement(result, group, before)
+        let before = self.state();
+        let (delta, caret) = self.document.replace(range, text, style)?;
+        self.typing_style = style;
+        self.finish_replacement(delta, caret, group, before);
+        Ok(())
     }
 
     fn finish_replacement(
         &mut self,
-        result: Result<(Delta, Position), Error>,
+        delta: Delta,
+        caret: Position,
         group: Group,
         before: EditState,
-    ) -> Result<(), Error> {
-        let (delta, caret) = match result {
-            Ok(result) => result,
-            Err(error) => {
-                self.restore(before);
-                return Err(error);
-            }
-        };
+    ) {
         self.selection = Selection::caret(caret);
         self.preferred_column = None;
-        if !delta.is_empty() {
-            self.record(delta, before, group);
-        }
-        Ok(())
+        self.record(delta, before, group);
     }
 
     fn record(&mut self, delta: Delta, before: EditState, group: Group) {
+        if delta.is_empty() {
+            return;
+        }
         self.saved.cached_match.take();
         self.history.record(delta, before, self.state(), group);
     }

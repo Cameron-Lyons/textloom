@@ -159,7 +159,7 @@ mod tests {
     fn paragraphs(kinds: &[ParagraphKind]) -> Vec<Arc<Paragraph>> {
         kinds
             .iter()
-            .map(|kind| Arc::new(Paragraph::plain("item").with_kind(*kind)))
+            .map(|kind| Arc::new(Paragraph::plain("item")).with_kind(*kind))
             .collect()
     }
 

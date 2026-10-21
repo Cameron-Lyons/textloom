@@ -58,7 +58,11 @@ impl fmt::Debug for Paragraph {
 
 impl Paragraph {
     pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
-        Self::from_parts(text, spans, kind)
+        let paragraph = Self::from_parts(text, spans, kind)?;
+        if text.contains(['\r', '\n', '\u{2029}']) {
+            return Err(Error::InvalidFragment);
+        }
+        Ok(paragraph)
     }
 
     pub fn text(&self) -> &str {
@@ -296,15 +300,18 @@ impl Paragraph {
         }
     }
 
-    pub(super) fn with_kind(&self, kind: ParagraphKind) -> Self {
-        Self {
+    pub(super) fn with_kind(self: &Arc<Self>, kind: ParagraphKind) -> Arc<Self> {
+        if self.kind == kind {
+            return Arc::clone(self);
+        }
+        Arc::new(Self {
             text: Arc::clone(&self.text),
             spans: Arc::clone(&self.spans),
             kind,
             ascii: self.ascii,
             linked: self.linked,
             indices: self.shared_indices(),
-        }
+        })
     }
 
     fn shared_indices(&self) -> OnceLock<Arc<TextIndices>> {
@@ -331,12 +338,10 @@ impl Paragraph {
         if range.is_empty() {
             return None;
         }
-        let first = self
-            .spans
-            .partition_point(|span| span.range.end <= range.start);
-        let last = self
-            .spans
-            .partition_point(|span| span.range.start < range.end);
+        let Range {
+            start: first,
+            end: last,
+        } = self.overlapping(range.clone());
         fn patched<'a>(
             span: &'a Span,
             patch: StylePatch,
@@ -438,19 +443,28 @@ impl Paragraph {
         {
             return Err(Error::InvalidHeadingLevel(level));
         }
-        if text.contains(['\r', '\n', '\u{2029}']) {
-            return Err(Error::InvalidFragment);
-        }
         let ascii = text.is_ascii();
         let mut end = 0;
-        let mut boundaries = text.grapheme_indices(true).map(|(byte, _)| byte);
+        let mut boundaries = None;
+        let mut is_boundary = |byte: usize| {
+            if !text.is_char_boundary(byte) {
+                return false;
+            }
+            let (chunk, start) = grapheme_context(text, byte);
+            GraphemeCursor::new(byte, text.len(), true)
+                .is_boundary(chunk, start)
+                .unwrap_or_else(|_| {
+                    boundaries
+                        .get_or_insert_with(|| text.grapheme_indices(true).map(|(byte, _)| byte))
+                        .find(|boundary| *boundary >= byte)
+                        == Some(byte)
+                })
+        };
         for span in &spans {
             if span.range.start != end
                 || span.range.start >= span.range.end
                 || span.range.end > text.len()
-                || (!ascii
-                    && span.range.end < text.len()
-                    && boundaries.find(|byte| *byte >= span.range.end) != Some(span.range.end))
+                || (!ascii && span.range.end < text.len() && !is_boundary(span.range.end))
             {
                 return Err(Error::InvalidFragment);
             }
@@ -475,6 +489,16 @@ impl Paragraph {
             ascii,
             indices: OnceLock::new(),
         })
+    }
+
+    pub(super) fn overlapping(&self, range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            return 0..0;
+        }
+        let first = self
+            .spans
+            .partition_point(|span| span.range.end <= range.start);
+        first..first + self.spans[first..].partition_point(|span| span.range.start < range.end)
     }
 
     pub(super) fn style_for_byte(&self, byte: usize) -> InlineStyle {
@@ -515,22 +539,15 @@ pub(super) fn append_slice(
 ) {
     let offset = text.len();
     text.push_str(&paragraph.text[range.clone()]);
-    let first = paragraph
-        .spans
-        .partition_point(|span| span.range.end <= range.start);
-    let last = paragraph
-        .spans
-        .partition_point(|span| span.range.start < range.end);
-    if first >= last {
+    let [head, rest @ ..] = &paragraph.spans[paragraph.overlapping(range.clone())] else {
         return;
-    }
+    };
     let clip = |span: &Span| {
         span.range.start.max(range.start) - range.start + offset
             ..span.range.end.min(range.end) - range.start + offset
     };
-    let head = &paragraph.spans[first];
     push_span(spans, clip(head), head.style, head.link.as_ref());
-    spans.extend(paragraph.spans[first + 1..last].iter().map(|span| Span {
+    spans.extend(rest.iter().map(|span| Span {
         range: clip(span),
         style: span.style,
         link: span.link.clone(),
