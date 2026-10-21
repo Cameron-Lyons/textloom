@@ -1003,6 +1003,232 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
 }
 
 #[test]
+fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
+    let link = Link::new("https://example.com").unwrap();
+    let mut linked = Editor::from_text("before  after");
+    linked
+        .set_selection(Selection::caret(Position::new(0, 7)))
+        .unwrap();
+    linked.insert_link("LINKED", link).unwrap();
+    let mut styled = Editor::from_text("plain\nheading\nitem\nlast");
+    styled
+        .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+        .unwrap();
+    styled.toggle_style(crate::InlineAttribute::Bold).unwrap();
+    styled
+        .set_selection(Selection::caret(Position::new(1, 0)))
+        .unwrap();
+    styled
+        .set_paragraph_kind(ParagraphKind::Heading { level: 2 })
+        .unwrap();
+    styled
+        .set_selection(Selection::caret(Position::new(2, 0)))
+        .unwrap();
+    styled
+        .set_paragraph_kind(ParagraphKind::Ordered {
+            indent: 0,
+            start: None,
+        })
+        .unwrap();
+    type Step = (&'static str, Option<Range<usize>>);
+    let cases: Vec<(Editor, Selection, Vec<Step>)> = vec![
+        (
+            Editor::from_text("first\nOLD\nlast"),
+            Selection::new(Position::new(1, 0), Position::new(1, 3)),
+            vec![
+                ("k", None),
+                ("か", Some(3..3)),
+                ("かn", None),
+                ("かん", Some(0..3)),
+                ("漢字", None),
+            ],
+        ),
+        (
+            Editor::from_text("cafe\nx"),
+            Selection::caret(Position::new(0, 4)),
+            vec![
+                ("\u{301}", None),
+                ("\u{301}x", None),
+                ("y", None),
+                ("\u{301}", None),
+                ("z", None),
+            ],
+        ),
+        (
+            Editor::from_text("ab\u{301}cd"),
+            Selection::caret(Position::new(0, 4)),
+            vec![
+                ("x", None),
+                ("xe", None),
+                ("x", None),
+                ("", None),
+                ("q", None),
+                ("q\u{301}", None),
+            ],
+        ),
+        (
+            Editor::from_text("🇺🇸🇨"),
+            Selection::caret(Position::new(0, 12)),
+            vec![("🇦", None), ("🇦🇺", None), ("x", None), ("🇦", None)],
+        ),
+        (
+            Editor::from_text("👩\u{200d}x"),
+            Selection::caret(Position::new(0, 7)),
+            vec![("a", None), ("\u{200d}", None), ("💻", None), ("b", None)],
+        ),
+        (
+            Editor::from_text("\u{301}abc"),
+            Selection::caret(Position::new(0, 0)),
+            vec![
+                ("e", None),
+                ("ex", None),
+                ("e", None),
+                ("f", None),
+                ("e", None),
+            ],
+        ),
+        (
+            Editor::from_text("\u{1161}z"),
+            Selection::caret(Position::new(0, 0)),
+            vec![
+                ("\u{1100}", None),
+                ("a\u{1100}", None),
+                ("\u{1100}", None),
+                ("b", None),
+            ],
+        ),
+        (
+            Editor::from_text("🇸x"),
+            Selection::caret(Position::new(0, 0)),
+            vec![
+                ("🇺", None),
+                ("🇺🇦", None),
+                ("🇺🇦🇺", None),
+                ("q", None),
+                ("🇺", None),
+            ],
+        ),
+        (
+            linked.clone(),
+            Selection::caret(Position::new(0, 10)),
+            vec![("a", None), ("ab", None), ("abc", Some(1..2)), ("z", None)],
+        ),
+        (
+            linked,
+            Selection::caret(Position::new(0, 7)),
+            vec![("a", None), ("ab", None), ("abc", None)],
+        ),
+        (
+            styled.clone(),
+            Selection::new(Position::new(0, 0), Position::new(2, 3)),
+            vec![
+                ("a", None),
+                ("ab", None),
+                ("a\nb", None),
+                ("abc", None),
+                ("a\r\nb", None),
+                ("x\u{2029}y", None),
+                ("q", None),
+            ],
+        ),
+        (
+            styled.clone(),
+            Selection::new(Position::new(1, 3), Position::new(3, 2)),
+            vec![
+                ("a", None),
+                ("ab", None),
+                ("abc", None),
+                ("", None),
+                ("d", None),
+            ],
+        ),
+        (
+            styled,
+            Selection::new(Position::new(0, 5), Position::new(0, 2)),
+            vec![("a\u{2028}b", None), ("ab", None), ("a\u{2028}", None)],
+        ),
+    ];
+    let appearance = appearance();
+    let mut in_place = 0;
+    for (case, (mut editor, replacement, steps)) in cases.into_iter().enumerate() {
+        let context = egui::Context::default();
+        let mut retained = Cache::default();
+        editor.set_selection(replacement).unwrap();
+        for (step, (text, selection)) in steps.into_iter().enumerate() {
+            let previous = retained
+                .preview
+                .as_ref()
+                .map(|preview| preview.document.content_identity());
+            editor.update_composition(text, selection).unwrap();
+            if text.is_empty() {
+                continue;
+            }
+            let actual = cached_preview_frame(&context, &mut retained, &editor, &appearance);
+            let mut fresh = Cache::default();
+            let expected = cached_preview_frame(&context, &mut fresh, &editor, &appearance);
+            let (actual_preview, expected_preview) = (
+                retained.preview.as_ref().unwrap(),
+                fresh.preview.as_ref().unwrap(),
+            );
+            if previous
+                .is_some_and(|identity| actual_preview.document.change_since(&identity).is_some())
+            {
+                in_place += 1;
+            }
+            let label = format!("case {case}, step {step}");
+            assert_eq!(
+                actual_preview.document.to_bytes(),
+                expected_preview.document.to_bytes(),
+                "{label}"
+            );
+            assert_eq!(
+                actual_preview.document.paragraphs(),
+                expected_preview.document.paragraphs(),
+                "{label}"
+            );
+            assert_eq!(actual_preview.caret, expected_preview.caret, "{label}");
+            assert_eq!(
+                actual_preview.selection, expected_preview.selection,
+                "{label}"
+            );
+            assert_eq!(actual.len(), expected.len(), "{label}");
+            for index in 0..actual.len() {
+                let (actual, expected) = (actual.get(index).unwrap(), expected.get(index).unwrap());
+                assert_eq!(actual.galley.job.text, expected.galley.job.text, "{label}");
+                assert_eq!(
+                    actual.galley.job.sections, expected.galley.job.sections,
+                    "{label}"
+                );
+                assert_eq!(actual.rect, expected.rect, "{label}");
+                assert_eq!(
+                    actual.marker.as_ref().map(|marker| &marker.job.text),
+                    expected.marker.as_ref().map(|marker| &marker.job.text),
+                    "{label}"
+                );
+            }
+        }
+    }
+    assert!(in_place >= 20, "{in_place} in-place preview updates");
+
+    let context = egui::Context::default();
+    let mut cache = Cache::default();
+    let mut editor = Editor::from_text("one");
+    editor.update_composition("a", None).unwrap();
+    cached_preview_frame(&context, &mut cache, &editor, &appearance);
+    editor = Editor::from_text("two");
+    editor.update_composition("ab", None).unwrap();
+    context
+        .run_ui(egui::RawInput::default(), |ui| {
+            cache.layout_preview(ui, &editor, &appearance).unwrap();
+        })
+        .drop_without_applying_deltas();
+    assert_eq!(
+        cache.preview.as_ref().unwrap().document.plain_text(),
+        "abtwo"
+    );
+}
+
+#[test]
 fn reused_preedit_cache_refreshes_for_width_fonts_and_color() {
     let context = egui::Context::default();
     let mut cache = Cache::default();
