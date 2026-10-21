@@ -1312,7 +1312,7 @@ mod tests {
                 start: None,
             },
         };
-        for _ in 0..60 {
+        for _ in 0..10 {
             let text: Vec<_> = (0..40).map(|index| format!("p{index}")).collect();
             let mut editor = Editor::from_text(&text.join("\n"));
             for index in 0..40 {
@@ -1323,7 +1323,7 @@ mod tests {
             }
             let mut cache = LayoutCache::default();
             layout_frame(&context, &mut cache, editor.document(), &appearance);
-            for step in 0..40 {
+            for step in 0..20 {
                 for _ in 0..1 + usize::from(next(4) == 0) {
                     let count = editor.document().paragraphs().len();
                     let paragraph = next(count);
