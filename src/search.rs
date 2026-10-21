@@ -511,13 +511,22 @@ fn is_word_boundary(text: &str, byte: usize) -> bool {
     WordBoundaries::new(text, word_restart(text, byte)).contains(byte)
 }
 
-// Word segmentation restarted after a space that precedes an ASCII character
-// other than a space reports the same boundaries as segmentation from byte 0.
+// A space is followed by a word boundary unless the next character is Extend,
+// Format, ZWJ, or WSegSpace (WB3d, WB4), and no later rule looks back past that
+// space, so segmentation restarted there matches segmentation from byte 0.
 fn word_restart(text: &str, byte: usize) -> usize {
     let bytes = text.as_bytes();
     (1..=byte.min(bytes.len().saturating_sub(1)))
         .rev()
-        .find(|&start| bytes[start - 1] == b' ' && bytes[start] != b' ' && bytes[start].is_ascii())
+        .find(|&start| {
+            bytes[start - 1] == b' '
+                && if bytes[start].is_ascii() {
+                    bytes[start] != b' '
+                } else {
+                    let pair = &text[start - 1..text.ceil_char_boundary(start + 1)];
+                    pair.split_word_bounds().next() == Some(" ")
+                }
+        })
         .unwrap_or(0)
 }
 
@@ -1139,5 +1148,86 @@ mod tests {
             }
         }
         assert!(decided > 10_000, "{decided}");
+    }
+
+    #[test]
+    fn word_restarts_agree_with_segmentation_from_the_paragraph_start() {
+        let tokens = [
+            " ", " ", " ", "  ", "a", "Z", "7", ":", ".", "'", ",", "\"", "_", "-", "\t", "é",
+            "\u{301}", "\u{200d}", "\u{ad}", "\u{2060}", "\u{3000}", "\u{a0}", "\u{2028}",
+            "\u{85}", "Мир", "λόγ", "你好", "\u{5d0}", "\u{5f3}", "\u{30a2}", "\u{ff70}", "🇺",
+            "👩", "١", "’", "·", "🏻",
+        ];
+        let mut seed = 0x3c6e_f372_fe94_f82b_u64;
+        let (mut checked, mut unicode_restarts) = (0, 0);
+        for length in 0..3_000 {
+            let mut text = String::new();
+            for _ in 0..length % 32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push_str(tokens[(seed >> 8) as usize % tokens.len()]);
+            }
+            let boundaries: Vec<_> = text
+                .split_word_bound_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for byte in (0..=text.len()).filter(|byte| text.is_char_boundary(*byte)) {
+                let restart = word_restart(&text, byte);
+                assert!(restart <= byte, "byte {byte} in {text:?}");
+                let restarted: Vec<_> = text[restart..]
+                    .split_word_bound_indices()
+                    .map(|(offset, _)| restart + offset)
+                    .chain([text.len()])
+                    .collect();
+                assert_eq!(
+                    restarted,
+                    boundaries[boundaries.partition_point(|boundary| *boundary < restart)..],
+                    "restart {restart} for byte {byte} in {text:?}"
+                );
+                assert_eq!(
+                    is_word_boundary(&text, byte),
+                    boundaries.binary_search(&byte).is_ok(),
+                    "byte {byte} in {text:?}"
+                );
+                checked += 1;
+                unicode_restarts +=
+                    usize::from(restart > 0 && !text.as_bytes()[restart].is_ascii());
+            }
+        }
+        assert!(
+            checked > 50_000 && unicode_restarts > 10_000,
+            "{checked} {unicode_restarts}"
+        );
+    }
+
+    #[test]
+    fn word_restarts_stay_near_the_caret_in_spaced_non_latin_prose() {
+        for word in [
+            "слово",
+            "Λόγος",
+            "你好",
+            "\u{5d0}\u{5d1}",
+            "\u{30a2}\u{30a4}",
+            "١٢",
+        ] {
+            let text = format!("{word} ").repeat(1_000);
+            let byte = text.len() / 2;
+            let restart = word_restart(&text, byte);
+            assert!(restart > 0 && byte - restart <= word.len() + 1, "{word:?}");
+            assert_eq!(&text[restart - 1..restart], " ", "{word:?}");
+        }
+        for (joined, restart) in [
+            ("\u{301}", 0),
+            ("\u{200d}", 0),
+            ("\u{ad}", 0),
+            ("\u{3000}", 0),
+            (" ", "слово  ".len()),
+            ("\u{a0}", "слово ".len()),
+        ] {
+            let text = format!("слово {joined}слово");
+            assert_eq!(word_restart(&text, text.len()), restart, "{joined:?}");
+        }
     }
 }

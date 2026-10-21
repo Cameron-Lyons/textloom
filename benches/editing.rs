@@ -27,6 +27,7 @@ fn main() {
     sparse_whole_word_search();
     search_navigation();
     long_literal_navigation();
+    long_whole_word_navigation();
     batch_replacement();
     sparse_replacement();
     #[cfg(feature = "accesskit")]
@@ -929,6 +930,57 @@ fn long_literal_navigation() {
             );
         },
     );
+}
+
+fn long_whole_word_navigation() {
+    let options = SearchOptions {
+        case_sensitive: false,
+        whole_word: true,
+    };
+    for (script, filler, target) in [
+        ("Latin", "lorem", "match"),
+        ("Cyrillic", "привет", "слово"),
+        ("Greek", "καλημέρα", "λόγος"),
+        ("space-separated CJK", "你好", "世界"),
+    ] {
+        let cycle = format!("{target} {}", format!("{filler} ").repeat(39));
+        let repetitions = 1_100_000 / cycle.len();
+        let mut editor = Editor::from_text(&cycle.repeat(repetitions));
+        let query = target.to_uppercase();
+        let start = cycle.len() * (repetitions / 2);
+        let found = |start: usize| {
+            Selection::new(
+                Position::new(0, start),
+                Position::new(0, start + target.len()),
+            )
+        };
+        measure(
+            &format!("long {script} paragraph lowercase whole-word find_next near middle"),
+            100,
+            || {
+                editor
+                    .set_selection(Selection::caret(Position::new(0, start + target.len())))
+                    .unwrap();
+                assert!(editor.find_next(black_box(&query), options, false).unwrap());
+                assert_eq!(editor.selection(), found(start + cycle.len()));
+            },
+        );
+        measure(
+            &format!("long {script} paragraph lowercase whole-word find_previous near middle"),
+            100,
+            || {
+                editor
+                    .set_selection(Selection::caret(Position::new(0, start)))
+                    .unwrap();
+                assert!(
+                    editor
+                        .find_previous(black_box(&query), options, false)
+                        .unwrap()
+                );
+                assert_eq!(editor.selection(), found(start - cycle.len()));
+            },
+        );
+    }
 }
 
 fn sparse_replacement() {

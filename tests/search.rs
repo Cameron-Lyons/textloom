@@ -1079,6 +1079,75 @@ fn nearby_navigation_keeps_shrinking_lowercase_and_joined_space_candidates_at_ev
 }
 
 #[test]
+fn whole_word_navigation_in_long_non_latin_paragraphs_matches_the_forward_match_stream() {
+    let mut text = String::new();
+    for index in 0..600 {
+        text.push_str(match index % 9 {
+            0 => "Слово слово, ",
+            1 => "λόγος ΛΌΓΟΣ ",
+            2 => "世界 你好 ",
+            3 => "слово\u{301} ",
+            4 => " \u{3000}слово ",
+            5 => "\u{200d}слово \u{ad}λόγος ",
+            6 => "\u{5d0}\"\u{5d1} \u{30a2}\u{30a2} ",
+            7 => "🇺🇸🇺 слово\u{a0}",
+            _ => "прочее ",
+        });
+    }
+    let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+    let mut carets = Vec::new();
+    for index in 0..2 {
+        let paragraph = editor.document().paragraph(index).unwrap();
+        for grapheme in (0..=paragraph.grapheme_count()).step_by(41) {
+            let byte = paragraph.byte_from_grapheme(grapheme).unwrap();
+            carets.push(Selection::caret(Position::new(index, byte)));
+        }
+    }
+    let mut matched = 0;
+    for case_sensitive in [false, true] {
+        let options = SearchOptions {
+            case_sensitive,
+            whole_word: true,
+        };
+        for query in [
+            "слово",
+            "λόγος",
+            "世界",
+            "\u{5d1}",
+            "\u{30a2}",
+            "🇺",
+            "missing",
+        ] {
+            let matches = editor.document().find(query, options);
+            matched += matches.len();
+            for &selection in &carets {
+                let range = selection.range();
+                for backward in [false, true] {
+                    let expected = if backward {
+                        matches.iter().rev().find(|item| item.end <= range.start)
+                    } else {
+                        matches.iter().find(|item| item.start >= range.end)
+                    };
+                    editor.set_selection(selection).unwrap();
+                    let found = if backward {
+                        editor.find_previous(query, options, false).unwrap()
+                    } else {
+                        editor.find_next(query, options, false).unwrap()
+                    };
+                    assert_eq!(found, expected.is_some());
+                    assert_eq!(
+                        editor.selection(),
+                        expected.map_or(selection, |item| Selection::new(item.start, item.end)),
+                        "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(matched > 2_000, "{matched}");
+}
+
+#[test]
 fn navigation_after_edits_between_presses_matches_document_search() {
     let text = "Match matches aab ΣΟΣ café 👩‍💻 \u{212A}elvin. ".repeat(80);
     for case_sensitive in [false, true] {
