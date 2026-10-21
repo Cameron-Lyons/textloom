@@ -399,6 +399,7 @@ impl Shaper<'_, '_> {
             if galley.end().index.0 != chars {
                 galley = self.fonts.layout_job(scalar_layout_job(&galley.job));
             }
+            spread_ligatures(&mut galley, paragraph);
             (galley, chars)
         };
         ParagraphCache {
@@ -430,6 +431,89 @@ impl Shaper<'_, '_> {
         let width = self.single_line(RESERVED_ORDINAL.to_owned()).size().x;
         *self.reserved_ordinal.insert(width)
     }
+}
+
+// egui gives every letter after the first in a ligature zero width, so carets,
+// clicks, and selections inside one would collapse onto its end.
+fn spread_ligatures(galley: &mut Arc<Galley>, paragraph: &Paragraph) {
+    let mut ligatures = Vec::new();
+    let mut parts = Vec::new();
+    let mut chars = paragraph.text().char_indices();
+    for (row_index, placed) in galley.rows.iter().enumerate() {
+        let glyphs = &placed.row.glyphs;
+        let mut lead = None;
+        let mut first_part = parts.len();
+        for (index, glyph) in glyphs.iter().enumerate() {
+            let Some((byte, _)) = chars.next() else {
+                return;
+            };
+            if glyph.advance_width > 0.0 {
+                if let Some(lead) = lead.replace(index)
+                    && first_part < parts.len()
+                {
+                    ligatures.push((row_index, lead, index, first_part..parts.len()));
+                }
+                first_part = parts.len();
+            } else if lead.is_some()
+                && joins_ligature(glyph.chr)
+                && paragraph.boundary_at_or_before(byte) == byte
+            {
+                parts.push(index);
+            }
+        }
+        if let Some(lead) = lead
+            && first_part < parts.len()
+        {
+            ligatures.push((row_index, lead, glyphs.len(), first_part..parts.len()));
+        }
+        if placed.ends_with_newline {
+            chars.next();
+        }
+    }
+    if ligatures.is_empty() {
+        return;
+    }
+    let galley = Arc::make_mut(galley);
+    for (row_index, lead, end, range) in ligatures {
+        let row = Arc::make_mut(&mut galley.rows[row_index].row);
+        let mut parts = parts[range].iter().copied().peekable();
+        let width = row.glyphs[lead].advance_width / (parts.len() + 1) as f32;
+        let mut x = row.glyphs[lead].pos.x;
+        for (index, glyph) in row.glyphs[lead..end].iter_mut().enumerate() {
+            glyph.pos.x = x;
+            if index == 0 || parts.next_if_eq(&(lead + index)).is_some() {
+                glyph.advance_width = width;
+                x += width;
+            } else {
+                glyph.advance_width = 0.0;
+            }
+        }
+    }
+}
+
+fn joins_ligature(chr: char) -> bool {
+    !chr.is_whitespace()
+        && !chr.is_control()
+        && !matches!(
+            chr,
+            '\u{AD}'
+                | '\u{34F}'
+                | '\u{61C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFF8}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
 }
 
 fn quote_bar(kind: ParagraphKind, em: f32, indent: f32, galley: &Galley) -> Option<Rect> {

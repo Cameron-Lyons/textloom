@@ -973,3 +973,41 @@ Latin, Cyrillic, Greek, and space-separated CJK paragraphs, and its sparse
 replacement uses the default history limits. The rendering harness measures
 frames of 1, 2, 4, or 8 typed characters followed by as many Backspaces at
 10,000 and 100,000 paragraphs.
+
+## October 21: egui 0.37 upgrade
+
+The rendering harness was run three times each, alternating between `main`
+(egui 0.36.2, commit `ed2be4e`) and the egui 0.37.0 upgrade, with Rust 1.99.1,
+separate target directories, and an 8-thread Linux x86_64 machine running other
+work. The table lists medians in microseconds. egui 0.37 shapes text with
+HarfRust, and the upgrade also divides ligature widths among their letters.
+
+| Workload | egui 0.36 | egui 0.37 |
+| --- | ---: | ---: |
+| 10,000 paragraphs, idle frame | 10.05 | 10.76 |
+| 10,000 paragraphs, local edit + frame | 24.89 | 22.46 |
+| 10,000 paragraphs, preedit update + frame | 104.44 | 85.45 |
+| 100,000 paragraphs, 8-edit frame | 36.50 | 30.65 |
+| 10,000 paragraphs, accessible local edit + frame | 16,305.91 | 17,645.04 |
+| Long Unicode preedit, text update + frame | 42,433.25 | 15,889.92 |
+| 100 paragraphs, initial frame | 2,274.50 | 1,846.38 |
+| 10,000 paragraphs, initial frame | 126,771.29 | 100,387.02 |
+| 10,000 paragraphs, width invalidation + frame | 140,562.74 | 105,419.03 |
+
+Idle and retained frames took 2–8% longer, about 0.3–0.7 µs. Edits, paragraph
+splits, and multi-edit frames were 3–16% faster, initial layout and invalidation
+5–46% faster, and accessible edits 4–8% slower.
+
+The harness text has no ligatures, so a separate probe measured them with
+egui's default font. Each of 10,000 distinct paragraphs read `Paragraph N:
+office files flow affix, different effort`, and a 72 KB paragraph repeated
+`office files flow affix `. Each figure is the middle of three runs.
+
+| Workload | egui 0.36 | egui 0.37, egui's ligature geometry | egui 0.37, divided ligatures |
+| --- | ---: | ---: | ---: |
+| 10,000 ligature paragraphs, initial frame | 99.5 ms | 98.1 ms | 115.1 ms |
+| 72 KB ligature paragraph, local edit + frame | 7.3 ms | 8.3 ms | 9.8 ms |
+
+Dividing ligatures costs about 1.5 µs per paragraph that contains one. About
+three quarters of that copies the row's glyphs and mesh, because egui's galley
+cache shares the galley. Paragraphs without ligatures keep egui's galley.

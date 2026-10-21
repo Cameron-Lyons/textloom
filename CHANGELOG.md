@@ -563,6 +563,10 @@ Library behavior changes relative to 0.1 come first, then host and CI changes.
 - The `egui` feature uses egui 0.37 and the `accesskit` feature uses AccessKit
   0.25; 0.1 used egui 0.36 and AccessKit 0.24. The `egui` feature no longer
   enables `egui/default_fonts`; eframe enables it by default.
+- With egui 0.37's text shaping, the egui widget renders kerning and the font's
+  ligatures. Carets, clicks, selections, and accessibility character bounds
+  divide a ligature's width evenly among its letters, so the caret moves through
+  "ffi" one letter at a time instead of jumping over it.
 - Native host: toolbar and search commands commit an active preedit instead of
   failing with `CompositionActive`. The paragraph-kind choice keeps indentation
   and numbering and shows the kind of a paragraph that commands change; its

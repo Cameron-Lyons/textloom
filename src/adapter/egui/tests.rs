@@ -3474,6 +3474,49 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
 }
 
 #[test]
+fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
+    let context = egui::Context::default();
+    let text = "office fl a\u{200b}b";
+    let editor = Editor::from_text(text);
+    let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
+    let layout = layouts.get(0).unwrap();
+    let shaped = context.fonts_mut(|fonts| fonts.layout_job((*layout.galley.job).clone()));
+    assert!(
+        shaped.rows[0]
+            .glyphs
+            .iter()
+            .any(|glyph| glyph.chr == 'i' && glyph.advance_width == 0.0),
+        "the default font joins ffi"
+    );
+    let y = layout.rect.center().y;
+    let x = |byte| {
+        document_caret_rect(
+            editor.document(),
+            &layouts,
+            Pos2::ZERO,
+            Position::new(0, byte),
+            true,
+        )
+        .center()
+        .x
+    };
+    let space = text.find('\u{200b}').unwrap();
+    let boundaries: Vec<_> = text.char_indices().map(|(byte, _)| byte).collect();
+    for pair in boundaries.windows(2) {
+        let (left, right) = (x(pair[0]), x(pair[1]));
+        if pair[0] == space {
+            assert_eq!(left, right, "the zero-width space stays empty");
+        } else {
+            assert!(left < right, "{:?}", &text[pair[0]..pair[1]]);
+            assert_eq!(
+                hit_test(&editor, &layouts, Vec2::new(left, y)).0,
+                Position::new(0, pair[0])
+            );
+        }
+    }
+}
+
+#[test]
 fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_edge() {
     let context = egui::Context::default();
     let narrow = "i".repeat(16);
