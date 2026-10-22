@@ -1,0 +1,3 @@
+# Tests may panic to report failures; everywhere else, `expect` documents why
+# a panic cannot happen (Google Rust Style Guide, "Prefer expect over unwrap").
+allow-unwrap-in-tests = true
