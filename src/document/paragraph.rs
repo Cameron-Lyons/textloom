@@ -1,9 +1,10 @@
-use std::fmt;
+use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
+use crate::types::Direction;
 use crate::{Error, InlineStyle, Link, ParagraphKind, StylePatch};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,13 +20,13 @@ impl Span {
     }
 }
 
-pub(crate) struct SpanCursor<'a> {
-    spans: &'a [Span],
+pub(crate) struct SpanCursor<'spans> {
+    spans: &'spans [Span],
     index: usize,
 }
 
-impl<'a> SpanCursor<'a> {
-    pub(crate) fn new(spans: &'a [Span]) -> Self {
+impl<'spans> SpanCursor<'spans> {
+    pub(crate) fn new(spans: &'spans [Span]) -> Self {
         Self { spans, index: 0 }
     }
 
@@ -34,7 +35,7 @@ impl<'a> SpanCursor<'a> {
         self.index
     }
 
-    pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'a Link>) {
+    pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'spans Link>) {
         while self
             .spans
             .get(self.index)
@@ -75,8 +76,8 @@ impl PartialEq for Paragraph {
 
 impl Eq for Paragraph {}
 
-impl fmt::Debug for Paragraph {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Paragraph {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Paragraph")
             .field("text", &&*self.text)
             .field("spans", &&*self.spans)
@@ -158,7 +159,7 @@ impl Paragraph {
             while !self.text.is_char_boundary(byte) {
                 byte -= 1;
             }
-            self.local_grapheme_boundary(byte, false)
+            self.local_grapheme_boundary(byte, Direction::Backward)
                 .unwrap_or_else(|| {
                     let boundaries = self.grapheme_boundaries();
                     boundaries[boundaries
@@ -180,12 +181,13 @@ impl Paragraph {
             while !self.text.is_char_boundary(byte) {
                 byte += 1;
             }
-            self.local_grapheme_boundary(byte, true).unwrap_or_else(|| {
-                let boundaries = self.grapheme_boundaries();
-                boundaries[boundaries
-                    .partition_point(|offset| *offset < byte)
-                    .min(boundaries.len() - 1)]
-            })
+            self.local_grapheme_boundary(byte, Direction::Forward)
+                .unwrap_or_else(|| {
+                    let boundaries = self.grapheme_boundaries();
+                    boundaries[boundaries
+                        .partition_point(|offset| *offset < byte)
+                        .min(boundaries.len() - 1)]
+                })
         }
     }
 
@@ -197,30 +199,32 @@ impl Paragraph {
         } else if let Some(boundaries) = self.cached_grapheme_boundaries() {
             boundaries.binary_search(&byte).is_ok()
         } else {
-            let (chunk, start) = self.grapheme_context(byte);
+            let context = self.grapheme_context(byte);
             GraphemeCursor::new(byte, self.text.len(), true)
-                .is_boundary(chunk, start)
+                .is_boundary(context.chunk, context.start)
                 .unwrap_or_else(|_| self.grapheme_boundaries().binary_search(&byte).is_ok())
         }
     }
 
-    fn local_grapheme_boundary(&self, byte: usize, forward: bool) -> Option<usize> {
-        let (chunk, start) = self.grapheme_context(byte);
+    fn local_grapheme_boundary(&self, byte: usize, direction: Direction) -> Option<usize> {
+        let context = self.grapheme_context(byte);
         let mut cursor = GraphemeCursor::new(byte, self.text.len(), true);
-        if cursor.is_boundary(chunk, start).ok()? {
+        if cursor.is_boundary(context.chunk, context.start).ok()? {
             return Some(byte);
         }
-        Some(if forward {
-            cursor
-                .next_boundary(chunk, start)
+        Some(match direction {
+            Direction::Forward => cursor
+                .next_boundary(context.chunk, context.start)
                 .ok()?
-                .unwrap_or(self.text.len())
-        } else {
-            cursor.prev_boundary(chunk, start).ok()?.unwrap_or(0)
+                .unwrap_or(self.text.len()),
+            Direction::Backward => cursor
+                .prev_boundary(context.chunk, context.start)
+                .ok()?
+                .unwrap_or(0),
         })
     }
 
-    fn grapheme_context(&self, byte: usize) -> (&str, usize) {
+    fn grapheme_context(&self, byte: usize) -> GraphemeContext<'_> {
         grapheme_context(&self.text, byte)
     }
 
@@ -483,9 +487,9 @@ impl Paragraph {
             if !text.is_char_boundary(byte) {
                 return false;
             }
-            let (chunk, start) = grapheme_context(text, byte);
+            let context = grapheme_context(text, byte);
             GraphemeCursor::new(byte, text.len(), true)
-                .is_boundary(chunk, start)
+                .is_boundary(context.chunk, context.start)
                 .unwrap_or_else(|_| {
                     boundaries
                         .get_or_insert_with(|| text.grapheme_indices(true).map(|(byte, _)| byte))
@@ -620,9 +624,9 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
         return raw;
     }
     if raw[..raw.len() - 1].iter().all(|span| {
-        let (chunk, start) = grapheme_context(text, span.range.end);
+        let context = grapheme_context(text, span.range.end);
         GraphemeCursor::new(span.range.end, text.len(), true)
-            .is_boundary(chunk, start)
+            .is_boundary(context.chunk, context.start)
             .unwrap_or(false)
     }) {
         return raw;
@@ -636,7 +640,16 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
     result
 }
 
-fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
+// A window of text around a byte offset, for `GraphemeCursor` queries that would otherwise
+// need the whole text. Callers fall back to the full grapheme index when the cursor needs
+// context beyond the window.
+struct GraphemeContext<'text> {
+    chunk: &'text str,
+    // Byte offset of `chunk` in the whole text.
+    start: usize,
+}
+
+fn grapheme_context(text: &str, byte: usize) -> GraphemeContext<'_> {
     const CONTEXT_BYTES: usize = 64;
     let mut start = byte.saturating_sub(CONTEXT_BYTES);
     let mut end = byte.saturating_add(CONTEXT_BYTES).min(text.len());
@@ -646,7 +659,10 @@ fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    (&text[start..end], start)
+    GraphemeContext {
+        chunk: &text[start..end],
+        start,
+    }
 }
 
 fn word_stops(text: &str) -> Vec<Range<usize>> {
@@ -749,9 +765,13 @@ mod tests {
             let expected = current.map_or((InlineStyle::default(), None), |index| {
                 (spans[index].style, spans[index].link.as_ref())
             });
-            assert_eq!(cursor.at(byte), expected);
+            assert_eq!(cursor.at(byte), expected, "byte {byte}");
             #[cfg(feature = "accesskit")]
-            assert_eq!(cursor.index(), current.unwrap_or(spans.len()));
+            assert_eq!(
+                cursor.index(),
+                current.unwrap_or(spans.len()),
+                "byte {byte}"
+            );
         }
 
         let paragraph = Paragraph::styled(
@@ -804,10 +824,10 @@ mod tests {
                 char::UNICODE_VERSION
             );
         }
-        // U+0558 is unassigned in the pinned Unicode 17 tables and a letter in Unicode 18.
         assert_eq!(
             word_stops("ab \u{558}\u{558}\u{558} cd"),
-            [0..2, 3..9, 10..12]
+            [0..2, 3..9, 10..12],
+            "U+0558 is unassigned in the pinned Unicode 17 tables and a letter in Unicode 18"
         );
     }
 }

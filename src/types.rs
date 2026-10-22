@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -27,12 +27,15 @@ impl Selection {
             focus: position,
         }
     }
+
     pub const fn new(anchor: Position, focus: Position) -> Self {
         Self { anchor, focus }
     }
+
     pub fn is_caret(self) -> bool {
         self.anchor == self.focus
     }
+
     #[must_use]
     pub fn range(self) -> Range<Position> {
         self.anchor.min(self.focus)..self.anchor.max(self.focus)
@@ -95,14 +98,14 @@ impl Link {
     }
 }
 
-impl fmt::Debug for Link {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Link {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Link").field(&&*self.0).finish()
     }
 }
 
-impl fmt::Display for Link {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Link {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
@@ -267,6 +270,12 @@ pub enum InlineAttribute {
     Code,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Backward,
+    Forward,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -280,11 +289,15 @@ pub enum Error {
     InvalidLink,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPosition(p) => {
-                write!(f, "invalid grapheme position {}:{}", p.paragraph, p.byte)
+            Self::InvalidPosition(position) => {
+                write!(
+                    f,
+                    "invalid grapheme position {}:{}",
+                    position.paragraph, position.byte
+                )
             }
             Self::InvalidRange => f.write_str("range endpoints are reversed"),
             Self::InvalidFragment => {
@@ -310,4 +323,5 @@ impl fmt::Display for Error {
         }
     }
 }
+
 impl std::error::Error for Error {}
