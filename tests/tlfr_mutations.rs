@@ -102,7 +102,7 @@ fn styled_fragment() -> Fragment {
             ))
             .expect("a substring found in the paragraph has grapheme boundaries at both ends");
         let link =
-            Link::new(target).expect("each target is a short URL without control characters");
+            Link::try_new(target).expect("each target is a short URL without control characters");
         editor
             .set_link(Some(link))
             .expect("no IME composition is active");

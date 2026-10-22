@@ -126,8 +126,8 @@ impl Paragraph {
     /// Returns [`Error::InvalidHeadingLevel`] for a heading level outside
     /// `1..=6`, and [`Error::InvalidFragment`] if the spans do not cover the
     /// text as described or the text contains CR, LF, or U+2029.
-    pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
-        let paragraph = Self::from_parts(text, spans, kind)?;
+    pub fn try_new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
+        let paragraph = Self::try_from_parts(text, spans, kind)?;
         if text.contains(['\r', '\n', '\u{2029}']) {
             return Err(Error::InvalidFragment);
         }
@@ -577,7 +577,7 @@ impl Paragraph {
         }
     }
 
-    pub(crate) fn from_parts(
+    pub(crate) fn try_from_parts(
         text: &str,
         mut spans: Vec<Span>,
         kind: ParagraphKind,
@@ -848,7 +848,7 @@ mod tests {
             italic: true,
             ..InlineStyle::default()
         };
-        let link = Link::new("https://example.com").unwrap();
+        let link = Link::try_new("https://example.com").unwrap();
         let spans = [
             Span {
                 range: 0..2,

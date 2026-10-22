@@ -895,7 +895,7 @@ mod tests {
             .set_selection(Selection::new(Position::new(1, 2), Position::new(2, 3)))
             .unwrap();
         editor
-            .set_link(Some(Link::new("https://example.com/é").unwrap()))
+            .set_link(Some(Link::try_new("https://example.com/é").unwrap()))
             .unwrap();
         let fragment = Fragment::from_document(editor.document());
         let spans: usize = fragment

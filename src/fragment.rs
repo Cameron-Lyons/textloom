@@ -372,7 +372,7 @@ impl Fragment {
             if start != text.len() {
                 return Err(FragmentError::InvalidSpans);
             }
-            let paragraph = Paragraph::from_parts(&text, spans, kind)
+            let paragraph = Paragraph::try_from_parts(&text, spans, kind)
                 .map_err(|_| FragmentError::InvalidSpans)?;
             paragraphs.push(Arc::new(paragraph));
         }
@@ -551,7 +551,7 @@ fn read_format(
     let target = str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidLink)?;
     let link = match last_link {
         Some(link) if link.as_str() == target => link.clone(),
-        _ => Link::new(target).map_err(|_| FragmentError::InvalidLink)?,
+        _ => Link::try_new(target).map_err(|_| FragmentError::InvalidLink)?,
     };
     *last_link = Some(link.clone());
     Ok((style, Some(link)))

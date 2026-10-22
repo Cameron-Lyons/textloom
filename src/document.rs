@@ -105,7 +105,7 @@ impl Document {
     }
 
     /// Creates a document from paragraphs, such as ones an importer built
-    /// with [`Paragraph::new`].
+    /// with [`Paragraph::try_new`].
     ///
     /// Accepts owned or shared (`Arc`) paragraphs. No paragraphs give one
     /// empty paragraph.

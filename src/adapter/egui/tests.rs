@@ -1415,7 +1415,7 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
 
 #[test]
 fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
-    let link = Link::new("https://example.com").unwrap();
+    let link = Link::try_new("https://example.com").unwrap();
     let mut linked = Editor::from_text("before  after");
     linked
         .set_selection(Selection::caret(Position::new(0, 7)))
@@ -9065,7 +9065,7 @@ fn link_frame(
 }
 
 fn linked_widget_editor() -> (Editor, Link) {
-    let link = Link::new("https://example.com/docs").unwrap();
+    let link = Link::try_new("https://example.com/docs").unwrap();
     let mut editor = Editor::from_text("Visit example now");
     editor
         .set_selection(Selection::new(Position::new(0, 6), Position::new(0, 13)))

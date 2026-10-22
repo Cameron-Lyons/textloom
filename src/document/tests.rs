@@ -93,7 +93,7 @@ fn soft_line_breaks_are_whitespace_graphemes_inside_one_paragraph() {
         },
         link: None,
     };
-    let rich = Paragraph::new(
+    let rich = Paragraph::try_new(
         "a\u{2028}b",
         vec![span(0..1, false), span(1..4, true), span(4..5, false)],
         ParagraphKind::Heading { level: 1 },
@@ -101,7 +101,7 @@ fn soft_line_breaks_are_whitespace_graphemes_inside_one_paragraph() {
     .unwrap();
     assert_eq!(rich.text(), "a\u{2028}b");
     assert_eq!(
-        Paragraph::new(
+        Paragraph::try_new(
             "a\u{2028}b",
             vec![span(0..2, false), span(2..5, true)],
             ParagraphKind::Body
@@ -917,7 +917,7 @@ fn uniform_unicode_end_typing_does_not_build_text_indexes() {
 
 #[test]
 fn rich_parts_validate_and_merge_runs() {
-    let paragraph = Paragraph::new(
+    let paragraph = Paragraph::try_new(
         "aéébc",
         vec![
             Span {
@@ -964,10 +964,10 @@ fn rich_parts_validate_and_merge_runs() {
             }
         ]
     );
-    assert!(Paragraph::new("", vec![], ParagraphKind::Body).is_ok());
+    assert!(Paragraph::try_new("", vec![], ParagraphKind::Body).is_ok());
     for level in [0, 7] {
         assert_eq!(
-            Paragraph::new("", vec![], ParagraphKind::Heading { level }),
+            Paragraph::try_new("", vec![], ParagraphKind::Heading { level }),
             Err(Error::InvalidHeadingLevel(level))
         );
     }
@@ -1062,7 +1062,7 @@ fn rich_parts_validate_and_merge_runs() {
     ] {
         let case = format!("{text:?} with {spans:?}");
         assert_eq!(
-            Paragraph::new(text, spans, kind),
+            Paragraph::try_new(text, spans, kind),
             Err(Error::InvalidFragment),
             "{case}"
         );
@@ -1071,7 +1071,7 @@ fn rich_parts_validate_and_merge_runs() {
 
 #[test]
 fn documents_assemble_from_validated_or_shared_paragraphs() {
-    let heading = Paragraph::new(
+    let heading = Paragraph::try_new(
         "Title",
         vec![Span {
             range: 0..5,
@@ -1081,7 +1081,7 @@ fn documents_assemble_from_validated_or_shared_paragraphs() {
         ParagraphKind::Heading { level: 2 },
     )
     .unwrap();
-    let item = Paragraph::new(
+    let item = Paragraph::try_new(
         "ité",
         vec![Span {
             range: 0..4,
@@ -1124,7 +1124,7 @@ fn documents_assemble_from_validated_or_shared_paragraphs() {
 
 #[test]
 fn rich_unicode_run_validation_keeps_navigation_indexes_lazy() {
-    let paragraph = Paragraph::new(
+    let paragraph = Paragraph::try_new(
         "ééé🦀",
         vec![
             Span {
@@ -1173,7 +1173,7 @@ fn rich_run_ends_match_complete_segmentation_beyond_local_context() {
                 link: None,
             })
             .collect();
-        Paragraph::new(text, spans, ParagraphKind::Body).is_ok()
+        Paragraph::try_new(text, spans, ParagraphKind::Body).is_ok()
     };
     for text in texts {
         let boundaries: Vec<_> = text.grapheme_indices(true).map(|(byte, _)| byte).collect();
@@ -1479,7 +1479,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                 })
                 .collect();
             Arc::new(
-                Paragraph::from_parts(
+                Paragraph::try_from_parts(
                     text,
                     spans,
                     if index == 0 {
@@ -1583,7 +1583,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                             })
                             .collect();
                         Arc::new(
-                            Paragraph::from_parts(paragraph.text(), spans, paragraph.kind())
+                            Paragraph::try_from_parts(paragraph.text(), spans, paragraph.kind())
                                 .unwrap(),
                         )
                     })

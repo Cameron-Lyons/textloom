@@ -16,6 +16,11 @@ item is documented.
 - `AccessibilitySnapshot::new` and `AccessKitAdapter::update` take an
   `accessibility::Focus` instead of a `bool`: `Focus::Focused` for `true` and
   `Focus::Unfocused` for `false`.
+- Constructors that return a `Result` are named `try_new`: `Link::try_new`,
+  `Paragraph::try_new`, and `AccessKitAdapter::try_new`.
+- `AccessKitAdapter::to_text_position` and `from_text_position` are
+  `text_position` and `editor_position`, since they convert their argument
+  rather than the adapter.
 
 ## 1.0.0-rc.1
 

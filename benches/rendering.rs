@@ -387,7 +387,7 @@ fn formatted_editor(count: usize) -> Editor {
     use textloom::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
 
     let colors = [Color([255, 0, 0, 255]), Color([0, 0, 255, 255])];
-    let paragraph = Paragraph::new(
+    let paragraph = Paragraph::try_new(
         &"x".repeat(count),
         (0..count)
             .map(|index| Span {

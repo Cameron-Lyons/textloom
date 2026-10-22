@@ -88,7 +88,7 @@ assert_eq!(numbers, [None, Some(1), None, Some(2)]);
 // Fill "Rust 1.95" with Excel's Yellow, then link it.
 editor.set_selection(Selection::new(Position::new(1, 8), Position::new(1, 17))).unwrap();
 editor.apply_style(StylePatch { background: Some(Some(Color::YELLOW)), ..Default::default() }).unwrap();
-let link = Link::new("https://www.rust-lang.org/").unwrap();
+let link = Link::try_new("https://www.rust-lang.org/").unwrap();
 editor.set_link(Some(link.clone())).unwrap();
 assert_eq!(editor.selected_link(), Some(link));
 let html = editor.document().to_html();
@@ -98,7 +98,7 @@ assert!(html.contains("background-color:#ffff00"));
 
 Positions are `(paragraph index, UTF-8 byte offset)`. Document selections must land at extended grapheme boundaries: combining marks, emoji sequences, and flags cannot be split. Invalid public input returns an error before mutation. IME preedit selections use native UTF-8 scalar boundaries because a composition can contain unfinished graphemes.
 
-`Document::paragraphs()` exposes immutable shared paragraphs and normalized style spans with their links. `plain_text()` and clipboard selection export omit visual list markers. `Paragraph` also maps grapheme/scalar indexes to UTF-8 bytes for custom GUI integrations. Importers build validated rich paragraphs, whose text excludes CR, LF, and U+2029, with `Paragraph::new()` and assemble them with `Document::from_paragraphs()`. `Editor`, `Document`, `Paragraph`, and `Fragment` are `Send + Sync`; cloned editors share unchanged paragraphs and keep independent history.
+`Document::paragraphs()` exposes immutable shared paragraphs and normalized style spans with their links. `plain_text()` and clipboard selection export omit visual list markers. `Paragraph` also maps grapheme/scalar indexes to UTF-8 bytes for custom GUI integrations. Importers build validated rich paragraphs, whose text excludes CR, LF, and U+2029, with `Paragraph::try_new()` and assemble them with `Document::from_paragraphs()`. `Editor`, `Document`, `Paragraph`, and `Fragment` are `Send + Sync`; cloned editors share unchanged paragraphs and keep independent history.
 
 `SelectionStyle` uses `Some(true)` for uniformly enabled emphasis, `Some(false)` for uniformly disabled emphasis, and `None` for mixed values. Its foreground and background fields use `None` for mixed values, `Some(None)` for the renderer's default color or no fill throughout, and `Some(Some(color))` for one explicit color throughout. The summary ignores paragraph separators and empty paragraphs; a selection containing only separators uses the pending typing style. Reading it does not allocate or change selection, history, or IME state. Typing over a selection uses the style of its first selected grapheme in either direction; a caret uses the text before it, and moves that leave the selection unchanged keep a pending caret style.
 

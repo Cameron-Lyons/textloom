@@ -2744,10 +2744,10 @@ fn repeated_saved_state_reads_follow_all_edit_commands_and_disabled_history() {
         }),
         ("link", |editor| {
             editor.select_all();
-            editor.set_link(Some(Link::new("https://example.com")?))
+            editor.set_link(Some(Link::try_new("https://example.com")?))
         }),
         ("insert link", |editor| {
-            editor.insert_link("link", Link::new("https://example.com")?)
+            editor.insert_link("link", Link::try_new("https://example.com")?)
         }),
         ("paragraph kind", |editor| {
             editor.set_paragraph_kind(ParagraphKind::Quote)

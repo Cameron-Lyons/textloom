@@ -1441,7 +1441,7 @@ fn seeded_documents_replace_selections_like_deleting_them_first() {
                     link: None,
                 });
             }
-            Paragraph::new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
+            Paragraph::try_new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
         }));
         let positions: Vec<_> = document
             .paragraphs()
@@ -2424,7 +2424,7 @@ fn document_with(lines: &[Line]) -> Document {
                 link: None,
             }]
         };
-        Paragraph::new(&line.text, spans, line.kind)
+        Paragraph::try_new(&line.text, spans, line.kind)
             .expect("one span covering the whole text, or none for empty text, is valid")
     }))
 }

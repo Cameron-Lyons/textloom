@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn links_use_the_hyperlink_color_and_underline_unless_colored_explicitly() {
         let mut editor = Editor::from_text("plain link bold red filled");
-        let link = Link::new("https://example.com").unwrap();
+        let link = Link::try_new("https://example.com").unwrap();
         select(&mut editor, (0, 6), (0, 26));
         editor.set_link(Some(link)).unwrap();
         for (range, patch) in [

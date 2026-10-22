@@ -11,7 +11,7 @@ use textloom::{
 };
 
 fn link(target: &str) -> Link {
-    Link::new(target).expect("callers pass short targets without control characters")
+    Link::try_new(target).expect("callers pass short targets without control characters")
 }
 
 fn select(editor: &mut Editor, paragraph: usize, bytes: Range<usize>) {
@@ -80,18 +80,25 @@ fn hash(link: &Link) -> u64 {
 #[test]
 fn link_targets_are_validated_and_compare_by_text() {
     for invalid in ["", "a\0b", "tab\there", "line\nbreak", "\u{7f}", "\u{85}"] {
-        assert_eq!(Link::new(invalid), Err(Error::InvalidLink), "{invalid:?}");
+        assert_eq!(
+            Link::try_new(invalid),
+            Err(Error::InvalidLink),
+            "{invalid:?}"
+        );
     }
     for separator in ["\u{2028}", "\u{2029}"] {
         assert_eq!(
-            Link::new(&format!("https://example.com/{separator}")),
+            Link::try_new(&format!("https://example.com/{separator}")),
             Err(Error::InvalidLink),
             "{separator:?}"
         );
     }
     let longest = "a".repeat(Link::MAX_LEN);
-    assert_eq!(Link::new(&longest).unwrap().as_str().len(), 64 * 1024);
-    assert_eq!(Link::new(&format!("{longest}a")), Err(Error::InvalidLink));
+    assert_eq!(Link::try_new(&longest).unwrap().as_str().len(), 64 * 1024);
+    assert_eq!(
+        Link::try_new(&format!("{longest}a")),
+        Err(Error::InvalidLink)
+    );
 
     let unicode = link("https://例え.jp/パス?q=café#👩\u{200d}💻");
     assert_eq!(unicode.as_str(), "https://例え.jp/パス?q=café#👩\u{200d}💻");
@@ -115,7 +122,7 @@ fn runs_merge_only_when_their_style_and_link_agree() {
         style,
         link: target.map(link),
     };
-    let paragraph = Paragraph::new(
+    let paragraph = Paragraph::try_new(
         "abcdefgh",
         vec![
             span(0..1, InlineStyle::default(), Some("https://a")),
@@ -166,7 +173,7 @@ fn runs_merge_only_when_their_style_and_link_agree() {
         assert_eq!(document.link_at(missing), None, "{missing:?}");
         assert_eq!(document.link_range_at(missing), None, "{missing:?}");
     }
-    let emoji = Document::from_paragraphs([Paragraph::new(
+    let emoji = Document::from_paragraphs([Paragraph::try_new(
         "👩\u{200d}💻",
         vec![span(0..11, InlineStyle::default(), Some("https://a"))],
         ParagraphKind::Body,
@@ -409,8 +416,8 @@ fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
         link,
     });
     let document = Document::from_paragraphs([
-        Paragraph::new("é👩\u{200d}💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
-        Paragraph::new(
+        Paragraph::try_new("é👩\u{200d}💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
+        Paragraph::try_new(
             "next",
             vec![Span {
                 range: 0..4,

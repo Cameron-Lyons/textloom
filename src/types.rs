@@ -154,7 +154,7 @@ impl Link {
     /// Returns [`Error::InvalidLink`] if `target` is empty, is longer than
     /// [`Link::MAX_LEN`] bytes, or contains a control character (Unicode
     /// category Cc), U+2028, or U+2029.
-    pub fn new(target: &str) -> Result<Self, Error> {
+    pub fn try_new(target: &str) -> Result<Self, Error> {
         if target.is_empty()
             || target.len() > Self::MAX_LEN
             || target.chars().any(|character| {
@@ -166,7 +166,7 @@ impl Link {
         Ok(Self(Arc::from(target)))
     }
 
-    /// Returns the target exactly as it was passed to [`Link::new`].
+    /// Returns the target exactly as it was passed to [`Link::try_new`].
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -502,7 +502,7 @@ pub enum Error {
     InvalidPosition(Position),
     /// The range's start comes after its end.
     InvalidRange,
-    /// The paragraph passed to [`Paragraph::new`](crate::Paragraph::new) is
+    /// The paragraph passed to [`Paragraph::try_new`](crate::Paragraph::try_new) is
     /// malformed: its text contains CR, LF, or U+2029, or its spans do not
     /// cover the text contiguously with nonempty ranges whose ends fall on
     /// grapheme boundaries.

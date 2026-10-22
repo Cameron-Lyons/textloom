@@ -3360,7 +3360,8 @@ mod tests {
                 link: None,
             })
             .collect();
-        let paragraph = Paragraph::new(&text, spans, ParagraphKind::Heading { level: 2 }).unwrap();
+        let paragraph =
+            Paragraph::try_new(&text, spans, ParagraphKind::Heading { level: 2 }).unwrap();
         let editor = Editor::new(Document::from_paragraphs([paragraph]));
         for width in [8.0, 500.0] {
             let (_, snapshot) = snapshot_for(&editor, width);
@@ -3407,7 +3408,7 @@ mod tests {
 
     #[test]
     fn links_publish_link_nodes_around_their_runs_for_platform_adapters() {
-        let docs = Link::new("https://example.com/docs").unwrap();
+        let docs = Link::try_new("https://example.com/docs").unwrap();
         let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line");
         select(&mut editor, (0, 5), (0, 19));
         editor.set_link(Some(docs.clone())).unwrap();
@@ -3420,7 +3421,7 @@ mod tests {
             .unwrap();
         select(&mut editor, (1, 5), (1, 9));
         editor
-            .set_link(Some(Link::new("https://b.example").unwrap()))
+            .set_link(Some(Link::try_new("https://b.example").unwrap()))
             .unwrap();
         select(&mut editor, (0, 11), (0, 11));
         let (layouts, snapshot) = snapshot_for(&editor, 500.0);

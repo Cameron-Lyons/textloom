@@ -308,12 +308,13 @@ fn empty_single_paragraph_paste_preserves_blocks_and_restores_document_typing_st
     ];
     for destination in kinds {
         for source in kinds {
-            let fragment = Fragment::from_document(&Document::from_paragraphs([Paragraph::new(
-                "",
-                Vec::new(),
-                source,
-            )
-            .unwrap()]));
+            let fragment =
+                Fragment::from_document(&Document::from_paragraphs([Paragraph::try_new(
+                    "",
+                    Vec::new(),
+                    source,
+                )
+                .unwrap()]));
             for text in ["", "e\u{301}x"] {
                 let mut editor = Editor::from_text(text);
                 editor.set_paragraph_kind(destination).unwrap();
@@ -515,7 +516,7 @@ fn version_two_encoding_has_fixed_architecture_independent_layout() {
         versioned_paragraphs(2, &[RawParagraph::new(&[0], b"", &[])])
     );
     let document = Document::from_paragraphs([
-        Paragraph::new(
+        Paragraph::try_new(
             "",
             Vec::new(),
             ParagraphKind::Ordered {
@@ -524,7 +525,7 @@ fn version_two_encoding_has_fixed_architecture_independent_layout() {
             },
         )
         .unwrap(),
-        Paragraph::new(
+        Paragraph::try_new(
             "",
             Vec::new(),
             ParagraphKind::Ordered {
@@ -630,7 +631,8 @@ fn version_two_rich_fixture_remains_readable_and_byte_identical() {
     };
     let item = |text: &str, indent, start| {
         Arc::new(
-            Paragraph::new(text, plain(text), ParagraphKind::Ordered { indent, start }).unwrap(),
+            Paragraph::try_new(text, plain(text), ParagraphKind::Ordered { indent, start })
+                .unwrap(),
         )
     };
     let mut paragraphs = version_one.paragraphs()[..4].to_vec();
@@ -1344,7 +1346,7 @@ fn quotes_encode_as_version_two_tag_six_and_export_one_blockquote_per_run() {
             })
             .into_iter()
             .collect();
-        Paragraph::new(text, spans, ParagraphKind::Quote).unwrap()
+        Paragraph::try_new(text, spans, ParagraphKind::Quote).unwrap()
     };
     assert_eq!(
         Document::from_paragraphs([quote("")]).to_bytes(),
@@ -1534,7 +1536,7 @@ fn paragraph_separators_cannot_appear_inside_paragraph_text() {
         }]
     };
     assert_eq!(
-        Paragraph::new(text, spans(), ParagraphKind::Body),
+        Paragraph::try_new(text, spans(), ParagraphKind::Body),
         Err(Error::InvalidFragment)
     );
     let raw = |version| {

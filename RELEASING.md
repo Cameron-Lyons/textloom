@@ -448,7 +448,7 @@ rules, limits, and trailing-data rejection, and changes only these rows:
   present + 4 RGBA bytes) are shared. Version 2 adds bit 6 (fill present + 4 RGBA
   bytes after the foreground bytes) and bit 7 (link present + `u64` byte length
   and UTF-8 target after the fill bytes). Adjacent spans must differ in style or
-  link, and targets must be valid for `Link::new`.
+  link, and targets must be valid for `Link::try_new`.
 - Paragraph text is UTF-8 without CR or LF in both versions; version 2 also
   rejects U+2029 PARAGRAPH SEPARATOR. U+2028 LINE SEPARATOR is a soft line break
   and was already valid v1 text, so soft breaks need no format change.

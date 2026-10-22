@@ -904,7 +904,7 @@ fn apply_link(editor: &mut Editor, url: &str) -> Result<(), textloom::Error> {
     if url.is_empty() {
         return link_selection(editor, None);
     }
-    let link = Link::new(url)?;
+    let link = Link::try_new(url)?;
     if editor.selection().is_caret() && editor.selected_link().is_none() {
         editor.insert_link("", link)
     } else {
@@ -3359,7 +3359,7 @@ mod tests {
             harness
                 .app
                 .editor
-                .set_link(Some(Link::new(target).unwrap()))
+                .set_link(Some(Link::try_new(target).unwrap()))
                 .unwrap();
         }
         harness
@@ -3401,7 +3401,7 @@ mod tests {
         harness
             .app
             .editor
-            .set_link(Some(Link::new("\u{3000}https://example.com/").unwrap()))
+            .set_link(Some(Link::try_new("\u{3000}https://example.com/").unwrap()))
             .unwrap();
         harness
             .app
@@ -3420,7 +3420,7 @@ mod tests {
         harness
             .app
             .editor
-            .set_link(Some(Link::new("https://exmaple.com/typo").unwrap()))
+            .set_link(Some(Link::try_new("https://exmaple.com/typo").unwrap()))
             .unwrap();
         let targets = |harness: &Harness| -> Vec<_> {
             [0, 6, 7, 10, 11]
@@ -3468,7 +3468,7 @@ mod tests {
 
     #[test]
     fn followed_links_and_the_link_field_apply_rules_match_the_host_ui() {
-        let link = |target| Link::new(target).unwrap();
+        let link = |target| Link::try_new(target).unwrap();
         for (target, opened) in [
             ("https://a", "https://a"),
             ("HTTP://a", "HTTP://a"),

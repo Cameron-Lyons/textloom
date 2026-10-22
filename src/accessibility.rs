@@ -665,7 +665,7 @@ mod accesskit_bridge {
     /// [`update`](Self::update) builds the first tree and then incremental updates
     /// that republish only what changed: unchanged paragraphs keep their node IDs
     /// and cached nodes, and a selection change republishes only the text input.
-    /// Node IDs count up from the root ID given to [`new`](Self::new), which is 1
+    /// Node IDs count up from the root ID given to [`try_new`](Self::try_new), which is 1
     /// for [`Default`], and the IDs of removed nodes are not given out again. The
     /// adapter thus claims every ID from its root upward, so a host that adds its
     /// own nodes to the same tree must give them lower IDs.
@@ -720,7 +720,7 @@ mod accesskit_bridge {
 
     impl Default for AccessKitAdapter {
         fn default() -> Self {
-            Self::new(NodeId(1)).expect("constant root ID has room for descendants")
+            Self::try_new(NodeId(1)).expect("constant root ID has room for descendants")
         }
     }
 
@@ -734,7 +734,7 @@ mod accesskit_bridge {
         ///
         /// Returns [`AccessKitError::NodeIdExhausted`] if `root_id` is
         /// `NodeId(u64::MAX)`, which leaves no ID for the text input.
-        pub fn new(root_id: NodeId) -> Result<Self, AccessKitError> {
+        pub fn try_new(root_id: NodeId) -> Result<Self, AccessKitError> {
             let editor_id = NodeId(
                 root_id
                     .0
@@ -1152,7 +1152,7 @@ mod accesskit_bridge {
         /// the one that the last [`update`](Self::update) published, and
         /// [`AccessKitError::Editor`] with [`Error::InvalidPosition`] if `position`
         /// is not a grapheme boundary of the document.
-        pub fn to_text_position(
+        pub fn text_position(
             &self,
             editor: &Editor,
             position: Position,
@@ -1175,7 +1175,7 @@ mod accesskit_bridge {
         /// the one that the last [`update`](Self::update) published, and
         /// [`AccessKitError::InvalidTextPosition`] if `position` is not in the
         /// published tree.
-        pub fn from_text_position(
+        pub fn editor_position(
             &self,
             editor: &Editor,
             position: TextPosition,
@@ -1749,9 +1749,9 @@ mod accesskit_bridge {
                 for grapheme in 0..=paragraph.grapheme_count() {
                     let position =
                         Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap());
-                    let published = adapter.to_text_position(editor, position).unwrap();
+                    let published = adapter.text_position(editor, position).unwrap();
                     assert_eq!(
-                        adapter.from_text_position(editor, published).unwrap(),
+                        adapter.editor_position(editor, published).unwrap(),
                         position
                     );
                 }
@@ -1939,16 +1939,16 @@ mod accesskit_bridge {
             assert_eq!(run.value(), Some("a👩🏽\u{200d}💻\n"));
             assert_eq!(run.character_lengths(), &[1, 15, 1]);
             let end = adapter
-                .to_text_position(&editor, Position::new(0, 16))
+                .text_position(&editor, Position::new(0, 16))
                 .unwrap();
             assert_eq!(end.character_index, 2);
             assert_eq!(
-                adapter.from_text_position(&editor, end).unwrap(),
+                adapter.editor_position(&editor, end).unwrap(),
                 Position::new(0, 16)
             );
             assert_eq!(
                 adapter
-                    .from_text_position(
+                    .editor_position(
                         &editor,
                         TextPosition {
                             node: first,
@@ -2027,12 +2027,8 @@ mod accesskit_bridge {
                     .focus_requested
             );
             let selection = TextSelection {
-                anchor: adapter
-                    .to_text_position(&editor, Position::new(1, 2))
-                    .unwrap(),
-                focus: adapter
-                    .to_text_position(&editor, Position::new(0, 1))
-                    .unwrap(),
+                anchor: adapter.text_position(&editor, Position::new(1, 2)).unwrap(),
+                focus: adapter.text_position(&editor, Position::new(0, 1)).unwrap(),
             };
             let select = request(
                 &adapter,
@@ -2129,12 +2125,8 @@ mod accesskit_bridge {
             assert_eq!(adapter.paragraph_node(0), paragraph_id);
 
             let selection = TextSelection {
-                anchor: adapter
-                    .to_text_position(&editor, Position::new(0, 8))
-                    .unwrap(),
-                focus: adapter
-                    .to_text_position(&editor, Position::new(0, 0))
-                    .unwrap(),
+                anchor: adapter.text_position(&editor, Position::new(0, 8)).unwrap(),
+                focus: adapter.text_position(&editor, Position::new(0, 0)).unwrap(),
             };
             let select = request(
                 &adapter,
@@ -2183,9 +2175,7 @@ mod accesskit_bridge {
                     .any(|(_, node)| node.font_weight() == Some(700.0))
             );
             assert_eq!(
-                adapter
-                    .to_text_position(&editor, Position::new(0, 1))
-                    .unwrap(),
+                adapter.text_position(&editor, Position::new(0, 1)).unwrap(),
                 TextPosition {
                     node: runs[1].0,
                     character_index: 0
@@ -2193,9 +2183,9 @@ mod accesskit_bridge {
             );
             for byte in 0..=3 {
                 let position = Position::new(0, byte);
-                let text_position = adapter.to_text_position(&editor, position).unwrap();
+                let text_position = adapter.text_position(&editor, position).unwrap();
                 assert_eq!(
-                    adapter.from_text_position(&editor, text_position).unwrap(),
+                    adapter.editor_position(&editor, text_position).unwrap(),
                     position
                 );
             }
@@ -2275,9 +2265,7 @@ mod accesskit_bridge {
                 assert_eq!(adapter.paragraph_node(0), Some(first));
                 assert_eq!(adapter.paragraph_node(3), Some(last));
             }
-            let obsolete = adapter
-                .to_text_position(&editor, Position::new(1, 0))
-                .unwrap();
+            let obsolete = adapter.text_position(&editor, Position::new(1, 0)).unwrap();
             for paragraph in [1, 2] {
                 editor
                     .set_selection(Selection::caret(Position::new(paragraph, 0)))
@@ -2288,16 +2276,16 @@ mod accesskit_bridge {
             assert_eq!(adapter.paragraph_node(0), Some(first));
             assert_eq!(adapter.paragraph_node(3), Some(last));
             assert_eq!(
-                adapter.from_text_position(&editor, obsolete),
+                adapter.editor_position(&editor, obsolete),
                 Err(AccessKitError::InvalidTextPosition(obsolete))
             );
             for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
                 for grapheme in 0..=paragraph.grapheme_count() {
                     let position =
                         Position::new(index, paragraph.byte_from_grapheme(grapheme).unwrap());
-                    let published = adapter.to_text_position(&editor, position).unwrap();
+                    let published = adapter.text_position(&editor, position).unwrap();
                     assert_eq!(
-                        adapter.from_text_position(&editor, published).unwrap(),
+                        adapter.editor_position(&editor, published).unwrap(),
                         position
                     );
                 }
@@ -2311,9 +2299,7 @@ mod accesskit_bridge {
             adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let storage = adapter.paragraphs.as_ptr();
             let before = adapter.paragraphs.clone();
-            let removed = adapter
-                .to_text_position(&editor, Position::new(1, 0))
-                .unwrap();
+            let removed = adapter.text_position(&editor, Position::new(1, 0)).unwrap();
             let fragment = editor
                 .document()
                 .fragment(Position::new(0, 0)..Position::new(0, 4))
@@ -2338,14 +2324,14 @@ mod accesskit_bridge {
             }
             assert_ne!(adapter.paragraph_node(0), adapter.paragraph_node(1));
             assert_eq!(
-                adapter.from_text_position(&editor, removed),
+                adapter.editor_position(&editor, removed),
                 Err(AccessKitError::InvalidTextPosition(removed))
             );
             for index in 0..3 {
                 let position = Position::new(index, 2);
-                let published = adapter.to_text_position(&editor, position).unwrap();
+                let published = adapter.text_position(&editor, position).unwrap();
                 assert_eq!(
-                    adapter.from_text_position(&editor, published).unwrap(),
+                    adapter.editor_position(&editor, published).unwrap(),
                     position
                 );
                 let run = &adapter.paragraphs[index].runs[0];
@@ -2353,7 +2339,7 @@ mod accesskit_bridge {
                 if run.line_break {
                     assert_eq!(
                         adapter
-                            .from_text_position(
+                            .editor_position(
                                 &editor,
                                 TextPosition {
                                     node: run.id,
@@ -2376,9 +2362,9 @@ mod accesskit_bridge {
             let before = adapter.paragraphs.clone();
             let storage = adapter.paragraphs.as_ptr();
             let position = Position::new(1, 2);
-            let published = adapter.to_text_position(&editor, position).unwrap();
+            let published = adapter.text_position(&editor, position).unwrap();
             assert_eq!(
-                adapter.from_text_position(&editor, published).unwrap(),
+                adapter.editor_position(&editor, published).unwrap(),
                 position
             );
             let locations = adapter.run_locations.get().cloned();
@@ -2410,12 +2396,12 @@ mod accesskit_bridge {
                 );
                 assert_eq!(
                     adapter
-                        .from_text_position(&published_editor, published)
+                        .editor_position(&published_editor, published)
                         .unwrap(),
                     position
                 );
                 assert_eq!(
-                    adapter.from_text_position(&editor, published),
+                    adapter.editor_position(&editor, published),
                     Err(AccessKitError::StaleDocument)
                 );
                 assert!(editor.undo(), "structural: {structural}");
@@ -2435,12 +2421,8 @@ mod accesskit_bridge {
             let editor = Editor::from_text("first\nsecond\nlast");
             let mut adapter = AccessKitAdapter::default();
             adapter.update(&editor, "Notes", Focus::Focused).unwrap();
-            let first = adapter
-                .to_text_position(&editor, Position::new(0, 2))
-                .unwrap();
-            let second = adapter
-                .to_text_position(&editor, Position::new(1, 2))
-                .unwrap();
+            let first = adapter.text_position(&editor, Position::new(0, 2)).unwrap();
+            let second = adapter.text_position(&editor, Position::new(1, 2)).unwrap();
             let before = adapter.paragraphs.clone();
             let source = editor.document().paragraphs();
             let fragment = Fragment::from_paragraphs(vec![
@@ -2455,11 +2437,11 @@ mod accesskit_bridge {
             assert!(Arc::ptr_eq(&before[1], &adapter.paragraphs[0]));
             assert!(Arc::ptr_eq(&before[2], &adapter.paragraphs[2]));
             assert_eq!(
-                adapter.from_text_position(&reordered, first).unwrap(),
+                adapter.editor_position(&reordered, first).unwrap(),
                 Position::new(1, 2)
             );
             assert_eq!(
-                adapter.from_text_position(&reordered, second).unwrap(),
+                adapter.editor_position(&reordered, second).unwrap(),
                 Position::new(0, 2)
             );
         }
@@ -2516,27 +2498,27 @@ mod accesskit_bridge {
             let mut adapter = AccessKitAdapter::default();
             adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let position = Position::new(1, 3);
-            let published = adapter.to_text_position(&editor, position).unwrap();
+            let published = adapter.text_position(&editor, position).unwrap();
 
             let cloned = Editor::new(editor.document().clone());
             assert_eq!(
-                adapter.from_text_position(&cloned, published).unwrap(),
+                adapter.editor_position(&cloned, published).unwrap(),
                 position
             );
             let unrelated = Editor::from_text("other\ntext\nhere");
             assert_eq!(
-                adapter.from_text_position(&unrelated, published),
+                adapter.editor_position(&unrelated, published),
                 Err(AccessKitError::StaleDocument)
             );
 
             editor.insert_text("new\n").unwrap();
             assert_eq!(
-                adapter.from_text_position(&editor, published),
+                adapter.editor_position(&editor, published),
                 Err(AccessKitError::StaleDocument)
             );
             adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(
-                adapter.from_text_position(&editor, published).unwrap(),
+                adapter.editor_position(&editor, published).unwrap(),
                 Position::new(2, 3)
             );
 
@@ -2545,7 +2527,7 @@ mod accesskit_bridge {
                 character_index: 0,
             };
             assert_eq!(
-                adapter.from_text_position(&editor, invalid),
+                adapter.editor_position(&editor, invalid),
                 Err(AccessKitError::InvalidTextPosition(invalid))
             );
             let invalid = TextPosition {
@@ -2553,7 +2535,7 @@ mod accesskit_bridge {
                 ..published
             };
             assert_eq!(
-                adapter.from_text_position(&editor, invalid),
+                adapter.editor_position(&editor, invalid),
                 Err(AccessKitError::InvalidTextPosition(invalid))
             );
             assert!(
@@ -2595,10 +2577,7 @@ mod accesskit_bridge {
                 let position = Position::new(index, 2);
                 assert_eq!(
                     adapter
-                        .from_text_position(
-                            &editor,
-                            adapter.to_text_position(&editor, position).unwrap()
-                        )
+                        .editor_position(&editor, adapter.text_position(&editor, position).unwrap())
                         .unwrap(),
                     position
                 );
@@ -2621,10 +2600,10 @@ mod accesskit_bridge {
         #[test]
         fn exhausted_node_ids_return_errors_without_panics() {
             assert!(matches!(
-                AccessKitAdapter::new(NodeId(u64::MAX)),
+                AccessKitAdapter::try_new(NodeId(u64::MAX)),
                 Err(AccessKitError::NodeIdExhausted)
             ));
-            let mut exhausted = AccessKitAdapter::new(NodeId(u64::MAX - 1)).unwrap();
+            let mut exhausted = AccessKitAdapter::try_new(NodeId(u64::MAX - 1)).unwrap();
             for _ in 0..2 {
                 assert_eq!(
                     exhausted.update(&Editor::from_text("a"), "Notes", Focus::Focused),
@@ -2656,11 +2635,11 @@ mod accesskit_bridge {
                 character_index,
             };
             assert_eq!(
-                adapter.from_text_position(&editor, character(4)).unwrap(),
+                adapter.editor_position(&editor, character(4)).unwrap(),
                 Position::new(1, 3)
             );
             assert_eq!(
-                adapter.from_text_position(&editor, character(5)).unwrap(),
+                adapter.editor_position(&editor, character(5)).unwrap(),
                 Position::new(1, 404)
             );
             editor
@@ -2688,7 +2667,7 @@ mod accesskit_bridge {
             };
             assert!(runs[1].1.start > 0);
             assert_eq!(
-                adapter.from_text_position(&editor, inside).unwrap(),
+                adapter.editor_position(&editor, inside).unwrap(),
                 Position::new(0, 0)
             );
         }
@@ -2728,7 +2707,7 @@ mod accesskit_bridge {
 
             let encode = |byte| {
                 let position = adapter
-                    .to_text_position(&editor, Position::new(0, byte))
+                    .text_position(&editor, Position::new(0, byte))
                     .unwrap();
                 (position.node, position.character_index)
             };
@@ -2736,7 +2715,7 @@ mod accesskit_bridge {
             assert_eq!(encode(5), (runs[1].0, 0));
             assert_eq!(encode(10), (runs[2].0, 0));
             let decode = |node, character_index| {
-                adapter.from_text_position(
+                adapter.editor_position(
                     &editor,
                     TextPosition {
                         node,
@@ -2942,9 +2921,7 @@ mod accesskit_bridge {
                 .children()
                 .to_vec();
             let quote = adapter.quotes[0].id;
-            let obsolete = adapter
-                .to_text_position(&editor, Position::new(2, 1))
-                .unwrap();
+            let obsolete = adapter.text_position(&editor, Position::new(2, 1)).unwrap();
 
             editor
                 .set_selection(Selection::new(Position::new(1, 1), Position::new(2, 1)))
@@ -2964,7 +2941,7 @@ mod accesskit_bridge {
             assert_eq!(update.nodes[0].0, ids[1]);
             assert_eq!(update.nodes[2].0, ids[2]);
             assert_eq!(
-                adapter.from_text_position(&editor, obsolete),
+                adapter.editor_position(&editor, obsolete),
                 Err(AccessKitError::InvalidTextPosition(obsolete))
             );
 
@@ -3217,7 +3194,7 @@ pub(crate) mod random_edits {
             .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
             .unwrap();
         editor
-            .set_link(Some(Link::new("https://a.example").unwrap()))
+            .set_link(Some(Link::try_new("https://a.example").unwrap()))
             .unwrap();
         editor
     }
@@ -3297,7 +3274,7 @@ pub(crate) mod random_edits {
             },
         ];
         let kind = kinds[random(kinds.len())];
-        let link = Link::new(["https://a.example", "https://b.example"][random(2)]).unwrap();
+        let link = Link::try_new(["https://a.example", "https://b.example"][random(2)]).unwrap();
         let anchor = position(editor, random);
         let focus = position(editor, random);
         let range = Selection::new(anchor, focus);

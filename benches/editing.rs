@@ -313,7 +313,8 @@ fn styled_repetitions(phrase: &str, repetitions: usize) -> Document {
 fn caret_link_queries() {
     for repetitions in [100, 100_000] {
         let mut editor = Editor::new(styled_repetitions("é", repetitions));
-        let target = Link::new("https://example.com").expect("a short URL is a valid link target");
+        let target =
+            Link::try_new("https://example.com").expect("a short URL is a valid link target");
         editor.select_all();
         editor.set_link(Some(target.clone())).expect(NO_COMPOSITION);
         editor.clear_history();
@@ -1388,14 +1389,14 @@ fn accessibility_navigation() {
             .expect(TREE_UPDATE);
         let position = Position::new(paragraphs - 1, 3);
         let text_position = adapter
-            .to_text_position(&editor, position)
+            .text_position(&editor, position)
             .expect("the adapter is current, and the position follows \"aé\"");
         measure(
             &format!("{paragraphs} paragraphs AccessKit position roundtrip"),
             2_000,
             || {
                 let encoded = adapter
-                    .to_text_position(&editor, hint::black_box(position))
+                    .text_position(&editor, hint::black_box(position))
                     .expect("the adapter is current, and the position follows \"aé\"");
                 assert_eq!(
                     encoded, text_position,
@@ -1403,7 +1404,7 @@ fn accessibility_navigation() {
                 );
                 assert_eq!(
                     adapter
-                        .from_text_position(&editor, hint::black_box(encoded))
+                        .editor_position(&editor, hint::black_box(encoded))
                         .expect("the text position came from this adapter and document"),
                     position,
                     "converting to an AccessKit position and back should be lossless"

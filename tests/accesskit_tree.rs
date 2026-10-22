@@ -442,7 +442,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
                 let end = Position::new(index, end);
                 let _ = editor.set_selection(Selection::new(caret.min(end), caret.max(end)));
                 let link = ["https://a.example", "https://b.example"][random(2)];
-                editor.set_link((random(3) != 0).then(|| Link::new(link).unwrap()))
+                editor.set_link((random(3) != 0).then(|| Link::try_new(link).unwrap()))
             }
             _ => editor.delete_word_backward(),
         };
@@ -501,7 +501,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
             let focus = editor.selection().focus;
             assert!(scalar_index(&editor, focus) <= expected, "step {step}");
             assert_eq!(
-                adapter.to_text_position(&editor, focus).map(|_| ()),
+                adapter.text_position(&editor, focus).map(|_| ()),
                 Ok(()),
                 "step {step}"
             );
@@ -633,7 +633,7 @@ fn link_nodes(node: Node<'_>) -> Vec<LinkNode> {
 
 #[test]
 fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
-    let docs = Link::new("https://example.com/docs").unwrap();
+    let docs = Link::try_new("https://example.com/docs").unwrap();
     let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line");
     editor
         .set_selection(Selection::new(Position::new(0, 5), Position::new(0, 19)))
@@ -644,7 +644,7 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .set_selection(Selection::new(Position::new(1, 5), Position::new(1, 9)))
         .unwrap();
     editor
-        .set_link(Some(Link::new("https://b.example").unwrap()))
+        .set_link(Some(Link::try_new("https://b.example").unwrap()))
         .unwrap();
     editor
         .set_selection(Selection::caret(Position::new(0, 11)))
