@@ -1,5 +1,11 @@
+//! Tests document search and the editor's find and replace commands: literal,
+//! case-insensitive, and whole-word matching on grapheme and word boundaries,
+//! matches across paragraphs, and navigation that agrees with
+//! `Document::find` at every caret, including after edits between presses.
+
+use std::ops::Range;
+
 use textloom::{Document, Editor, Error, Position, SearchOptions, Selection, StylePatch};
-use unicode_segmentation::UnicodeSegmentation;
 
 fn default_options() -> SearchOptions {
     SearchOptions::default()
@@ -145,6 +151,8 @@ fn whole_words_use_unicode_word_boundaries() {
 
 #[test]
 fn matches_beside_ascii_punctuation_and_digits_follow_word_segmentation() {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let tokens = [
         "a", "B", "x", "1", "2", ".", ":", ",", ";", "'", "_", " ", "  ", "\t", "-", "\"", "\n",
         "ab", "a.b", "1.2", "1,2", "a:b", "x_1", "can't", "é", "É", "\u{301}", "\u{200d}", "’",
@@ -210,7 +218,9 @@ fn matches_beside_ascii_punctuation_and_digits_follow_word_segmentation() {
                     };
                     let mut expected = Vec::new();
                     let mut consumed = 0;
-                    for &start in graphemes.iter().filter(|_| !needle.is_empty()) {
+                    // An empty needle matches nothing.
+                    let candidate_starts = graphemes.iter().filter(|_| !needle.is_empty());
+                    for &start in candidate_starts {
                         let end = start + needle.len();
                         if start >= consumed
                             && searched[start..].starts_with(&needle)
@@ -251,15 +261,26 @@ fn case_insensitive_cross_paragraph_middle_lines_must_fill_their_paragraphs() {
         assert!(
             !editor
                 .replace_selected_match(query, "_", insensitive)
-                .unwrap()
+                .unwrap(),
+            "{text:?}"
         );
         assert_eq!(editor.document().plain_text(), text);
         for wrap in [false, true] {
             for caret in [Position::new(0, 0), editor.document().end()] {
                 editor.set_selection(Selection::caret(caret)).unwrap();
-                assert!(!editor.find_next(query, insensitive, wrap).unwrap());
-                assert!(!editor.find_previous(query, insensitive, wrap).unwrap());
-                assert_eq!(editor.selection(), Selection::caret(caret));
+                assert!(
+                    !editor.find_next(query, insensitive, wrap).unwrap(),
+                    "{text:?}, wrap={wrap}, caret={caret:?}"
+                );
+                assert!(
+                    !editor.find_previous(query, insensitive, wrap).unwrap(),
+                    "{text:?}, wrap={wrap}, caret={caret:?}"
+                );
+                assert_eq!(
+                    editor.selection(),
+                    Selection::caret(caret),
+                    "{text:?}, wrap={wrap}, caret={caret:?}"
+                );
             }
         }
     }
@@ -321,11 +342,18 @@ fn overlapping_retries_preserve_earlier_and_later_matches() {
     for source in ["🇺🇺 🇨🇺🇺🇺 🇺🇺", "🇺🇺\n🇨🇺🇺🇺\n🇺🇺"] {
         let document = Document::from_text(source);
         let matches = document.find("🇺🇺", SearchOptions::default());
-        assert_eq!(matches.len(), 3);
+        assert_eq!(matches.len(), 3, "{source:?}");
         for range in &matches {
-            assert_eq!(document.text(range.clone()).unwrap(), "🇺🇺");
+            assert_eq!(
+                document.text(range.clone()).unwrap(),
+                "🇺🇺",
+                "{source:?}, {range:?}"
+            );
         }
-        assert!(matches.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        assert!(
+            matches.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "{source:?}: {matches:?}"
+        );
     }
 
     let document = Document::from_text("i İ i\ni İ i");
@@ -337,8 +365,8 @@ fn overlapping_retries_preserve_earlier_and_later_matches() {
         },
     );
     assert_eq!(matches.len(), 4);
-    for range in matches {
-        assert_eq!(document.text(range).unwrap(), "i");
+    for range in &matches {
+        assert_eq!(document.text(range.clone()).unwrap(), "i", "{range:?}");
     }
 
     assert_eq!(
@@ -419,20 +447,38 @@ fn repetitive_rejected_matches_preserve_later_whole_matches() {
                 needle.to_uppercase()
             };
             let mut editor = Editor::from_text(&source);
-            assert_eq!(editor.document().find(&query, options), expected);
-            assert!(editor.find_next(&query, options, false).unwrap());
-            assert_eq!(editor.selection().range(), expected[0]);
-            assert!(editor.find_next(&query, options, false).unwrap());
-            assert_eq!(editor.selection().range(), expected[1]);
-            assert!(editor.find_previous(&query, options, false).unwrap());
-            assert_eq!(editor.selection().range(), expected[0]);
-            assert_eq!(editor.replace_all(&query, "found", options), Ok(2));
+            assert_eq!(
+                editor.document().find(&query, options),
+                expected,
+                "{options:?}"
+            );
+            assert!(
+                editor.find_next(&query, options, false).unwrap(),
+                "{options:?}"
+            );
+            assert_eq!(editor.selection().range(), expected[0], "{options:?}");
+            assert!(
+                editor.find_next(&query, options, false).unwrap(),
+                "{options:?}"
+            );
+            assert_eq!(editor.selection().range(), expected[1], "{options:?}");
+            assert!(
+                editor.find_previous(&query, options, false).unwrap(),
+                "{options:?}"
+            );
+            assert_eq!(editor.selection().range(), expected[0], "{options:?}");
+            assert_eq!(
+                editor.replace_all(&query, "found", options),
+                Ok(2),
+                "{options:?}"
+            );
             assert_eq!(
                 editor.document().plain_text(),
-                format!("{rejected} found found")
+                format!("{rejected} found found"),
+                "{options:?}"
             );
-            assert!(editor.undo());
-            assert_eq!(editor.document().plain_text(), source);
+            assert!(editor.undo(), "{options:?}");
+            assert_eq!(editor.document().plain_text(), source, "{options:?}");
         }
     }
 }
@@ -454,19 +500,42 @@ fn alternating_rejected_and_valid_candidates_preserve_the_match_stream() {
             };
             let query = if case_sensitive { "aa" } else { "AA" };
             let mut editor = Editor::from_text(&source);
-            assert_eq!(editor.document().find(query, options), expected);
+            assert_eq!(
+                editor.document().find(query, options),
+                expected,
+                "{part:?}, {options:?}"
+            );
             for range in &expected {
-                assert!(editor.find_next(query, options, false).unwrap());
-                assert_eq!(editor.selection().range(), *range);
+                assert!(
+                    editor.find_next(query, options, false).unwrap(),
+                    "{part:?}, {options:?}, {range:?}"
+                );
+                assert_eq!(
+                    editor.selection().range(),
+                    *range,
+                    "{part:?}, {options:?}, {range:?}"
+                );
             }
-            assert!(!editor.find_next(query, options, false).unwrap());
-            assert_eq!(editor.replace_all(query, "Z", options), Ok(32));
+            assert!(
+                !editor.find_next(query, options, false).unwrap(),
+                "{part:?}, {options:?}"
+            );
+            assert_eq!(
+                editor.replace_all(query, "Z", options),
+                Ok(32),
+                "{part:?}, {options:?}"
+            );
             assert_eq!(
                 editor.document().plain_text(),
-                if whole_word { "aaX Z " } else { "\u{600}aZ " }.repeat(32)
+                if whole_word { "aaX Z " } else { "\u{600}aZ " }.repeat(32),
+                "{part:?}, {options:?}"
             );
-            assert!(editor.undo());
-            assert_eq!(editor.document().plain_text(), source);
+            assert!(editor.undo(), "{part:?}, {options:?}");
+            assert_eq!(
+                editor.document().plain_text(),
+                source,
+                "{part:?}, {options:?}"
+            );
         }
     }
 }
@@ -484,7 +553,8 @@ fn paragraph_local_options_fold_final_sigma_and_respect_word_boundaries() {
             vec![
                 Position::new(0, 0)..Position::new(0, 4),
                 Position::new(1, 0)..Position::new(1, 4)
-            ]
+            ],
+            "{query:?}"
         );
     }
     assert_eq!(
@@ -498,15 +568,18 @@ fn paragraph_local_options_fold_final_sigma_and_respect_word_boundaries() {
         };
         assert_eq!(
             document.find("cat", options),
-            vec![Position::new(5, 0)..Position::new(5, 3)]
+            vec![Position::new(5, 0)..Position::new(5, 3)],
+            "{options:?}"
         );
         assert_eq!(
             document.find("你", options),
-            vec![Position::new(6, 0)..Position::new(6, 3)]
+            vec![Position::new(6, 0)..Position::new(6, 3)],
+            "{options:?}"
         );
         assert_eq!(
             document.find("word", options),
-            vec![Position::new(8, 0)..Position::new(8, 4)]
+            vec![Position::new(8, 0)..Position::new(8, 4)],
+            "{options:?}"
         );
     }
 }
@@ -521,26 +594,31 @@ fn longer_lowercase_queries_match_expansions_but_skip_short_paragraphs() {
         };
         assert_eq!(
             document.find("i\u{307}", options),
-            vec![Position::new(1, 0)..Position::new(1, 2)]
+            vec![Position::new(1, 0)..Position::new(1, 2)],
+            "{options:?}"
         );
         assert_eq!(
             document.find("K", options),
             vec![
                 Position::new(3, 0)..Position::new(3, 3),
                 Position::new(4, 0)..Position::new(4, 1)
-            ]
+            ],
+            "{options:?}"
         );
-        assert!(document.find(&"absent".repeat(100), options).is_empty());
+        assert!(
+            document.find(&"absent".repeat(100), options).is_empty(),
+            "{options:?}"
+        );
     }
 }
 
 #[test]
 fn generated_unicode_matches_agree_with_a_grapheme_reference() {
-    fn reference(
-        document: &Document,
-        query: &str,
-        options: SearchOptions,
-    ) -> Vec<std::ops::Range<Position>> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    /// Finds matches by brute force over grapheme and word boundaries, as the
+    /// oracle for `Document::find`.
+    fn reference(document: &Document, query: &str, options: SearchOptions) -> Vec<Range<Position>> {
         let source = document.plain_text();
         let needle = query.replace("\r\n", "\n").replace('\r', "\n");
         let needle = if options.case_sensitive {
@@ -778,10 +856,14 @@ fn local_navigation_keeps_forward_nonoverlap_and_folds_final_sigma() {
         editor
             .set_selection(Selection::caret(Position::new(2, 4)))
             .unwrap();
-        assert!(editor.find_previous(query, insensitive, false).unwrap());
+        assert!(
+            editor.find_previous(query, insensitive, false).unwrap(),
+            "{query:?}"
+        );
         assert_eq!(
             editor.selection(),
-            Selection::new(Position::new(2, 0), Position::new(2, 4))
+            Selection::new(Position::new(2, 0), Position::new(2, 4)),
+            "{query:?}"
         );
     }
 }
@@ -849,7 +931,11 @@ fn literal_navigation_agrees_with_forward_matches_around_rejected_unicode_candid
                     } else {
                         editor.find_next(query, options, wrap).unwrap()
                     };
-                    assert_eq!(found, expected.is_some());
+                    assert_eq!(
+                        found,
+                        expected.is_some(),
+                        "query={query:?}, selection={selection:?}, wrap={wrap}, backward={backward}"
+                    );
                     assert_eq!(
                         editor.selection(),
                         expected.map_or(selection, |item| Selection::new(item.start, item.end)),
@@ -919,7 +1005,11 @@ fn navigation_matches_global_results_for_sparse_paragraphs_and_crossing_selectio
                             } else {
                                 editor.find_next(query, options, wrap).unwrap()
                             };
-                            assert_eq!(found, expected.is_some());
+                            assert_eq!(
+                                found,
+                                expected.is_some(),
+                                "query={query:?}, options={options:?}, selection={selection:?}, wrap={wrap}, backward={backward}"
+                            );
                             assert_eq!(
                                 editor.selection(),
                                 expected
@@ -979,13 +1069,13 @@ fn nearby_navigation_in_long_paragraphs_matches_the_forward_match_stream() {
                         0..0
                     };
                     for offset in offsets {
-                        for byte in [
+                        let nearby_bytes = [
                             range.start.byte.checked_sub(offset),
                             Some(range.end.byte + offset),
                         ]
                         .into_iter()
-                        .flatten()
-                        {
+                        .flatten();
+                        for byte in nearby_bytes {
                             let byte = paragraph.boundary_at_or_before(byte);
                             selections
                                 .push(Selection::caret(Position::new(range.start.paragraph, byte)));
@@ -994,7 +1084,10 @@ fn nearby_navigation_in_long_paragraphs_matches_the_forward_match_stream() {
                     let mut copy = editor.clone();
                     copy.set_selection(Selection::new(range.start, range.end))
                         .unwrap();
-                    assert!(copy.replace_selected_match(query, "x", options).unwrap());
+                    assert!(
+                        copy.replace_selected_match(query, "x", options).unwrap(),
+                        "query={query:?}, options={options:?}, {range:?}"
+                    );
                 }
                 for &selection in &selections {
                     let range = selection.range();
@@ -1010,7 +1103,11 @@ fn nearby_navigation_in_long_paragraphs_matches_the_forward_match_stream() {
                         } else {
                             editor.find_next(query, options, false).unwrap()
                         };
-                        assert_eq!(found, expected.is_some());
+                        assert_eq!(
+                            found,
+                            expected.is_some(),
+                            "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                        );
                         assert_eq!(
                             editor.selection(),
                             expected.map_or(selection, |item| Selection::new(item.start, item.end)),
@@ -1065,7 +1162,11 @@ fn nearby_navigation_keeps_shrinking_lowercase_and_joined_space_candidates_at_ev
                         } else {
                             editor.find_next(query, options, false).unwrap()
                         };
-                        assert_eq!(found, expected.is_some());
+                        assert_eq!(
+                            found,
+                            expected.is_some(),
+                            "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                        );
                         assert_eq!(
                             editor.selection(),
                             expected.map_or(selection, |item| Selection::new(item.start, item.end)),
@@ -1134,7 +1235,11 @@ fn whole_word_navigation_in_long_non_latin_paragraphs_matches_the_forward_match_
                     } else {
                         editor.find_next(query, options, false).unwrap()
                     };
-                    assert_eq!(found, expected.is_some());
+                    assert_eq!(
+                        found,
+                        expected.is_some(),
+                        "query={query:?}, options={options:?}, selection={selection:?}, backward={backward}"
+                    );
                     assert_eq!(
                         editor.selection(),
                         expected.map_or(selection, |item| Selection::new(item.start, item.end)),
@@ -1167,7 +1272,8 @@ fn navigation_after_edits_between_presses_matches_document_search() {
                     let mut copy = editor.clone();
                     assert_eq!(
                         copy.find_previous(query, options, false).unwrap(),
-                        previous.is_some()
+                        previous.is_some(),
+                        "query={query:?}, options={options:?}, selection={selection:?}"
                     );
                     assert_eq!(
                         copy.selection(),
@@ -1175,11 +1281,21 @@ fn navigation_after_edits_between_presses_matches_document_search() {
                         "query={query:?}, options={options:?}, selection={selection:?}"
                     );
                     let Some(next) = matches.iter().find(|item| item.start >= range.end) else {
-                        assert!(!editor.find_next(query, options, false).unwrap());
-                        assert_eq!(editor.selection(), selection);
+                        assert!(
+                            !editor.find_next(query, options, false).unwrap(),
+                            "query={query:?}, options={options:?}, selection={selection:?}"
+                        );
+                        assert_eq!(
+                            editor.selection(),
+                            selection,
+                            "query={query:?}, options={options:?}, selection={selection:?}"
+                        );
                         break;
                     };
-                    assert!(editor.find_next(query, options, false).unwrap());
+                    assert!(
+                        editor.find_next(query, options, false).unwrap(),
+                        "query={query:?}, options={options:?}, selection={selection:?}"
+                    );
                     assert_eq!(
                         editor.selection(),
                         Selection::new(next.start, next.end),
@@ -1187,7 +1303,10 @@ fn navigation_after_edits_between_presses_matches_document_search() {
                     );
                     let revision = editor.document().revision();
                     match presses % 4 {
-                        0 => assert!(editor.replace_selected_match(query, "x", options).unwrap()),
+                        0 => assert!(
+                            editor.replace_selected_match(query, "x", options).unwrap(),
+                            "query={query:?}, options={options:?}, selection={selection:?}"
+                        ),
                         1 => editor.replace_range(next.end..next.end, "s").unwrap(),
                         2 => {
                             let start = Position::new(next.start.paragraph, 0);
@@ -1200,9 +1319,15 @@ fn navigation_after_edits_between_presses_matches_document_search() {
                                 .set_selection(Selection::new(shift(next.start), shift(next.end)))
                                 .unwrap();
                         }
-                        _ => assert!(editor.undo()),
+                        _ => assert!(
+                            editor.undo(),
+                            "query={query:?}, options={options:?}, selection={selection:?}"
+                        ),
                     }
-                    assert!(editor.document().revision() > revision);
+                    assert!(
+                        editor.document().revision() > revision,
+                        "query={query:?}, options={options:?}, selection={selection:?}"
+                    );
                     presses += 1;
                 }
                 assert!(
@@ -1254,7 +1379,8 @@ fn cross_paragraph_navigation_after_edits_between_presses_matches_document_searc
                         let mut copy = editor.clone();
                         assert_eq!(
                             copy.find_previous(query, options, wrap).unwrap(),
-                            previous.is_some()
+                            previous.is_some(),
+                            "wrap={wrap}, {context}"
                         );
                         assert_eq!(
                             copy.selection(),
@@ -1263,11 +1389,15 @@ fn cross_paragraph_navigation_after_edits_between_presses_matches_document_searc
                         );
                     }
                     let Some(next) = matches.iter().find(|item| item.start >= range.end) else {
-                        assert!(!editor.find_next(query, options, false).unwrap());
-                        assert_eq!(editor.selection(), selection);
+                        assert!(
+                            !editor.find_next(query, options, false).unwrap(),
+                            "{context}"
+                        );
+                        assert_eq!(editor.selection(), selection, "{context}");
                         assert_eq!(
                             editor.find_next(query, options, true).unwrap(),
-                            !matches.is_empty()
+                            !matches.is_empty(),
+                            "{context}"
                         );
                         assert_eq!(
                             editor.selection(),
@@ -1278,7 +1408,10 @@ fn cross_paragraph_navigation_after_edits_between_presses_matches_document_searc
                         );
                         break;
                     };
-                    assert!(editor.find_next(query, options, false).unwrap());
+                    assert!(
+                        editor.find_next(query, options, false).unwrap(),
+                        "{context}"
+                    );
                     assert_eq!(
                         editor.selection(),
                         Selection::new(next.start, next.end),
@@ -1286,7 +1419,10 @@ fn cross_paragraph_navigation_after_edits_between_presses_matches_document_searc
                     );
                     let revision = editor.document().revision();
                     match presses % 4 {
-                        0 => assert!(editor.replace_selected_match(query, "x", options).unwrap()),
+                        0 => assert!(
+                            editor.replace_selected_match(query, "x", options).unwrap(),
+                            "{context}"
+                        ),
                         1 => editor.replace_range(next.end..next.end, "s").unwrap(),
                         2 => {
                             let start = Position::new(next.start.paragraph, 0);
@@ -1306,9 +1442,9 @@ fn cross_paragraph_navigation_after_edits_between_presses_matches_document_searc
                                 .set_selection(Selection::new(shift(next.start), shift(next.end)))
                                 .unwrap();
                         }
-                        _ => assert!(editor.undo()),
+                        _ => assert!(editor.undo(), "{context}"),
                     }
-                    assert!(editor.document().revision() > revision);
+                    assert!(editor.document().revision() > revision, "{context}");
                     presses += 1;
                 }
                 total += presses;
@@ -1433,8 +1569,12 @@ fn only_selections_in_the_match_stream_are_replaced() {
             "{query:?} {start:?}..{end:?}"
         );
         if !expected {
-            assert_eq!(copy.selection(), selection);
-            assert_eq!(copy.document().paragraphs(), content);
+            assert_eq!(copy.selection(), selection, "{query:?} {start:?}..{end:?}");
+            assert_eq!(
+                copy.document().paragraphs(),
+                content,
+                "{query:?} {start:?}..{end:?}"
+            );
         }
     }
     select(&mut editor, (0, 22), (1, 2));
@@ -1458,7 +1598,7 @@ fn only_selections_in_the_match_stream_are_replaced() {
 fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
     editor
         .set_selection(Selection::caret(Position::new(paragraph, byte)))
-        .unwrap();
+        .expect("callers place the caret on a grapheme boundary of an existing paragraph");
 }
 
 #[test]
