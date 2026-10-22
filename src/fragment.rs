@@ -89,10 +89,12 @@ impl Default for Fragment {
 }
 
 impl Fragment {
+    #[must_use]
     pub fn from_text(text: &str) -> Self {
         Self::from_paragraphs(Document::from_text(text).into_paragraphs())
     }
 
+    #[must_use]
     pub fn from_document(document: &Document) -> Self {
         Self::from_paragraphs(document.paragraphs().to_vec())
     }
@@ -116,6 +118,7 @@ impl Fragment {
         self.paragraphs
     }
 
+    #[must_use]
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
     }

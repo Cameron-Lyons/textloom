@@ -13,6 +13,7 @@ pub struct Composition {
 }
 
 impl Editor {
+    #[must_use]
     pub fn composition(&self) -> Option<&Composition> {
         self.composition.as_deref()
     }

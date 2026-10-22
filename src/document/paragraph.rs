@@ -95,14 +95,17 @@ impl Paragraph {
         Ok(paragraph)
     }
 
+    #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    #[must_use]
     pub fn spans(&self) -> &[Span] {
         &self.spans
     }
 
+    #[must_use]
     pub fn kind(&self) -> ParagraphKind {
         self.kind
     }
@@ -111,6 +114,7 @@ impl Paragraph {
         self.ascii
     }
 
+    #[must_use]
     pub fn grapheme_count(&self) -> usize {
         if self.ascii {
             self.text.len()
@@ -119,6 +123,7 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn byte_from_grapheme(&self, index: usize) -> Option<usize> {
         if index == 0 || self.ascii {
             (index <= self.text.len()).then_some(index)
@@ -127,6 +132,7 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn grapheme_index(&self, byte: usize) -> Option<usize> {
         if byte == 0 {
             Some(0)
@@ -139,14 +145,17 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn previous_grapheme(&self, byte: usize) -> usize {
         self.boundary_at_or_before(byte.saturating_sub(1))
     }
 
+    #[must_use]
     pub fn next_grapheme(&self, byte: usize) -> usize {
         self.boundary_at_or_after(byte.saturating_add(1))
     }
 
+    #[must_use]
     pub fn boundary_at_or_before(&self, byte: usize) -> usize {
         if byte == 0 || byte >= self.text.len() || self.ascii {
             byte.min(self.text.len())
@@ -169,6 +178,7 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn boundary_at_or_after(&self, byte: usize) -> usize {
         if byte == 0 || byte >= self.text.len() || self.ascii {
             byte.min(self.text.len())
@@ -228,6 +238,7 @@ impl Paragraph {
         grapheme_context(&self.text, byte)
     }
 
+    #[must_use]
     pub fn scalar_count(&self) -> usize {
         if self.ascii {
             self.text.len()
@@ -238,6 +249,7 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn byte_from_scalar(&self, index: usize) -> Option<usize> {
         if index == 0 || self.ascii {
             (index <= self.text.len()).then_some(index)
@@ -246,6 +258,7 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn scalar_index(&self, byte: usize) -> Option<usize> {
         if byte == 0 {
             Some(0)
@@ -258,6 +271,7 @@ impl Paragraph {
         }
     }
 
+    #[must_use]
     pub fn previous_word(&self, byte: usize) -> usize {
         if byte == 0 {
             return 0;
@@ -273,6 +287,7 @@ impl Paragraph {
         self.boundary_at_or_before(byte)
     }
 
+    #[must_use]
     pub fn next_word(&self, byte: usize) -> usize {
         if byte >= self.text.len() {
             return self.text.len();

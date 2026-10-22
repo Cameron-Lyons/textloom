@@ -9,6 +9,7 @@ pub struct Position {
 }
 
 impl Position {
+    #[must_use]
     pub const fn new(paragraph: usize, byte: usize) -> Self {
         Self { paragraph, byte }
     }
@@ -21,6 +22,7 @@ pub struct Selection {
 }
 
 impl Selection {
+    #[must_use]
     pub const fn caret(position: Position) -> Self {
         Self {
             anchor: position,
@@ -28,10 +30,12 @@ impl Selection {
         }
     }
 
+    #[must_use]
     pub const fn new(anchor: Position, focus: Position) -> Self {
         Self { anchor, focus }
     }
 
+    #[must_use]
     pub fn is_caret(self) -> bool {
         self.anchor == self.focus
     }
@@ -89,6 +93,7 @@ impl Link {
         Ok(Self(Arc::from(target)))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }

@@ -118,6 +118,7 @@ pub(crate) struct Presentation {
 }
 
 impl Editor {
+    #[must_use]
     pub fn new(document: Document) -> Self {
         Self {
             typing_style: document.style_at(Position::default()),
@@ -131,18 +132,22 @@ impl Editor {
         }
     }
 
+    #[must_use]
     pub fn from_text(text: &str) -> Self {
         Self::new(Document::from_text(text))
     }
 
+    #[must_use]
     pub fn document(&self) -> &Document {
         &self.document
     }
 
+    #[must_use]
     pub fn selection(&self) -> Selection {
         self.selection
     }
 
+    #[must_use]
     pub fn typing_style(&self) -> InlineStyle {
         self.typing_style
     }
@@ -224,26 +229,32 @@ impl Editor {
         kinds.all(|kind| same_block(first, kind)).then_some(first)
     }
 
+    #[must_use]
     pub fn can_undo(&self) -> bool {
         self.undo_len() != 0
     }
 
+    #[must_use]
     pub fn can_redo(&self) -> bool {
         self.redo_len() != 0
     }
 
+    #[must_use]
     pub fn history_limits(&self) -> HistoryLimits {
         self.history.limits()
     }
 
+    #[must_use]
     pub fn history_bytes(&self) -> usize {
         self.history.resolved(self.state()).bytes()
     }
 
+    #[must_use]
     pub fn undo_len(&self) -> usize {
         self.history.resolved(self.state()).undo_len()
     }
 
+    #[must_use]
     pub fn redo_len(&self) -> usize {
         self.history.resolved(self.state()).redo_len()
     }

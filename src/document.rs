@@ -60,10 +60,12 @@ impl Default for Document {
 }
 
 impl Document {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
     pub fn from_text(text: &str) -> Self {
         let text = normalize_newlines(text);
         Self::from_shared(
@@ -73,6 +75,7 @@ impl Document {
         )
     }
 
+    #[must_use]
     pub fn from_fragment(fragment: &Fragment) -> Self {
         Self::from_shared(fragment.paragraphs().to_vec())
     }
@@ -101,6 +104,7 @@ impl Document {
         }
     }
 
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Fragment::encode_paragraphs(self.paragraphs())
     }
@@ -109,6 +113,7 @@ impl Document {
         Fragment::from_bytes(bytes).map(|fragment| Self::from_shared(fragment.into_paragraphs()))
     }
 
+    #[must_use]
     pub fn to_html(&self) -> String {
         export::html(self.paragraphs(), Levels::default())
     }
@@ -156,6 +161,7 @@ impl Document {
         Ok(Fragment::captured(paragraphs, numbering))
     }
 
+    #[must_use]
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
     }
@@ -164,10 +170,12 @@ impl Document {
         self.paragraphs
     }
 
+    #[must_use]
     pub fn paragraph(&self, index: usize) -> Option<&Paragraph> {
         self.paragraphs.get(index).map(Arc::as_ref)
     }
 
+    #[must_use]
     pub fn list_number(&self, index: usize) -> Option<u32> {
         match self.paragraphs.get(index)?.kind {
             ParagraphKind::Ordered {
@@ -194,11 +202,13 @@ impl Document {
         &numbers[numbers.partition_point(|&(index, _)| index < from)..]
     }
 
+    #[must_use]
     pub fn end(&self) -> Position {
         let paragraph = self.paragraphs.len() - 1;
         Position::new(paragraph, self.paragraphs[paragraph].text.len())
     }
 
+    #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -207,6 +217,7 @@ impl Document {
         Arc::clone(&self.identity)
     }
 
+    #[must_use]
     pub fn plain_text(&self) -> String {
         export::plain_text(self.paragraphs())
     }
@@ -263,6 +274,7 @@ impl Document {
         }
     }
 
+    #[must_use]
     pub fn style_at(&self, position: Position) -> InlineStyle {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return InlineStyle::default();
@@ -281,6 +293,7 @@ impl Document {
         self.validate_position(range.end)
     }
 
+    #[must_use]
     pub fn link_at(&self, position: Position) -> Option<&Link> {
         let paragraph = self.paragraph(position.paragraph)?;
         if !paragraph.is_grapheme_boundary(position.byte) {
@@ -289,6 +302,7 @@ impl Document {
         paragraph.link_for_byte(position.byte)
     }
 
+    #[must_use]
     pub fn link_range_at(&self, position: Position) -> Option<Range<Position>> {
         let paragraph = self.paragraph(position.paragraph)?;
         if !paragraph.is_grapheme_boundary(position.byte) {
