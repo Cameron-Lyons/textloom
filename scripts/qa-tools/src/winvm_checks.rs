@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
 use crate::winvm::{Qmp, Vm};
-use crate::{Context, Result, bail, repo_root};
+use crate::{Context, Result, repo_root};
 
 pub const USAGE: &str = "\
 usage: winvm-checks build                  cross-compile the host, the winit harness, and the report validator for x86_64-pc-windows-gnu
@@ -72,7 +72,7 @@ fn git_revision() -> Result<String> {
         .current_dir(repo_root())
         .output()?;
     if !output.status.success() {
-        bail!("git rev-parse HEAD failed");
+        return Err("git rev-parse HEAD failed".into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
@@ -102,7 +102,7 @@ fn cargo_build(
     }
     let status = command.status().context("cargo")?;
     if !status.success() {
-        bail!("cargo build of {} failed", manifest.display());
+        return Err(format!("cargo build of {} failed", manifest.display()).into());
     }
     Ok(())
 }
@@ -219,11 +219,12 @@ impl Checks {
             .vm
             .run(&format!(". C:\\textloom-qa\\qa.ps1\n{script}"), false, 180)?;
         if result.exit != 0 || result.timed_out {
-            bail!(
+            return Err(format!(
                 "guest job failed ({}): {}",
                 result.exit,
                 crate::tail(&result.output, 3000)
-            );
+            )
+            .into());
         }
         for line in result.output.lines().rev() {
             if line.trim_start().starts_with(['{', '[']) {
@@ -610,10 +611,11 @@ fn build() -> Result<()> {
 fn deploy(c: &Checks) -> Result<()> {
     for path in [host_exe(), winit_exe(), validator_exe()] {
         if !path.exists() {
-            bail!(
+            return Err(format!(
                 "{} is missing; run `cargo winvm-checks build`",
                 path.display()
-            );
+            )
+            .into());
         }
     }
     for path in [
@@ -637,11 +639,12 @@ fn deploy(c: &Checks) -> Result<()> {
         300,
     )?;
     if result.exit != 0 || result.timed_out {
-        bail!(
+        return Err(format!(
             "deploying failed ({}): {}",
             result.exit,
             crate::tail(&result.output, 3000)
-        );
+        )
+        .into());
     }
     println!("Deployed the host, the winit harness, the report validator, and qa.ps1.");
     Ok(())
@@ -918,7 +921,7 @@ pub fn popup_rect(before: &Path, after: &Path, ignore: &[Rect]) -> Result<Option
     ]);
     let output = command.output().context("magick")?;
     if !output.status.success() {
-        bail!("magick failed: {}", String::from_utf8_lossy(&output.stderr));
+        return Err(format!("magick failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
     let mut bounds: Option<[i64; 4]> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
@@ -998,7 +1001,7 @@ fn ime_on(s: &mut Session, language: &str, toggle: &str) -> Result<String> {
         s.keys(&[toggle])?;
         sleep(0.8);
     }
-    bail!("the {language} IME did not start composing")
+    Err(format!("the {language} IME did not start composing").into())
 }
 
 fn japanese_on(s: &mut Session) -> Result<String> {
@@ -1432,7 +1435,7 @@ fn winit_ime_first_composition(c: &Checks) -> Result<Value> {
             .map(|event| field(event, "painted_caret"))
             .ok_or("the winit harness synced no IME area")??;
         let [caret_x, caret_y, ..] = caret[..] else {
-            bail!("the painted caret has no position");
+            return Err("the painted caret has no position".into());
         };
         let line = w.cell(((caret_y - 20.0) / 24.0).round_ties_even() as i64, ((caret_x - 20.0) / 10.0).round_ties_even() as i64);
         let ignore = [TASKBAR, [w.origin[0], line[1] - 4, 800, line[3] + 8]];
@@ -1550,8 +1553,9 @@ fn read_at(file: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
 fn nvda_audible_speech(c: &Checks) -> Result<Value> {
     let recording = c.vm.audio();
     if !recording.exists() {
-        bail!(
+        return Err(
             "guest audio is not recorded; start the VM with `cargo winvm up` (the default --audio wav)"
+                .into(),
         );
     }
     let (mark, end, caret) = c.session("nvda-audible", |s| {

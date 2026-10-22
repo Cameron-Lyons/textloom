@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::Arguments;
-use crate::{Context, Result, TempDir, bail, repo_root};
+use crate::{Context, Result, TempDir, repo_root};
 
 pub const USAGE: &str = "\
 usage: winvm create [--force|--resume]   install Windows unattended (about 30 minutes)
@@ -121,7 +121,7 @@ fn exec(program: &str, arguments: &[&str]) -> Result<()> {
         .status()
         .context(program)?;
     if !status.success() {
-        bail!("{program} failed ({status})");
+        return Err(format!("{program} failed ({status})").into());
     }
     Ok(())
 }
@@ -258,7 +258,7 @@ impl Vm {
     fn request_json(&self, method: &str, path: &str, timeout: f64) -> Result<Value> {
         let (status, body) = self.request(method, path, None, timeout)?;
         if status >= 400 {
-            bail!("HTTP {status}");
+            return Err(format!("HTTP {status}").into());
         }
         Ok(if body.is_empty() {
             Value::Null
@@ -290,7 +290,7 @@ impl Vm {
             }
             sleep(0.1);
         }
-        bail!("the job server did not start; see server.log")
+        Err("the job server did not start; see server.log".into())
     }
 
     fn agent_seen(&self, since: f64) -> bool {
@@ -319,7 +319,7 @@ impl Vm {
         let (status, body) =
             self.request("POST", "/run", Some(&payload), timeout as f64 + 180.0)?;
         if status >= 400 {
-            bail!("guest job failed with HTTP {status}");
+            return Err(format!("guest job failed with HTTP {status}").into());
         }
         let result: Option<JobResult> = if body.is_empty() {
             None
@@ -356,7 +356,7 @@ impl Vm {
             }
             sleep(0.1);
         }
-        bail!("QEMU's QMP socket is not available; is the VM up?")
+        Err("QEMU's QMP socket is not available; is the VM up?".into())
     }
 }
 
@@ -764,7 +764,7 @@ impl Qmp {
         loop {
             let mut line = String::new();
             if self.reader.read_line(&mut line)? == 0 {
-                bail!("QMP connection closed");
+                return Err("QMP connection closed".into());
             }
             let message: Value = serde_json::from_str(&line)?;
             if message.get("event").is_none() {
@@ -781,7 +781,9 @@ impl Qmp {
         self.writer.write_all(format!("{message}\n").as_bytes())?;
         let reply = self.read()?;
         if let Some(error) = reply.get("error") {
-            bail!("QMP {name}: {}", error["desc"].as_str().unwrap_or_default());
+            return Err(
+                format!("QMP {name}: {}", error["desc"].as_str().unwrap_or_default()).into(),
+            );
         }
         Ok(reply.get("return").cloned().unwrap_or(Value::Null))
     }
@@ -830,7 +832,7 @@ impl Qmp {
             } else if let Some(key) = lookup(US_SHIFTED, &character) {
                 (key.to_owned(), true)
             } else {
-                bail!("no US key for {character:?}");
+                return Err(format!("no US key for {character:?}").into());
             };
             self.chord(&if shifted { format!("shift+{key}") } else { key })?;
             sleep(0.04);
@@ -850,7 +852,7 @@ impl Qmp {
             }
             sleep(0.05);
         }
-        bail!("screendump produced no file")
+        Err("screendump produced no file".into())
     }
 
     /// The guest display's size in pixels.
@@ -996,7 +998,7 @@ fn qemu_command(vm: &Vm, install: bool, view: bool, audio: Audio) -> Vec<String>
 
 fn start_qemu(vm: &Vm, install: bool, view: bool, audio: Audio) -> Result<()> {
     if alive(&vm.qemu_pid()).is_some() {
-        bail!("the VM is already running");
+        return Err("the VM is already running".into());
     }
     let _ = fs::remove_file(vm.qmp_socket());
     let log = OpenOptions::new()
@@ -1018,7 +1020,7 @@ fn start_qemu(vm: &Vm, install: bool, view: bool, audio: Audio) -> Result<()> {
         }
         sleep(0.1);
     }
-    bail!("QEMU did not start; see qemu.log")
+    Err("QEMU did not start; see qemu.log".into())
 }
 
 fn which(tool: &str) -> bool {
@@ -1037,10 +1039,11 @@ fn require_tools() -> Result<()> {
             .filter(|path| !Path::new(path).exists()),
     );
     if !missing.is_empty() {
-        bail!(
+        return Err(format!(
             "missing {}; install them with: sudo pacman -S --needed qemu-desktop edk2-ovmf libisoburn",
             missing.join(", ")
-        );
+        )
+        .into());
     }
     Ok(())
 }
@@ -1080,19 +1083,20 @@ fn create(vm: &Vm, force: bool, resume: bool) -> Result<()> {
     let started = if resume {
         // Wait for an install that is already running, for example after this tool was interrupted.
         if alive(&vm.qemu_pid()).is_none() {
-            bail!("no install is running");
+            return Err("no install is running".into());
         }
         vm.ensure_server()?;
         0.0
     } else {
         if vm.disk().exists() && !force {
-            bail!(
+            return Err(format!(
                 "{} exists; pass --force to reinstall Windows",
                 vm.disk().display()
-            );
+            )
+            .into());
         }
         if alive(&vm.qemu_pid()).is_some() {
-            bail!("the VM is running; run `cargo winvm down` first");
+            return Err("the VM is running; run `cargo winvm down` first".into());
         }
         fs::create_dir_all(&vm.state)?;
         if fs::metadata(vm.iso()).map_or(true, |metadata| metadata.len() != ISO_SIZE) {
@@ -1145,10 +1149,11 @@ fn create(vm: &Vm, force: bool, resume: bool) -> Result<()> {
     };
     println!("Installing Windows unattended; this takes about 30 minutes.");
     if !vm.wait_for_agent(150.0 * 60.0, started, progress) {
-        bail!(
+        return Err(format!(
             "the guest agent did not start; the VM is still running (screen: {})",
             progress_png.display()
-        );
+        )
+        .into());
     }
     let result = vm.run(
         "(Get-CimInstance Win32_OperatingSystem) | ForEach-Object { \"$($_.Caption) $($_.Version)\" }",
@@ -1179,14 +1184,14 @@ fn provision(vm: &Vm) -> Result<()> {
     )?;
     println!("{}", result.output);
     if result.exit != 0 {
-        bail!("provisioning failed; the VM is still running for inspection");
+        return Err("provisioning failed; the VM is still running for inspection".into());
     }
     let restarted = unix_now();
     vm.run("shutdown /r /t 5", true, 60)?;
     sleep(60.0);
     // A long poll begun just before the restart can end up to 30 s later.
     if !vm.wait_for_agent(15.0 * 60.0, restarted + 60.0, |_| {}) {
-        bail!("the guest agent did not return after the restart");
+        return Err("the guest agent did not return after the restart".into());
     }
     println!(
         "{}",
@@ -1201,19 +1206,19 @@ fn provision(vm: &Vm) -> Result<()> {
 
 fn up_vm(vm: &Vm, view: bool, audio: Audio) -> Result<()> {
     if !vm.disk().exists() {
-        bail!("no VM yet; run `cargo winvm create`");
+        return Err("no VM yet; run `cargo winvm create`".into());
     }
     vm.ensure_server()?;
     if alive(&vm.qemu_pid()).is_some() {
         if vm.wait_for_agent(60.0, 0.0, |_| {}) {
             return Ok(());
         }
-        bail!("the VM is running but its agent is not responding");
+        return Err("the VM is running but its agent is not responding".into());
     }
     let started = unix_now();
     start_qemu(vm, false, view, audio)?;
     if !vm.wait_for_agent(10.0 * 60.0, started, |_| {}) {
-        bail!("the guest agent did not start within 10 minutes");
+        return Err("the guest agent did not start within 10 minutes".into());
     }
     Ok(())
 }
@@ -1272,7 +1277,7 @@ fn status(vm: &Vm) {
 
 fn snapshot_create(vm: &Vm, name: &str) -> Result<()> {
     if alive(&vm.qemu_pid()).is_some() {
-        bail!("snapshots need the VM down");
+        return Err("snapshots need the VM down".into());
     }
     exec(
         "qemu-img",
@@ -1285,7 +1290,7 @@ fn snapshot_create(vm: &Vm, name: &str) -> Result<()> {
 
 fn restore(vm: &Vm, name: &str) -> Result<()> {
     if alive(&vm.qemu_pid()).is_some() {
-        bail!("restoring needs the VM down");
+        return Err("restoring needs the VM down".into());
     }
     exec(
         "qemu-img",
@@ -1308,7 +1313,7 @@ fn run_command(vm: &Vm, script: &str, admin: bool, timeout: u64) -> Result<ExitC
     print!("{}", result.output);
     io::stdout().flush()?;
     if result.timed_out {
-        bail!("the job timed out after {timeout} s");
+        return Err(format!("the job timed out after {timeout} s").into());
     }
     Ok(ExitCode::from(result.exit as u8))
 }

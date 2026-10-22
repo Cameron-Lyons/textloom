@@ -17,7 +17,7 @@ use std::{env, thread};
 use serde_json::{Map, Value, json};
 
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
-use crate::{Context, Result, TempDir, bail, repo_root, tail};
+use crate::{Context, Result, TempDir, repo_root, tail};
 
 pub const TITLE: &str = "TextLoom native example";
 pub const ORIGINAL: &str = "TextLoom\nSelect text to format it, or start writing.\n\
@@ -222,7 +222,7 @@ impl Machine {
     fn check_interrupted(&self) -> Result<()> {
         // Reported once, so the cleanup that follows can still run.
         if self.interrupted.swap(false, Ordering::SeqCst) {
-            bail!("Hosted native probe interrupted");
+            return Err("Hosted native probe interrupted".into());
         }
         Ok(())
     }
@@ -286,7 +286,7 @@ impl System for Machine {
             if let Some(message) = stop {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("{message}");
+                return Err(message.into());
             }
             thread::sleep(Duration::from_millis(5));
         };
@@ -527,13 +527,14 @@ impl<S: System> Probe<S> {
             let name = Path::new(&arguments[0])
                 .file_name()
                 .map(|name| name.to_string_lossy());
-            bail!(
+            return Err(format!(
                 "{} exited {}: {}{}",
                 name.unwrap_or_default(),
                 result.code,
                 tail(&result.stderr(), 4000),
                 tail(&result.stdout(), 1000)
-            );
+            )
+            .into());
         }
         Ok(result)
     }
@@ -584,10 +585,11 @@ impl<S: System> Probe<S> {
             }
             let stderr = result.stderr();
             if !stderr.contains("Target window count 0") || self.system.monotonic() >= deadline {
-                bail!(
+                return Err(format!(
                     "Native {command} on PID {pid} / {window}: {}",
                     tail(&stderr, 4000)
-                );
+                )
+                .into());
             }
             self.system.sleep(0.2)?;
         }
@@ -598,7 +600,7 @@ impl<S: System> Probe<S> {
         let mut last_error = "target window did not appear".to_owned();
         while self.system.monotonic() < deadline {
             if host && let Some(code) = self.system.poll(pid) {
-                bail!("Native process exited early ({code})");
+                return Err(format!("Native process exited early ({code})").into());
             }
             let (document, resolved) = self.documents(window);
             let result = self.apple(
@@ -611,7 +613,7 @@ impl<S: System> Probe<S> {
             last_error = result.stderr().trim().to_owned();
             self.system.sleep(0.25)?;
         }
-        bail!("Could not focus PID-checked target window: {last_error}")
+        Err(format!("Could not focus PID-checked target window: {last_error}").into())
     }
 
     fn clipboard(
@@ -639,7 +641,7 @@ impl<S: System> Probe<S> {
             }
             self.system.sleep(0.15)?;
         }
-        bail!("Clipboard {command} failed: {last_error}")
+        Err(format!("Clipboard {command} failed: {last_error}").into())
     }
 
     fn copy(
@@ -662,7 +664,7 @@ impl<S: System> Probe<S> {
         // exact restores. Pin only the clipboard subprocess encoding.
         let pasted = self.run(&strings(&PASTE), None, 10.0, true)?;
         if pasted.stdout != expected.as_bytes() {
-            bail!("Native clipboard differs from the exact Unicode fixture");
+            return Err("Native clipboard differs from the exact Unicode fixture".into());
         }
         result.insert("plain_utf8_exact".to_owned(), true.into());
         Ok(result)
@@ -747,7 +749,7 @@ impl<S: System> Probe<S> {
                 .any(|line| line == MARKER)
             {
                 if self.system.poll(pid).is_some() || self.system.monotonic() >= deadline {
-                    bail!("Native clipboard fixture did not complete successfully");
+                    return Err("Native clipboard fixture did not complete successfully".into());
                 }
                 self.system.sleep(0.2)?;
             }
@@ -764,9 +766,9 @@ impl<S: System> Probe<S> {
         let name = mode.name();
         self.action(pid, TITLE, "close", "")?;
         match self.system.wait(pid, 10.0)? {
-            None => bail!("{name}: native host did not exit within 10 s"),
+            None => return Err(format!("{name}: native host did not exit within 10 s").into()),
             Some(0) => {}
-            Some(code) => bail!("{name}: native host exited {code}"),
+            Some(code) => return Err(format!("{name}: native host exited {code}").into()),
         }
         let expected = Expected {
             revision: self.revision.clone(),
@@ -781,7 +783,7 @@ impl<S: System> Probe<S> {
         let events = &observation.host_input_events;
         let changes = &observation.observed_state_changes;
         if events.key_press == 0 {
-            bail!("{name}: no native keyboard events observed");
+            return Err(format!("{name}: no native keyboard events observed").into());
         }
         if mode == Mode::Editable {
             let counts = [
@@ -792,15 +794,21 @@ impl<S: System> Probe<S> {
                 events.window_focus_gained,
             ];
             if counts.contains(&0) {
-                bail!("Editable session did not observe actual input and focus transitions");
+                return Err(
+                    "Editable session did not observe actual input and focus transitions".into(),
+                );
             }
             if changes.document_revision == 0 {
-                bail!("Editable session did not observe document mutation");
+                return Err("Editable session did not observe document mutation".into());
             }
         } else if changes.document_revision != 0 || observation.final_document.undo_steps != 0 {
-            bail!("{name}: guarded native input changed the document/history");
+            return Err(
+                format!("{name}: guarded native input changed the document/history").into(),
+            );
         } else if mode == Mode::ReadOnly && [events.paste, events.copy, events.cut].contains(&0) {
-            bail!("Read-only guards were not exercised through native clipboard events");
+            return Err(
+                "Read-only guards were not exercised through native clipboard events".into(),
+            );
         }
         let file = report
             .file_name()
@@ -825,7 +833,7 @@ impl<S: System> Probe<S> {
                 break pid;
             }
             if self.system.monotonic() >= deadline {
-                bail!("TextEdit did not launch");
+                return Err("TextEdit did not launch".into());
             }
             self.textedit_pid = self.textedit()?;
             if self.textedit_pid.is_none() {
@@ -1202,7 +1210,7 @@ impl<S: System> Probe<S> {
             self.action(pid, TITLE, "chord", "c")?;
             let state = self.clipboard("plain", &[EXTERNAL], None)?;
             if change_count(&state)? != generation {
-                bail!("Disabled editor changed the external clipboard");
+                return Err("Disabled editor changed the external clipboard".into());
             }
             self.note(
                 "disabled: native editing/copy/cut attempts preserved external clipboard",
@@ -1246,7 +1254,7 @@ impl<S: System> Probe<S> {
                         .file_name()
                         .is_none_or(|name| name != "TextEdit")
                     {
-                        bail!("TextEdit PID identity changed before cleanup");
+                        return Err("TextEdit PID identity changed before cleanup".into());
                     }
                     for signal in [Signal::Terminate, Signal::Kill] {
                         self.system.signal(pid, signal, false);
@@ -1271,7 +1279,7 @@ impl<S: System> Probe<S> {
         if !required.iter().all(|key| self.cleanup_flag(key)) {
             self.observe("passed", false.into());
             self.save()?;
-            bail!("Native/TextEdit processes did not all close and disappear");
+            return Err("Native/TextEdit processes did not all close and disappear".into());
         }
         self.save()
     }
@@ -1279,7 +1287,7 @@ impl<S: System> Probe<S> {
     pub fn execute(&mut self) -> Result<()> {
         self.apple(&["preflight"], true)?;
         if self.textedit()?.is_some() {
-            bail!("Refusing to operate on an existing TextEdit process");
+            return Err("Refusing to operate on an existing TextEdit process".into());
         }
         let source = self.root.join("scripts/native-qa/macos_clipboard.swift");
         let build = vec![

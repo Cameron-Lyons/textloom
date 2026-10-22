@@ -55,14 +55,6 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// Returns early with a formatted [`Error`].
-#[macro_export]
-macro_rules! bail {
-    ($($message:tt)*) => {
-        return Err($crate::Error::from(format!($($message)*)))
-    };
-}
-
 /// Names what was being done when an error occurred.
 pub trait Context<T> {
     fn context(self, what: impl fmt::Display) -> Result<T>;
