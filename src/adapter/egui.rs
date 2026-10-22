@@ -974,17 +974,16 @@ impl Cache {
         }
     }
     fn layout(&mut self, ui: &Ui, editor: &Editor, appearance: &Appearance) -> ParagraphLayouts {
-        let (layouts, document_changed, layout_changed) =
-            self.layout.update(ui, editor.document(), appearance);
-        if document_changed {
+        let update = self.layout.update(ui, editor.document(), appearance);
+        if update.document_changed {
             self.plain_text = None;
             self.preview = None;
             self.interaction.link_press = None;
         }
-        if layout_changed {
+        if update.layout_changed {
             self.interaction.navigation = None;
         }
-        layouts
+        update.layouts
     }
     fn plain_text(&mut self, document: &Document) -> Arc<str> {
         self.plain_text

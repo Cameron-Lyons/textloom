@@ -1,11 +1,11 @@
-use super::PARAGRAPH_GAP;
-use crate::document::LINE_SEPARATOR;
-use crate::{Document, InlineStyle, Paragraph, ParagraphKind};
+use crate::document::{self, LINE_SEPARATOR};
+use crate::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
 use egui::epaint::{FontsView, TextOptions};
 use egui::text::{ByteIndex, LayoutJob, LayoutSection};
 use egui::{Color32, FontData, FontFamily, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Ui};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::ptr;
 use std::sync::Arc;
 mod index;
 pub(super) use index::{LayoutIdentity, ParagraphLayouts};
@@ -47,10 +47,10 @@ pub(super) struct ParagraphLayout {
     pub(super) quote_bar: Option<Rect>,
 }
 
-pub(crate) struct ParagraphLayoutView<'a> {
-    pub(crate) galley: &'a Arc<Galley>,
+pub(crate) struct ParagraphLayoutView<'layout> {
+    pub(crate) galley: &'layout Arc<Galley>,
     pub(crate) rect: Rect,
-    pub(crate) marker: Option<&'a Arc<Galley>>,
+    pub(crate) marker: Option<&'layout Arc<Galley>>,
     pub(crate) marker_position: Pos2,
     pub(crate) quote_bar: Option<Rect>,
 }
@@ -131,6 +131,14 @@ struct PendingChange {
     paragraphs: Option<(Range<usize>, usize)>,
 }
 
+pub(super) struct LayoutUpdate {
+    pub(super) layouts: ParagraphLayouts,
+    // The document's content differs from the one laid out before.
+    pub(super) document_changed: bool,
+    // The cache replaced some or all layouts, so earlier caret geometry may be stale.
+    pub(super) layout_changed: bool,
+}
+
 impl LayoutCache {
     // Call after each edit so that one later update knows which paragraphs all of them changed.
     pub(super) fn track(&mut self, document: &Document) {
@@ -164,7 +172,7 @@ impl LayoutCache {
         document: &Document,
         appearance: &Appearance,
     ) -> ParagraphLayouts {
-        self.update(ui, document, appearance).0
+        self.update(ui, document, appearance).layouts
     }
 
     pub(super) fn update(
@@ -172,7 +180,7 @@ impl LayoutCache {
         ui: &Ui,
         document: &Document,
         appearance: &Appearance,
-    ) -> (ParagraphLayouts, bool, bool) {
+    ) -> LayoutUpdate {
         let mut layout_changed = false;
         let appearance_changed = self.appearance.as_ref() != Some(appearance);
         let document_identity = document.content_identity();
@@ -203,14 +211,10 @@ impl LayoutCache {
             };
 
             if appearance_changed || environment_changed {
-                let caches: Vec<_> = document
-                    .paragraphs()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, paragraph)| {
-                        shaper.create(paragraph, document.list_number(index), None)
-                    })
-                    .collect();
+                let mut caches = Vec::with_capacity(document.paragraphs().len());
+                for (index, paragraph) in document.paragraphs().iter().enumerate() {
+                    caches.push(shaper.create(paragraph, document.list_number(index), None));
+                }
                 self.layouts.rebuild(&caches);
             } else {
                 let source = document.paragraphs();
@@ -228,13 +232,13 @@ impl LayoutCache {
                         prefix..source.len() - suffix,
                     )
                 };
-                let previous: Vec<_> = self.layouts.caches(old.clone()).collect();
+                let previous: Vec<&ParagraphCache> = self.layouts.caches(old.clone()).collect();
                 let renumbered = if old.len() == new.len() {
                     previous
                         .iter()
                         .zip(&source[new.clone()])
                         .any(|(cache, paragraph)| {
-                            !crate::document::same_numbering_effect(
+                            !document::same_numbering_effect(
                                 cache.paragraph.kind(),
                                 paragraph.kind(),
                             )
@@ -244,50 +248,43 @@ impl LayoutCache {
                         .iter()
                         .map(|cache| cache.paragraph.kind())
                         .chain(source[new.clone()].iter().map(|paragraph| paragraph.kind()))
-                        .any(|kind| {
-                            !crate::document::same_numbering_effect(kind, ParagraphKind::Body)
-                        })
+                        .any(|kind| !document::same_numbering_effect(kind, ParagraphKind::Body))
                 };
-                let replacement: Vec<_> = if old.len() == new.len() {
-                    previous
-                        .iter()
-                        .zip(&source[new.clone()])
-                        .zip(new.clone())
-                        .map(|((cache, paragraph), index)| {
-                            let number = document.list_number(index);
+                let mut replacement = Vec::with_capacity(new.len());
+                if old.len() == new.len() {
+                    let aligned = previous.iter().zip(&source[new.clone()]).zip(new.clone());
+                    for ((cache, paragraph), index) in aligned {
+                        let number = document.list_number(index);
+                        replacement.push(
                             if Arc::ptr_eq(&cache.paragraph, paragraph) && cache.number == number {
                                 (*cache).clone()
                             } else {
                                 shaper.create(paragraph, number, Some(cache))
-                            }
-                        })
-                        .collect()
+                            },
+                        );
+                    }
                 } else {
-                    let by_paragraph: HashMap<_, _> = previous
+                    let by_paragraph: HashMap<*const Paragraph, &ParagraphCache> = previous
                         .iter()
                         .map(|&cache| (Arc::as_ptr(&cache.paragraph), cache))
                         .collect();
-                    let by_content: HashMap<_, _> = previous
+                    let by_content: HashMap<ContentKey, &ParagraphCache> = previous
                         .iter()
                         .map(|&cache| (content_key(&cache.paragraph), cache))
                         .collect();
-                    source[new.clone()]
-                        .iter()
-                        .zip(new.clone())
-                        .map(|(paragraph, index)| {
-                            let number = document.list_number(index);
-                            match by_paragraph.get(&Arc::as_ptr(paragraph)) {
-                                Some(cache) if cache.number == number => (*cache).clone(),
-                                Some(cache) => shaper.create(paragraph, number, Some(cache)),
-                                None => shaper.create(
-                                    paragraph,
-                                    number,
-                                    by_content.get(&content_key(paragraph)).copied(),
-                                ),
-                            }
-                        })
-                        .collect()
-                };
+                    for (paragraph, index) in source[new.clone()].iter().zip(new.clone()) {
+                        let number = document.list_number(index);
+                        replacement.push(match by_paragraph.get(&Arc::as_ptr(paragraph)) {
+                            Some(cache) if cache.number == number => (*cache).clone(),
+                            Some(cache) => shaper.create(paragraph, number, Some(cache)),
+                            None => shaper.create(
+                                paragraph,
+                                number,
+                                by_content.get(&content_key(paragraph)).copied(),
+                            ),
+                        });
+                    }
+                }
                 self.layouts.replace(old, &replacement);
                 if renumbered {
                     let items = document.numbered_items_from(new.end);
@@ -312,7 +309,11 @@ impl LayoutCache {
             self.appearance = Some(appearance.clone());
             self.document_identity = Some(document_identity);
         });
-        (self.layouts.clone(), document_changed, layout_changed)
+        LayoutUpdate {
+            layouts: self.layouts.clone(),
+            document_changed,
+            layout_changed,
+        }
     }
 }
 
@@ -327,13 +328,24 @@ fn merge_changes(
     (start..old_end, new_end - start)
 }
 
-fn content_key(paragraph: &Paragraph) -> (*const u8, *const crate::Span) {
-    (paragraph.text().as_ptr(), paragraph.spans().as_ptr())
+// Identifies a paragraph's text and span storage by address, so that a new
+// paragraph sharing them with an old one can reuse its shaped text.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ContentKey {
+    text: *const u8,
+    spans: *const Span,
 }
 
-struct Shaper<'a, 'f> {
-    fonts: &'a mut FontsView<'f>,
-    appearance: &'a Appearance,
+fn content_key(paragraph: &Paragraph) -> ContentKey {
+    ContentKey {
+        text: paragraph.text().as_ptr(),
+        spans: paragraph.spans().as_ptr(),
+    }
+}
+
+struct Shaper<'pass, 'fonts> {
+    fonts: &'pass mut FontsView<'fonts>,
+    appearance: &'pass Appearance,
     families: Families,
     reserved_ordinal: Option<f32>,
 }
@@ -379,8 +391,8 @@ impl Shaper<'_, '_> {
         let (galley, chars) = if let Some(previous) = previous
             && previous.layout.rect.left() == indent
             && size_scale(previous.paragraph.kind()) == scale
-            && std::ptr::eq(previous.paragraph.text(), paragraph.text())
-            && std::ptr::eq(previous.paragraph.spans(), paragraph.spans())
+            && ptr::eq(previous.paragraph.text(), paragraph.text())
+            && ptr::eq(previous.paragraph.spans(), paragraph.spans())
         {
             (Arc::clone(&previous.layout.galley), previous.chars)
         } else {
@@ -488,11 +500,11 @@ fn spread_ligatures(galley: &mut Arc<Galley>, paragraph: &Paragraph) {
     }
 }
 
-fn joins_ligature(chr: char) -> bool {
-    !chr.is_whitespace()
-        && !chr.is_control()
+fn joins_ligature(character: char) -> bool {
+    !character.is_whitespace()
+        && !character.is_control()
         && !matches!(
-            chr,
+            character,
             '\u{AD}'
                 | '\u{34F}'
                 | '\u{61C}'
@@ -661,7 +673,7 @@ fn text_format(
                 appearance.color
             }
         },
-        |color| Color32::from_rgba_unmultiplied(color.0[0], color.0[1], color.0[2], color.0[3]),
+        |Color([red, green, blue, alpha])| Color32::from_rgba_unmultiplied(red, green, blue, alpha),
     );
     let mut format = TextFormat {
         font_id: font,
@@ -684,7 +696,7 @@ fn text_format(
         },
         ..Default::default()
     };
-    if let Some(crate::Color([red, green, blue, alpha])) = style.background {
+    if let Some(Color([red, green, blue, alpha])) = style.background {
         format.background = Color32::from_rgba_unmultiplied(red, green, blue, alpha);
         format.expand_bg = 0.0;
     }
@@ -695,9 +707,10 @@ fn text_format(
 mod tests {
     use super::super::{Cache, RichTextEditor};
     use super::*;
-    use crate::{Editor, Position, Selection, StylePatch};
+    use crate::{Editor, Fragment, Link, Position, Selection, StylePatch};
     use egui::epaint::Shape;
     use egui::{Event, Key, Modifiers, Vec2};
+    use std::collections::BTreeSet;
 
     fn appearance(size: f32) -> Appearance {
         Appearance {
@@ -720,8 +733,8 @@ mod tests {
         let mut result = None;
         context
             .run_ui(egui::RawInput::default(), |ui| {
-                let (layouts, _, changed) = cache.update(ui, document, appearance);
-                result = Some((layouts, changed));
+                let update = cache.update(ui, document, appearance);
+                result = Some((update.layouts, update.layout_changed));
             })
             .drop_without_applying_deltas();
         result.unwrap()
@@ -755,6 +768,14 @@ mod tests {
             ui.label("editor hidden");
         });
     }
+
+    // A pass that does not show the editor.
+    type UnrelatedPass = fn(&egui::Context);
+
+    const UNRELATED_PASSES: [(&str, UnrelatedPass); 2] = [
+        ("other viewport", other_viewport_pass),
+        ("hidden editor", hidden_editor_pass),
+    ];
 
     fn widget_frame(
         context: &egui::Context,
@@ -807,19 +828,25 @@ mod tests {
         let appearance = appearance(16.0);
         let (initial, changed) = layout_frame(&context, &mut cache, &document, &appearance);
         assert!(changed);
-        for pass in [other_viewport_pass, hidden_editor_pass] {
+        for (name, pass) in UNRELATED_PASSES {
             pass(&context);
             let (after, changed) = layout_frame(&context, &mut cache, &document, &appearance);
-            assert!(!changed);
-            assert!(initial.identity().ptr_eq(&after.identity()));
-            assert!(Arc::ptr_eq(
-                &initial.environment_identity(),
-                &after.environment_identity()
-            ));
-            assert!(Arc::ptr_eq(
-                &initial.get(1).unwrap().galley,
-                &after.get(1).unwrap().galley
-            ));
+            assert!(!changed, "{name} pass");
+            assert!(initial.identity().ptr_eq(&after.identity()), "{name} pass");
+            assert!(
+                Arc::ptr_eq(
+                    &initial.environment_identity(),
+                    &after.environment_identity()
+                ),
+                "{name} pass"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &initial.get(1).unwrap().galley,
+                    &after.get(1).unwrap().galley
+                ),
+                "{name} pass"
+            );
         }
     }
 
@@ -952,10 +979,10 @@ mod tests {
         let mut editor = Editor::from_text("first\nsecond");
         widget_frame(&context, &mut editor, vec![], |_| {});
         let before = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
-        for pass in [other_viewport_pass, hidden_editor_pass] {
+        for (name, pass) in UNRELATED_PASSES {
             pass(&context);
             let after = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
-            assert!(Arc::ptr_eq(&before, &after));
+            assert!(Arc::ptr_eq(&before, &after), "{name} pass");
         }
     }
 
@@ -998,17 +1025,20 @@ mod tests {
             let recorded = context.fonts(|fonts| fonts.font_atlas_fill_ratio());
             let mut fill = 0.0;
             unrelated_pass(&context, viewport, |ui| fill = fill_atlas(ui));
-            assert!(fill > 0.8);
+            assert!(fill > 0.8, "the atlas fills up: {viewport:?}");
             unrelated_pass(&context, viewport, |ui| {
                 ui.label(egui::RichText::new("ABCDEFGHIJKLM").font(FontId::proportional(120.0)));
                 fill = ui.fonts(|fonts| fonts.font_atlas_fill_ratio());
             });
-            assert!((recorded..0.8).contains(&fill), "{fill} vs {recorded}");
+            assert!(
+                (recorded..0.8).contains(&fill),
+                "the atlas was recreated: {fill} vs {recorded}, {viewport:?}"
+            );
             let painted = painted_first(&widget_frame(&context, &mut editor, vec![], |_| {}));
-            assert!(!Arc::ptr_eq(&stale, &painted));
+            assert!(!Arc::ptr_eq(&stale, &painted), "{viewport:?}");
             let reference = fresh_uvs(&context, &mut editor, &painted);
-            assert_ne!(uvs(&stale), reference);
-            assert_eq!(uvs(&painted), reference);
+            assert_ne!(uvs(&stale), reference, "{viewport:?}");
+            assert_eq!(uvs(&painted), reference, "{viewport:?}");
         }
     }
 
@@ -1065,7 +1095,11 @@ mod tests {
                 let marker = layout.marker.unwrap();
                 assert_eq!(marker.job.text, format!("{}.", index + 1));
                 let gap = layout.rect.left() - layout.marker_position.x - marker.size().x;
-                assert!((gap - MARKER_GAP * size).abs() < 1e-3, "size={size}");
+                assert!(
+                    (gap - MARKER_GAP * size).abs() < 1e-3,
+                    "size={size}, item={}",
+                    index + 1
+                );
             }
 
             let mut cache = LayoutCache::default();
@@ -1073,7 +1107,11 @@ mod tests {
             let top = layouts.get(0).unwrap().rect.left();
             let nested = layouts.get(1).unwrap().rect.left();
             assert_eq!(top, (BULLET_GUTTER * size).ceil(), "size={size}");
-            assert_eq!(nested, (LEVEL_STEP * size + BULLET_GUTTER * size).ceil());
+            assert_eq!(
+                nested,
+                (LEVEL_STEP * size + BULLET_GUTTER * size).ceil(),
+                "size={size}"
+            );
         }
     }
 
@@ -1091,19 +1129,33 @@ mod tests {
             let (layouts, _) = layout_frame(&context, &mut cache, editor.document(), &appearance);
             for index in [0, 3] {
                 let layout = layouts.get(index).unwrap();
-                assert_eq!(layout.rect.left(), 0.0);
-                assert!(layout.quote_bar.is_none() && layout.marker.is_none());
+                assert_eq!(layout.rect.left(), 0.0, "size={size}, paragraph {index}");
+                assert!(
+                    layout.quote_bar.is_none() && layout.marker.is_none(),
+                    "size={size}, paragraph {index}"
+                );
             }
             for index in [1, 2] {
                 let layout = layouts.get(index).unwrap();
                 let indent = (QUOTE_GUTTER * size).ceil();
                 assert_eq!(layout.rect.left(), indent, "size={size}");
-                assert_eq!(layout.galley.job.wrap.max_width, appearance.width - indent);
-                assert!(layout.marker.is_none());
+                assert_eq!(
+                    layout.galley.job.wrap.max_width,
+                    appearance.width - indent,
+                    "size={size}"
+                );
+                assert!(layout.marker.is_none(), "size={size}, paragraph {index}");
                 let bar = layout.quote_bar.unwrap();
-                assert!(bar.left() > 0.0 && bar.right() < layout.rect.left());
-                assert!(bar.width() >= 1.0);
-                assert_eq!(bar.y_range(), layout.rect.y_range());
+                assert!(
+                    bar.left() > 0.0 && bar.right() < layout.rect.left(),
+                    "the bar lies inside the gutter: size={size}, paragraph {index}"
+                );
+                assert!(bar.width() >= 1.0, "size={size}, paragraph {index}");
+                assert_eq!(
+                    bar.y_range(),
+                    layout.rect.y_range(),
+                    "size={size}, paragraph {index}"
+                );
             }
         }
 
@@ -1155,7 +1207,7 @@ mod tests {
             let (actual, _) = layout_frame(&context, &mut cache, editor.document(), &appearance);
             let mut fresh = LayoutCache::default();
             let (expected, _) = layout_frame(&context, &mut fresh, editor.document(), &appearance);
-            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual.len(), expected.len(), "step {step}");
             for index in 0..expected.len() {
                 let (actual, expected) = (actual.get(index).unwrap(), expected.get(index).unwrap());
                 assert_eq!(actual.rect, expected.rect, "step {step}, {index}");
@@ -1242,14 +1294,17 @@ mod tests {
         editor.insert_paragraph().unwrap();
         let (split, _) = layout_frame(&context, &mut cache, editor.document(), &appearance);
         for (old, new) in [(1, 2), (2, 3), (3, 4)] {
-            assert!(Arc::ptr_eq(
-                &paragraphs[old],
-                &editor.document().paragraphs()[new]
-            ));
-            assert!(Arc::ptr_eq(
-                &before.get(old).unwrap().galley,
-                &split.get(new).unwrap().galley
-            ));
+            assert!(
+                Arc::ptr_eq(&paragraphs[old], &editor.document().paragraphs()[new]),
+                "paragraph {old} moved to {new}"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &before.get(old).unwrap().galley,
+                    &split.get(new).unwrap().galley
+                ),
+                "paragraph {old} moved to {new} keeps its shaped text"
+            );
             let marker = split.get(new).unwrap().marker.unwrap();
             assert_eq!(marker.job.text, format!("{}.", new + 8));
         }
@@ -1268,14 +1323,17 @@ mod tests {
         let (expected, _) = layout_frame(&context, &mut fresh, editor.document(), &appearance);
         for index in 0..5 {
             let actual = restarted.get(index).unwrap();
-            assert!(Arc::ptr_eq(
-                &split.get(index).unwrap().galley,
-                &actual.galley
-            ));
+            assert!(
+                Arc::ptr_eq(&split.get(index).unwrap().galley, &actual.galley),
+                "renumbering paragraph {index} keeps its shaped text"
+            );
             let expected = expected.get(index).unwrap();
-            assert_eq!(actual.galley.job, expected.galley.job);
-            assert_eq!(actual.rect, expected.rect);
-            assert_eq!(actual.marker_position, expected.marker_position);
+            assert_eq!(actual.galley.job, expected.galley.job, "paragraph {index}");
+            assert_eq!(actual.rect, expected.rect, "paragraph {index}");
+            assert_eq!(
+                actual.marker_position, expected.marker_position,
+                "paragraph {index}"
+            );
             assert_eq!(
                 actual.marker.map(|marker| marker.job.text.clone()),
                 Some(format!("{}.", index + 1))
@@ -1386,7 +1444,7 @@ mod tests {
             let (actual, _) = layout_frame(&context, &mut cache, editor.document(), &appearance);
             let mut fresh = LayoutCache::default();
             let (expected, _) = layout_frame(&context, &mut fresh, editor.document(), &appearance);
-            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual.len(), expected.len(), "step {step}");
             for index in 0..expected.len() {
                 let (actual, expected) = (actual.get(index).unwrap(), expected.get(index).unwrap());
                 let marker = |layout: &ParagraphLayout| {
@@ -1394,7 +1452,10 @@ mod tests {
                 };
                 assert_eq!(marker(&actual), marker(&expected), "step {step}, {index}");
                 assert_eq!(actual.rect, expected.rect, "step {step}, {index}");
-                assert_eq!(actual.marker_position, expected.marker_position);
+                assert_eq!(
+                    actual.marker_position, expected.marker_position,
+                    "step {step}, {index}"
+                );
                 let document = editor.document();
                 let shown = match document.paragraphs()[index].kind() {
                     ParagraphKind::Ordered { .. } => document
@@ -1408,10 +1469,10 @@ mod tests {
                     .position(|old| Arc::ptr_eq(old, &document.paragraphs()[index]))
                     && before.get(old).unwrap().rect.left() == actual.rect.left()
                 {
-                    assert!(Arc::ptr_eq(
-                        &before.get(old).unwrap().galley,
-                        &actual.galley
-                    ));
+                    assert!(
+                        Arc::ptr_eq(&before.get(old).unwrap().galley, &actual.galley),
+                        "an unchanged paragraph keeps its shaped text: step {step}, {index}"
+                    );
                 }
             }
         }
@@ -1509,14 +1570,18 @@ mod tests {
                 let (expected, _) =
                     layout_frame(&context, &mut fresh, editor.document(), &appearance);
                 let document = editor.document();
-                assert_eq!(actual.len(), document.paragraphs().len());
-                assert_eq!(actual.content_height(), expected.content_height());
+                assert_eq!(actual.len(), document.paragraphs().len(), "step {step}");
+                assert_eq!(
+                    actual.content_height(),
+                    expected.content_height(),
+                    "step {step}"
+                );
                 let cached = cache.layouts.caches(0..actual.len());
                 for (index, cached) in cached.enumerate() {
-                    assert!(Arc::ptr_eq(
-                        &cached.paragraph,
-                        &document.paragraphs()[index]
-                    ));
+                    assert!(
+                        Arc::ptr_eq(&cached.paragraph, &document.paragraphs()[index]),
+                        "step {step}, {index}"
+                    );
                     assert_eq!(cached.number, document.list_number(index), "step {step}");
                     let (actual, expected) =
                         (actual.get(index).unwrap(), expected.get(index).unwrap());
@@ -1525,9 +1590,15 @@ mod tests {
                     };
                     assert_eq!(marker(&actual), marker(&expected), "step {step}, {index}");
                     assert_eq!(actual.rect, expected.rect, "step {step}, {index}");
-                    assert_eq!(actual.marker_position, expected.marker_position);
-                    assert_eq!(actual.quote_bar, expected.quote_bar);
-                    assert_eq!(actual.galley.job, expected.galley.job);
+                    assert_eq!(
+                        actual.marker_position, expected.marker_position,
+                        "step {step}, {index}"
+                    );
+                    assert_eq!(actual.quote_bar, expected.quote_bar, "step {step}, {index}");
+                    assert_eq!(
+                        actual.galley.job, expected.galley.job,
+                        "step {step}, {index}"
+                    );
                 }
             }
         }
@@ -1602,9 +1673,9 @@ mod tests {
         pasted.apply_numbered_list(0).unwrap();
         select(&mut pasted, (1, 0), (1, 0));
         pasted.indent_list().unwrap();
-        let fragment = crate::Fragment::from_document(pasted.document());
-        let mut widths = std::collections::BTreeSet::new();
-        let mut crossings = std::collections::BTreeSet::new();
+        let fragment = Fragment::from_document(pasted.document());
+        let mut widths = BTreeSet::new();
+        let mut crossings = BTreeSet::new();
         let mut wrapped = false;
         for _ in 0..8 {
             let text: Vec<_> = (0..16)
@@ -1675,13 +1746,20 @@ mod tests {
                 let (expected, _) =
                     layout_frame(&context, &mut fresh, editor.document(), &appearance);
                 let document = editor.document();
-                assert_eq!(actual.len(), document.paragraphs().len());
-                assert_eq!(actual.content_height(), expected.content_height());
+                assert_eq!(actual.len(), document.paragraphs().len(), "step {step}");
+                assert_eq!(
+                    actual.content_height(),
+                    expected.content_height(),
+                    "step {step}"
+                );
                 let mut current = Vec::new();
                 let cached = cache.layouts.caches(0..actual.len());
                 for (index, cached) in cached.enumerate() {
                     let paragraph = &document.paragraphs()[index];
-                    assert!(Arc::ptr_eq(&cached.paragraph, paragraph));
+                    assert!(
+                        Arc::ptr_eq(&cached.paragraph, paragraph),
+                        "step {step}, {index}"
+                    );
                     assert_eq!(cached.number, document.list_number(index), "step {step}");
                     let (actual, expected) =
                         (actual.get(index).unwrap(), expected.get(index).unwrap());
@@ -1690,10 +1768,16 @@ mod tests {
                         Some((marker.job.text.clone(), marker.size()))
                     };
                     assert_eq!(marker(&actual), marker(&expected), "step {step}, {index}");
-                    assert_eq!(actual.marker_position, expected.marker_position);
+                    assert_eq!(
+                        actual.marker_position, expected.marker_position,
+                        "step {step}, {index}"
+                    );
                     assert_eq!(actual.rect, expected.rect, "step {step}, {index}");
-                    assert_eq!(actual.quote_bar, expected.quote_bar);
-                    assert_eq!(actual.galley.job, expected.galley.job);
+                    assert_eq!(actual.quote_bar, expected.quote_bar, "step {step}, {index}");
+                    assert_eq!(
+                        actual.galley.job, expected.galley.job,
+                        "step {step}, {index}"
+                    );
                     let rows = |layout: &ParagraphLayout| {
                         let rows = layout.galley.rows.iter();
                         rows.map(|row| (row.rect(), row.char_count_including_newline()))
@@ -1724,7 +1808,7 @@ mod tests {
     #[test]
     fn links_use_the_hyperlink_color_and_underline_unless_colored_explicitly() {
         let mut editor = Editor::from_text("plain link bold red filled");
-        let link = crate::Link::new("https://example.com").unwrap();
+        let link = Link::new("https://example.com").unwrap();
         select(&mut editor, (0, 6), (0, 26));
         editor.set_link(Some(link)).unwrap();
         for (range, patch) in [
@@ -1738,14 +1822,14 @@ mod tests {
             (
                 16..19,
                 StylePatch {
-                    foreground: Some(Some(crate::Color::RED)),
+                    foreground: Some(Some(Color::RED)),
                     ..StylePatch::default()
                 },
             ),
             (
                 20..26,
                 StylePatch {
-                    background: Some(Some(crate::Color::YELLOW)),
+                    background: Some(Some(Color::YELLOW)),
                     ..StylePatch::default()
                 },
             ),

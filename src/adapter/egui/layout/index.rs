@@ -1,12 +1,18 @@
 #[cfg(test)]
 mod tests;
 
-use super::{PARAGRAPH_GAP, ParagraphCache, ParagraphLayout, ParagraphLayoutView};
+use super::{ParagraphCache, ParagraphLayout, ParagraphLayoutView};
+#[cfg(test)]
+use crate::Document;
 use crate::Paragraph;
+use crate::adapter::egui::PARAGRAPH_GAP;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
+use std::{ptr, slice};
 
 const LEAF_CAPACITY: usize = 32;
+// Leaves have depth one, so a subtree deeper than another cannot be a leaf.
+const DEEPER_IS_BRANCH: &str = "a subtree deeper than its sibling is a branch";
 
 #[derive(Clone)]
 struct Entry {
@@ -69,9 +75,16 @@ struct Node {
 }
 
 fn leaf(entries: Vec<Entry>) -> Arc<Node> {
-    debug_assert!(!entries.is_empty() && entries.len() <= LEAF_CAPACITY);
-    debug_assert!(entries.iter().all(|entry| entry.layout().rect.top() == 0.0));
-    let tail = entries.last().expect("nonempty layout leaf");
+    debug_assert!(
+        !entries.is_empty() && entries.len() <= LEAF_CAPACITY,
+        "callers split entries into leaves of 1 to {LEAF_CAPACITY}, got {}",
+        entries.len()
+    );
+    debug_assert!(
+        entries.iter().all(|entry| entry.layout().rect.top() == 0.0),
+        "entries store paragraph-local geometry; tree offsets supply their y"
+    );
+    let tail = entries.last().expect("checked that the leaf is nonempty");
     Arc::new(Node {
         len: entries.len(),
         height: entries.iter().map(|entry| entry.height).sum(),
@@ -100,30 +113,38 @@ fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     })
 }
 
+// Joins two subtrees under a new branch, rotating once or twice when their
+// depths differ by more than one.
 fn balanced(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     if left.depth > right.depth + 1 {
-        let Children::Branch(ll, lr) = &left.children else {
-            unreachable!()
+        let Children::Branch(outer, inner) = &left.children else {
+            unreachable!("{DEEPER_IS_BRANCH}")
         };
-        if ll.depth >= lr.depth {
-            branch(ll.clone(), branch(lr.clone(), right))
+        if outer.depth >= inner.depth {
+            branch(outer.clone(), branch(inner.clone(), right))
         } else {
-            let Children::Branch(lrl, lrr) = &lr.children else {
-                unreachable!()
+            let Children::Branch(inner_left, inner_right) = &inner.children else {
+                unreachable!("{DEEPER_IS_BRANCH}")
             };
-            branch(branch(ll.clone(), lrl.clone()), branch(lrr.clone(), right))
+            branch(
+                branch(outer.clone(), inner_left.clone()),
+                branch(inner_right.clone(), right),
+            )
         }
     } else if right.depth > left.depth + 1 {
-        let Children::Branch(rl, rr) = &right.children else {
-            unreachable!()
+        let Children::Branch(inner, outer) = &right.children else {
+            unreachable!("{DEEPER_IS_BRANCH}")
         };
-        if rr.depth >= rl.depth {
-            branch(branch(left, rl.clone()), rr.clone())
+        if outer.depth >= inner.depth {
+            branch(branch(left, inner.clone()), outer.clone())
         } else {
-            let Children::Branch(rll, rlr) = &rl.children else {
-                unreachable!()
+            let Children::Branch(inner_left, inner_right) = &inner.children else {
+                unreachable!("{DEEPER_IS_BRANCH}")
             };
-            branch(branch(left, rll.clone()), branch(rlr.clone(), rr.clone()))
+            branch(
+                branch(left, inner_left.clone()),
+                branch(inner_right.clone(), outer.clone()),
+            )
         }
     } else {
         branch(left, right)
@@ -131,21 +152,28 @@ fn balanced(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
 }
 
 fn join(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
-    if let (Children::Leaf(a), Children::Leaf(b)) = (&left.children, &right.children)
-        && a.len() + b.len() <= LEAF_CAPACITY
+    if let (Children::Leaf(left_entries), Children::Leaf(right_entries)) =
+        (&left.children, &right.children)
+        && left_entries.len() + right_entries.len() <= LEAF_CAPACITY
     {
-        return leaf(a.iter().chain(b.iter()).cloned().collect());
+        return leaf(
+            left_entries
+                .iter()
+                .chain(right_entries.iter())
+                .cloned()
+                .collect(),
+        );
     }
     if left.depth > right.depth + 1 {
-        let Children::Branch(ll, lr) = &left.children else {
-            unreachable!()
+        let Children::Branch(left_left, left_right) = &left.children else {
+            unreachable!("{DEEPER_IS_BRANCH}")
         };
-        balanced(ll.clone(), join(lr.clone(), right))
+        balanced(left_left.clone(), join(left_right.clone(), right))
     } else if right.depth > left.depth + 1 {
-        let Children::Branch(rl, rr) = &right.children else {
-            unreachable!()
+        let Children::Branch(right_left, right_right) = &right.children else {
+            unreachable!("{DEEPER_IS_BRANCH}")
         };
-        balanced(join(left, rl.clone()), rr.clone())
+        balanced(join(left, right_left.clone()), right_right.clone())
     } else {
         branch(left, right)
     }
@@ -153,8 +181,8 @@ fn join(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
 
 fn concat(left: Option<Arc<Node>>, right: Option<Arc<Node>>) -> Option<Arc<Node>> {
     match (left, right) {
-        (Some(a), Some(b)) => Some(join(a, b)),
-        (a, b) => a.or(b),
+        (Some(left), Some(right)) => Some(join(left, right)),
+        (left, right) => left.or(right),
     }
 }
 
@@ -165,7 +193,11 @@ fn split(node: Arc<Node>, at: usize) -> (Option<Arc<Node>>, Option<Arc<Node>>) {
     if at == node.len {
         return (Some(node), None);
     }
-    debug_assert!(at < node.len);
+    debug_assert!(
+        at < node.len,
+        "split point {at} lies outside a node of {} entries",
+        node.len
+    );
     match &node.children {
         Children::Leaf(entries) => (
             Some(leaf(entries[..at].to_vec())),
@@ -197,7 +229,7 @@ fn build(entries: impl IntoIterator<Item = Entry>) -> Option<Arc<Node>> {
     let mut entries = entries.into_iter();
     let mut leaves = Vec::new();
     loop {
-        let chunk: Vec<_> = entries.by_ref().take(LEAF_CAPACITY).collect();
+        let chunk: Vec<Entry> = entries.by_ref().take(LEAF_CAPACITY).collect();
         if chunk.is_empty() {
             break;
         }
@@ -325,7 +357,7 @@ impl LayoutIdentity {
     pub(crate) fn matches(&self, layouts: &ParagraphLayouts) -> bool {
         layouts.version.as_ref().map_or_else(
             || self.0.ptr_eq(&Weak::new()),
-            |version| std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(version)),
+            |version| ptr::eq(self.0.as_ptr(), Arc::as_ptr(version)),
         )
     }
 
@@ -422,13 +454,19 @@ impl ParagraphLayouts {
         left
     }
 
-    fn partition_y(&self, y: f32, bottom: bool, inclusive: bool, extra: f32) -> usize {
+    // Counts the leading paragraphs whose `edge`, moved down by `extra`, lies
+    // before `y`.
+    fn partition_y(&self, y: f32, edge: Edge, boundary: Boundary, extra: f32) -> usize {
         let Some(mut node) = self.root().map(Arc::as_ref) else {
             return 0;
         };
+        let bottom = matches!(edge, Edge::Bottom);
         let mut index = 0;
         let mut offset = 0.0;
-        let before = |edge: f32| if inclusive { edge <= y } else { edge < y };
+        let before = |edge: f32| match boundary {
+            Boundary::Inclusive => edge <= y,
+            Boundary::Exclusive => edge < y,
+        };
         loop {
             match &node.children {
                 Children::Branch(left, right) => {
@@ -464,18 +502,20 @@ impl ParagraphLayouts {
     }
 
     pub(crate) fn first_bottom_at_least(&self, y: f32) -> usize {
-        self.partition_y(y, true, false, 0.0)
+        self.partition_y(y, Edge::Bottom, Boundary::Exclusive, 0.0)
     }
 
     pub(crate) fn first_top_after(&self, y: f32) -> usize {
-        self.partition_y(y, false, true, 0.0)
+        self.partition_y(y, Edge::Top, Boundary::Inclusive, 0.0)
     }
 
     pub(crate) fn paragraph_at_y(&self, y: f32) -> usize {
-        self.partition_y(y, true, false, PARAGRAPH_GAP / 2.0)
+        self.partition_y(y, Edge::Bottom, Boundary::Exclusive, PARAGRAPH_GAP / 2.0)
     }
 
-    fn prefix(&self, mut count: usize, lists: bool) -> usize {
+    // Sums `total` over the first `count` paragraphs.
+    fn prefix(&self, mut count: usize, total: Total) -> usize {
+        let lists = matches!(total, Total::ListItems);
         let Some(mut node) = self.root().map(Arc::as_ref) else {
             return 0;
         };
@@ -487,11 +527,11 @@ impl ParagraphLayouts {
                     return total
                         + entries[..count]
                             .iter()
-                            .map(|e| {
+                            .map(|entry| {
                                 if lists {
-                                    usize::from(e.layout().marker.is_some())
+                                    usize::from(entry.layout().marker.is_some())
                                 } else {
-                                    e.chars()
+                                    entry.chars()
                                 }
                             })
                             .sum::<usize>();
@@ -510,11 +550,11 @@ impl ParagraphLayouts {
     }
 
     pub(crate) fn char_offset(&self, paragraph: usize) -> usize {
-        self.prefix(paragraph, false)
+        self.prefix(paragraph, Total::Chars)
     }
 
     pub(crate) fn contains_list(&self, range: Range<usize>) -> bool {
-        self.prefix(range.end, true) > self.prefix(range.start, true)
+        self.prefix(range.end, Total::ListItems) > self.prefix(range.start, Total::ListItems)
     }
 
     pub(super) fn rebuild(&mut self, paragraphs: &[ParagraphCache]) {
@@ -640,7 +680,7 @@ impl ParagraphLayouts {
 
     #[cfg(test)]
     pub(crate) fn from_test_layouts(layouts: Vec<ParagraphLayout>) -> Self {
-        let paragraph = crate::Document::new().paragraphs()[0].clone();
+        let paragraph = Document::new().paragraphs()[0].clone();
         let entries: Vec<_> = layouts
             .into_iter()
             .map(|mut layout| {
@@ -667,14 +707,36 @@ impl ParagraphLayouts {
     }
 }
 
-struct LayoutIter<'a> {
-    stack: Vec<&'a Node>,
-    leaf: std::slice::Iter<'a, Entry>,
+// Which edge of each paragraph `ParagraphLayouts::partition_y` compares.
+#[derive(Clone, Copy)]
+enum Edge {
+    Top,
+    Bottom,
+}
+
+// Whether an edge exactly at the queried y counts as before it.
+#[derive(Clone, Copy)]
+enum Boundary {
+    Exclusive,
+    Inclusive,
+}
+
+// What `ParagraphLayouts::prefix` adds up per paragraph.
+#[derive(Clone, Copy)]
+enum Total {
+    // Scalar values, counting one for each paragraph's separator.
+    Chars,
+    ListItems,
+}
+
+struct LayoutIter<'tree> {
+    stack: Vec<&'tree Node>,
+    leaf: slice::Iter<'tree, Entry>,
     y: f64,
 }
 
-impl<'a> Iterator for LayoutIter<'a> {
-    type Item = (&'a Entry, f64);
+impl<'tree> Iterator for LayoutIter<'tree> {
+    type Item = (&'tree Entry, f64);
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(entry) = self.leaf.next() {

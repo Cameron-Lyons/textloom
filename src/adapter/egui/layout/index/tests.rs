@@ -1,9 +1,13 @@
-use super::*;
+use super::{Children, Entry, LEAF_CAPACITY, Node, ParagraphLayouts};
+use crate::adapter::egui::PARAGRAPH_GAP;
+use crate::adapter::egui::layout::{ParagraphCache, ParagraphLayout};
+use crate::{Document, Paragraph};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 struct Fixture {
     galley: Arc<egui::Galley>,
-    paragraph: Arc<crate::Paragraph>,
+    paragraph: Arc<Paragraph>,
 }
 
 impl Fixture {
@@ -22,7 +26,7 @@ impl Fixture {
         output.textures_delta.clear();
         Self {
             galley: galley.unwrap(),
-            paragraph: crate::Document::from_text("index fixture").paragraphs()[0].clone(),
+            paragraph: Document::from_text("index fixture").paragraphs()[0].clone(),
         }
     }
 
@@ -57,38 +61,58 @@ impl Fixture {
     }
 }
 
-fn assert_tree(node: &Node) -> (usize, f64, usize, usize, u16) {
+// The aggregates a node caches about its subtree.
+#[derive(Debug, PartialEq)]
+struct Summary {
+    len: usize,
+    height: f64,
+    chars: usize,
+    lists: usize,
+    depth: u16,
+}
+
+fn assert_tree(node: &Node) -> Summary {
     let expected = match &node.children {
         Children::Leaf(entries) => {
             assert!(!entries.is_empty());
             assert!(entries.len() <= LEAF_CAPACITY);
-            (
-                entries.len(),
-                entries.iter().map(|entry| entry.height).sum(),
-                entries.iter().map(Entry::chars).sum(),
-                entries
+            Summary {
+                len: entries.len(),
+                height: entries.iter().map(|entry| entry.height).sum(),
+                chars: entries.iter().map(Entry::chars).sum(),
+                lists: entries
                     .iter()
                     .filter(|entry| entry.layout().marker.is_some())
                     .count(),
-                1,
-            )
+                depth: 1,
+            }
         }
         Children::Branch(left, right) => {
-            let a = assert_tree(left);
-            let b = assert_tree(right);
+            let left = assert_tree(left);
+            let right = assert_tree(right);
             assert!(
-                a.4.abs_diff(b.4) <= 1,
+                left.depth.abs_diff(right.depth) <= 1,
                 "unbalanced depths {} and {}",
-                a.4,
-                b.4
+                left.depth,
+                right.depth
             );
-            (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4.max(b.4) + 1)
+            Summary {
+                len: left.len + right.len,
+                height: left.height + right.height,
+                chars: left.chars + right.chars,
+                lists: left.lists + right.lists,
+                depth: left.depth.max(right.depth) + 1,
+            }
         }
     };
-    assert_eq!(
-        (node.len, node.height, node.chars, node.lists, node.depth),
-        expected
-    );
+    let actual = Summary {
+        len: node.len,
+        height: node.height,
+        chars: node.chars,
+        lists: node.lists,
+        depth: node.depth,
+    };
+    assert_eq!(actual, expected);
     let expected_tail = match &node.children {
         Children::Leaf(entries) => {
             assert!(entries.iter().all(|entry| entry.layout().rect.top() == 0.0));
@@ -220,11 +244,13 @@ fn assert_layouts(layouts: &ParagraphLayouts, expected: &[ParagraphCache]) {
     ] {
         assert_eq!(
             layouts.partition_point(|layout| layout.rect.bottom() < point),
-            flat.partition_point(|layout| layout.rect.bottom() < point)
+            flat.partition_point(|layout| layout.rect.bottom() < point),
+            "bottom predicate at {point}"
         );
         assert_eq!(
             layouts.partition_point(|layout| layout.rect.top() <= point),
-            flat.partition_point(|layout| layout.rect.top() <= point)
+            flat.partition_point(|layout| layout.rect.top() <= point),
+            "top predicate at {point}"
         );
         assert_y_partitions(layouts, &flat, point);
     }
@@ -234,7 +260,8 @@ fn assert_layouts(layouts: &ParagraphLayouts, expected: &[ParagraphCache]) {
                 layouts.contains_list(start..end),
                 expected[start..end]
                     .iter()
-                    .any(|cache| cache.layout.marker.is_some())
+                    .any(|cache| cache.layout.marker.is_some()),
+                "paragraphs {start}..{end}"
             );
         }
     }
@@ -426,26 +453,44 @@ fn range_iteration_matches_flat_slices_across_leaf_boundaries_and_edits() {
 #[test]
 fn every_split_boundary_and_rejoin_matches_a_flat_sequence() {
     let fixture = Fixture::new();
-    assert!(build(Vec::new()).is_none());
-    assert!(concat(None, None).is_none());
+    assert!(super::build(Vec::new()).is_none());
+    assert!(super::concat(None, None).is_none());
     for len in [
         1, 2, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 255, 256, 257, 513,
     ] {
         let caches = fixture.caches(0, len);
-        let root = build(caches.iter().cloned().map(Entry::new)).unwrap();
+        let root = super::build(caches.iter().cloned().map(Entry::new)).unwrap();
         let counts: Vec<_> = caches.iter().map(|cache| cache.chars + 1).collect();
         for boundary in 0..=len {
-            let (before, after) = split(root.clone(), boundary);
-            assert_eq!(entry_counts(before.as_deref()), counts[..boundary]);
-            assert_eq!(entry_counts(after.as_deref()), counts[boundary..]);
+            let (before, after) = super::split(root.clone(), boundary);
+            assert_eq!(
+                entry_counts(before.as_deref()),
+                counts[..boundary],
+                "len={len}, boundary={boundary}"
+            );
+            assert_eq!(
+                entry_counts(after.as_deref()),
+                counts[boundary..],
+                "len={len}, boundary={boundary}"
+            );
             if boundary == 0 {
-                assert!(Arc::ptr_eq(after.as_ref().unwrap(), &root));
+                assert!(
+                    Arc::ptr_eq(after.as_ref().unwrap(), &root),
+                    "splitting at the start keeps the whole tree, len={len}"
+                );
             } else if boundary == len {
-                assert!(Arc::ptr_eq(before.as_ref().unwrap(), &root));
+                assert!(
+                    Arc::ptr_eq(before.as_ref().unwrap(), &root),
+                    "splitting at the end keeps the whole tree, len={len}"
+                );
             }
-            assert_eq!(entry_counts(concat(before, after).as_deref()), counts);
+            assert_eq!(
+                entry_counts(super::concat(before, after).as_deref()),
+                counts,
+                "len={len}, boundary={boundary}"
+            );
         }
-        assert_eq!(entry_counts(Some(&root)), counts);
+        assert_eq!(entry_counts(Some(&root)), counts, "len={len}");
     }
 }
 
@@ -554,7 +599,8 @@ fn equal_count_updates_share_every_untouched_leaf_across_tree_seams() {
         let changed_leaves = (range.end - 1) / LEAF_CAPACITY - range.start / LEAF_CAPACITY + 1;
         assert_eq!(
             before.intersection(&after).count(),
-            before.len() - changed_leaves
+            before.len() - changed_leaves,
+            "replaced {range:?}"
         );
         let mut expected = original.clone();
         expected.splice(range, replacement);
