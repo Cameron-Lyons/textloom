@@ -2,14 +2,10 @@ use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-mod composition;
-mod history;
+use super::composition::Composition;
+use super::history::{EditState, Group, History, HistoryLimits, OpenTransaction, TransactionLevel};
 
-pub use composition::Composition;
-pub use history::HistoryLimits;
-use history::{EditState, Group, History, OpenTransaction, TransactionLevel};
-
-use crate::document::{Delta, Indent, Replacement};
+use crate::model::{Delta, Indent, Replacement};
 use crate::types::Direction;
 use crate::{
     Document, Error, Fragment, InlineAttribute, InlineStyle, Link, Movement, Paragraph,
@@ -56,11 +52,11 @@ use crate::{
 /// ```
 pub struct Editor {
     document: Document,
-    selection: Selection,
+    pub(super) selection: Selection,
     typing_style: InlineStyle,
     history: History,
     preferred_column: Option<usize>,
-    composition: Option<Arc<Composition>>,
+    pub(super) composition: Option<Arc<Composition>>,
     saved: SavePoint,
     style_cache: Mutex<Option<StyleCache>>,
 }
@@ -1274,7 +1270,7 @@ impl Editor {
             style: self.typing_style,
         }
     }
-    fn normalize_history(&mut self) {
+    pub(super) fn normalize_history(&mut self) {
         self.history.normalize(self.state());
     }
 
@@ -1294,7 +1290,7 @@ impl Editor {
         self.document.style_at(selection.focus)
     }
 
-    fn replace_selection(&mut self, text: &str, group: Group) -> Result<(), Error> {
+    pub(super) fn replace_selection(&mut self, text: &str, group: Group) -> Result<(), Error> {
         self.replace_range_inner(self.selection.range(), text, self.typing_style, group)
     }
 
@@ -1426,7 +1422,7 @@ impl Editor {
     }
 }
 
-fn typing_group(text: &str) -> Group {
+pub(super) fn typing_group(text: &str) -> Group {
     if text.is_empty() || text.contains(['\n', '\r', '\u{2029}']) {
         Group::None
     } else {

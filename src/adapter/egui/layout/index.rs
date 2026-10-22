@@ -6,7 +6,7 @@ use super::{ParagraphCache, ParagraphLayout, ParagraphLayoutView};
 use crate::Document;
 use crate::Paragraph;
 use crate::adapter::egui::PARAGRAPH_GAP;
-use crate::document::NumberedItem;
+use crate::model::NumberedItem;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::{ptr, slice};

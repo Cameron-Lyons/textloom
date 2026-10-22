@@ -1,4 +1,4 @@
-use crate::document::{self, LINE_SEPARATOR, ParagraphChange};
+use crate::model::{self, LINE_SEPARATOR, ParagraphChange};
 use crate::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
 use egui::epaint::{FontsView, TextOptions};
 use egui::text::{ByteIndex, LayoutJob, LayoutSection};
@@ -242,17 +242,14 @@ impl LayoutCache {
                         .iter()
                         .zip(&source[new.clone()])
                         .any(|(cache, paragraph)| {
-                            !document::same_numbering_effect(
-                                cache.paragraph.kind(),
-                                paragraph.kind(),
-                            )
+                            !model::same_numbering_effect(cache.paragraph.kind(), paragraph.kind())
                         })
                 } else {
                     previous
                         .iter()
                         .map(|cache| cache.paragraph.kind())
                         .chain(source[new.clone()].iter().map(|paragraph| paragraph.kind()))
-                        .any(|kind| !document::same_numbering_effect(kind, ParagraphKind::Body))
+                        .any(|kind| !model::same_numbering_effect(kind, ParagraphKind::Body))
                 };
                 let mut replacement = Vec::with_capacity(new.len());
                 if old.len() == new.len() {

@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{Editor, typing_group};
+use super::editor::{self, Editor};
 use crate::{Error, Selection};
 
 /// An active IME composition, as [`Editor::composition`] reports it.
@@ -121,7 +121,7 @@ impl Editor {
         if let Some(composition) = self.composition.take() {
             self.selection = composition.replacement;
         }
-        self.replace_selection(text, typing_group(text))
+        self.replace_selection(text, editor::typing_group(text))
     }
 
     /// Discards the composition, restores the selection from before it

@@ -409,7 +409,7 @@ pub(crate) mod node_semantics {
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
     use super::{AccessibilityOutcome, AccessibleAction, Focus, node_semantics};
-    use crate::document::{LINE_SEPARATOR, SpanCursor};
+    use crate::model::{LINE_SEPARATOR, SpanCursor};
     use crate::{Editor, Error, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
     use accesskit::{
         Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, TreeId,
@@ -1730,7 +1730,7 @@ mod accesskit_bridge {
     mod tests {
         use super::*;
         use crate::accessibility::random_edits;
-        use crate::document::SparseCoverage;
+        use crate::model::SparseCoverage;
         use crate::{Document, Fragment, StylePatch};
         use accesskit_consumer::{NodeRef as PublishedNode, TreeChangeHandler};
         use std::collections::HashSet;
@@ -3068,7 +3068,7 @@ mod accesskit_bridge {
 
         #[test]
         fn sparse_edits_between_updates_match_fresh_trees() {
-            crate::document::take_sparse_coverage();
+            crate::model::take_sparse_coverage();
             random_updates_match_fresh_trees(
                 random_edits::seeded(0x2545_f491_4f6c_dd1d),
                 8,
@@ -3167,7 +3167,7 @@ pub use accesskit_bridge::{AccessKitAdapter, AccessKitError};
 pub(crate) mod random_edits {
     use std::ops::Range;
 
-    use crate::document::{self, SparseCoverage};
+    use crate::model::{self, SparseCoverage};
     use crate::{Editor, Link, ParagraphKind, Position, SearchOptions, Selection, StylePatch};
 
     pub(crate) fn seeded(mut seed: u64) -> impl FnMut(usize) -> usize {
@@ -3466,7 +3466,7 @@ pub(crate) mod random_edits {
     }
 
     pub(crate) fn assert_sparse_coverage(minimum: SparseCoverage) {
-        let coverage = document::take_sparse_coverage();
+        let coverage = model::take_sparse_coverage();
         assert!(
             coverage.recorded >= minimum.recorded
                 && coverage.replayed >= minimum.replayed

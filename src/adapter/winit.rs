@@ -70,7 +70,7 @@
 //! [`WinitAdapter`] shows the effect of individual key and IME events.
 
 use super::{ControlCharacters, Shortcut};
-use crate::document::LINE_SEPARATOR;
+use crate::model::LINE_SEPARATOR;
 use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection, SelectionMode};
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, WindowEvent};

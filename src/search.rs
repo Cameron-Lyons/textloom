@@ -4,7 +4,7 @@ use std::ops::{ControlFlow, Range};
 use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
 use crate::types::Direction;
-use crate::{Document, Position, document};
+use crate::{Document, Position, model};
 
 /// Options for [`Document::find`] and the editor's search commands.
 ///
@@ -468,7 +468,7 @@ impl Document {
 }
 
 fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
-    let query = document::normalize_newlines(query);
+    let query = model::normalize_newlines(query);
     if options.case_sensitive {
         query
     } else {

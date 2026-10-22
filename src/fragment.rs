@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 
-use crate::document::Levels;
+use crate::model::Levels;
 use crate::{Color, Document, InlineStyle, Link, Paragraph, ParagraphKind, Span, export};
 
 const MAGIC: &[u8; 4] = b"TLFR";

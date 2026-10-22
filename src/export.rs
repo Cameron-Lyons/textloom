@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::document::{LINE_SEPARATOR, Levels};
+use crate::model::{LINE_SEPARATOR, Levels};
 use crate::{Color, Link, Paragraph, ParagraphKind};
 
 pub(crate) fn plain_text(paragraphs: &[Arc<Paragraph>]) -> String {

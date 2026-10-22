@@ -10,23 +10,11 @@ use crate::{
     Error, Fragment, FragmentError, InlineStyle, Link, ParagraphKind, Position, StylePatch, export,
 };
 
-mod change;
-mod numbering;
-mod paragraph;
-mod words;
-
-#[cfg(feature = "egui")]
-pub(crate) use change::ParagraphChange;
-pub(crate) use change::{Delta, Replay};
-#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-pub(crate) use change::{SparseCoverage, take_sparse_coverage};
-pub(crate) use numbering::{Levels, NumberedItem, same_effect as same_numbering_effect};
-#[cfg(any(feature = "accesskit", feature = "egui"))]
-pub(crate) use paragraph::SpanCursor;
-pub use paragraph::{Paragraph, Span};
-
+use super::change::Delta;
 #[cfg(any(feature = "egui", feature = "accesskit"))]
-use change::LastChange;
+use super::change::LastChange;
+use super::numbering::{self, Levels, NumberedItem};
+use super::paragraph::{self, Paragraph, Span};
 
 /// The result of replacing part of a document: the change, for undo history,
 /// and where the caret goes afterward.
@@ -60,12 +48,12 @@ pub(crate) enum Indent {
 /// [revisions](Document::revision) are equal.
 #[derive(Clone)]
 pub struct Document {
-    paragraphs: Vec<Arc<Paragraph>>,
-    revision: u64,
-    identity: Arc<()>,
-    numbers: OnceLock<Arc<[NumberedItem]>>,
+    pub(super) paragraphs: Vec<Arc<Paragraph>>,
+    pub(super) revision: u64,
+    pub(super) identity: Arc<()>,
+    pub(super) numbers: OnceLock<Arc<[NumberedItem]>>,
     #[cfg(any(feature = "egui", feature = "accesskit"))]
-    last_change: Option<LastChange>,
+    pub(super) last_change: Option<LastChange>,
 }
 
 impl PartialEq for Document {

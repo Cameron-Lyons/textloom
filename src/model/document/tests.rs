@@ -8,8 +8,8 @@ use std::{iter, mem};
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::change::{Delta, Replay};
 use super::{Indent, Replacement};
+use crate::model::{Delta, Replay};
 use crate::{
     Color, Document, Editor, Error, Fragment, InlineStyle, Movement, Paragraph, ParagraphKind,
     Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,

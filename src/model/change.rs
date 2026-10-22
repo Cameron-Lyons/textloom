@@ -521,7 +521,7 @@ impl<'paragraphs> Allocations<'paragraphs> {
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
 mod tests {
     use super::*;
-    use crate::document::{Indent, Replacement};
+    use crate::model::{Indent, Replacement};
     use crate::{InlineStyle, ParagraphKind, Position, StylePatch};
 
     fn assert_change(document: &Document, identity: &Arc<()>, range: Range<usize>, new_len: usize) {

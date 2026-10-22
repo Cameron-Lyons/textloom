@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use crate::document::{Delta, Replay};
+use crate::model::{Delta, Replay};
 use crate::{Document, InlineStyle, Selection};
 
 /// Bounds on retained undo and redo history, set with

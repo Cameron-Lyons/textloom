@@ -49,16 +49,16 @@
 
 pub mod accessibility;
 pub mod adapter;
-mod document;
-mod editor;
+mod editing;
 mod export;
 mod fragment;
+mod model;
 mod search;
 mod types;
 
-pub use document::{Document, Paragraph, Span};
-pub use editor::{Composition, Editor, HistoryLimits};
+pub use editing::{Composition, Editor, HistoryLimits};
 pub use fragment::{DecodeLimits, Fragment, FragmentError};
+pub use model::{Document, Paragraph, Span};
 pub use search::{SearchOptions, SearchWrap};
 pub use types::{
     Color, Error, InlineAttribute, InlineStyle, Link, Movement, NamedColor, ParagraphKind,

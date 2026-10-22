@@ -1,7 +1,7 @@
 use super::layout::{self, LayoutIdentity, ParagraphLayouts};
 use super::navigation::CaretPlacement;
 use crate::accessibility::node_semantics;
-use crate::document::{self, LINE_SEPARATOR, SpanCursor};
+use crate::model::{self, LINE_SEPARATOR, SpanCursor};
 use crate::{Color, Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span};
 use egui::epaint::text::PlacedRow;
 use egui::text::CharIndex;
@@ -612,7 +612,7 @@ impl Snapshot {
         let after = editor.document().paragraphs().get(index)?.kind();
         (self.paragraphs.len() == layouts.len()
             && Arc::ptr_eq(&self.environment_identity, &layouts.environment_identity())
-            && document::same_numbering_effect(before, after))
+            && model::same_numbering_effect(before, after))
         .then_some(index)
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
     use super::super::{Cache, PADDING, RichTextEditor};
     use super::*;
     use crate::accessibility::random_edits;
-    use crate::document::SparseCoverage;
+    use crate::model::SparseCoverage;
     use crate::{Document, Fragment, Selection, StylePatch};
     use std::collections::HashSet;
     use unicode_segmentation::UnicodeSegmentation;
@@ -2218,7 +2218,7 @@ mod tests {
 
     #[test]
     fn sparse_edit_frames_match_fresh_snapshots_and_layouts() {
-        document::take_sparse_coverage();
+        model::take_sparse_coverage();
         random_frames_match_fresh_snapshots(
             random_edits::seeded(0x5851_f42d_4c95_7f2d),
             3,

@@ -1,7 +1,7 @@
 use super::{Children, Entry, LEAF_CAPACITY, Node, ParagraphLayouts};
 use crate::adapter::egui::PARAGRAPH_GAP;
 use crate::adapter::egui::layout::{ParagraphCache, ParagraphLayout};
-use crate::document::NumberedItem;
+use crate::model::NumberedItem;
 use crate::{Document, Paragraph};
 use std::collections::HashSet;
 use std::sync::Arc;
