@@ -1,22 +1,38 @@
 use std::collections::{HashMap, VecDeque};
+use std::mem;
 use std::time::Duration;
 
 use egui::{Context, Event, FullOutput, Modifiers, Plugin, RawInput, ViewportId};
 
-/// Preserve input order around accessibility focus requests, including native
-/// egui widgets in the same context, and capture each pass's starting modifiers
-/// for plain-text paste shortcuts.
+/// Installs the egui plugin that keeps input in order around accessibility
+/// focus requests and records each pass's starting modifiers.
 ///
-/// Call this once when creating the context. [`super::RichTextEditor`] also
-/// installs it automatically when first shown, taking effect on the next pass.
-/// Installation in an already-running context cannot recover the starting
-/// modifiers of the pass in which it is installed.
+/// Call this once when creating the context (in eframe, from the creation
+/// callback's `egui_ctx`). Installing it again has no effect.
+/// [`RichTextEditor`](super::RichTextEditor) also installs it the first time it
+/// is shown, taking effect on the next pass; installing it in an already
+/// running context cannot recover the starting modifiers of that first pass.
 ///
-/// egui applies an accessibility focus request when its target widget is added.
-/// This plugin gives each focus request a separate pass so that input before and
-/// after it reaches the appropriate widget regardless of widget order. Ordinary
-/// batches need no extra pass. If the context's pass limit is reached, remaining
-/// input stays ordered ahead of new input and requests another repaint.
+/// egui applies an AccessKit focus request when its target widget is added, so
+/// without this plugin, input that follows the request in the same batch can
+/// reach whichever widget runs first. The plugin gives each focus request a
+/// separate pass, so that input before and after it reaches the right widget,
+/// rich editors and native egui widgets such as `TextEdit` alike, regardless of
+/// draw order. Ordinary batches need no extra pass. If the context's pass limit
+/// is reached, the remaining input waits ahead of newer input and the plugin
+/// requests an immediate repaint, which the host must honor to deliver it,
+/// including when it calls `begin_pass` and `end_pass` itself.
+///
+/// The recorded modifiers let the widget tell a plain-text paste
+/// (Command/Ctrl+Shift+V) from a rich one even when the modifiers change later
+/// in the same batch.
+///
+/// # Examples
+///
+/// ```
+/// let ctx = egui::Context::default();
+/// textloom::adapter::egui::install_input_routing(&ctx);
+/// ```
 pub fn install_input_routing(ctx: &Context) {
     if ctx.plugin_opt::<InputRouting>().is_none() {
         ctx.add_plugin(InputRouting::default());
@@ -103,26 +119,35 @@ impl Plugin for InputRouting {
         // Preserve window focus, but keep current timestamps and geometry.
         if !input.events.is_empty() || input.focused != pending.latest_focused {
             pending.batches.push_back(InputBatch {
-                events: std::mem::take(&mut input.events).into(),
+                events: mem::take(&mut input.events).into(),
                 focused: input.focused,
             });
             pending.latest_focused = input.focused;
         }
-        let batch = pending.batches.front_mut().expect("pending input batch");
+        let batch = pending.batches.front_mut().expect(
+            "pending viewports keep at least one batch, and a new entry receives this pass's \
+             focus request",
+        );
         input.focused = batch.focused;
         if batch.events.front().is_some_and(requests_focus) {
-            input
-                .events
-                .push(batch.events.pop_front().expect("checked event"));
+            input.events.push(
+                batch
+                    .events
+                    .pop_front()
+                    .expect("the front event was just checked"),
+            );
         } else {
             while batch
                 .events
                 .front()
                 .is_some_and(|event| !requests_focus(event))
             {
-                input
-                    .events
-                    .push(batch.events.pop_front().expect("checked event"));
+                input.events.push(
+                    batch
+                        .events
+                        .pop_front()
+                        .expect("the front event was just checked"),
+                );
             }
         }
         if batch.events.is_empty() {

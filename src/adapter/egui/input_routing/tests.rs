@@ -1,8 +1,9 @@
-use super::*;
-use crate::Editor;
+use super::InputRouting;
 use crate::adapter::egui::RichTextEditor;
-use egui::{Id, ImeEvent, Pos2, Rect, Ui};
+use crate::{Editor, ParagraphKind};
+use egui::{Context, Event, FullOutput, Id, ImeEvent, Pos2, RawInput, Rect, Ui, ViewportId};
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
 enum FieldKind {
@@ -71,7 +72,8 @@ impl Fields {
 
     fn show(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            for index in if self.reversed { [1, 0] } else { [0, 1] } {
+            let order = if self.reversed { [1, 0] } else { [0, 1] };
+            for index in order {
                 ui.add_enabled_ui(index == 0 || self.second_enabled, |ui| {
                     self.fields[index].show(ui, self.names[index]);
                 });
@@ -145,7 +147,7 @@ fn shift_tab() -> Event {
 fn context(max_passes: usize) -> Context {
     let ctx = Context::default();
     ctx.enable_accesskit();
-    install_input_routing(&ctx);
+    super::install_input_routing(&ctx);
     ctx.options_mut(|options| options.max_passes = NonZeroUsize::new(max_passes).unwrap());
     ctx
 }
@@ -176,21 +178,30 @@ fn focus_actions_route_each_input_segment_to_its_field() {
                             "first",
                         ),
                     ] {
+                        let case = format!(
+                            "{first:?} then {second:?}, reversed={reversed}, \
+                             max_passes={max_passes}, {events:?}"
+                        );
                         let ctx = context(max_passes);
                         let mut fields = Fields::new(first, second);
                         fields.reversed = reversed;
                         fields.warm(&ctx);
                         let output = fields.frame(&ctx, events);
                         if max_passes >= 2 && expected == ["a", "xb"] {
-                            assert_eq!(output.platform_output.num_completed_passes, 2);
-                            assert_eq!(fields.fields[1].text(), "xb");
+                            assert_eq!(output.platform_output.num_completed_passes, 2, "{case}");
+                            assert_eq!(fields.fields[1].text(), "xb", "{case}");
                         }
                         output.drop_without_applying_deltas();
                         fields.flush(&ctx);
-                        assert_eq!(fields.fields.each_ref().map(Field::text), expected);
+                        assert_eq!(
+                            fields.fields.each_ref().map(Field::text),
+                            expected,
+                            "{case}"
+                        );
                         assert_eq!(
                             ctx.memory(|memory| memory.focused()),
-                            Some(Id::unique(focused))
+                            Some(Id::unique(focused)),
+                            "{case}"
                         );
                     }
                 }
@@ -209,6 +220,9 @@ fn ime_input_after_a_focus_request_reaches_the_newly_focused_field() {
                     vec![preedit("x")],
                     vec![preedit("x"), commit("x")],
                 ] {
+                    let case = format!(
+                        "{second:?}, reversed={reversed}, max_passes={max_passes}, {ime:?}"
+                    );
                     let committed = matches!(ime.last(), Some(Event::Ime(ImeEvent::Commit(_))));
                     let ctx = context(max_passes);
                     let mut fields = Fields::new(FieldKind::Rich, second);
@@ -218,14 +232,15 @@ fn ime_input_after_a_focus_request_reaches_the_newly_focused_field() {
                     events.extend(ime);
                     fields.frame(&ctx, events).drop_without_applying_deltas();
                     fields.flush(&ctx);
-                    assert_eq!(fields.fields[0].text(), "a");
-                    assert!(fields.fields[0].rich.composition().is_none());
+                    assert_eq!(fields.fields[0].text(), "a", "{case}");
+                    assert!(fields.fields[0].rich.composition().is_none(), "{case}");
                     if committed {
-                        assert_eq!(fields.fields[1].text(), "xb");
+                        assert_eq!(fields.fields[1].text(), "xb", "{case}");
                     }
                     assert_eq!(
                         ctx.memory(|memory| memory.focused()),
-                        Some(Id::unique("second"))
+                        Some(Id::unique("second")),
+                        "{case}"
                     );
                 }
             }
@@ -288,7 +303,7 @@ fn ime_input_after_shift_tab_reaches_the_previous_field() {
                 if list {
                     fields.fields[0]
                         .rich
-                        .set_paragraph_kind(crate::ParagraphKind::Bullet { indent: 1 })
+                        .set_paragraph_kind(ParagraphKind::Bullet { indent: 1 })
                         .unwrap();
                 }
                 fields.reversed = reversed;
@@ -307,7 +322,10 @@ fn ime_input_after_shift_tab_reaches_the_previous_field() {
                     Some(Id::unique(focused)),
                     "list={list}, reversed={reversed}"
                 );
-                assert!(fields.fields[0].rich.composition().is_none());
+                assert!(
+                    fields.fields[0].rich.composition().is_none(),
+                    "list={list}, reversed={reversed}"
+                );
                 assert_eq!(
                     fields.fields.each_ref().map(Field::text),
                     texts,
@@ -316,7 +334,8 @@ fn ime_input_after_shift_tab_reaches_the_previous_field() {
                 if list {
                     assert_eq!(
                         fields.fields[0].rich.document().paragraphs()[0].kind(),
-                        crate::ParagraphKind::Bullet { indent: 0 }
+                        ParagraphKind::Bullet { indent: 0 },
+                        "reversed={reversed}"
                     );
                 }
             }
@@ -380,17 +399,21 @@ fn rejected_focus_requests_keep_the_original_composition_and_input() {
         fields
             .frame(&ctx, vec![event])
             .drop_without_applying_deltas();
-        assert!(fields.fields[0].rich.composition().is_some());
+        assert!(
+            fields.fields[0].rich.composition().is_some(),
+            "rejection {rejected}"
+        );
         assert_eq!(
             ctx.memory(|memory| memory.focused()),
-            Some(Id::unique("first"))
+            Some(Id::unique("first")),
+            "rejection {rejected}"
         );
         fields
             .frame(&ctx, vec![Event::Ime(ImeEvent::Commit("한".into()))])
             .drop_without_applying_deltas();
         fields.flush(&ctx);
-        assert_eq!(fields.fields[0].text(), "한a");
-        assert_eq!(fields.fields[1].text(), "b");
+        assert_eq!(fields.fields[0].text(), "한a", "rejection {rejected}");
+        assert_eq!(fields.fields[1].text(), "b", "rejection {rejected}");
     }
 }
 
@@ -452,24 +475,32 @@ fn queued_input_keeps_its_window_focus_and_precedes_later_pointer_input() {
             } else {
                 input.focused = false;
             }
+            let case = format!("{target:?}, click={click}");
             ctx.run_ui(input.clone(), |ui| fields.show(ui))
                 .drop_without_applying_deltas();
-            assert_eq!(fields.fields[0].text(), "a");
-            assert_eq!(fields.fields[1].text(), "xb");
-            assert!(ctx.input(|input| input.focused));
+            assert_eq!(fields.fields[0].text(), "a", "{case}");
+            assert_eq!(fields.fields[1].text(), "xb", "{case}");
+            assert!(
+                ctx.input(|input| input.focused),
+                "queued input keeps its window focus: {case}"
+            );
             input.events.clear();
             ctx.run_ui(input, |ui| fields.show(ui))
                 .drop_without_applying_deltas();
-            assert_eq!(fields.fields[0].text(), "a");
-            assert_eq!(fields.fields[1].text(), "xb");
-            assert_eq!(ctx.input(|input| input.focused), click);
+            assert_eq!(fields.fields[0].text(), "a", "{case}");
+            assert_eq!(fields.fields[1].text(), "xb", "{case}");
+            assert_eq!(ctx.input(|input| input.focused), click, "{case}");
             if click {
                 assert_eq!(
                     ctx.memory(|memory| memory.focused()),
-                    Some(Id::unique("first"))
+                    Some(Id::unique("first")),
+                    "{case}"
                 );
             }
-            assert!(ctx.plugin::<InputRouting>().lock().pending.is_empty());
+            assert!(
+                ctx.plugin::<InputRouting>().lock().pending.is_empty(),
+                "{case}"
+            );
         }
     }
 }
@@ -566,6 +597,8 @@ fn nested_viewports_keep_their_own_queued_events_and_repaint_requests() {
 
 #[test]
 fn removed_viewports_discard_their_undeliverable_input() {
+    use egui::Plugin as _;
+
     let ctx = context(1);
     let child_id = ViewportId::from_hash_of("removed child");
     let mut routing = InputRouting::default();
@@ -574,10 +607,14 @@ fn removed_viewports_discard_their_undeliverable_input() {
     let mut child = raw(vec![focus("child"), text("pending")]);
     child.viewport_id = child_id;
     routing.input_hook(&ctx, &mut child);
-    // An inner viewport's output must not discard its parent's or siblings' input.
     routing.output_hook(&ctx, &mut FullOutput::default());
-    assert!(routing.pending.contains_key(&child_id));
-    // The outermost output is authoritative about which viewports are still alive.
+    assert!(
+        routing.pending.contains_key(&child_id),
+        "an inner viewport's output must not discard its parent's or siblings' input"
+    );
     routing.output_hook(&ctx, &mut FullOutput::default());
-    assert!(routing.pending.is_empty());
+    assert!(
+        routing.pending.is_empty(),
+        "the outermost output is authoritative about which viewports are still alive"
+    );
 }
