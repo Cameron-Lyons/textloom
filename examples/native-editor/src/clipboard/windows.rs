@@ -1,18 +1,34 @@
-use std::thread;
+//! The Windows clipboard backend.
+//!
+//! A publication sets the registered rich format, CF_HTML, and
+//! `CF_UNICODETEXT` while the host window owns the clipboard, then reads each
+//! one back. Every native size is checked against [`MAX_NATIVE_BYTES`] before
+//! allocating a buffer for it.
+
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
+use std::{mem, thread};
 
 use clipboard_win::{Clipboard, formats, raw};
 
 use super::{MAX_NATIVE_BYTES, MIME, NativeItem};
 
+/// How many times to try opening the clipboard, which another process may
+/// hold.
 const OPEN_ATTEMPTS: usize = 10;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// The registered name of the CF_HTML format.
 const HTML_FORMAT: &str = "HTML Format";
+/// The CF_HTML header written on copy, with placeholder byte offsets of the
+/// fixed width that [`encode_html`] fills in.
 const HTML_HEADER: &str = "Version:1.0\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
 const HTML_PREFIX: &str = "<html><body><!--StartFragment-->";
 const HTML_SUFFIX: &str = "<!--EndFragment--></body></html>";
+/// How far into CF_HTML data [`decode_html`] looks for header lines.
 const MAX_HTML_HEADER_BYTES: usize = 8192;
 
+/// Publishes `item` with `owner`, the host window's handle as an integer, as
+/// the clipboard owner, and verifies each format by reading it back.
 pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
     if owner == 0 {
         return Err("Windows rich clipboard copy requires a native window owner".into());
@@ -53,6 +69,8 @@ pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
     })
 }
 
+/// Reads the rich item, or `None` if the clipboard has no rich format. A
+/// missing HTML or text format reads as empty.
 pub fn read() -> Result<Option<NativeItem>, String> {
     let rich_format = registered_format(MIME, "rich")?;
     let html_format = registered_format(HTML_FORMAT, "HTML")?;
@@ -75,12 +93,16 @@ pub fn read() -> Result<Option<NativeItem>, String> {
     })
 }
 
+/// Registers the clipboard format `name`, or gets its existing ID. `label`
+/// names the format in errors.
 fn registered_format(name: &str, label: &str) -> Result<u32, String> {
     raw::register_format(name)
-        .map(std::num::NonZeroU32::get)
+        .map(NonZeroU32::get)
         .ok_or_else(|| format!("Windows clipboard {label} format registration failed"))
 }
 
+/// Runs `operation` with the clipboard open for `owner` (0 for none), then
+/// closes it, reporting both errors if both fail.
 fn with_clipboard<T>(
     owner: usize,
     operation: impl FnOnce() -> Result<T, String>,
@@ -89,7 +111,9 @@ fn with_clipboard<T>(
     let result = operation();
     let close = raw::close().map_err(|error| format!("Windows clipboard close failed: {error}"));
     if close.is_ok() {
-        std::mem::forget(guard);
+        // The clipboard is closed already; dropping the guard would close it
+        // again.
+        mem::forget(guard);
     }
     match (result, close) {
         (Ok(value), Ok(())) => Ok(value),
@@ -98,6 +122,7 @@ fn with_clipboard<T>(
     }
 }
 
+/// Opens the clipboard for `owner`, retrying while another process holds it.
 fn open_clipboard(owner: usize) -> Result<Clipboard, String> {
     for attempt in 0..OPEN_ATTEMPTS {
         match Clipboard::new_for(owner as clipboard_win::types::HWND) {
@@ -113,6 +138,7 @@ fn open_clipboard(owner: usize) -> Result<Clipboard, String> {
     Err("Windows clipboard open attempts exhausted".into())
 }
 
+/// Returns `size` if it is within [`MAX_NATIVE_BYTES`].
 fn checked_size(size: usize, label: &str) -> Result<usize, String> {
     if size > MAX_NATIVE_BYTES {
         Err(format!(
@@ -123,6 +149,8 @@ fn checked_size(size: usize, label: &str) -> Result<usize, String> {
     }
 }
 
+/// Returns an empty buffer with room for `size` bytes, after checking `size`
+/// and without aborting if the allocation fails.
 fn byte_buffer(size: usize, label: &str) -> Result<Vec<u8>, String> {
     checked_size(size, label)?;
     let mut bytes = Vec::new();
@@ -132,6 +160,8 @@ fn byte_buffer(size: usize, label: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Reads `format` from the open clipboard, failing if its size changes during
+/// the read.
 fn read_bytes(format: u32, label: &str) -> Result<Vec<u8>, String> {
     let size = raw::size(format)
         .ok_or_else(|| format!("Windows clipboard {label} native byte size is unavailable"))?
@@ -140,7 +170,7 @@ fn read_bytes(format: u32, label: &str) -> Result<Vec<u8>, String> {
     bytes.resize(size, 0);
     let copied = raw::get(format, &mut bytes)
         .map_err(|error| format!("Windows clipboard {label} read failed: {error}"))?;
-    if copied != size || raw::size(format).map(std::num::NonZeroUsize::get) != Some(size) {
+    if copied != size || raw::size(format).map(NonZeroUsize::get) != Some(size) {
         return Err(format!(
             "Windows clipboard {label} changed during the bounded read"
         ));
@@ -148,6 +178,8 @@ fn read_bytes(format: u32, label: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Encodes `text` as `CF_UNICODETEXT`: NUL-terminated UTF-16LE, with LF line
+/// breaks converted to CRLF.
 fn encode_unicode(text: &str) -> Result<Vec<u8>, String> {
     if text.contains('\0') {
         return Err("Windows Unicode clipboard text contains a NUL character".into());
@@ -176,6 +208,8 @@ fn encode_unicode(text: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Decodes `CF_UNICODETEXT` up to its NUL terminator, ignoring padding after
+/// it, and converts CRLF line breaks to LF.
 fn decode_unicode(bytes: &[u8]) -> Result<String, String> {
     let (units, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
@@ -207,6 +241,8 @@ fn decode_unicode(bytes: &[u8]) -> Result<String, String> {
     Ok(text)
 }
 
+/// Wraps the HTML `fragment` in a NUL-terminated CF_HTML document whose
+/// header gives the byte offsets of the document and the fragment.
 fn encode_html(fragment: &str) -> Result<Vec<u8>, String> {
     if fragment.contains('\0') {
         return Err("Windows HTML clipboard fragment contains a NUL character".into());
@@ -237,12 +273,17 @@ fn encode_html(fragment: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Extracts the fragment from CF_HTML data, validating the header's version
+/// and byte offsets.
 fn decode_html(bytes: &[u8]) -> Result<String, String> {
-    let mut offsets = [None; 4];
+    // StartHTML, EndHTML, StartFragment, and EndFragment. StartHTML and
+    // EndHTML are both -1 when the data has no context around the fragment.
+    let mut offsets: [Option<i64>; 4] = [None; 4];
     let mut version = false;
     let mut header_end = 0;
     let header = &bytes[..bytes.len().min(MAX_HTML_HEADER_BYTES)];
-    for line in header.split_inclusive(|byte| *byte == b'\r' || *byte == b'\n') {
+    let lines = header.split_inclusive(|byte| *byte == b'\r' || *byte == b'\n');
+    for line in lines {
         header_end += line.len();
         let line = line.trim_ascii();
         if line.is_empty() {
@@ -271,9 +312,9 @@ fn decode_html(bytes: &[u8]) -> Result<String, String> {
             return Err("Windows HTML clipboard header has duplicate offsets".into());
         }
         offsets[index] = Some(
-            std::str::from_utf8(value.trim_ascii())
+            str::from_utf8(value.trim_ascii())
                 .ok()
-                .and_then(|value| value.parse::<i64>().ok())
+                .and_then(|value| value.parse().ok())
                 .ok_or("Windows HTML clipboard header has an invalid byte offset")?,
         );
         if offsets.iter().all(Option::is_some) {
@@ -312,7 +353,7 @@ fn decode_html(bytes: &[u8]) -> Result<String, String> {
             return Err("Windows HTML clipboard context offsets are out of bounds".into());
         }
     }
-    let fragment = std::str::from_utf8(&bytes[start..end])
+    let fragment = str::from_utf8(&bytes[start..end])
         .map_err(|_| "Windows HTML clipboard fragment is invalid UTF-8")?;
     let mut html = String::new();
     html.try_reserve_exact(fragment.len())
@@ -358,12 +399,12 @@ mod tests {
     #[test]
     fn html_rejects_bad_bounds_and_split_utf8() {
         let mut native = encode_html("é").unwrap();
-        let text = std::str::from_utf8(&native).unwrap();
+        let text = str::from_utf8(&native).unwrap();
         let start_key = text.find("StartFragment:").unwrap() + "StartFragment:".len();
         native[start_key..start_key + 10].copy_from_slice(b"9999999999");
         assert!(decode_html(&native).is_err());
         let mut native = encode_html("é").unwrap();
-        let end_key = std::str::from_utf8(&native)
+        let end_key = str::from_utf8(&native)
             .unwrap()
             .find("EndFragment:")
             .unwrap()

@@ -1,3 +1,10 @@
+//! The macOS clipboard backend, for the general pasteboard.
+//!
+//! A publication is one pasteboard item with plain text, HTML, and rich
+//! types. It is written eagerly, so the copy helper can exit afterwards, and
+//! it is verified by reading it back. Reads accept only a single item and fail
+//! if the pasteboard changes meanwhile.
+
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardWriting};
@@ -5,10 +12,14 @@ use objc2_foundation::{NSArray, NSData, NSString};
 
 use super::{MAX_NATIVE_BYTES, NativeItem};
 
+/// The pasteboard type of the plain text representation.
 const PLAIN_TYPE: &str = "public.utf8-plain-text";
+/// The pasteboard type of the HTML representation.
 const HTML_TYPE: &str = "public.html";
+/// The pasteboard type of the enveloped fragment.
 const RICH_TYPE: &str = "org.textloom.fragment";
 
+/// The pasteboard types as Foundation strings.
 struct Types {
     plain: Retained<NSString>,
     html: Retained<NSString>,
@@ -25,12 +36,20 @@ impl Types {
     }
 }
 
+/// The representations of one pasteboard item, as Foundation data.
 struct ItemData {
     plain: Retained<NSData>,
     html: Retained<NSData>,
     rich: Retained<NSData>,
 }
 
+/// Returns the representations of the pasteboard's only item, or `None` if the
+/// pasteboard does not hold exactly one item or the item has no rich type.
+///
+/// # Errors
+///
+/// Fails if the item lacks plain text or HTML, or if a representation exceeds
+/// [`MAX_NATIVE_BYTES`].
 fn bounded_item(board: &NSPasteboard, types: &Types) -> Result<Option<ItemData>, String> {
     let Some(items) = board.pasteboardItems() else {
         return Ok(None);
@@ -60,10 +79,19 @@ fn bounded_item(board: &NSPasteboard, types: &Types) -> Result<Option<ItemData>,
     Ok(Some(ItemData { plain, html, rich }))
 }
 
+/// Publishes `item` to the general pasteboard. The window owner is only used
+/// on Windows.
 pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
     autoreleasepool(|_| publish_to(&NSPasteboard::generalPasteboard(), item))
 }
 
+/// Replaces the contents of `board` with `item` and verifies them by reading
+/// them back.
+///
+/// # Errors
+///
+/// Fails if a representation exceeds [`MAX_NATIVE_BYTES`], if writing or
+/// verification fails, or if another application changes `board` meanwhile.
 fn publish_to(board: &NSPasteboard, item: &NativeItem) -> Result<(), String> {
     if [item.plain.len(), item.html.len(), item.rich.len()]
         .into_iter()
@@ -116,10 +144,18 @@ fn publish_to(board: &NSPasteboard, item: &NativeItem) -> Result<(), String> {
     })
 }
 
+/// Reads the rich item from the general pasteboard, or `None` if it holds
+/// none.
 pub(super) fn read() -> Result<Option<NativeItem>, String> {
     autoreleasepool(|_| read_from(&NSPasteboard::generalPasteboard()))
 }
 
+/// Reads the rich item from `board`; see [`bounded_item`].
+///
+/// # Errors
+///
+/// Fails if the item is incomplete or oversized, if its plain text or HTML is
+/// not UTF-8, or if `board` changes during the read.
 fn read_from(board: &NSPasteboard) -> Result<Option<NativeItem>, String> {
     autoreleasepool(|_| {
         let generation = board.changeCount();
@@ -181,11 +217,14 @@ mod tests {
                 .unwrap();
             let fragment = Fragment::from_document(editor.document());
             for _ in 0..2 {
-                // Identical text still represents a fresh publication.
                 let item = NativeItem::from_fragment(&fragment).unwrap();
                 let generation = board.0.changeCount();
                 publish_to(&board.0, &item).unwrap();
-                assert_ne!(board.0.changeCount(), generation);
+                assert_ne!(
+                    board.0.changeCount(),
+                    generation,
+                    "identical text still represents a fresh publication"
+                );
                 let captured = read_from(&board.0).unwrap().unwrap();
                 assert_eq!(captured, item);
                 assert_eq!(captured.fragment().unwrap(), fragment);
@@ -287,7 +326,7 @@ mod tests {
                     ProtocolObject::from_ref(&*item);
                 board.0.clearContents();
                 assert!(board.0.writeObjects(&NSArray::from_slice(&[writer])));
-                assert!(read_from(&board.0).is_err());
+                assert!(read_from(&board.0).is_err(), "plain {plain:?}");
             }
         });
     }
