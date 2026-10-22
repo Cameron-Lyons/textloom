@@ -13,6 +13,17 @@ pub(super) struct VerticalNavigation {
     pub(super) prefer_next_row: bool,
 }
 
+// Where a visual caret movement lands, and the column that later vertical
+// movements keep.
+#[derive(Clone, Copy)]
+pub(super) struct NavigationTarget {
+    pub(super) position: Position,
+    // The caret column in layout coordinates.
+    pub(super) preferred_x: f32,
+    // Places a caret at a soft-wrap seam at the start of the next row.
+    pub(super) prefer_next_row: bool,
+}
+
 pub(super) fn hit_test(
     editor: &Editor,
     layouts: &ParagraphLayouts,
@@ -161,7 +172,7 @@ pub(super) fn vertical_position(
     layouts: &ParagraphLayouts,
     navigation: Option<&VerticalNavigation>,
     down: bool,
-) -> Option<(Position, f32, bool)> {
+) -> Option<NavigationTarget> {
     let focus = editor.selection().focus;
     let source = editor.document().paragraph(focus.paragraph)?;
     let layout = layouts.get(focus.paragraph)?;
@@ -213,7 +224,11 @@ pub(super) fn vertical_position(
     let source = editor.document().paragraph(paragraph)?;
     let x = preferred_x - target.rect.left();
     let (byte, prefer_next_row) = snap_vertical_cursor(source, &target.galley, cursor, x, down)?;
-    Some((Position::new(paragraph, byte), preferred_x, prefer_next_row))
+    Some(NavigationTarget {
+        position: Position::new(paragraph, byte),
+        preferred_x,
+        prefer_next_row,
+    })
 }
 
 pub(super) fn page_position(
@@ -222,7 +237,7 @@ pub(super) fn page_position(
     navigation: Option<&VerticalNavigation>,
     down: bool,
     page: f32,
-) -> Option<(Position, f32, bool)> {
+) -> Option<NavigationTarget> {
     let document = editor.document();
     let focus = editor.selection().focus;
     let prefer_next_row = navigation.is_none_or(|navigation| navigation.prefer_next_row);
@@ -230,10 +245,18 @@ pub(super) fn page_position(
     let preferred_x = navigation.map_or(caret.center().x, |navigation| navigation.preferred_x);
     let y = caret.center().y + if down { page } else { -page };
     if y < 0.0 {
-        return Some((Position::default(), preferred_x, true));
+        return Some(NavigationTarget {
+            position: Position::default(),
+            preferred_x,
+            prefer_next_row: true,
+        });
     }
     if y > layouts.content_height()? {
-        return Some((document.end(), preferred_x, true));
+        return Some(NavigationTarget {
+            position: document.end(),
+            preferred_x,
+            prefer_next_row: true,
+        });
     }
     let paragraph = layouts.paragraph_at_y(y).min(layouts.len().checked_sub(1)?);
     let target = layouts.get(paragraph)?;
@@ -244,7 +267,11 @@ pub(super) fn page_position(
     ));
     let source = document.paragraph(paragraph)?;
     let (byte, prefer_next_row) = snap_vertical_cursor(source, &target.galley, cursor, x, down)?;
-    Some((Position::new(paragraph, byte), preferred_x, prefer_next_row))
+    Some(NavigationTarget {
+        position: Position::new(paragraph, byte),
+        preferred_x,
+        prefer_next_row,
+    })
 }
 
 pub(super) fn row_boundary_position(
@@ -252,7 +279,7 @@ pub(super) fn row_boundary_position(
     layouts: &ParagraphLayouts,
     prefer_next_row: bool,
     end: bool,
-) -> Option<(Position, f32, bool)> {
+) -> Option<NavigationTarget> {
     let focus = editor.selection().focus;
     let source = editor.document().paragraph(focus.paragraph)?;
     let layout = layouts.get(focus.paragraph)?;
@@ -268,7 +295,7 @@ pub(super) fn row_boundary_position(
     let target_x = layout.galley.pos_from_cursor(target).center().x;
     let (byte, prefer_next_row) =
         snap_vertical_cursor(source, &layout.galley, target, target_x, end)?;
-    let x = layout.rect.left()
+    let preferred_x = layout.rect.left()
         + layout
             .galley
             .pos_from_cursor(CCursor {
@@ -277,7 +304,11 @@ pub(super) fn row_boundary_position(
             })
             .center()
             .x;
-    Some((Position::new(focus.paragraph, byte), x, prefer_next_row))
+    Some(NavigationTarget {
+        position: Position::new(focus.paragraph, byte),
+        preferred_x,
+        prefer_next_row,
+    })
 }
 
 pub(super) fn paragraph_boundary_position(editor: &Editor, end: bool) -> Position {
@@ -285,7 +316,7 @@ pub(super) fn paragraph_boundary_position(editor: &Editor, end: bool) -> Positio
     let document = editor.document();
     let length = document
         .paragraph(focus.paragraph)
-        .expect("valid selection")
+        .expect("the editor keeps its selection inside the document")
         .text()
         .len();
     let paragraph = if end && focus.byte == length {
@@ -300,7 +331,7 @@ pub(super) fn paragraph_boundary_position(editor: &Editor, end: bool) -> Positio
         if end {
             document
                 .paragraph(paragraph)
-                .expect("valid paragraph")
+                .expect("the target paragraph is clamped to the document")
                 .text()
                 .len()
         } else {

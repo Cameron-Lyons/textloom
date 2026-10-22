@@ -1,10 +1,7 @@
 use super::layout::ParagraphLayouts;
-use super::navigation::{
-    VerticalNavigation, page_position, paragraph_boundary_position, preedit_byte_range,
-    row_boundary_position, vertical_position,
-};
-use super::{CommitEcho, RichClipboard, record};
-use crate::adapter::{Shortcut, clean_text, shortcut_key_name};
+use super::navigation::{self, NavigationTarget, VerticalNavigation};
+use super::{CommitEcho, RichClipboard};
+use crate::adapter::{self, Shortcut};
 use crate::{Document, Editor, Error, Movement, ParagraphKind, Position, Selection};
 use egui::os::OperatingSystem;
 use egui::{Event, ImeEvent, Key, Modifiers, Ui};
@@ -71,7 +68,7 @@ pub(super) fn handle_event(
     event: &Event,
     event_modifiers: Modifiers,
     layouts: &ParagraphLayouts,
-    navigation: &mut Option<VerticalNavigation>,
+    vertical_navigation: &mut Option<VerticalNavigation>,
     commit_echo: &mut Option<CommitEcho>,
     errors: &mut Vec<Error>,
     interrupted: &mut bool,
@@ -99,8 +96,8 @@ pub(super) fn handle_event(
         return true;
     }
     let input_text = match event {
-        Event::Text(text) => Some((text, clean_text(text, false))),
-        Event::Paste(text) => Some((text, clean_text(text, true))),
+        Event::Text(text) => Some((text, adapter::clean_text(text, false))),
+        Event::Paste(text) => Some((text, adapter::clean_text(text, true))),
         _ => None,
     };
     if input_text
@@ -122,7 +119,7 @@ pub(super) fn handle_event(
                 *interrupted |= cancel_empty_composition(editor);
                 *commit_echo = None;
                 copy_selection(editor, ui, clipboard);
-                record(
+                super::record(
                     editor.isolated_edit(|editor| editor.insert_text("")),
                     errors,
                 );
@@ -137,7 +134,7 @@ pub(super) fn handle_event(
                     .as_deref_mut()
                     .filter(|_| !plain)
                     .and_then(|clipboard| clipboard.paste(text));
-                record(
+                super::record(
                     editor.isolated_edit(|editor| match fragment {
                         Some(fragment) => editor.insert_fragment(&fragment),
                         None => editor.insert_text(clean),
@@ -150,7 +147,7 @@ pub(super) fn handle_event(
         Event::Text(_) => {
             if let Some((_, clean)) = &input_text {
                 *commit_echo = None;
-                record(editor.insert_text(clean), errors);
+                super::record(editor.insert_text(clean), errors);
             }
             true
         }
@@ -165,7 +162,7 @@ pub(super) fn handle_event(
         }) => {
             let range = match active_range_chars
                 .as_ref()
-                .map(|range| preedit_byte_range(text, range))
+                .map(|range| navigation::preedit_byte_range(text, range))
                 .transpose()
             {
                 Ok(range) => range,
@@ -179,23 +176,23 @@ pub(super) fn handle_event(
                     // Only an accepted candidate starts a new IME input session.
                     *commit_echo = None;
                 }
-                record(editor.update_composition(text, range), errors);
+                super::record(editor.update_composition(text, range), errors);
             }
             true
         }
         Event::Ime(ImeEvent::Commit(text)) => {
-            let clean = clean_text(text, true);
+            let clean = adapter::clean_text(text, true);
             if !clean.is_empty() || editor.composition().is_some() {
                 *commit_echo = None;
             }
             if editor.composition().is_none() {
                 if !clean.is_empty() {
-                    record(editor.insert_text(&clean), errors);
+                    super::record(editor.insert_text(&clean), errors);
                 }
             } else if clean.is_empty() && !text.is_empty() {
                 editor.cancel_composition();
             } else {
-                record(editor.commit_composition(&clean), errors);
+                super::record(editor.commit_composition(&clean), errors);
             }
             true
         }
@@ -252,7 +249,7 @@ pub(super) fn handle_event(
                 *physical_key,
                 *modifiers,
                 layouts,
-                navigation,
+                vertical_navigation,
                 errors,
                 options,
             );
@@ -274,7 +271,7 @@ fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor)
         Event::Ime(ImeEvent::Commit(text))
             if !matches!(text.as_str(), "\n" | "\r" | "\r\n")
                 && editor.composition().is_none()
-                && clean_text(text, true) == pending.text =>
+                && adapter::clean_text(text, true) == pending.text =>
         {
             *echo = None;
             true
@@ -299,7 +296,7 @@ fn resolve_shortcut(
     let physical = physical_key
         .and_then(key_character)
         .filter(|key| key.is_ascii_alphanumeric() || matches!(key, '[' | ']'));
-    let name = shortcut_key_name(key_character(key), physical)?;
+    let name = adapter::shortcut_key_name(key_character(key), physical)?;
     match Shortcut::new(name, shift)? {
         Shortcut::Copy | Shortcut::Cut | Shortcut::Paste => None,
         Shortcut::Paragraph(ParagraphKind::Body | ParagraphKind::Heading { .. }) if !headings => {
@@ -453,7 +450,7 @@ pub(super) fn handle_key(
     physical_key: Option<Key>,
     modifiers: Modifiers,
     layouts: &ParagraphLayouts,
-    navigation: &mut Option<VerticalNavigation>,
+    vertical_navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
     options: &InputOptions,
 ) -> bool {
@@ -474,108 +471,114 @@ pub(super) fn handle_key(
                 let revision = editor.document().revision();
                 let selection = editor.selection();
                 cancel_empty_composition(editor);
-                record(shortcut.apply(editor), errors);
+                super::record(shortcut.apply(editor), errors);
                 // Changing only the pending typing style must preserve the visual caret.
                 if editor.document().revision() != revision || editor.selection() != selection {
-                    *navigation = None;
+                    *vertical_navigation = None;
                 }
             }
             return true;
         }
         _ => {}
     }
-    let prefer_next_row = navigation
+    let prefer_next_row = vertical_navigation
         .as_ref()
         .is_none_or(|navigation| navigation.prefer_next_row);
     if !matches!(
         key_command,
         KeyCommand::Vertical { .. } | KeyCommand::Page { .. }
     ) {
-        *navigation = None;
+        *vertical_navigation = None;
     }
     cancel_empty_composition(editor);
     let target = match key_command {
         KeyCommand::ParagraphBoundary { end } => {
-            let position = paragraph_boundary_position(editor, end);
+            let position = navigation::paragraph_boundary_position(editor, end);
             let anchor = if modifiers.shift {
                 editor.selection().anchor
             } else {
                 position
             };
-            record(
+            super::record(
                 editor.set_selection(Selection::new(anchor, position)),
                 errors,
             );
             None
         }
         KeyCommand::RowBoundary { end } => {
-            let target = row_boundary_position(editor, layouts, prefer_next_row, end);
+            let target = navigation::row_boundary_position(editor, layouts, prefer_next_row, end);
             if target.is_none() {
                 let movement = if end {
                     Movement::ParagraphEnd
                 } else {
                     Movement::ParagraphStart
                 };
-                record(editor.move_cursor(movement, modifiers.shift), errors);
+                super::record(editor.move_cursor(movement, modifiers.shift), errors);
             }
             target
         }
         KeyCommand::Vertical { down } => {
-            vertical_position(editor, layouts, navigation.as_ref(), down)
+            navigation::vertical_position(editor, layouts, vertical_navigation.as_ref(), down)
         }
-        KeyCommand::Page { down } => page_position(
+        KeyCommand::Page { down } => navigation::page_position(
             editor,
             layouts,
-            navigation.as_ref(),
+            vertical_navigation.as_ref(),
             down,
             options.page_height,
         ),
         KeyCommand::Move(movement) => {
-            record(editor.move_cursor(movement, modifiers.shift), errors);
+            super::record(editor.move_cursor(movement, modifiers.shift), errors);
             None
         }
         KeyCommand::Edit(edit) | KeyCommand::ListEdit(edit) => {
-            record(edit(editor), errors);
+            super::record(edit(editor), errors);
             None
         }
         KeyCommand::DeleteRowStart => {
             if editor.selection().is_caret() {
                 let focus = editor.selection().focus;
-                let start = row_boundary_position(editor, layouts, prefer_next_row, false)
-                    .map_or(Position::new(focus.paragraph, 0), |target| target.0);
+                let start =
+                    navigation::row_boundary_position(editor, layouts, prefer_next_row, false)
+                        .map_or(Position::new(focus.paragraph, 0), |target| target.position);
                 if start < focus {
-                    record(editor.replace_range(start..focus, ""), errors);
+                    super::record(editor.replace_range(start..focus, ""), errors);
                 }
             } else {
-                record(editor.delete_backward(), errors);
+                super::record(editor.delete_backward(), errors);
             }
             None
         }
         KeyCommand::Shortcut(_) | KeyCommand::ReadOnlyNoop => None,
     };
     if let Some(target) = target {
-        set_visual_selection(editor, navigation, errors, target, modifiers.shift);
+        set_visual_selection(editor, vertical_navigation, errors, target, modifiers.shift);
     }
     true
 }
 
 fn set_visual_selection(
     editor: &mut Editor,
-    navigation: &mut Option<VerticalNavigation>,
+    vertical_navigation: &mut Option<VerticalNavigation>,
     errors: &mut Vec<Error>,
-    (position, preferred_x, prefer_next_row): (Position, f32, bool),
+    target: NavigationTarget,
     extend: bool,
 ) {
+    let NavigationTarget {
+        position,
+        preferred_x,
+        prefer_next_row,
+    } = target;
     let anchor = if extend {
         editor.selection().anchor
     } else {
         position
     };
-    record(
+    super::record(
         editor.set_selection(Selection::new(anchor, position)),
         errors,
     );
-    *navigation = Some(VerticalNavigation {
+    *vertical_navigation = Some(VerticalNavigation {
         selection: editor.selection(),
         preferred_x,
         prefer_next_row,
@@ -592,7 +595,7 @@ pub(super) fn delete_surrounding(
     let start = surrounding_position(editor.document(), focus, before, false);
     let end = surrounding_position(editor.document(), focus, after, true);
     if start < end {
-        record(editor.replace_range(start..end, ""), errors);
+        super::record(editor.replace_range(start..end, ""), errors);
     }
 }
 
@@ -609,7 +612,9 @@ pub(super) fn surrounding_position(
         .scalar_index(focus.byte)
         .expect("editor maintains a valid selection");
     loop {
-        let source = document.paragraph(paragraph).expect("valid paragraph");
+        let source = document
+            .paragraph(paragraph)
+            .expect("the walk stays between the first and last paragraphs");
         let chars = source.scalar_count();
         let available = if forward { chars - index } else { index };
         if remaining <= available {
@@ -642,7 +647,7 @@ pub(super) fn surrounding_position(
             paragraph -= 1;
             index = document
                 .paragraph(paragraph)
-                .expect("valid paragraph")
+                .expect("a paragraph precedes every paragraph but the first")
                 .scalar_count();
         }
         remaining -= 1;
