@@ -1201,6 +1201,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |context| {
             textloom::adapter::egui::install_input_routing(&context.egui_ctx);
+            if let Some(theme) = arguments.theme {
+                context.egui_ctx.set_theme(theme);
+            }
             let mut fonts = egui::FontDefinitions::default();
             if let Some(bytes) = regular_font {
                 fonts.font_data.insert(
