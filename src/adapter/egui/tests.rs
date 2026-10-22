@@ -5653,6 +5653,62 @@ fn pointer_and_blur_commit_preedit_text_while_escape_cancels_it() {
     assert_eq!(editor.document().plain_text(), "abc def");
 }
 
+#[test]
+fn ime_stays_requested_while_the_window_is_in_the_background() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("abc");
+    widget_frame(&context, &mut editor, vec![], Some(0.0), true, unchanged);
+    widget_frame(
+        &context,
+        &mut editor,
+        vec![Event::Ime(ImeEvent::Preedit {
+            text: "に".into(),
+            active_range_chars: Some(1..1),
+        })],
+        Some(0.1),
+        true,
+        unchanged,
+    );
+    let mut background_frame = |events, time| {
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                focused: false,
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let output = RichTextEditor::new(&mut editor)
+                        .id(Id::unique(WIDGET_ID))
+                        .show(ui);
+                    assert!(!output.response.has_focus());
+                });
+            },
+        )
+    };
+    let blurred = background_frame(vec![Event::WindowFocused(false)], 0.2);
+    let idle = background_frame(vec![], 0.3);
+    assert!(
+        blurred
+            .platform_output
+            .ime
+            .unwrap()
+            .should_interrupt_composition
+    );
+    assert!(
+        !idle
+            .platform_output
+            .ime
+            .unwrap()
+            .should_interrupt_composition
+    );
+    assert!(editor.composition().is_none());
+    assert_eq!(editor.document().plain_text(), "にabc");
+    assert_eq!(editor.undo_len(), 1);
+}
+
 fn composing_frame(context: &egui::Context, editor: &mut Editor, preedit: &str) -> Rect {
     let (_, widget) = widget_frame(context, editor, vec![], Some(0.0), true, unchanged);
     widget_frame(

@@ -382,7 +382,12 @@ impl WinitAdapter {
         let was_enabled = self.ime_enabled;
         let mut preedit_changed = false;
         match event {
-            Ime::Enabled => self.ime_enabled = true,
+            Ime::Enabled => {
+                self.ime_enabled = true;
+                // Wayland's enable resets the cursor rectangle, and a new X11 input
+                // context has no spot, so send the caret area again.
+                self.ime.area = None;
+            }
             Ime::Disabled => {
                 self.ime_enabled = false;
                 self.ime.stale = true;
@@ -532,7 +537,10 @@ impl WinitAdapter {
         if window_focused {
             self.observe_window_focus();
         }
-        let editable = self.is_focused() && !self.read_only;
+        // Keep IME allowed while only the window is in the background: winit 0.30
+        // on X11 recreates the input context on every change, unfocused and with
+        // the input method's per-context state reset.
+        let editable = self.focused && !self.read_only;
         let ime = &mut self.ime;
         let mut requests = ImeRequests::default();
         if !editable {
@@ -1917,8 +1925,8 @@ mod tests {
             .handle_window_event(&WindowEvent::Focused(false), &mut editor)
             .unwrap();
         assert_eq!(
-            adapter.plan_ime(&editor, false, area(1.0)),
-            ImeRequests::default()
+            adapter.plan_ime(&editor, false, area(1.0)).allowed,
+            Some(true)
         );
         assert!(!adapter.is_focused());
         let requests = adapter.plan_ime(&editor, true, area(1.0));
@@ -2581,13 +2589,50 @@ mod tests {
         adapter
             .handle_window_event(&WindowEvent::Focused(false), &mut editor)
             .unwrap();
-        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), release);
+        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), none);
         adapter
             .handle_window_event(&WindowEvent::Focused(true), &mut editor)
             .unwrap();
         assert_eq!(
             adapter.plan_ime(&editor, false, area(2.0)),
             allow(area(2.0))
+        );
+
+        adapter.handle_ime(&Ime::Enabled, &mut editor).unwrap();
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(2.0)),
+            ImeRequests {
+                area: Some(area(2.0)),
+                ..ImeRequests::default()
+            }
+        );
+        assert_eq!(adapter.plan_ime(&editor, false, area(2.0)), none);
+    }
+
+    #[test]
+    fn window_blur_keeps_ime_allowed_and_interrupts_a_canceled_preedit() {
+        let mut editor = Editor::from_text("ab");
+        let mut adapter = focused(&mut editor);
+        adapter.plan_ime(&editor, false, area(1.0));
+        adapter
+            .handle_ime(&Ime::Preedit("に".into(), Some((3, 3))), &mut editor)
+            .unwrap();
+        adapter
+            .handle_window_event(&WindowEvent::Focused(false), &mut editor)
+            .unwrap();
+        assert!(editor.composition().is_none());
+        assert_eq!(editor.document().plain_text(), "ab");
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(1.0)),
+            ImeRequests {
+                interrupt: true,
+                area: Some(area(1.0)),
+                ..ImeRequests::default()
+            }
+        );
+        assert_eq!(
+            adapter.plan_ime(&editor, false, area(1.0)),
+            ImeRequests::default()
         );
     }
 

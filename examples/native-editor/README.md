@@ -43,7 +43,8 @@ Capture/restore keeps a native rich snapshot in memory. Restoring clears
 editing history. Use `--read-only` to start with editing disabled while
 retaining selection and copy.
 Use `--disabled` to start with the document widget disabled, including focus,
-selection, and clipboard interaction. The independent **Enabled** and **Read only**
+selection, and clipboard interaction. `--theme light` or `--theme dark` overrides
+the system theme; winit reports none on Linux, where egui otherwise starts dark. The independent **Enabled** and **Read only**
 checkboxes let you change these modes during an IME session. Formatting,
 undo/redo, replacement, and snapshot restoration controls follow the document's
 editing mode. Toolbar, find, and replace commands wait for the document to process

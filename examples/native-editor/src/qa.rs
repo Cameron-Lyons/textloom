@@ -10,7 +10,7 @@ use std::{
 use eframe::egui;
 use textloom::{Composition, Editor, InlineStyle, Selection};
 
-pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--rich-clipboard] [--clipboard-self-test] [--font PATH] [--bold-font PATH] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--rich-clipboard enables the example's native rich clipboard transport.\n--clipboard-self-test runs a deterministic rich clipboard fixture check.\n                      Requires --rich-clipboard and writes the system clipboard;\n                      use only in an isolated test session.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH is created at startup and must not already exist;\n            reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
+pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--rich-clipboard] [--clipboard-self-test] [--font PATH] [--bold-font PATH] [--theme light|dark] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--rich-clipboard enables the example's native rich clipboard transport.\n--clipboard-self-test runs a deterministic rich clipboard fixture check.\n                      Requires --rich-clipboard and writes the system clipboard;\n                      use only in an isolated test session.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--theme overrides the system theme; Linux reports none, so egui uses dark.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH is created at startup and must not already exist;\n            reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -22,6 +22,7 @@ pub struct Options {
     pub regular_font: Option<PathBuf>,
     pub bold_font: Option<PathBuf>,
     pub qa_report: Option<PathBuf>,
+    pub theme: Option<egui::Theme>,
     pub help: bool,
 }
 
@@ -42,6 +43,15 @@ impl Options {
                 options.clipboard_self_test = true;
             } else if argument == "--help" || argument == "-h" {
                 options.help = true;
+            } else if argument == "--theme" {
+                if options.theme.is_some() {
+                    return Err("--theme was supplied twice".to_owned());
+                }
+                options.theme = match arguments.next().as_ref().and_then(|theme| theme.to_str()) {
+                    Some("light") => Some(egui::Theme::Light),
+                    Some("dark") => Some(egui::Theme::Dark),
+                    _ => return Err("--theme requires light or dark".to_owned()),
+                };
             } else {
                 let target = match argument.to_str() {
                     Some("--font") => &mut options.regular_font,
@@ -486,6 +496,14 @@ mod tests {
         assert_eq!(parsed.qa_report, Some(PathBuf::from("qa.json")));
         assert_eq!(options(&[]).unwrap(), Options::default());
         assert!(options(&["--help"]).unwrap().help);
+        assert_eq!(
+            options(&["--theme", "light"]).unwrap().theme,
+            Some(egui::Theme::Light)
+        );
+        assert_eq!(
+            options(&["--theme", "dark"]).unwrap().theme,
+            Some(egui::Theme::Dark)
+        );
     }
 
     #[test]
@@ -495,6 +513,9 @@ mod tests {
             &["--font", "--read-only"],
             &["--bold-font", ""],
             &["--qa-report", "one", "--qa-report", "two"],
+            &["--theme"],
+            &["--theme", "blue"],
+            &["--theme", "light", "--theme", "dark"],
             &["--unknown"],
         ] {
             assert!(options(arguments).is_err(), "{arguments:?}");

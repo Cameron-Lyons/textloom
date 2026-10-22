@@ -22,6 +22,25 @@ This is virtual-input evidence, not physical-keyboard or platform manual
 signoff, and the speech was synthesized, not heard. The evidence that follows
 predates this candidate.
 
+On 2026-10-22 the remaining Linux gaps were checked in the same kind of
+sessions, on branch `x11-ime-window-blur` at
+`025f9a79dd9bacbc01c82023e737d4a930fd02d3`. X11 IME, now testable under Xvfb
+with Fcitx 5's XIM frontend, and a scratch winit host found three IME defects,
+which that branch fixes: the egui widget and the winit adapter released IME
+whenever the window lost focus, so after an app switch winit 0.30's X11 backend
+recreated the input context and Fcitx 5 reset it to direct input; and the winit
+adapter did not resend its caret area after `Ime::Enabled`, so on Wayland the
+first preedit arrived without a cursor rectangle. The native host gained
+`--theme light|dark` for the light-theme checks. At that commit
+`scripts/check-release.sh` passed, the 27 checks above passed again, and the
+light-theme, X11 IME, and winit adapter results below were recorded. One X11
+problem remained: composing in the document, clicking Find, and clicking back
+into the document stopped all keyboard input to the window. A follow-up the same
+day traced it to Fcitx 5's XIM library, xcb-imdkit 1.0.9
+([fcitx/xcb-imdkit#17](https://github.com/fcitx/xcb-imdkit/issues/17)). Egui's
+own text fields lose input the same way, so it is a platform limitation, not a
+Textloom defect (see the second table).
+
 Clean implementation candidate `5f8ccfbb83279d962f8c5a16d6b9d80673bd88e8`
 passed all six [release CI jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/37931457171)
 and both [hosted interaction jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/37931457145)
@@ -257,7 +276,7 @@ signoff remain pending.
 | Native formatting shortcuts | Passed; bold/italic/underline and their undo verified in toolbar and rendered text |
 | Native read-only selection/copy | Passed; exact clipboard content verified |
 | Native read-only editing suppression | Passed; typing, Backspace/Delete, Enter, paste, and undo preserve the document; cut copies without deleting |
-| Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input; physical-keyboard and macOS/Windows signoff pending |
+| Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input under Wayland and, from 2026-10-22, X11; physical-keyboard and macOS/Windows signoff pending |
 | Dead keys and Compose | German XKB virtual sequences on clean `f05a518` produced visible `é`, exact copied bytes, and complete undo restoration; physical-keyboard/platform signoff pending |
 | AltGr | German XKB virtual AltGr on clean `f05a518` produced visible `@€`, exact copied bytes, and complete undo restoration without focus loss; physical-keyboard/platform signoff pending |
 | Screen-reader selection and replacement | Linux Orca and hosted Windows NVDA generated speech, accessible selection/caret, native replacement and undo/redo passed; direct AT-SPI EditableText unavailable then, since added by `accesskit_unix` 0.24 (see above); VoiceOver, audible Windows speech, and full manual signoff pending |
@@ -265,24 +284,26 @@ signoff remain pending.
 | macOS and Windows native host checks | Hosted macOS native editing/focus/guard checks and Windows NVDA interaction passed; physical keyboards, IMEs, VoiceOver, scale changes, and full manual signoff pending |
 
 The later improvement and feature passes added the checks below. Their Linux
-results come from the isolated sessions of 2026-10-21 described at the top;
-macOS, Windows, and physical-keyboard results are still pending. No windowed
-host in this repository uses the winit adapter, so its row needs a
-host-supplied winit harness. The `NATIVE_QA.md` protocol gives steps for the
-feature rows.
+results come from the isolated sessions of 2026-10-21 and 2026-10-22 described
+at the top; macOS, Windows, and physical-keyboard results are still pending. No
+windowed host in this repository uses the winit adapter, so its Linux results
+come from a scratch winit host that follows the README: it calls `set_focused`
+at startup, routes every window event through `handle_window_event`, and calls
+`sync_ime` each frame with its painted caret. The `NATIVE_QA.md` protocol gives
+steps for the feature rows.
 
 | Check | Result |
 | --- | --- |
-| Winit adapter: macOS typing at launch without switching apps; IME candidate window at the caret on the first composition; Russian layout Ctrl+C/Ctrl+V; Linux Ctrl+Alt+T reaching the host; Windows Shift+Delete, Ctrl+Insert, Shift+Insert, and AltGr through Ctrl+Alt | Pending; needs a winit harness |
-| Egui click, drag, and focus loss during composition commit the preedit exactly once, without a double commit, on macOS, Windows, and IBus/Fcitx 5 under Wayland and X11 | Fcitx 5 under Wayland passed: click, drag, a touchpad tap, and moving focus to Find each committed the visible preedit once where it was composed. Switching to another application either committed it once or canceled it, depending on whether Fcitx's preedit clear reached egui in the same frame as the focus loss (both outcomes seen with egui 0.36 and 0.37); it was never duplicated, and typing resumed at the caret. X11 untested: the host's XIM connection did not open under Xvfb with egui 0.36 or 0.37. macOS, Windows, and IBus pending |
-| Egui IME candidate placement in long scrolled documents | Fcitx 5 Mozc under Wayland passed: composing on the last line of a 300-line document kept the cursor rectangle inside the visible area, and the candidate list opened beside it, above the caret at the bottom edge. Also passed at 200% scale. macOS and Windows pending |
+| Winit adapter: macOS typing at launch without switching apps; IME candidate window at the caret on the first composition; Russian layout Ctrl+C/Ctrl+V; Linux Ctrl+Alt+T reaching the host; Windows Shift+Delete, Ctrl+Insert, Shift+Insert, and AltGr through Ctrl+Alt | Linux passed on Wayland and X11 with Fcitx 5 Mozc, twice each: the first composition had the caret's cursor rectangle in effect and its candidate list opened under the caret, also for a host that anchors its IME area at the composition start; under X11 composition worked from the first key and after an app switch; with a Russian layout, Ctrl and the physical A, C, V, and Z keys (logical ф, с, м, я) selected all, copied the exact text, pasted it once, and undid the paste in one step; Ctrl+Alt+T and Ctrl+T were left unhandled and typed nothing; typing worked at launch once the compositor focused the window. On X11 the candidate list covers the bottom 9–14 px of the caret line, because winit 0.30 sends only the area's top-left as the XIM spot. macOS and Windows rows pending |
+| Egui click, drag, and focus loss during composition commit the preedit exactly once, without a double commit, on macOS, Windows, and IBus/Fcitx 5 under Wayland and X11 | Fcitx 5 under Wayland passed: click, drag, a touchpad tap, and moving focus to Find each committed the visible preedit once where it was composed. Switching to another application either committed it once or canceled it, depending on whether Fcitx's preedit clear reached egui in the same frame as the focus loss (both outcomes seen with egui 0.36 and 0.37); it was never duplicated, and typing resumed at the caret. Fcitx 5 XIM under X11 passed after the 2026-10-22 fix: click, drag, and moving focus to Find committed the visible preedit once; switching applications canceled the preedit, never duplicated it, and kept Mozc active for the next composition. X11 platform limitation: after composing and clicking an egui text field, keyboard input stopped for the whole window with Fcitx 5.1.23 and xcb-imdkit 1.0.9. Release builds lost it in 8 of 8 runs both for the document and Find and for egui's own Replace and Find fields. An earlier control between egui fields that kept working was invalid, because its click landed on the candidate window. Egui-winit recreates the X11 input context on each IME interrupt, and `TextEdit` interrupts on both press and release. The second recreation makes libX11 answer Fcitx for a destroyed context, and xcb-imdkit then queues every later key ([fcitx/xcb-imdkit#17](https://github.com/fcitx/xcb-imdkit/issues/17)). With xcb-imdkit built from its fix ([#18](https://github.com/fcitx/xcb-imdkit/pull/18), merged 2026-10-09, not yet released), both round trips kept the keyboard in all 18 runs. Restarting Fcitx 5 restored typing and composition in 3 of 3 runs. macOS, Windows, and IBus pending |
+| Egui IME candidate placement in long scrolled documents | Fcitx 5 Mozc under Wayland passed: composing on the last line of a 300-line document kept the cursor rectangle inside the visible area, and the candidate list opened beside it, above the caret at the bottom edge. Also passed at 200% scale. Under X11 the list opened at the caret's x, 10 px below the caret's top, and flipped above the caret at the bottom edge. macOS and Windows pending |
 | Egui touch scrolling: swipes scroll until the editor has focus | Pending; virtual touch input was unavailable |
 | AZERTY digit-row shortcuts (Ctrl/Command+0–6, Shift+7/8) | Linux French XKB layout through a virtual keyboard with evdev keycodes passed: Ctrl+physical 1/3/0 set Heading 1, Heading 3, and Body; Ctrl+Shift+physical 7/8 made numbered and bulleted lists; unmodified keys typed `&é`. Physical keyboards and macOS/Windows pending |
 | Egui touchpad tap-to-click places the caret, commits a preedit, and activates links | Linux press-and-release in one frame passed: it placed the caret, committed a Mozc preedit once, and opened a link in read-only mode. Physical touchpads pending |
 | Fill Color and Font Color: apply, No Fill/Automatic, undo/redo; selections and found matches stay visible over fills; fill survives external rich copy | Linux passed: AT-SPI attributes confirmed yellow, a menu color, the button repeating it, No Fill removing only that fill, Red, a menu color, and Automatic; each command undid and redid in one step. A selection and a found match painted visibly over the fill. LibreOffice kept the fill and font color. macOS and Windows pending |
 | Soft line breaks: Shift+Enter in a list item and a heading; caret, selection, Home/End, and Up/Down across the break; screen-reader line reading; external plain copy shows a line break; HTML paste into Word/TextEdit shows the break | Linux passed: the numbered item kept its number and marker, the heading stayed one heading, Home/End/Up/Down and Shift+Left followed the visual lines, AT-SPI and Orca read the two lines separately, plain copy had a line break, and LibreOffice showed one numbered paragraph with a line break. macOS and Windows pending |
 | Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Linux passed: add, edit, and remove were one undo step each and kept the selection; Ctrl+click, a read-only click, and AT-SPI activation opened the URL once without moving the caret; the `javascript:` target was refused with a status message; hovering showed the target, and the cursor became a pointing hand only with Ctrl held or in read-only mode; LibreOffice kept the hyperlink. Orca read link text but did not announce links at the caret, because AccessKit's Unix adapter has no Hypertext interface. macOS and Windows pending |
-| Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Linux dark theme passed: one bar spanned three consecutive quote paragraphs; Enter continued the quote, and Enter on an empty quote paragraph or Backspace at a quote's start made body text in one undo step; AT-SPI exposed one block quote; LibreOffice used its Quotations style. Orca read through the quote without announcing it. Light theme (the Linux host follows egui's dark default), macOS, and Windows pending |
+| Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Linux dark theme passed: one bar spanned three consecutive quote paragraphs; Enter continued the quote, and Enter on an empty quote paragraph or Backspace at a quote's start made body text in one undo step; AT-SPI exposed one block quote; LibreOffice used its Quotations style. Orca read through the quote without announcing it. With `--theme light` and `--theme dark`, one bar ran along the quote's left edge for the full height of three consecutive quote paragraphs, in egui's weak text color (contrast 2.96:1 light, 2.78:1 dark). macOS and Windows pending |
 | Numbering controls: Numbered list and Ctrl/Command+Shift+7 extend or start lists; markers and the "Item N." label continue past body text and restart after headings; Restart at 1 and Continue numbering change only the focused item in one undo step; copied items keep their numbers in Word/TextEdit | Linux passed: markers and the "Item N." label read 1, 2, 3; body text in the middle gave 1, 2, and changing it back restored 1, 2, 3; Restart at 1 and Continue numbering changed only the focused item, one undo step each; Ctrl+Shift+7 extended the list; an item after a heading restarted at 1; LibreOffice showed 2 and 3. macOS and Windows pending |
 
 ## Compatibility contract
