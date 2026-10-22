@@ -5,9 +5,19 @@ use std::sync::{Arc, OnceLock, Weak};
 use crate::document::Delta;
 use crate::{Document, InlineStyle, Selection};
 
+/// Bounds on retained undo and redo history, set with
+/// [`Editor::set_history_limits`](crate::Editor::set_history_limits).
+///
+/// When history exceeds a bound, the oldest undo steps are discarded first,
+/// then the redo steps farthest from the current state, so a single step
+/// larger than `max_bytes` is not kept. A zero bound disables history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryLimits {
+    /// The maximum number of undo and redo steps together; 256 by default.
     pub max_entries: usize,
+    /// The maximum estimated memory of undo and redo steps together, in
+    /// bytes, as [`Editor::history_bytes`](crate::Editor::history_bytes)
+    /// reports it; 8 MiB by default.
     pub max_bytes: usize,
 }
 

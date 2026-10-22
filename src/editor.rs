@@ -16,6 +16,43 @@ use crate::{
     ParagraphKind, Position, SearchOptions, Selection, SelectionStyle, StylePatch,
 };
 
+/// An editing session over a [`Document`]: the document with a selection, a
+/// typing style, undo history, a save point, and an optional IME composition.
+///
+/// Commands correspond to the actions of a rich-text editor: typing, deleting,
+/// formatting, links, lists, search and replace, rich copy and paste, and
+/// undo. They validate their input first, so a command that returns an error
+/// changes nothing. While an IME composition is active, commands that change
+/// the document fail with [`Error::CompositionActive`] until the composition
+/// is committed or canceled.
+///
+/// Each command that changes the document records one undo step, except that
+/// consecutive typing, Backspaces, or Deletes within one paragraph merge into
+/// one step. [`Editor::break_history_group`] ends such a group, and
+/// [`Editor::transaction`] records several commands as one step. Undo and redo
+/// restore the selection and typing style along with the content.
+///
+/// The editor works without a window or renderer; the optional adapters
+/// connect it to egui, winit, and AccessKit. A clone shares the unchanged
+/// paragraphs and has its own history.
+///
+/// # Examples
+///
+/// ```
+/// use textloom::{Editor, InlineAttribute, Movement, Position, Selection};
+///
+/// let mut editor = Editor::from_text("Hello world");
+/// editor.set_selection(Selection::new(Position::new(0, 6), Position::new(0, 11)))?;
+/// editor.toggle_style(InlineAttribute::Bold)?;
+/// assert_eq!(editor.selection_style().bold, Some(true));
+///
+/// editor.move_cursor(Movement::DocumentEnd, false)?;
+/// editor.insert_text("!")?;
+/// assert_eq!(editor.document().plain_text(), "Hello world!");
+/// assert!(editor.undo());
+/// assert_eq!(editor.document().plain_text(), "Hello world");
+/// # Ok::<(), textloom::Error>(())
+/// ```
 pub struct Editor {
     document: Document,
     selection: Selection,
@@ -118,6 +155,11 @@ pub(crate) struct Presentation {
 }
 
 impl Editor {
+    /// Creates an editor for `document` with a caret at its start, empty
+    /// history, and the document marked as saved.
+    ///
+    /// The typing style is that of the document's first grapheme, or the
+    /// default style if the first paragraph is empty.
     #[must_use]
     pub fn new(document: Document) -> Self {
         Self {
@@ -132,27 +174,50 @@ impl Editor {
         }
     }
 
+    /// Creates an editor for plain text, split into paragraphs as by
+    /// [`Document::from_text`].
     #[must_use]
     pub fn from_text(text: &str) -> Self {
         Self::new(Document::from_text(text))
     }
 
+    /// Returns the document being edited.
     #[must_use]
     pub fn document(&self) -> &Document {
         &self.document
     }
 
+    /// Returns the selection, whose positions are always valid in the
+    /// [document](Editor::document).
     #[must_use]
     pub fn selection(&self) -> Selection {
         self.selection
     }
 
+    /// Returns the style that inserted text receives, whether typed, pasted
+    /// as plain text, or committed by an IME.
+    ///
+    /// Selecting sets it to the style of the first selected grapheme, or at a
+    /// caret, to [`Document::style_at`] the caret. Formatting commands at a
+    /// caret change only this pending style, and moves that leave the
+    /// selection unchanged keep it.
     #[must_use]
     pub fn typing_style(&self) -> InlineStyle {
         self.typing_style
     }
 
+    /// Summarizes the formatting of the selection, for a formatting toolbar.
+    ///
+    /// At a caret, the summary is the [typing style](Editor::typing_style).
+    /// For a range, each attribute is uniform only if all selected text
+    /// agrees on it; paragraph breaks and empty paragraphs are ignored, and a
+    /// selection of only paragraph breaks also reports the typing style. The
+    /// scan of a range is cached until the document or selection changes.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expect checks an internal invariant: nothing panics while the cache is locked"
+    )]
     pub fn selection_style(&self) -> SelectionStyle {
         if self.selection.is_caret() {
             return self.typing_style.into();
@@ -193,6 +258,12 @@ impl Editor {
         result
     }
 
+    /// Returns the link that a link editor should start from.
+    ///
+    /// At a caret, this is the link of the grapheme before the caret, or
+    /// failing that, after it. For a range, it is the link that all selected
+    /// text shares, or `None` if any selected text is unlinked or the links
+    /// differ.
     #[must_use]
     pub fn selected_link(&self) -> Option<Link> {
         if self.selection.is_caret() {
@@ -209,6 +280,12 @@ impl Editor {
         shared.cloned()
     }
 
+    /// Returns the indexes of the paragraphs that block commands, such as
+    /// [`set_paragraph_kind`](Editor::set_paragraph_kind), change.
+    ///
+    /// These are the paragraphs the selection touches, except a last
+    /// paragraph that a multi-paragraph selection only enters at its start.
+    /// The range is never empty.
     #[must_use]
     pub fn selected_paragraphs(&self) -> Range<usize> {
         let range = self.selection.range();
@@ -220,7 +297,17 @@ impl Editor {
         range.start.paragraph..end
     }
 
+    /// Returns the kind of the first [selected
+    /// paragraph](Editor::selected_paragraphs) if all of them share it, for a
+    /// block format menu, or `None` if they differ.
+    ///
+    /// Bullets count as one kind whatever their indents, and so do ordered
+    /// items whatever their indents and starts.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expect checks an internal invariant: a selection covers a paragraph"
+    )]
     pub fn selection_paragraph_kind(&self) -> Option<ParagraphKind> {
         let mut kinds = self.document.paragraphs()[self.selected_paragraphs()]
             .iter()
@@ -229,46 +316,76 @@ impl Editor {
         kinds.all(|kind| same_block(first, kind)).then_some(first)
     }
 
+    /// Returns whether there is a step to undo.
+    ///
+    /// [`undo`](Editor::undo) still does nothing inside a
+    /// [transaction](Editor::transaction).
     #[must_use]
     pub fn can_undo(&self) -> bool {
         self.undo_len() != 0
     }
 
+    /// Returns whether there is an undone step to redo.
+    ///
+    /// [`redo`](Editor::redo) still does nothing inside a
+    /// [transaction](Editor::transaction).
     #[must_use]
     pub fn can_redo(&self) -> bool {
         self.redo_len() != 0
     }
 
+    /// Returns the bounds on retained history.
     #[must_use]
     pub fn history_limits(&self) -> HistoryLimits {
         self.history.limits()
     }
 
+    /// Returns an estimate of the memory that undo and redo steps retain, in
+    /// bytes, which [`HistoryLimits::max_bytes`] bounds.
+    ///
+    /// Each step is charged for the text, formatting runs, and link targets on
+    /// the larger side of its change that the other side does not share, plus
+    /// the paragraph pointers of both sides. Navigation indexes and allocator
+    /// overhead are not counted.
     #[must_use]
     pub fn history_bytes(&self) -> usize {
         self.history.resolved(self.state()).bytes()
     }
 
+    /// Returns the number of steps that [`undo`](Editor::undo) can undo.
     #[must_use]
     pub fn undo_len(&self) -> usize {
         self.history.resolved(self.state()).undo_len()
     }
 
+    /// Returns the number of undone steps that [`redo`](Editor::redo) can
+    /// redo.
     #[must_use]
     pub fn redo_len(&self) -> usize {
         self.history.resolved(self.state()).redo_len()
     }
 
+    /// Sets the bounds on retained history and discards steps beyond them.
+    ///
+    /// The oldest undo steps go first, then the redo steps farthest from the
+    /// current state. A zero bound disables history, so later commands record
+    /// no steps. Ends the current undo group.
     pub fn set_history_limits(&mut self, limits: HistoryLimits) {
         self.normalize_history();
         self.history.set_limits(limits);
     }
 
+    /// Discards all undo and redo steps and ends the current undo group.
     pub fn clear_history(&mut self) {
         self.normalize_history();
         self.history.clear();
     }
 
+    /// Ends the current undo group, so that the next typing, Backspace, or
+    /// Delete starts a new undo step instead of joining the previous one.
+    ///
+    /// Selection changes, formatting, and other commands end groups
+    /// themselves; hosts call this when, for example, the editor loses focus.
     pub fn break_history_group(&mut self) {
         self.normalize_history();
         self.history.break_group();
@@ -284,6 +401,44 @@ impl Editor {
         result
     }
 
+    /// Runs `edit` on this editor as one undo step and returns its result.
+    ///
+    /// When `edit` returns `Ok`, the document changes of the commands it ran
+    /// form a single undo step, in which successive edits to one paragraph
+    /// merge. The step is recorded whenever the document changed, even if the
+    /// changes cancel out. When `edit` returns `Err` or panics, the document,
+    /// selection, typing style, and IME composition return to their state
+    /// before the call, and history is unchanged. A transaction inside another
+    /// joins the outer step, and its failure reverts only its own edits. While
+    /// a transaction is open, [`undo`](Editor::undo) and
+    /// [`redo`](Editor::redo) do nothing.
+    ///
+    /// If `edit` puts another editor in this one's place, commit and rollback
+    /// leave that editor as it is. An editor moved out of the callback becomes
+    /// an independent snapshot once its transactions end, keeping their edits
+    /// as one undo step, like a clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that `edit` returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use textloom::{Editor, StylePatch};
+    ///
+    /// let mut editor = Editor::from_text("draft");
+    /// editor.select_all();
+    /// editor.transaction(|editor| {
+    ///     editor.insert_text("final")?;
+    ///     editor.select_all();
+    ///     editor.apply_style(StylePatch { bold: Some(true), ..StylePatch::default() })
+    /// })?;
+    /// assert_eq!(editor.undo_len(), 1);
+    /// assert!(editor.undo());
+    /// assert_eq!(editor.document().plain_text(), "draft");
+    /// # Ok::<(), textloom::Error>(())
+    /// ```
     pub fn transaction<R>(
         &mut self,
         edit: impl FnOnce(&mut Self) -> Result<R, Error>,
@@ -296,16 +451,39 @@ impl Editor {
         result
     }
 
+    /// Records the current content as saved, for
+    /// [`is_modified`](Editor::is_modified).
+    ///
+    /// The save point keeps the saved paragraphs alive, sharing them with the
+    /// document.
     pub fn mark_saved(&mut self) {
         self.normalize_history();
         self.saved = SavePoint::new(&self.document);
     }
 
+    /// Returns whether the content differs from the content at the last
+    /// [`mark_saved`](Editor::mark_saved), or at creation if it was never
+    /// called.
+    ///
+    /// Content is compared rather than history, so undoing back to the saved
+    /// text reads as unmodified. The comparison is cached until the next
+    /// change.
     #[must_use]
     pub fn is_modified(&self) -> bool {
         !self.saved.matches(&self.document)
     }
 
+    /// Selects `selection`, keeping its direction.
+    ///
+    /// Cancels any IME composition and ends the current undo group. A changed
+    /// selection takes its typing style from the first selected grapheme, or
+    /// at a caret, from [`Document::style_at`]; setting the current selection
+    /// again keeps a pending typing style.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPosition`] if the anchor or focus is not a
+    /// valid position in the document.
     pub fn set_selection(&mut self, selection: Selection) -> Result<(), Error> {
         self.document.validate_position(selection.anchor)?;
         self.document.validate_position(selection.focus)?;
@@ -320,15 +498,31 @@ impl Editor {
         Ok(())
     }
 
+    /// Selects the whole document, from its start to its end, as
+    /// [`set_selection`](Editor::set_selection) does.
     pub fn select_all(&mut self) {
         let _ = self.set_selection(Selection::new(Position::default(), self.document.end()));
     }
 
+    /// Selects the [word range](Document::word_range_at) at `position`, as a
+    /// double click does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPosition`] if `position` is not a valid
+    /// position in the document.
     pub fn select_word_at(&mut self, position: Position) -> Result<(), Error> {
         let range = self.document.word_range_at(position)?;
         self.set_selection(Selection::new(range.start, range.end))
     }
 
+    /// Selects the text of paragraph `index`, without its paragraph break, as
+    /// a triple click does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPosition`] holding `Position::new(index, 0)` if
+    /// there is no paragraph `index`.
     pub fn select_paragraph(&mut self, index: usize) -> Result<(), Error> {
         let end = self
             .document
@@ -342,20 +536,45 @@ impl Editor {
         ))
     }
 
+    /// Returns the selected text as plain text, written as by
+    /// [`Document::text`], for a plain-text copy.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expect checks an internal invariant: the editor's selection is valid"
+    )]
     pub fn selected_text(&self) -> String {
         self.document
             .text(self.selection.range())
             .expect("editor maintains a valid selection")
     }
 
+    /// Returns the selected text with its formatting, links, and paragraph
+    /// kinds, captured as by [`Document::fragment`], for a rich copy.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expect checks an internal invariant: the editor's selection is valid"
+    )]
     pub fn selected_fragment(&self) -> Fragment {
         self.document
             .fragment(self.selection.range())
             .expect("editor maintains a valid selection")
     }
 
+    /// Replaces the selection with `fragment`, as a rich paste does, in one
+    /// undo step, and leaves a caret after the inserted content.
+    ///
+    /// Complete pasted paragraphs keep their kinds, including explicit list
+    /// starts, and surviving text at the edges of the selection keeps its
+    /// formatting and paragraph kind. A fragment without a paragraph break
+    /// takes its source kind only when it fills an empty paragraph or whole
+    /// selected paragraphs. A fragment of one empty paragraph changes nothing
+    /// at a caret and deletes a range selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn insert_fragment(&mut self, fragment: &Fragment) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let before = self.state();
@@ -370,6 +589,18 @@ impl Editor {
         Ok(())
     }
 
+    /// Selects the first match of `query` that starts at or after the end of
+    /// the selection, and returns whether there was one.
+    ///
+    /// Starting from the selection's end skips a selected match, so repeated
+    /// calls step through the matches. With `wrap`, the search continues from
+    /// the start of the document when no later match exists. The match is
+    /// selected from its start to its end; without a match, the selection
+    /// stays as it is. Matching follows [`Document::find`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn find_next(
         &mut self,
         query: &str,
@@ -379,6 +610,17 @@ impl Editor {
         self.find_match(query, options, wrap, Direction::Forward)
     }
 
+    /// Selects the last match of `query` that ends at or before the start of
+    /// the selection, and returns whether there was one.
+    ///
+    /// With `wrap`, the search continues from the end of the document when no
+    /// earlier match exists. The match is selected from its start to its end;
+    /// without a match, the selection stays as it is. Matching follows
+    /// [`Document::find`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn find_previous(
         &mut self,
         query: &str,
@@ -407,6 +649,18 @@ impl Editor {
         }
     }
 
+    /// Replaces the selection with `replacement` if the selection is a match
+    /// of `query`, as a Replace button does, and returns whether it was.
+    ///
+    /// The selection must be exactly a match that [`Document::find`] reports,
+    /// so an overlapping occurrence that the match sequence skips is not
+    /// replaced. The replacement takes the style and link of the match's first
+    /// grapheme, is one undo step, and leaves a caret after it; follow with
+    /// [`find_next`](Editor::find_next) to select the next match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn replace_selected_match(
         &mut self,
         query: &str,
@@ -422,6 +676,16 @@ impl Editor {
         Ok(true)
     }
 
+    /// Replaces every match of `query`, as [`Document::find`] reports them,
+    /// with `replacement` in one undo step, and returns the number of matches.
+    ///
+    /// Each replacement takes the style and link of its match's first
+    /// grapheme, and the caret ends after the last one. Without matches,
+    /// nothing changes and no step is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn replace_all(
         &mut self,
         query: &str,
@@ -446,11 +710,37 @@ impl Editor {
         self.record(delta, before, Group::None);
     }
 
+    /// Replaces the selection with `text` in the [typing
+    /// style](Editor::typing_style), as typing or a plain-text paste does, and
+    /// leaves a caret after it.
+    ///
+    /// LF, CRLF, a lone CR, and U+2029 in `text` become paragraph breaks;
+    /// U+2028 stays as a soft line break. New paragraphs continue the kind of
+    /// the paragraph they split, except that text after the end of a heading
+    /// becomes body text. Text inserted strictly inside a link joins the link.
+    /// Consecutive insertions without paragraph breaks in one paragraph form
+    /// one undo step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn insert_text(&mut self, text: &str) -> Result<(), Error> {
         self.ensure_no_composition()?;
         self.replace_selection(text, typing_group(text))
     }
 
+    /// Replaces `range` with `text` in the typing style, as
+    /// [`insert_text`](Editor::insert_text) does for the selection, in its own
+    /// undo step, and leaves a caret after the inserted text.
+    ///
+    /// Undo restores the selection from before the call, which need not
+    /// overlap `range`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition,
+    /// [`Error::InvalidRange`] if `range.start` comes after `range.end`, and
+    /// [`Error::InvalidPosition`] if either end is not a valid position.
     pub fn replace_range(&mut self, range: Range<Position>, text: &str) -> Result<(), Error> {
         self.replace_range_with_style(range, text, self.typing_style)
     }
@@ -483,6 +773,17 @@ impl Editor {
         Ok(())
     }
 
+    /// Replaces the selection with a paragraph break, as Enter does, in its own
+    /// undo step.
+    ///
+    /// The new paragraph continues the kind of the one it splits, except after
+    /// the end of a heading. At a caret in an empty list item, the item is
+    /// outdented one level instead, so a top-level item becomes body text,
+    /// and an empty quote paragraph becomes body text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn insert_paragraph(&mut self) -> Result<(), Error> {
         self.ensure_no_composition()?;
         if self
@@ -494,11 +795,33 @@ impl Editor {
         self.replace_selection("\n", Group::None)
     }
 
+    /// Replaces the selection with a soft line break (U+2028 LINE SEPARATOR),
+    /// as Shift+Enter does.
+    ///
+    /// The break stays inside the paragraph, keeping its kind, and joins the
+    /// typing undo step like typed text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn insert_line_break(&mut self) -> Result<(), Error> {
         self.ensure_no_composition()?;
         self.replace_selection("\u{2028}", Group::Typing)
     }
 
+    /// Deletes the selection, or the grapheme before a caret, as Backspace
+    /// does.
+    ///
+    /// At the start of a list item, it outdents the item one level instead (a
+    /// top-level item becomes body text), and at the start of a quote
+    /// paragraph it makes the paragraph body text. At the start of another
+    /// paragraph, it joins the paragraph to the previous one, and at the start
+    /// of the document it does nothing. Consecutive deletions within one
+    /// paragraph form one undo step; a deleted paragraph break is its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn delete_backward(&mut self) -> Result<(), Error> {
         self.ensure_no_composition()?;
         if !self.selection.is_caret() {
@@ -513,6 +836,15 @@ impl Editor {
         )
     }
 
+    /// Deletes the selection, or the grapheme after a caret, as Delete does.
+    ///
+    /// At the end of a paragraph, it joins the next paragraph to it, and at
+    /// the end of the document it does nothing. Consecutive deletions within
+    /// one paragraph form one undo step; a deleted paragraph break is its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn delete_forward(&mut self) -> Result<(), Error> {
         self.ensure_no_composition()?;
         if !self.selection.is_caret() {
@@ -524,14 +856,40 @@ impl Editor {
         )
     }
 
+    /// Deletes the selection, or from a caret back to where
+    /// [`Movement::WordBackward`] would move it, as Ctrl+Backspace does.
+    ///
+    /// At the start of a paragraph, it deletes the paragraph break before it.
+    /// Each deletion is its own undo step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn delete_word_backward(&mut self) -> Result<(), Error> {
         self.delete_word(Direction::Backward)
     }
 
+    /// Deletes the selection, or from a caret forward to where
+    /// [`Movement::WordForward`] would move it, as Ctrl+Delete does.
+    ///
+    /// At the end of a paragraph, it deletes the paragraph break after it.
+    /// Each deletion is its own undo step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn delete_word_forward(&mut self) -> Result<(), Error> {
         self.delete_word(Direction::Forward)
     }
 
+    /// Deletes the selection, or from a caret back to the start of its
+    /// paragraph, in one undo step.
+    ///
+    /// It never joins paragraphs: at a paragraph start it does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn delete_to_paragraph_start(&mut self) -> Result<(), Error> {
         self.ensure_no_composition()?;
         if !self.selection.is_caret() {
@@ -568,6 +926,16 @@ impl Editor {
         self.replace_range_inner(range, "", self.typing_style, group)
     }
 
+    /// Applies `patch` to the selected text and to the typing style, in one
+    /// undo step.
+    ///
+    /// At a caret, only the typing style changes, which affects the next
+    /// inserted text. A patch that changes no text records no step. Ends the
+    /// current undo group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn apply_style(&mut self, patch: StylePatch) -> Result<(), Error> {
         self.ensure_no_composition()?;
         self.break_history_group();
@@ -578,6 +946,16 @@ impl Editor {
         Ok(())
     }
 
+    /// Toggles `attribute` as the adapters' Ctrl+B, Ctrl+I, and Ctrl+U
+    /// shortcuts do: removes it if the [selection
+    /// style](Editor::selection_style) has it throughout, and otherwise,
+    /// including for mixed selections, applies it.
+    ///
+    /// Applies the change as [`apply_style`](Editor::apply_style) does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn toggle_style(&mut self, attribute: InlineAttribute) -> Result<(), Error> {
         let style = self.selection_style();
         let current = match attribute {
@@ -599,6 +977,15 @@ impl Editor {
         self.apply_style(patch)
     }
 
+    /// Resets the inline attributes, text color, and fill of the selected text
+    /// and of the typing style, like Excel's Clear Formats, in one undo step.
+    ///
+    /// Links and paragraph kinds are kept. At a caret, only the typing style
+    /// is reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn clear_formatting(&mut self) -> Result<(), Error> {
         self.apply_style(StylePatch {
             bold: Some(false),
@@ -611,6 +998,16 @@ impl Editor {
         })
     }
 
+    /// Links the selected text to `link`, or unlinks it with `None`, in one
+    /// undo step, keeping its formatting.
+    ///
+    /// At a caret, it changes or removes the whole link next to the caret (the
+    /// one [`selected_link`](Editor::selected_link) reports), and does nothing
+    /// if there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn set_link(&mut self, link: Option<Link>) -> Result<(), Error> {
         self.ensure_no_composition()?;
         self.break_history_group();
@@ -628,6 +1025,14 @@ impl Editor {
         Ok(())
     }
 
+    /// Replaces the selection with `text` linked to `link`, in the typing
+    /// style, as one undo step, and leaves a caret after it.
+    ///
+    /// Empty `text` inserts the link's target as its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn insert_link(&mut self, text: &str, link: Link) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let text = if text.is_empty() { link.as_str() } else { text };
@@ -644,6 +1049,16 @@ impl Editor {
         Ok(())
     }
 
+    /// Sets the kind of the [selected paragraphs](Editor::selected_paragraphs)
+    /// to `kind`, in one undo step.
+    ///
+    /// For an ordered kind, `start` applies only to the first selected
+    /// paragraph, and the others continue its list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition, and
+    /// [`Error::InvalidHeadingLevel`] for a heading level outside `1..=6`.
     pub fn set_paragraph_kind(&mut self, kind: ParagraphKind) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let before = self.state();
@@ -653,6 +1068,18 @@ impl Editor {
         Ok(())
     }
 
+    /// Makes the [selected paragraphs](Editor::selected_paragraphs) ordered
+    /// items at `indent`, as a Numbered List command does, in one undo step.
+    ///
+    /// The items continue a list whose last item at `indent` comes right
+    /// before the selection, deeper items aside, and otherwise start a new
+    /// list at 1. A first item already ordered at `indent` keeps its start.
+    /// When every selected paragraph is already an ordered item at `indent`,
+    /// nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn apply_numbered_list(&mut self, indent: u8) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let before = self.state();
@@ -664,10 +1091,26 @@ impl Editor {
         Ok(())
     }
 
+    /// Indents the selected list items by one level, up to 255, in one undo
+    /// step, keeping their list starts.
+    ///
+    /// Other selected paragraphs, including quotes, are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn indent_list(&mut self) -> Result<(), Error> {
         self.change_list_indent(true)
     }
 
+    /// Outdents the selected list items by one level, in one undo step; items
+    /// at level 0 become body text.
+    ///
+    /// Other selected paragraphs, including quotes, are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn outdent_list(&mut self) -> Result<(), Error> {
         self.change_list_indent(false)
     }
@@ -683,6 +1126,22 @@ impl Editor {
         Ok(())
     }
 
+    /// Moves the caret by `movement`, or with `extend`, moves only the
+    /// selection's focus and keeps its anchor, as Shift does.
+    ///
+    /// Without `extend`, a grapheme or word movement from a range selection
+    /// collapses it to its start (backward movements) or end (forward
+    /// movements) instead. A changed selection updates the typing style as
+    /// [`set_selection`](Editor::set_selection) does. Ends the current undo
+    /// group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CompositionActive`] during an IME composition.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expects check an internal invariant: the editor's selection is valid"
+    )]
     pub fn move_cursor(&mut self, movement: Movement, extend: bool) -> Result<(), Error> {
         self.ensure_no_composition()?;
         self.break_history_group();
@@ -756,6 +1215,13 @@ impl Editor {
         Ok(())
     }
 
+    /// Undoes the latest step and returns whether there was one.
+    ///
+    /// Restores the document, selection, and typing style from before the
+    /// step and makes it available to [`redo`](Editor::redo). Cancels an IME
+    /// composition first, even when there is nothing to undo. Inside a
+    /// [transaction](Editor::transaction), it does nothing and returns
+    /// `false`.
     pub fn undo(&mut self) -> bool {
         self.normalize_history();
         if self.history.in_transaction() {
@@ -770,6 +1236,13 @@ impl Editor {
         true
     }
 
+    /// Redoes the latest undone step and returns whether there was one.
+    ///
+    /// Restores the document, selection, and typing style from after the step.
+    /// Any new change discards the undone steps. Cancels an IME composition
+    /// first, even when there is nothing to redo. Inside a
+    /// [transaction](Editor::transaction), it does nothing and returns
+    /// `false`.
     pub fn redo(&mut self) -> bool {
         self.normalize_history();
         if self.history.in_transaction() {

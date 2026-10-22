@@ -4,15 +4,28 @@ use std::sync::Arc;
 use super::{Editor, typing_group};
 use crate::{Error, Selection};
 
+/// An active IME composition, as [`Editor::composition`] reports it.
+///
+/// The preedit text is transient: it is not part of the document or of
+/// history. [`Editor::commit_composition`] replaces the `replacement` selection with the
+/// committed text, and [`Editor::cancel_composition`] discards the preedit and
+/// restores that selection. Fields may be added in minor releases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Composition {
+    /// The uncommitted text that the input method is composing.
     pub text: String,
+    /// The input method's cursor or selection in `text`, as a byte range on
+    /// UTF-8 character boundaries (not necessarily grapheme boundaries, since
+    /// the preedit may hold unfinished graphemes), or `None` if it gave none.
     pub selection: Option<Range<usize>>,
+    /// The editor selection when the composition began, which the committed
+    /// text replaces.
     pub replacement: Selection,
 }
 
 impl Editor {
+    /// Returns the active IME composition, or `None` if there is none.
     #[must_use]
     pub fn composition(&self) -> Option<&Composition> {
         self.composition.as_deref()
@@ -21,6 +34,12 @@ impl Editor {
     pub(crate) fn composition_snapshot(&self) -> Option<Arc<Composition>> {
         self.composition.clone()
     }
+    /// Starts an IME composition with empty preedit text that will replace
+    /// the current selection, unless a composition is already active.
+    ///
+    /// Commands that change the document fail with
+    /// [`Error::CompositionActive`] until the composition is committed or
+    /// canceled.
     pub fn begin_composition(&mut self) {
         self.normalize_history();
         self.active_composition_mut();
@@ -38,6 +57,17 @@ impl Editor {
         })
     }
 
+    /// Sets the preedit text and the input method's selection in it, first
+    /// [beginning a composition](Editor::begin_composition) if none is active.
+    ///
+    /// The document does not change. An update equal to the current preedit
+    /// keeps the existing [`Composition`] snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCompositionSelection`] if `selection` is
+    /// reversed, ends past `text`, or splits a UTF-8 character. The composition
+    /// stays as it was.
     pub fn update_composition(
         &mut self,
         text: &str,
@@ -72,6 +102,20 @@ impl Editor {
         Ok(())
     }
 
+    /// Ends the composition and replaces its replacement selection with
+    /// `text`, as typing does; without a composition, replaces the current
+    /// selection.
+    ///
+    /// The committed text may differ from the last preedit. Commits without
+    /// paragraph breaks join adjacent typing in one undo step, so
+    /// syllable-by-syllable input undoes at once. An empty commit deletes the
+    /// replacement selection.
+    ///
+    /// # Errors
+    ///
+    /// This does not fail in practice: the replacement selection stays valid
+    /// because commands that would change the document are rejected during a
+    /// composition.
     pub fn commit_composition(&mut self, text: &str) -> Result<(), Error> {
         self.normalize_history();
         if let Some(composition) = self.composition.take() {
@@ -80,6 +124,10 @@ impl Editor {
         self.replace_selection(text, typing_group(text))
     }
 
+    /// Discards the composition, restores the selection from before it
+    /// began, and returns whether a composition was active.
+    ///
+    /// Ends the current undo group when a composition was active.
     pub fn cancel_composition(&mut self) -> bool {
         self.normalize_history();
         if let Some(composition) = self.composition.take() {
