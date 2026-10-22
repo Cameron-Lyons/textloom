@@ -6,7 +6,9 @@
 //! VM's state directory, with screenshots per check.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, SeekFrom};
+use std::num::ParseIntError;
+use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -17,10 +19,12 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
+use crate::cli::Arguments;
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
 use crate::winvm::{Elevation, Qmp, ScreenSize, Vm};
-use crate::{Result, ResultExt, repo_root};
+use crate::{Result, ResultExt};
 
+/// The `winvm-checks` help text.
 pub const USAGE: &str = "\
 usage: winvm-checks build                  cross-compile the host, the winit harness, and the report validator for x86_64-pc-windows-gnu
        winvm-checks deploy                 copy them and the guest helpers into the VM
@@ -38,7 +42,7 @@ const TEXT_FIELDS: [&str; 3] = ["Document", "Find", "Replace"];
 /// The taskbar along the bottom of the 1280x800 screen.
 const TASKBAR: Rect = [0, 752, 1280, 48];
 
-/// x, y, width, height in screen pixels.
+/// A rectangle on the guest screen: `[x, y, width, height]` in pixels.
 pub type Rect = [i64; 4];
 
 fn sleep(seconds: f64) {
@@ -46,21 +50,21 @@ fn sleep(seconds: f64) {
 }
 
 fn host_exe() -> PathBuf {
-    repo_root()
+    crate::repo_root()
         .join("target")
         .join(TARGET)
         .join("release/textloom-native-example.exe")
 }
 
 fn winit_exe() -> PathBuf {
-    repo_root()
+    crate::repo_root()
         .join("target/winit-harness")
         .join(TARGET)
         .join("release/tlqa-winit-harness.exe")
 }
 
 fn validator_exe() -> PathBuf {
-    repo_root()
+    crate::repo_root()
         .join("target/qa-tools")
         .join(TARGET)
         .join("release/check-native-report.exe")
@@ -69,7 +73,7 @@ fn validator_exe() -> PathBuf {
 fn git_revision() -> Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(repo_root())
+        .current_dir(crate::repo_root())
         .output()?;
     if !output.status.success() {
         return Err("git rev-parse HEAD failed".into());
@@ -110,11 +114,13 @@ fn cargo_build(
 // ---------------------------------------------------------------------------- text offsets
 
 /// The UTF-16 offset UI Automation uses for a character index.
+#[must_use]
 pub fn utf16(text: &str, index: usize) -> usize {
     text.chars().take(index).map(char::len_utf16).sum()
 }
 
 /// The character index of a UTF-16 offset.
+#[must_use]
 pub fn codepoints(text: &str, offset: usize) -> usize {
     let mut units = 0;
     for (index, character) in text.chars().enumerate() {
@@ -200,17 +206,21 @@ enum Caret {
     End,
 }
 
+/// The VM the checks run in, and the directory their results go to.
+#[derive(Debug)]
 pub struct Checks {
     vm: Vm,
-    out: PathBuf,
+    output: PathBuf,
 }
 
 impl Checks {
+    /// The VM from [`Vm::from_env`], with results in `TLQA_WINDOWS_OUT` or in
+    /// the VM's `results` directory.
     pub fn from_env() -> Self {
         let vm = Vm::from_env();
-        let out =
+        let output =
             env::var_os("TLQA_WINDOWS_OUT").map_or_else(|| vm.state.join("results"), PathBuf::from);
-        Self { vm, out }
+        Self { vm, output }
     }
 
     /// Runs PowerShell with qa.ps1 loaded; returns the JSON from its last JSON line.
@@ -237,15 +247,15 @@ impl Checks {
     }
 
     /// Runs one check's session: a host started in the VM, input through QMP,
-    /// screenshots under OUT/<name>.
+    /// screenshots under `OUT/<name>`.
     fn session<T>(&self, name: &str, body: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
-        let out = self.out.join(name);
-        fs::create_dir_all(&out).context(out.display())?;
+        let output = self.output.join(name);
+        fs::create_dir_all(&output).context(output.display())?;
         let mut monitor = self.vm.qmp(30.0)?;
         let size = monitor.size()?;
         let mut session = Session {
-            c: self,
-            out,
+            checks: self,
+            output,
             monitor,
             size,
         };
@@ -258,8 +268,8 @@ impl Checks {
     }
 
     fn record(&self, name: &str, result: &Value) -> Result<()> {
-        fs::create_dir_all(&self.out)?;
-        let path = self.out.join("results.json");
+        fs::create_dir_all(&self.output)?;
+        let path = self.output.join("results.json");
         let mut results: Map<String, Value> = match fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
@@ -274,16 +284,18 @@ impl Checks {
     }
 }
 
-struct Session<'c> {
-    c: &'c Checks,
-    out: PathBuf,
+/// One check's session: the checks' VM, a QMP connection, and a directory for
+/// the check's screenshots.
+struct Session<'checks> {
+    checks: &'checks Checks,
+    output: PathBuf,
     monitor: Qmp,
     size: ScreenSize,
 }
 
-impl<'c> Session<'c> {
+impl<'checks> Session<'checks> {
     fn guest(&self, script: &str) -> Result<Value> {
-        self.c.guest(script)
+        self.checks.guest(script)
     }
 
     fn start(&mut self, arguments: &[&str]) -> Result<i64> {
@@ -303,7 +315,7 @@ impl<'c> Session<'c> {
         Ok(pid)
     }
 
-    fn winit(&mut self, arguments: &[&str]) -> Result<Winit<'c>> {
+    fn winit(&mut self, arguments: &[&str]) -> Result<Winit<'checks>> {
         self.monitor.chord("esc")?;
         let quoted: Vec<String> = arguments
             .iter()
@@ -315,7 +327,10 @@ impl<'c> Session<'c> {
         ))?;
         let origin = field(&started, "origin")?;
         sleep(1.0);
-        Ok(Winit { c: self.c, origin })
+        Ok(Winit {
+            checks: self.checks,
+            origin,
+        })
     }
 
     fn running(&self) -> Result<bool> {
@@ -372,6 +387,9 @@ impl<'c> Session<'c> {
         )
     }
 
+    /// Clicks the element named `name` of UI Automation control type `kind` (by
+    /// default, an Edit for the text fields), at `offset` from its top-left
+    /// corner or at its center.
     fn click_element(&mut self, name: &str, offset: Option<(i64, i64)>, kind: &str) -> Result<()> {
         let kind = if kind.is_empty() && TEXT_FIELDS.contains(&name) {
             "Edit"
@@ -432,14 +450,16 @@ impl<'c> Session<'c> {
             .any(|text| text == "IME composing"))
     }
 
-    /// Selects the nth occurrence of `find`, or puts the caret at its start or end.
+    /// Selects occurrence number `occurrence` (counting from 1) of `needle` in
+    /// the text field `field`, or puts the caret at its start or end; returns
+    /// the selection's character range.
     fn select_in(
         &self,
         needle: &str,
         occurrence: usize,
         caret: Option<Caret>,
         field: &str,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<Range<usize>> {
         let text = self.state_of(field)?.text;
         let mut start = None;
         for _ in 0..occurrence {
@@ -462,10 +482,10 @@ impl<'c> Session<'c> {
             utf16(&text, end)
         ))?;
         sleep(0.3);
-        Ok((start, end))
+        Ok(start..end)
     }
 
-    fn select(&self, needle: &str, caret: Option<Caret>) -> Result<(usize, usize)> {
+    fn select(&self, needle: &str, caret: Option<Caret>) -> Result<Range<usize>> {
         self.select_in(needle, 1, caret, "Document")
     }
 
@@ -500,7 +520,7 @@ impl<'c> Session<'c> {
     }
 
     fn screenshot(&mut self, label: &str) -> Result<PathBuf> {
-        let path = self.out.join(format!("{label}.png"));
+        let path = self.output.join(format!("{label}.png"));
         self.monitor.screenshot(&path)
     }
 }
@@ -516,15 +536,17 @@ fn listed(value: Value) -> Vec<Value> {
 
 /// The winit harness: one editor through textloom's winit adapter, drawn as
 /// 10x24 px cells from (20, 20) in its client area, logging JSON events.
-struct Winit<'c> {
-    c: &'c Checks,
+struct Winit<'checks> {
+    checks: &'checks Checks,
+    /// The screen position of the top-left corner of the harness window's
+    /// client area, as `[x, y]`.
     origin: [i64; 2],
 }
 
 impl Winit<'_> {
     fn events(&self, after: i64) -> Result<Vec<Value>> {
         field(
-            &self.c.guest(&format!(
+            &self.checks.guest(&format!(
                 "Out-Json @{{ events = @(Get-WinitEvents {after}) }}"
             ))?,
             "events",
@@ -548,7 +570,8 @@ impl Winit<'_> {
             .find(|event| event["event"] == kind))
     }
 
-    fn seq(&self) -> Result<i64> {
+    /// The sequence number of the harness's latest event, or 0.
+    fn last_sequence(&self) -> Result<i64> {
         Ok(self
             .events(0)?
             .last()
@@ -558,22 +581,16 @@ impl Winit<'_> {
 
     /// Screen rectangle of a cell, in physical pixels at 100% scale.
     fn cell(&self, line: i64, column: i64) -> Rect {
-        [
-            self.origin[0] + 20 + column * 10,
-            self.origin[1] + 20 + line * 24,
-            10,
-            24,
-        ]
+        let [x, y] = self.origin;
+        [x + 20 + column * 10, y + 20 + line * 24, 10, 24]
     }
 
-    fn focus(&self, s: &mut Session) -> Result<()> {
+    fn focus(&self, session: &mut Session) -> Result<()> {
         // Below the text, so the click only focuses the window.
-        s.monitor.click(
-            self.origin[0] + 400,
-            self.origin[1] + 300,
-            "left",
-            Some(s.size),
-        )?;
+        let [x, y] = self.origin;
+        session
+            .monitor
+            .click(x + 400, y + 300, "left", Some(session.size))?;
         sleep(0.8);
         Ok(())
     }
@@ -582,7 +599,7 @@ impl Winit<'_> {
 // ---------------------------------------------------------------------------- setup commands
 
 fn build() -> Result<()> {
-    let root = repo_root();
+    let root = crate::repo_root();
     let revision = git_revision()?;
     let target = root.join("target");
     cargo_build(
@@ -610,7 +627,7 @@ fn build() -> Result<()> {
     Ok(())
 }
 
-fn deploy(c: &Checks) -> Result<()> {
+fn deploy(checks: &Checks) -> Result<()> {
     for path in [host_exe(), winit_exe(), validator_exe()] {
         if !path.exists() {
             return Err(format!(
@@ -624,11 +641,11 @@ fn deploy(c: &Checks) -> Result<()> {
         host_exe(),
         winit_exe(),
         validator_exe(),
-        repo_root().join("scripts/windows-vm/guest/qa.ps1"),
+        crate::repo_root().join("scripts/windows-vm/guest/qa.ps1"),
     ] {
-        c.vm.share(&path, None)?;
+        checks.vm.share(&path, None)?;
     }
-    let result = c.vm.run(
+    let result = checks.vm.run(
         "$ErrorActionPreference = 'Stop'\n\
          New-Item -ItemType Directory -Force C:\\textloom-qa\\host, C:\\textloom-qa\\winit | Out-Null\n\
          Get-Process textloom-native-example, tlqa-winit-harness -ErrorAction SilentlyContinue | Stop-Process -Force\n\
@@ -662,21 +679,21 @@ fn pretty(value: &Value) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn explore(c: &Checks) -> Result<()> {
-    c.session("explore", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        s.screenshot("start")?;
-        println!("{}", pretty(&s.guest("Out-Json (Get-Tree 6)")?)?);
-        let state = s.state()?;
+fn explore(checks: &Checks) -> Result<()> {
+    checks.session("explore", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        session.screenshot("start")?;
+        println!("{}", pretty(&session.guest("Out-Json (Get-Tree 6)")?)?);
+        let state = session.state()?;
         println!(
             "{}",
             json!({"text": state.text, "selection": state.selection, "focused": state.focused,
                                "caret_box": state.caret_box, "rect": state.rect})
         );
-        println!("{}", Value::Array(s.kinds()?));
-        println!("{}", s.status()?);
-        println!("{}", s.toplevels()?);
+        println!("{}", Value::Array(session.kinds()?));
+        println!("{}", session.status()?);
+        println!("{}", session.toplevels()?);
         Ok(())
     })
 }
@@ -689,7 +706,7 @@ fn all_true(expectations: &Value) -> bool {
         .is_some_and(|map| map.values().all(|value| value == true))
 }
 
-fn renderer_smoke(c: &Checks) -> Result<Value> {
+fn renderer_smoke(checks: &Checks) -> Result<Value> {
     let revision = git_revision()?;
     let mut observed = Map::new();
     for mode in Mode::ALL {
@@ -701,7 +718,7 @@ fn renderer_smoke(c: &Checks) -> Result<Value> {
         };
         let report = format!("C:\\textloom-qa\\smoke-{name}.json");
         // The host refuses to replace an existing report.
-        let result = c.guest(&format!(
+        let result = checks.guest(&format!(
             r#"$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"; $env:GALLIUM_DRIVER = 'llvmpipe'
 $env:GLUTIN_WGL_OPENGL_DLL = 'C:\textloom-qa\host\opengl32.dll'
 Remove-Item -LiteralPath {report} -ErrorAction SilentlyContinue
@@ -717,8 +734,10 @@ Out-Json @{{ exit = $LASTEXITCODE; output = ($out -join "`n") }}"#
             interaction: false,
             clipboard: Clipboard::Rich,
         };
-        let validation =
-            native_report::check_file(&c.vm.inbox().join(format!("smoke-{name}.json")), &expected);
+        let validation = native_report::check_file(
+            &checks.vm.inbox().join(format!("smoke-{name}.json")),
+            &expected,
+        );
         let message = match &validation {
             Ok(_) => expected.summary(),
             Err(error) => format!("Native report validation failed: {error}"),
@@ -744,50 +763,57 @@ Out-Json @{{ exit = $LASTEXITCODE; output = ($out -join "`n") }}"#
 }
 
 /// Presses undo until the document text is `text`; returns the number of presses.
-fn undo_until(s: &mut Session, text: &str, chord: &str, limit: usize) -> Result<Option<usize>> {
-    let mut current = s.state()?.text;
+fn undo_until(
+    session: &mut Session,
+    text: &str,
+    chord: &str,
+    limit: usize,
+) -> Result<Option<usize>> {
+    let mut current = session.state()?.text;
     for steps in 0..=limit {
         if current == text {
             return Ok(Some(steps));
         }
-        s.keys(&[chord])?;
+        session.keys(&[chord])?;
         let previous = current;
-        current = s.wait_state(3.0, |state| state.text != previous)?.text;
+        current = session
+            .wait_state(3.0, |state| state.text != previous)?
+            .text;
     }
     Ok(None)
 }
 
-fn german_dead_keys_and_altgr(c: &Checks) -> Result<Value> {
-    c.session("german", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        s.select("writing", Some(Caret::Start))?;
-        let before = s.state()?;
-        let offset = before.selection()?[0];
-        let layout = s.input_method("de-DE")?;
+fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
+    checks.session("german", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        session.select("writing", Some(Caret::Start))?;
+        let before = session.state()?;
+        let [offset, _] = before.selection()?;
+        let layout = session.input_method("de-DE")?;
         // ´ is a dead key at the US = position. winit 0.30 loses the first dead key
         // after a layout switch (it prepares the new layout on that key press and
         // consumes the key's state; see RELEASING.md), so that is recorded but not
         // required here.
-        s.keys(&["equal", "e"])?;
-        let first = slice(&s.wait(|state| state.text != before.text)?.text, offset, offset + 1);
+        session.keys(&["equal", "e"])?;
+        let first = slice(&session.wait(|state| state.text != before.text)?.text, offset, offset + 1);
         let at = utf16(&before.text, offset);
-        s.guest(&format!("Select-HostRange {at} {}; Out-Json @{{}}", at + 1))?;
-        s.keys(&["equal", "e"])?;
-        let after_dead = s.wait(|state| slice(&state.text, offset, offset + 1) != first || first == "é")?;
-        s.keys(&["alt_r+q", "alt_r+e"])?;
-        let after_altgr = s.wait(|state| length(&state.text) >= length(&after_dead.text) + 2)?;
-        s.screenshot("typed")?;
+        session.guest(&format!("Select-HostRange {at} {}; Out-Json @{{}}", at + 1))?;
+        session.keys(&["equal", "e"])?;
+        let after_dead = session.wait(|state| slice(&state.text, offset, offset + 1) != first || first == "é")?;
+        session.keys(&["alt_r+q", "alt_r+e"])?;
+        let after_altgr = session.wait(|state| length(&state.text) >= length(&after_dead.text) + 2)?;
+        session.screenshot("typed")?;
         // QWERTZ: the physical Y key is Z, and Latin logical keys select shortcuts.
-        let undo_steps = undo_until(s, &before.text, "ctrl+y", 6)?;
-        let restored = s.state()?;
+        let undo_steps = undo_until(session, &before.text, "ctrl+y", 6)?;
+        let restored = session.state()?;
         // Windows also accepts Ctrl+Alt for AltGr. egui-winit drops typed text while
         // Ctrl is held, so egui never types it, and egui's default quit shortcut,
         // Ctrl+Q matched ignoring Alt, takes this chord and closes the window.
-        s.keys(&["ctrl+alt+q"])?;
+        session.keys(&["ctrl+alt+q"])?;
         sleep(1.0);
-        let survived = s.running()?;
-        let after_ctrl_alt = if survived { Some(s.state()?) } else { None };
+        let survived = session.running()?;
+        let after_ctrl_alt = if survived { Some(session.state()?) } else { None };
         let expectations = json!({
             "the German layout is active": layout.ends_with("0407"),
             "dead acute + e types é": slice(&after_dead.text, offset, offset + 1) == "é"
@@ -807,27 +833,28 @@ fn german_dead_keys_and_altgr(c: &Checks) -> Result<Value> {
     })
 }
 
+/// A guest script that prints the clipboard's text.
 const CLIPBOARD: &str = "Out-Json @{ text = (Get-Clipboard -Raw) }";
 
-fn windows_clipboard_keys(c: &Checks) -> Result<Value> {
-    c.session("clipboard-keys", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        s.select("format", None)?;
-        let before = s.state()?;
+fn windows_clipboard_keys(checks: &Checks) -> Result<Value> {
+    checks.session("clipboard-keys", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        session.select("format", None)?;
+        let before = session.state()?;
         let [start, end] = before.selection()?;
-        s.keys(&["ctrl+insert"])?;
+        session.keys(&["ctrl+insert"])?;
         sleep(0.5);
-        let copied = take(s.guest(CLIPBOARD)?, "text");
-        s.keys(&["shift+delete"])?;
-        let after_cut = s.wait(|state| state.text != before.text)?;
-        let cut = take(s.guest(CLIPBOARD)?, "text");
-        s.keys(&["shift+insert"])?;
-        let after_paste = s.wait(|state| state.text != after_cut.text)?;
-        s.keys(&["ctrl+z"])?;
-        let undo_paste = s.wait(|state| state.text != after_paste.text)?.text;
-        s.keys(&["ctrl+z"])?;
-        let undo_cut = s.wait(|state| state.text != undo_paste)?.text;
+        let copied = take(session.guest(CLIPBOARD)?, "text");
+        session.keys(&["shift+delete"])?;
+        let after_cut = session.wait(|state| state.text != before.text)?;
+        let cut = take(session.guest(CLIPBOARD)?, "text");
+        session.keys(&["shift+insert"])?;
+        let after_paste = session.wait(|state| state.text != after_cut.text)?;
+        session.keys(&["ctrl+z"])?;
+        let undo_paste = session.wait(|state| state.text != after_paste.text)?.text;
+        session.keys(&["ctrl+z"])?;
+        let undo_cut = session.wait(|state| state.text != undo_paste)?.text;
         let expectations = json!({
             "Ctrl+Insert copies the selection": copied == "format",
             "Shift+Delete removes the selection":
@@ -846,11 +873,11 @@ fn windows_clipboard_keys(c: &Checks) -> Result<Value> {
     })
 }
 
-fn azerty_digit_row_shortcuts(c: &Checks) -> Result<Value> {
-    c.session("azerty", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        let layout = s.input_method("fr-FR")?;
+fn azerty_digit_row_shortcuts(checks: &Checks) -> Result<Value> {
+    checks.session("azerty", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        let layout = session.input_method("fr-FR")?;
         let mut observed = Map::new();
         for (label, chord) in [
             ("Ctrl+1", "ctrl+1"),
@@ -860,16 +887,16 @@ fn azerty_digit_row_shortcuts(c: &Checks) -> Result<Value> {
             ("Ctrl+Shift+7", "ctrl+shift+7"),
             ("Ctrl+Shift+8", "ctrl+shift+8"),
         ] {
-            s.select("Select", Some(Caret::End))?;
-            s.keys(&[chord])?;
+            session.select("Select", Some(Caret::End))?;
+            session.keys(&[chord])?;
             sleep(0.8);
-            observed.insert(label.to_owned(), s.paragraph_style()?);
+            observed.insert(label.to_owned(), session.paragraph_style()?);
         }
-        let (start, _) = s.select("Select", Some(Caret::Start))?;
-        let before = s.state()?;
-        s.keys(&["1", "2"])?;
-        let typed = slice(&s.wait(|state| length(&state.text) >= length(&before.text) + 2)?.text, start, start + 2);
-        let style = |label: &str| observed[label].clone();
+        let start = session.select("Select", Some(Caret::Start))?.start;
+        let before = session.state()?;
+        session.keys(&["1", "2"])?;
+        let typed = slice(&session.wait(|state| length(&state.text) >= length(&before.text) + 2)?.text, start, start + 2);
+        let style = |label: &str| observed.get(label).cloned().unwrap_or_default();
         let expectations = json!({
             "the French layout is active": layout.ends_with("040C"),
             "Ctrl+physical 1 makes Heading 1": style("Ctrl+1") == "Heading 1",
@@ -925,21 +952,21 @@ pub fn popup_rect(before: &Path, after: &Path, ignore: &[Rect]) -> Result<Option
     if !output.status.success() {
         return Err(format!("magick failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
-    let mut bounds: Option<[i64; 4]> = None;
+    let mut bounds: Option<Rect> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 5
-            || !(fields[4].starts_with("gray(255") || fields[4].starts_with("graya(255"))
-        {
+        // An object line: its ID, WxH+X+Y geometry, centroid, area, and color.
+        let [_, geometry, _, _, color, ..] = fields[..] else {
+            continue;
+        };
+        if !(color.starts_with("gray(255") || color.starts_with("graya(255")) {
             continue;
         }
-        let numbers: Vec<i64> = fields[1]
-            .split(['x', '+'])
-            .map(str::parse)
-            .collect::<std::result::Result<_, _>>()
-            .context(fields[1])?;
+        let numbers: Result<Vec<i64>, ParseIntError> =
+            geometry.split(['x', '+']).map(str::parse).collect();
+        let numbers = numbers.context(geometry)?;
         let [width, height, x, y] =
-            <[i64; 4]>::try_from(numbers).map_err(|_| format!("bad geometry {}", fields[1]))?;
+            <[i64; 4]>::try_from(numbers).map_err(|_| format!("bad geometry {geometry}"))?;
         let [left, top, right, bottom] = bounds.unwrap_or([x, y, x + width, y + height]);
         bounds = Some([
             left.min(x),
@@ -952,13 +979,14 @@ pub fn popup_rect(before: &Path, after: &Path, ignore: &[Rect]) -> Result<Option
 }
 
 /// The full-width row of a text line, which changes as a composition is typed.
-fn line_band(s: &Session, line: Option<Rect>) -> Result<Rect> {
-    let [x, _, width, _] = s.window_rect()?;
+fn line_band(session: &Session, line: Option<Rect>) -> Result<Rect> {
+    let [x, _, width, _] = session.window_rect()?;
     let [_, y, _, height] = line.ok_or("the caret has no box")?;
     Ok([x, y - 4, width, height + 8])
 }
 
 /// A panel starts near the composition and sits just below or above its line without covering it.
+#[must_use]
 pub fn beside(panel: Option<Rect>, line: Option<Rect>) -> bool {
     let (Some([x, y, _, height]), Some([line_x, line_y, _, line_height])) = (panel, line) else {
         return false;
@@ -969,16 +997,19 @@ pub fn beside(panel: Option<Rect>, line: Option<Rect>) -> bool {
     (line_x - slack..=line_x + slack).contains(&x) && (below || above)
 }
 
+/// A panel lies wholly on the 1280x800 screen, above the taskbar.
+#[must_use]
 pub fn on_screen(panel: Option<Rect>) -> bool {
+    let [_, taskbar_top, _, _] = TASKBAR;
     panel.is_some_and(|[x, y, width, height]| {
-        x >= 0 && y >= 0 && x + width <= 1280 && y + height <= TASKBAR[1]
+        x >= 0 && y >= 0 && x + width <= 1280 && y + height <= taskbar_top
     })
 }
 
-fn wait_composing(s: &Session, composing: bool, timeout: f64) -> Result<bool> {
+fn wait_composing(session: &Session, composing: bool, timeout: f64) -> Result<bool> {
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     loop {
-        let state = s.composing()?;
+        let state = session.composing()?;
         if state == composing || Instant::now() > deadline {
             return Ok(state);
         }
@@ -989,71 +1020,71 @@ fn wait_composing(s: &Session, composing: bool, timeout: f64) -> Result<bool> {
 /// Switches to an IME and makes sure it composes: a probe key either composes
 /// (then Escape cancels it) or types a letter (then Backspace removes it and
 /// `toggle` switches the IME's input mode).
-fn ime_on(s: &mut Session, language: &str, toggle: &str) -> Result<String> {
-    let layout = s.input_method(language)?;
+fn ime_on(session: &mut Session, language: &str, toggle: &str) -> Result<String> {
+    let layout = session.input_method(language)?;
     for _ in 0..3 {
-        s.keys(&["n"])?;
-        if wait_composing(s, true, 2.0)? {
-            s.keys(&["esc"])?;
-            wait_composing(s, false, 4.0)?;
+        session.keys(&["n"])?;
+        if wait_composing(session, true, 2.0)? {
+            session.keys(&["esc"])?;
+            wait_composing(session, false, 4.0)?;
             return Ok(layout);
         }
-        s.keys(&["backspace"])?;
+        session.keys(&["backspace"])?;
         sleep(0.4);
-        s.keys(&[toggle])?;
+        session.keys(&[toggle])?;
         sleep(0.8);
     }
     Err(format!("the {language} IME did not start composing").into())
 }
 
-fn japanese_on(s: &mut Session) -> Result<String> {
+fn japanese_on(session: &mut Session) -> Result<String> {
     // Alt+` turns the Microsoft Japanese IME's kana input on and off on a US keyboard.
-    ime_on(s, "ja-JP", "alt+grave_accent")
+    ime_on(session, "ja-JP", "alt+grave_accent")
 }
 
-fn pinyin_on(s: &mut Session) -> Result<String> {
+fn pinyin_on(session: &mut Session) -> Result<String> {
     // Shift switches Microsoft Pinyin between Chinese and English input.
-    ime_on(s, "zh-CN", "shift")
+    ime_on(session, "zh-CN", "shift")
 }
 
 /// Converts the typed reading, opens the candidate list, and returns its box.
-fn open_candidates(s: &mut Session, ignore: &[Rect]) -> Result<Option<Rect>> {
-    s.keys(&["spc"])?;
+fn open_candidates(session: &mut Session, ignore: &[Rect]) -> Result<Option<Rect>> {
+    session.keys(&["spc"])?;
     sleep(1.0);
-    let converted = s.screenshot("converted")?;
-    s.keys(&["spc"])?;
+    let converted = session.screenshot("converted")?;
+    session.keys(&["spc"])?;
     sleep(1.5);
-    let listed = s.screenshot("candidates")?;
+    let listed = session.screenshot("candidates")?;
     popup_rect(&converted, &listed, ignore)
 }
 
-fn japanese_ime_replacement(c: &Checks) -> Result<Value> {
-    c.session("japanese", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        japanese_on(s)?;
-        let (start, end) = s.select("format", None)?;
-        let before = s.state()?;
+fn japanese_ime_replacement(checks: &Checks) -> Result<Value> {
+    checks.session("japanese", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        japanese_on(session)?;
+        let Range { start, end } = session.select("format", None)?;
+        let before = session.state()?;
         let line = before.caret_box;
-        let ignore = [TASKBAR, line_band(s, line)?, s.status_band()?];
-        let base = s.screenshot("base")?;
-        s.type_text("nihongo")?;
-        let composing = wait_composing(s, true, 4.0)?;
-        let during = s.state()?;
-        let preedit = s.screenshot("preedit")?;
+        let ignore = [TASKBAR, line_band(session, line)?, session.status_band()?];
+        let base = session.screenshot("base")?;
+        session.type_text("nihongo")?;
+        let composing = wait_composing(session, true, 4.0)?;
+        let during = session.state()?;
+        let preedit = session.screenshot("preedit")?;
         let suggestions = popup_rect(&base, &preedit, &ignore)?;
-        let candidates = open_candidates(s, &ignore)?;
+        let candidates = open_candidates(session, &ignore)?;
         // The second Space moved to candidate 2; go back to the first and commit it.
-        s.keys(&["up"])?;
+        session.keys(&["up"])?;
         sleep(0.5);
-        s.keys(&["ret"])?;
-        let committed = s.wait(|state| state.text != before.text)?;
-        let still_composing = wait_composing(s, false, 4.0)?;
-        s.keys(&["ctrl+z"])?;
-        let undone = s.wait(|state| state.text == before.text)?;
-        s.keys(&["ctrl+y"])?;
-        let redone = s.wait(|state| state.text != before.text)?;
-        let expected = slice(&before.text, 0, start) + "日本語" + &from(&before.text, end);
+        session.keys(&["ret"])?;
+        let committed = session.wait(|state| state.text != before.text)?;
+        let still_composing = wait_composing(session, false, 4.0)?;
+        session.keys(&["ctrl+z"])?;
+        let undone = session.wait(|state| state.text == before.text)?;
+        session.keys(&["ctrl+y"])?;
+        let redone = session.wait(|state| state.text != before.text)?;
+        let expected = format!("{}日本語{}", slice(&before.text, 0, start), from(&before.text, end));
         let expectations = json!({
             "typing composes": composing,
             "the suggestion list opens beside the composition": beside(suggestions, line),
@@ -1075,27 +1106,27 @@ fn japanese_ime_replacement(c: &Checks) -> Result<Value> {
     })
 }
 
-fn chinese_pinyin(c: &Checks) -> Result<Value> {
-    c.session("pinyin", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        pinyin_on(s)?;
-        let (start, _) = s.select("writing", Some(Caret::Start))?;
-        let before = s.state()?;
+fn chinese_pinyin(checks: &Checks) -> Result<Value> {
+    checks.session("pinyin", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        pinyin_on(session)?;
+        let start = session.select("writing", Some(Caret::Start))?.start;
+        let before = session.state()?;
         let line = before.caret_box;
-        let ignore = [TASKBAR, line_band(s, line)?, s.status_band()?];
-        let base = s.screenshot("base")?;
-        s.type_text("nihao")?;
-        let composing = wait_composing(s, true, 4.0)?;
+        let ignore = [TASKBAR, line_band(session, line)?, session.status_band()?];
+        let base = session.screenshot("base")?;
+        session.type_text("nihao")?;
+        let composing = wait_composing(session, true, 4.0)?;
         sleep(0.8);
-        let listed = s.screenshot("candidates")?;
+        let listed = session.screenshot("candidates")?;
         let candidates = popup_rect(&base, &listed, &ignore)?;
-        s.keys(&["spc"])?;
-        let committed = s.wait(|state| state.text != before.text)?;
-        let still_composing = wait_composing(s, false, 4.0)?;
-        s.keys(&["ctrl+z"])?;
-        let undone = s.wait(|state| state.text == before.text)?;
-        let expected = slice(&before.text, 0, start) + "你好" + &from(&before.text, start);
+        session.keys(&["spc"])?;
+        let committed = session.wait(|state| state.text != before.text)?;
+        let still_composing = wait_composing(session, false, 4.0)?;
+        session.keys(&["ctrl+z"])?;
+        let undone = session.wait(|state| state.text == before.text)?;
+        let expected = format!("{}你好{}", slice(&before.text, 0, start), from(&before.text, start));
         let expectations = json!({
             "typing composes": composing,
             "the candidate list opens beside the composition": beside(candidates, line),
@@ -1111,44 +1142,44 @@ fn chinese_pinyin(c: &Checks) -> Result<Value> {
     })
 }
 
-fn ime_commit_once(c: &Checks) -> Result<Value> {
+fn ime_commit_once(checks: &Checks) -> Result<Value> {
     let scenarios = ["click in the document", "click in Find", "Escape"];
     let mut outcomes = Map::new();
-    c.session("commit-once", |s| {
+    checks.session("commit-once", |session| {
         for scenario in scenarios {
-            s.start(&[])?;
-            s.focus_document()?;
-            japanese_on(s)?;
-            let (start, _) = s.select("writing", Some(Caret::Start))?;
-            let before = s.state()?;
-            s.type_text("nihongo")?;
-            let composing = wait_composing(s, true, 4.0)?;
+            session.start(&[])?;
+            session.focus_document()?;
+            japanese_on(session)?;
+            let start = session.select("writing", Some(Caret::Start))?.start;
+            let before = session.state()?;
+            session.type_text("nihongo")?;
+            let composing = wait_composing(session, true, 4.0)?;
             match scenario {
                 "click in the document" => {
                     let [_, _, width, height] = before.rect.ok_or("the document has no bounds")?;
-                    s.click_element("Document", Some((width / 2, height - 30)), "")?;
+                    session.click_element("Document", Some((width / 2, height - 30)), "")?;
                 }
-                "click in Find" => s.click_element("Find", None, "")?,
-                _ => s.keys(&["esc"])?,
+                "click in Find" => session.click_element("Find", None, "")?,
+                _ => session.keys(&["esc"])?,
             }
             sleep(1.2);
-            let after = s.state()?;
-            s.screenshot(&scenario.replace(' ', "-"))?;
+            let after = session.state()?;
+            session.screenshot(&scenario.replace(' ', "-"))?;
             let count = |text: &str| text.matches("にほんご").count() as i64;
             let mut outcome = json!({
                 "composing before": composing,
                 "insertions": count(&after.text) - count(&before.text),
                 "at the original caret": slice(&after.text, start, start + 4) == "にほんご",
-                "still composing": s.composing()?,
+                "still composing": session.composing()?,
             });
             if scenario == "click in Find" {
-                outcome["Find text"] = s.state_of("Find")?.text.into();
+                outcome["Find text"] = session.state_of("Find")?.text.into();
             }
             outcomes.insert(scenario.to_owned(), outcome);
         }
         Ok(())
     })?;
-    let [document, find, escape] = scenarios.map(|name| &outcomes[name]);
+    let [document, find, escape] = scenarios.map(|name| outcomes.get(name).unwrap_or(&Value::Null));
     let expectations = json!({
         "every scenario composed": outcomes.values().all(|outcome| outcome["composing before"] == true),
         "a click in the document commits the preedit once where it was typed":
@@ -1163,37 +1194,40 @@ fn ime_commit_once(c: &Checks) -> Result<Value> {
     )
 }
 
-fn ime_long_document(c: &Checks) -> Result<Value> {
-    c.session("long-document", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        s.guest(r#"Set-Clipboard -Value ((1..300 | ForEach-Object { "Line $_ of a long document" }) -join "`r`n"); Out-Json @{}"#)?;
-        let original = s.state()?.text;
-        s.keys(&["ctrl+end", "ret", "ctrl+v"])?;
-        let pasted = s.wait_state(15.0, |state| state.text.contains("Line 300 of a long document"))?;
-        s.keys(&["ctrl+end"])?;
+fn ime_long_document(checks: &Checks) -> Result<Value> {
+    checks.session("long-document", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        session.guest(r#"Set-Clipboard -Value ((1..300 | ForEach-Object { "Line $_ of a long document" }) -join "`r`n"); Out-Json @{}"#)?;
+        let original = session.state()?.text;
+        session.keys(&["ctrl+end", "ret", "ctrl+v"])?;
+        let pasted = session.wait_state(15.0, |state| state.text.contains("Line 300 of a long document"))?;
+        session.keys(&["ctrl+end"])?;
         sleep(1.0);
-        japanese_on(s)?;
-        let before = s.state()?;
+        japanese_on(session)?;
+        let before = session.state()?;
         let line = before.caret_box;
         // The document element spans all 300 lines; the visible part lies between
         // its label and the bottom of the window.
-        let window = s.window_rect()?;
-        let label = s.rect("Document", "Text")?;
-        let label_bottom = label[1] + label[3];
-        let visible = [window[0], label_bottom, window[2], (window[1] + window[3]).min(TASKBAR[1]) - label_bottom];
-        let ignore = [TASKBAR, line_band(s, line)?, s.status_band()?];
-        s.type_text("nihongo")?;
-        let composing = wait_composing(s, true, 4.0)?;
-        let candidates = open_candidates(s, &ignore)?;
-        s.keys(&["up"])?;
+        let [window_x, window_y, window_width, window_height] = session.window_rect()?;
+        let [_, label_y, _, label_height] = session.rect("Document", "Text")?;
+        let label_bottom = label_y + label_height;
+        let [_, taskbar_top, _, _] = TASKBAR;
+        let window_bottom = (window_y + window_height).min(taskbar_top);
+        let visible = [window_x, label_bottom, window_width, window_bottom - label_bottom];
+        let [_, visible_top, _, visible_height] = visible;
+        let ignore = [TASKBAR, line_band(session, line)?, session.status_band()?];
+        session.type_text("nihongo")?;
+        let composing = wait_composing(session, true, 4.0)?;
+        let candidates = open_candidates(session, &ignore)?;
+        session.keys(&["up"])?;
         sleep(0.5);
-        s.keys(&["ret"])?;
-        let committed = s.wait(|state| state.text != before.text)?;
+        session.keys(&["ret"])?;
+        let committed = session.wait(|state| state.text != before.text)?;
         let expectations = json!({
             "300 lines were pasted": pasted.text.matches("of a long document").count() == 300 && pasted.text != original,
             "the caret line is visible": line.is_some_and(|[_, y, _, height]| {
-                visible[1] <= y && y + height <= visible[1] + visible[3]
+                visible_top <= y && y + height <= visible_top + visible_height
             }),
             "typing composes": composing,
             "the candidate list opens beside the composition": beside(candidates, line),
@@ -1214,8 +1248,8 @@ fn ime_long_document(c: &Checks) -> Result<Value> {
 /// Windows lets only the foreground process grant that, so a visible helper is
 /// clicked through QMP (real input brings it forward) and then calls
 /// AllowSetForegroundWindow(ASFW_ANY) until it is stopped.
-fn grant_foreground(c: &Checks, monitor: &mut Qmp, size: ScreenSize) -> Result<()> {
-    let helper = c.guest(
+fn grant_foreground(checks: &Checks, monitor: &mut Qmp, size: ScreenSize) -> Result<()> {
+    let helper = checks.guest(
         r#"$code = @'
 Add-Type -Namespace TextloomFocus -Name Native -MemberDefinition '[DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int process);'
 $host.UI.RawUI.WindowTitle = 'Textloom QA focus helper'
@@ -1234,8 +1268,8 @@ Out-Json @{ rect = $window.rect }"#,
     Ok(())
 }
 
-fn stop_foreground_grant(c: &Checks) -> Result<()> {
-    c.guest(
+fn stop_foreground_grant(checks: &Checks) -> Result<()> {
+    checks.guest(
         "Get-Content C:\\textloom-qa\\focus-helper.pid -ErrorAction SilentlyContinue | ForEach-Object { \
          Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; Out-Json @{}",
     )
@@ -1249,27 +1283,27 @@ fn read_json_file(path: &Path) -> Result<Value> {
     )?)
 }
 
-fn nvda_reader_probe(c: &Checks) -> Result<Value> {
+fn nvda_reader_probe(checks: &Checks) -> Result<Value> {
     let revision = git_revision()?;
-    let root = repo_root();
+    let root = crate::repo_root();
     for path in [
         "scripts/native-qa/windows_reader.ps1",
         "scripts/native-qa/nvda/textloomCapture.py",
     ] {
-        c.vm.share(&root.join(path), None)?;
+        checks.vm.share(&root.join(path), None)?;
     }
     for name in ["windows-reader-evidence.json", "windows-reader-native.json"] {
-        let _ = fs::remove_file(c.vm.inbox().join(name));
+        let _ = fs::remove_file(checks.vm.inbox().join(name));
     }
     {
-        let mut monitor = c.vm.qmp(30.0)?;
+        let mut monitor = checks.vm.qmp(30.0)?;
         let size = monitor.size()?;
-        grant_foreground(c, &mut monitor, size)?;
+        grant_foreground(checks, &mut monitor, size)?;
     }
     // The probe runs from a copy of the repository layout it expects: it loads
     // its NVDA plugin from next to itself. It refuses to run outside a
     // disposable CI runner; this VM is restored from a snapshot.
-    let result = c.vm.run(
+    let result = checks.vm.run(
         &format!(
             r#"$root = 'C:\textloom-qa\repo'
 Remove-Item -Recurse -Force $root, C:\textloom-qa\reader -ErrorAction SilentlyContinue
@@ -1290,20 +1324,20 @@ exit $code"#
         Elevation::Standard,
         420,
     );
-    let stopped = stop_foreground_grant(c);
+    let stopped = stop_foreground_grant(checks);
     let result = result?;
     stopped?;
-    let log_directory = c.out.join("nvda-reader-probe");
+    let log_directory = checks.output.join("nvda-reader-probe");
     fs::create_dir_all(&log_directory)?;
     let log = log_directory.join("probe.log");
     fs::write(&log, &result.output)?;
-    let evidence_path = c.vm.inbox().join("windows-reader-evidence.json");
+    let evidence_path = checks.vm.inbox().join("windows-reader-evidence.json");
     let evidence = if evidence_path.exists() {
         read_json_file(&evidence_path)?
     } else {
         json!({})
     };
-    let checks = evidence["checks"].as_object().cloned().unwrap_or_default();
+    let probe_checks = evidence["checks"].as_object().cloned().unwrap_or_default();
     // After NVDA exits, a desktop process can briefly keep NVDA's IAccessible2 proxy
     // loaded, so deleting the probe's temporary NVDA copy fails. That is recorded but
     // does not decide the result, which the evidence written before it does.
@@ -1311,10 +1345,11 @@ exit $code"#
     let expectations = json!({
         "the probe finished": !result.timed_out && (result.exit == 0 || temporary_copy_locked),
         "the probe's evidence says it succeeded": evidence["succeeded"] == true,
-        "all 15 probe checks passed": checks.len() == 15 && checks.values().all(|value| value == true),
+        "all 15 probe checks passed":
+            probe_checks.len() == 15 && probe_checks.values().all(|value| value == true),
         "owned processes were cleaned up": evidence["cleanup_succeeded"] == true,
     });
-    let failed: Vec<&String> = checks
+    let failed: Vec<&String> = probe_checks
         .iter()
         .filter(|(_, value)| *value != true)
         .map(|(name, _)| name)
@@ -1323,35 +1358,35 @@ exit $code"#
         "passed": all_true(&expectations), "expectations": expectations,
         "failed probe checks": failed,
         "temporary NVDA copy left behind": temporary_copy_locked,
-        "probe checks": checks.len(), "log": log,
+        "probe checks": probe_checks.len(), "log": log,
     }))
 }
 
 // ---------------------------------------------------------------------------- winit adapter
 
-fn winit_windows_clipboard_keys(c: &Checks) -> Result<Value> {
-    c.session("winit-clipboard", |s| {
-        let w = s.winit(&[])?;
-        w.focus(s)?;
-        let fixture = text(&w.state()?)?;
-        let start = w.seq()?;
-        s.keys(&["ctrl+a", "ctrl+insert"])?;
+fn winit_windows_clipboard_keys(checks: &Checks) -> Result<Value> {
+    checks.session("winit-clipboard", |session| {
+        let harness = session.winit(&[])?;
+        harness.focus(session)?;
+        let fixture = text(&harness.state()?)?;
+        let start = harness.last_sequence()?;
+        session.keys(&["ctrl+a", "ctrl+insert"])?;
         sleep(1.5);
-        let copy = w.last("clipboard_write", start)?;
-        let copied = s.guest(CLIPBOARD)?["text"].as_str().unwrap_or_default().replace("\r\n", "\n");
-        let start = w.seq()?;
-        s.keys(&["shift+delete"])?;
+        let copy = harness.last("clipboard_write", start)?;
+        let copied = session.guest(CLIPBOARD)?["text"].as_str().unwrap_or_default().replace("\r\n", "\n");
+        let start = harness.last_sequence()?;
+        session.keys(&["shift+delete"])?;
         sleep(1.5);
-        let cut = w.last("clipboard_write", start)?;
-        let after_cut = text(&w.state()?)?;
-        let start = w.seq()?;
-        s.keys(&["shift+insert"])?;
+        let cut = harness.last("clipboard_write", start)?;
+        let after_cut = text(&harness.state()?)?;
+        let start = harness.last_sequence()?;
+        session.keys(&["shift+insert"])?;
         sleep(3.0);
-        let paste = w.last("paste", start)?;
-        let after_paste = text(&w.state()?)?;
-        s.keys(&["ctrl+z"])?;
+        let paste = harness.last("paste", start)?;
+        let after_paste = text(&harness.state()?)?;
+        session.keys(&["ctrl+z"])?;
         sleep(1.0);
-        let undone = text(&w.state()?)?;
+        let undone = text(&harness.state()?)?;
         let wrote = |event: &Option<Value>, action: &str| {
             event.as_ref().is_some_and(|event| event["action"] == action && event["text"] == fixture.as_str())
         };
@@ -1369,48 +1404,48 @@ fn winit_windows_clipboard_keys(c: &Checks) -> Result<Value> {
     })
 }
 
-fn winit_altgr_ctrl_alt(c: &Checks) -> Result<Value> {
-    c.session("winit-altgr", |s| {
-        let w = s.winit(&["--caret-end"])?;
-        w.focus(s)?;
-        let layout = s.input_method("de-DE")?;
-        let before = text(&w.state()?)?;
-        s.keys(&["alt_r+q", "ctrl+alt+q", "alt_r+e"])?;
+fn winit_altgr_ctrl_alt(checks: &Checks) -> Result<Value> {
+    checks.session("winit-altgr", |session| {
+        let harness = session.winit(&["--caret-end"])?;
+        harness.focus(session)?;
+        let layout = session.input_method("de-DE")?;
+        let before = text(&harness.state()?)?;
+        session.keys(&["alt_r+q", "ctrl+alt+q", "alt_r+e"])?;
         sleep(1.0);
-        let after = text(&w.state()?)?;
+        let after = text(&harness.state()?)?;
         let expectations = json!({
             "the German layout is active": layout.ends_with("0407"),
-            "AltGr+Q, Ctrl+Alt+Q, and AltGr+E type @@€": after == before.clone() + "@@€",
+            "AltGr+Q, Ctrl+Alt+Q, and AltGr+E type @@€": after == format!("{before}@@€"),
         });
         Ok(json!({"passed": all_true(&expectations), "expectations": expectations, "typed": from(&after, length(&before))}))
     })
 }
 
-fn winit_russian_shortcuts(c: &Checks) -> Result<Value> {
-    c.session("winit-russian", |s| {
-        let w = s.winit(&["--caret-end"])?;
-        w.focus(s)?;
-        let layout = s.input_method("ru-RU")?;
-        let fixture = text(&w.state()?)?;
-        let start = w.seq()?;
-        s.keys(&["ctrl+a"])?;
+fn winit_russian_shortcuts(checks: &Checks) -> Result<Value> {
+    checks.session("winit-russian", |session| {
+        let harness = session.winit(&["--caret-end"])?;
+        harness.focus(session)?;
+        let layout = session.input_method("ru-RU")?;
+        let fixture = text(&harness.state()?)?;
+        let start = harness.last_sequence()?;
+        session.keys(&["ctrl+a"])?;
         sleep(0.6);
-        let mut selected: Vec<i64> = field(&w.state()?, "selection")?;
+        let mut selected: Vec<i64> = field(&harness.state()?, "selection")?;
         selected.sort_unstable();
-        s.keys(&["ctrl+c"])?;
+        session.keys(&["ctrl+c"])?;
         sleep(1.5);
-        let copy = w.last("clipboard_write", start)?;
-        s.keys(&["ctrl+end"])?;
+        let copy = harness.last("clipboard_write", start)?;
+        session.keys(&["ctrl+end"])?;
         sleep(0.4);
-        s.keys(&["ctrl+v"])?;
+        session.keys(&["ctrl+v"])?;
         sleep(3.0);
-        let pasted = text(&w.state()?)?;
-        s.keys(&["ctrl+z"])?;
+        let pasted = text(&harness.state()?)?;
+        session.keys(&["ctrl+z"])?;
         sleep(1.0);
-        let undone = text(&w.state()?)?;
-        s.keys(&["c"])?;
+        let undone = text(&harness.state()?)?;
+        session.keys(&["c"])?;
         sleep(0.6);
-        let typed = from(&text(&w.state()?)?, length(&undone));
+        let typed = from(&text(&harness.state()?)?, length(&undone));
         let expectations = json!({
             "the Russian layout is active": layout.ends_with("0419"),
             "Ctrl+physical A (ф) selects all": selected == [0, length(&fixture) as i64],
@@ -1423,43 +1458,45 @@ fn winit_russian_shortcuts(c: &Checks) -> Result<Value> {
     })
 }
 
-fn winit_ime_first_composition(c: &Checks) -> Result<Value> {
-    c.session("winit-ime", |s| {
-        let w = s.winit(&["--caret-end"])?;
-        w.focus(s)?;
-        s.input_method("ja-JP")?;
-        let before = w.state()?;
+fn winit_ime_first_composition(checks: &Checks) -> Result<Value> {
+    checks.session("winit-ime", |session| {
+        let harness = session.winit(&["--caret-end"])?;
+        harness.focus(session)?;
+        session.input_method("ja-JP")?;
+        let before = harness.state()?;
         let synced = |events: Vec<Value>| -> Vec<Value> {
             events.into_iter().filter(|event| event["event"] == "sync_ime").collect()
         };
-        let caret: Vec<f64> = synced(w.events(0)?)
+        let caret: Vec<f64> = synced(harness.events(0)?)
             .last()
             .map(|event| field(event, "painted_caret"))
             .ok_or("the winit harness synced no IME area")??;
         let [caret_x, caret_y, ..] = caret[..] else {
             return Err("the painted caret has no position".into());
         };
-        let line = w.cell(((caret_y - 20.0) / 24.0).round_ties_even() as i64, ((caret_x - 20.0) / 10.0).round_ties_even() as i64);
-        let ignore = [TASKBAR, [w.origin[0], line[1] - 4, 800, line[3] + 8]];
+        let line = harness.cell(((caret_y - 20.0) / 24.0).round_ties_even() as i64, ((caret_x - 20.0) / 10.0).round_ties_even() as i64);
+        let [origin_x, _] = harness.origin;
+        let [_, line_y, _, line_height] = line;
+        let ignore = [TASKBAR, [origin_x, line_y - 4, 800, line_height + 8]];
         // The IME starts in direct input; if a probe key types a letter, Alt+` turns kana input on.
-        s.keys(&["n"])?;
+        session.keys(&["n"])?;
         sleep(0.8);
-        if !truthy(&w.state()?["composition"]) {
-            s.keys(&["backspace", "alt+grave_accent"])?;
+        if !truthy(&harness.state()?["composition"]) {
+            session.keys(&["backspace", "alt+grave_accent"])?;
             sleep(0.8);
-            s.keys(&["n"])?;
+            session.keys(&["n"])?;
             sleep(0.8);
         }
-        s.type_text("ihongo")?;
+        session.type_text("ihongo")?;
         sleep(0.8);
-        let composing = truthy(&w.state()?["composition"]);
-        let candidates = open_candidates(s, &ignore)?;
-        let areas: Vec<Value> = synced(w.events(0)?).into_iter().map(|event| take(event, "rect")).collect();
-        s.keys(&["up"])?;
+        let composing = truthy(&harness.state()?["composition"]);
+        let candidates = open_candidates(session, &ignore)?;
+        let areas: Vec<Value> = synced(harness.events(0)?).into_iter().map(|event| take(event, "rect")).collect();
+        session.keys(&["up"])?;
         sleep(0.5);
-        s.keys(&["ret"])?;
+        session.keys(&["ret"])?;
         sleep(1.0);
-        let committed = text(&w.state()?)?;
+        let committed = text(&harness.state()?)?;
         let expectations = json!({
             "typing composes": composing,
             "the IME area follows the caret": areas.last().and_then(|area| area[1].as_f64()) == Some(caret_y),
@@ -1506,6 +1543,7 @@ automaticUpdates = disabled
 const SECOND: u64 = 176_400;
 
 /// Seconds of 16-bit stereo PCM whose RMS over 20 ms windows exceeds the noise floor.
+#[must_use]
 pub fn audible_seconds(data: &[u8]) -> f64 {
     let (rate, channels, window, threshold) = (44_100.0, 2.0, 0.02, 500.0);
     let samples: Vec<f64> = data
@@ -1526,11 +1564,13 @@ pub fn audible_seconds(data: &[u8]) -> f64 {
 }
 
 fn write_wav(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
     let data = &data[..data.len() - data.len() % 4];
     let length = u32::try_from(data.len()).map_err(|_| "the clip is too long")?;
+    let riff_length = length.checked_add(36).ok_or("the clip is too long")?;
     let mut file = File::create(path).context(path.display())?;
     file.write_all(b"RIFF")?;
-    file.write_all(&(36 + length).to_le_bytes())?;
+    file.write_all(&riff_length.to_le_bytes())?;
     file.write_all(b"WAVEfmt ")?;
     file.write_all(&16u32.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?; // PCM
@@ -1546,40 +1586,41 @@ fn write_wav(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn read_at(file: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek};
     let mut data = Vec::new();
     file.seek(SeekFrom::Start(offset))?;
     file.take(length).read_to_end(&mut data)?;
     Ok(data)
 }
 
-fn nvda_audible_speech(c: &Checks) -> Result<Value> {
-    let recording = c.vm.audio();
+fn nvda_audible_speech(checks: &Checks) -> Result<Value> {
+    let recording = checks.vm.audio();
     if !recording.exists() {
         return Err(
             "guest audio is not recorded; start the VM with `cargo winvm up` (the default --audio wav)"
                 .into(),
         );
     }
-    let (mark, end, caret) = c.session("nvda-audible", |s| {
-        s.start(&[])?;
-        s.focus_document()?;
-        s.select("TextLoom", Some(Caret::Start))?;
-        s.guest(&format!(
+    let (mark, end, caret) = checks.session("nvda-audible", |session| {
+        session.start(&[])?;
+        session.focus_document()?;
+        session.select("TextLoom", Some(Caret::Start))?;
+        session.guest(&format!(
             "New-Item -ItemType Directory -Force C:\\textloom-qa\\nvda-audible | Out-Null\n\
              Set-Content -LiteralPath C:\\textloom-qa\\nvda-audible\\nvda.ini -Encoding ascii -Value @'\n{NVDA_PROFILE}'@\n\
              Start-Process \"$env:ProgramFiles\\NVDA\\nvda.exe\" -ArgumentList '--config-path=C:\\textloom-qa\\nvda-audible', '--lang=en'\n\
              Start-Sleep -Seconds 8; Out-Json @{{ running = [bool](Get-Process nvda -ErrorAction SilentlyContinue) }}"
         ))?;
         // A real click refocuses the editor, so NVDA tracks it.
-        s.focus_document()?;
-        s.select("TextLoom", Some(Caret::Start))?;
+        session.focus_document()?;
+        session.select("TextLoom", Some(Caret::Start))?;
         sleep(3.0);
         let mark = fs::metadata(&recording)?.len();
-        s.keys(&["down"])?;
+        session.keys(&["down"])?;
         sleep(6.0);
         let end = fs::metadata(&recording)?.len();
-        let caret = s.state()?.selection;
-        s.guest(
+        let caret = session.state()?.selection;
+        session.guest(
             "Start-Process \"$env:ProgramFiles\\NVDA\\nvda.exe\" -ArgumentList '-q'; Start-Sleep -Seconds 3\n\
              Get-Process nvda -ErrorAction SilentlyContinue | Stop-Process -Force; Out-Json @{}",
         )?;
@@ -1598,7 +1639,7 @@ fn nvda_audible_speech(c: &Checks) -> Result<Value> {
         mark - mark.saturating_sub(44) % 4,
         end.saturating_sub(mark),
     )?;
-    let clip = c.out.join("nvda-audible/speech-after-down.wav");
+    let clip = checks.output.join("nvda-audible/speech-after-down.wav");
     write_wav(&clip, &data)?;
     let seconds = audible_seconds(&data);
     let baseline = audible_seconds(&quiet);
@@ -1696,9 +1737,9 @@ const CHECKS: &[Check] = &[
     },
 ];
 
-fn run_checks(c: &Checks, checks: &[&Check], runs: usize) -> Result<()> {
+fn run_checks(checks: &Checks, selected: &[&Check], runs: usize) -> Result<()> {
     for run in 1..=runs {
-        for check in checks {
+        for check in selected {
             let label = if runs == 1 {
                 check.name.to_owned()
             } else {
@@ -1706,43 +1747,44 @@ fn run_checks(c: &Checks, checks: &[&Check], runs: usize) -> Result<()> {
             };
             println!("== {label}");
             let started = Instant::now();
-            let mut result = match panic::catch_unwind(AssertUnwindSafe(|| (check.run)(c))) {
+            // Defense in depth only: the checks report every failure they can
+            // foresee, including bad guest data, through their `Result`. Should
+            // one panic anyway, the run records it and goes on to the next check.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| (check.run)(checks)));
+            let mut result = match outcome {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => json!({"passed": false, "error": error.to_string()}),
                 Err(_) => {
                     json!({"passed": false, "error": "the check panicked; see the message above"})
                 }
             };
-            result["seconds"] = ((started.elapsed().as_secs_f64() * 10.0).round() / 10.0).into();
-            c.record(&label, &result)?;
-            println!(
-                "{}",
-                result.to_string().chars().take(3000).collect::<String>()
-            );
+            let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+            if let Some(fields) = result.as_object_mut() {
+                fields.insert("seconds".to_owned(), seconds.into());
+            }
+            checks.record(&label, &result)?;
+            let summary: String = result.to_string().chars().take(3000).collect();
+            println!("{summary}");
         }
     }
     Ok(())
 }
 
 fn dispatch(arguments: Vec<String>) -> Result<(), String> {
-    let mut arguments = crate::cli::Arguments::new(arguments);
+    let mut arguments = Arguments::new(arguments);
     let runs = match arguments.option("--runs")? {
         Some(runs) => runs
             .parse()
             .map_err(|_| "--runs takes a whole number".to_owned())?,
         None => 1,
     };
-    let names = arguments.finish()?;
-    let c = Checks::from_env();
-    let outcome = match names
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    let positionals = arguments.finish()?;
+    let names: Vec<&str> = positionals.iter().map(String::as_str).collect();
+    let checks = Checks::from_env();
+    let outcome = match names.as_slice() {
         ["build"] => build(),
-        ["deploy"] => deploy(&c),
-        ["explore"] => explore(&c),
+        ["deploy"] => deploy(&checks),
+        ["explore"] => explore(&checks),
         ["list"] => {
             for check in CHECKS {
                 println!("{}: {}", check.name, check.description);
@@ -1770,13 +1812,14 @@ fn dispatch(arguments: Vec<String>) -> Result<(), String> {
                     .filter_map(|name| CHECKS.iter().find(|check| check.name == *name))
                     .collect()
             };
-            run_checks(&c, &selected, runs)
+            run_checks(&checks, &selected, runs)
         }
     };
     outcome.map_err(|error| error.to_string())
 }
 
 /// The `winvm-checks` command.
+#[must_use]
 pub fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments
