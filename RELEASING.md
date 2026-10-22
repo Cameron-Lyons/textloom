@@ -496,6 +496,9 @@ malformed-input regression tests when changing the codec.
    target directory cannot silently pass. A temporary copy of the repository's
    native host is also compiled against the extracted library with its unchanged
    lockfile; this leaves the verified crate untouched.
+   Its formatting check uses stable rustfmt; also run `./scripts/format.sh --check`,
+   which needs nightly rustfmt for the Google Rust Style Guide's import and macro
+   formatting options and covers every package in the repository. CI runs both.
 3. Review `cargo package --locked --list --allow-dirty`. Source, headless examples,
    tests, fixtures, benchmark documentation, changelog, and license must be
    included. The repository-only native host, workflows, and local build output
