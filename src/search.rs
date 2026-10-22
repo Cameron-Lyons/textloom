@@ -3,8 +3,8 @@ use std::ops::{ControlFlow, Range};
 
 use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
-use crate::document::normalize_newlines;
-use crate::{Document, Position};
+use crate::types::Direction;
+use crate::{Document, Position, document};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
@@ -53,7 +53,7 @@ impl Document {
                         &needle,
                         options,
                         Some(range.start),
-                        false,
+                        Direction::Forward,
                         ParagraphSearch::new(&needle, options),
                     )
                     .is_some_and(|found| found == *range);
@@ -65,7 +65,7 @@ impl Document {
                     &lines,
                     options,
                     Some(range.start),
-                    false,
+                    Direction::Forward,
                 )
                 .is_some_and(|found| found == *range);
         }
@@ -86,7 +86,7 @@ impl Document {
         options: SearchOptions,
         selection: Range<Position>,
         wrap: bool,
-        backward: bool,
+        direction: Direction,
     ) -> Option<Range<Position>> {
         if query.is_empty() {
             return None;
@@ -97,21 +97,24 @@ impl Document {
             let mut found = None;
             let mut wrapped = None;
             let _ = self.visit_flattened_matches(&needle, options, |range| {
-                if backward {
-                    if range.end <= selection.start {
-                        found = Some(range);
-                    } else if found.is_some() || !wrap {
-                        return ControlFlow::Break(());
-                    } else {
-                        wrapped = Some(range);
+                match direction {
+                    Direction::Backward => {
+                        if range.end <= selection.start {
+                            found = Some(range);
+                        } else if found.is_some() || !wrap {
+                            return ControlFlow::Break(());
+                        } else {
+                            wrapped = Some(range);
+                        }
                     }
-                } else {
-                    if range.start >= selection.end {
-                        found = Some(range);
-                        return ControlFlow::Break(());
-                    }
-                    if wrap && wrapped.is_none() {
-                        wrapped = Some(range);
+                    Direction::Forward => {
+                        if range.start >= selection.end {
+                            found = Some(range);
+                            return ControlFlow::Break(());
+                        }
+                        if wrap && wrapped.is_none() {
+                            wrapped = Some(range);
+                        }
                     }
                 }
                 ControlFlow::Continue(())
@@ -120,36 +123,34 @@ impl Document {
         }
 
         let strategy = ParagraphSearch::new(&needle, options);
-        let boundary = if backward {
-            selection.start
-        } else {
-            selection.end
+        let boundary = match direction {
+            Direction::Backward => selection.start,
+            Direction::Forward => selection.end,
         };
         let len = self.paragraphs().len();
         let start = boundary.paragraph;
         let search = |index: usize, bounded: bool| {
             let boundary = bounded.then_some(boundary);
             if let Some(lines) = &lines {
-                self.find_lines_match(index, lines, options, boundary, backward)
+                self.find_lines_match(index, lines, options, boundary, direction)
             } else {
-                self.find_paragraph_match(index, &needle, options, boundary, backward, strategy)
+                self.find_paragraph_match(index, &needle, options, boundary, direction, strategy)
             }
         };
-        if backward {
-            (0..=start)
+        match direction {
+            Direction::Backward => (0..=start)
                 .rev()
                 .find_map(|index| search(index, index == start))
                 .or_else(|| {
                     wrap.then(|| (start..len).rev().find_map(|index| search(index, false)))
                         .flatten()
-                })
-        } else {
-            (start..len)
+                }),
+            Direction::Forward => (start..len)
                 .find_map(|index| search(index, index == start))
                 .or_else(|| {
                     wrap.then(|| (0..=start).find_map(|index| search(index, false)))
                         .flatten()
-                })
+                }),
         }
     }
 
@@ -163,45 +164,49 @@ impl Document {
         needle: &str,
         options: SearchOptions,
         boundary: Option<Position>,
-        backward: bool,
+        direction: Direction,
         strategy: ParagraphSearch,
     ) -> Option<Range<Position>> {
         let text = self.paragraphs()[index].text();
-        if boundary.is_some_and(|position| {
-            if backward {
-                position.byte == 0
-            } else {
-                position.byte == text.len()
-            }
-        }) {
+        let (unbounded_edge, exhausted_edge) = match direction {
+            Direction::Backward => (text.len(), 0),
+            Direction::Forward => (0, text.len()),
+        };
+        if boundary.is_some_and(|position| position.byte == exhausted_edge) {
             return None;
         }
-        let edge = boundary.map_or(if backward { text.len() } else { 0 }, |position| {
-            position.byte
-        });
+        let edge = boundary.map_or(unbounded_edge, |position| position.byte);
         match strategy {
             ParagraphSearch::Literal => {
-                let window = if backward { 0..edge } else { edge..text.len() };
-                find_literal(&text[window.clone()], needle, backward, |bytes| {
+                let window = match direction {
+                    Direction::Backward => 0..edge,
+                    Direction::Forward => edge..text.len(),
+                };
+                find_literal(&text[window.clone()], needle, direction, |bytes| {
                     let range = Position::new(index, window.start + bytes.start)
                         ..Position::new(index, window.start + bytes.end);
                     self.is_grapheme_range(&range).then_some(range)
                 })
             }
             ParagraphSearch::Nearest => {
-                self.find_nearest_match(index, needle, options, edge, backward)
+                self.find_nearest_match(index, needle, options, edge, direction)
             }
             ParagraphSearch::Scan => {
                 let mut found = None;
                 let _ = self.visit_paragraph_matches(index, needle, options, |range| {
-                    if backward {
-                        if boundary.is_some_and(|position| range.end > position) {
-                            return ControlFlow::Break(());
+                    match direction {
+                        Direction::Backward => {
+                            if boundary.is_some_and(|position| range.end > position) {
+                                return ControlFlow::Break(());
+                            }
+                            found = Some(range);
                         }
-                        found = Some(range);
-                    } else if boundary.is_none_or(|position| range.start >= position) {
-                        found = Some(range);
-                        return ControlFlow::Break(());
+                        Direction::Forward => {
+                            if boundary.is_none_or(|position| range.start >= position) {
+                                found = Some(range);
+                                return ControlFlow::Break(());
+                            }
+                        }
                     }
                     ControlFlow::Continue(())
                 });
@@ -216,7 +221,7 @@ impl Document {
         needle: &str,
         options: SearchOptions,
         edge: usize,
-        backward: bool,
+        direction: Direction,
     ) -> Option<Range<Position>> {
         let text = self.paragraphs()[index].text();
         // A character spans at most four bytes and lowercases to at least one,
@@ -226,16 +231,19 @@ impl Document {
         let mut window = edge..edge;
         let mut words: Option<WordBoundaries<'_>> = None;
         loop {
-            window = if backward {
-                let end = text
-                    .ceil_char_boundary(window.start.saturating_add(overlap))
-                    .min(edge);
-                text.floor_char_boundary(end.saturating_sub(width))..end
-            } else {
-                let start = text
-                    .floor_char_boundary(window.end.saturating_sub(overlap))
-                    .max(edge);
-                start..text.ceil_char_boundary(start.saturating_add(width))
+            window = match direction {
+                Direction::Backward => {
+                    let end = text
+                        .ceil_char_boundary(window.start.saturating_add(overlap))
+                        .min(edge);
+                    text.floor_char_boundary(end.saturating_sub(width))..end
+                }
+                Direction::Forward => {
+                    let start = text
+                        .floor_char_boundary(window.end.saturating_sub(overlap))
+                        .max(edge);
+                    start..text.ceil_char_boundary(start.saturating_add(width))
+                }
             };
             let source = &text[window.clone()];
             let searched = if options.case_sensitive {
@@ -244,7 +252,7 @@ impl Document {
                 Cow::Owned(lowercase(source))
             };
             let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive);
-            let found = find_literal(&searched, needle, backward, |bytes| {
+            let found = find_literal(&searched, needle, direction, |bytes| {
                 let start = window.start + offsets.original(bytes.start)?;
                 let end = window.start + offsets.original(bytes.end)?;
                 if options.whole_word {
@@ -260,10 +268,9 @@ impl Document {
                 let range = Position::new(index, start)..Position::new(index, end);
                 self.is_grapheme_range(&range).then_some(range)
             });
-            let exhausted = if backward {
-                window.start == 0
-            } else {
-                window.end == text.len()
+            let exhausted = match direction {
+                Direction::Backward => window.start == 0,
+                Direction::Forward => window.end == text.len(),
             };
             if found.is_some() || exhausted {
                 return found;
@@ -278,16 +285,15 @@ impl Document {
         lines: &[&str],
         options: SearchOptions,
         boundary: Option<Position>,
-        backward: bool,
+        direction: Direction,
     ) -> Option<Range<Position>> {
         let [first_line, middle_lines @ .., last_line] = lines else {
             return None;
         };
         let breaks = middle_lines.len() + 1;
-        let first_index = if backward {
-            index.checked_sub(breaks)?
-        } else {
-            index
+        let first_index = match direction {
+            Direction::Backward => index.checked_sub(breaks)?,
+            Direction::Forward => index,
         };
         let [first, middle @ .., last] = self
             .paragraphs()
@@ -313,12 +319,9 @@ impl Document {
                 .then_some((start, end))?
         };
         let range = Position::new(first_index, start)..Position::new(first_index + breaks, end);
-        (boundary.is_none_or(|boundary| {
-            if backward {
-                range.end <= boundary
-            } else {
-                range.start >= boundary
-            }
+        (boundary.is_none_or(|boundary| match direction {
+            Direction::Backward => range.end <= boundary,
+            Direction::Forward => range.start >= boundary,
         }) && self.is_grapheme_range(&range)
             && (!options.whole_word
                 || (is_word_boundary(first, start) && is_word_boundary(last, end))))
@@ -371,7 +374,9 @@ impl Document {
         }
         if let Some(lines) = paragraph_lines(needle) {
             for index in 0..self.paragraphs().len() {
-                if let Some(range) = self.find_lines_match(index, &lines, options, None, false) {
+                if let Some(range) =
+                    self.find_lines_match(index, &lines, options, None, Direction::Forward)
+                {
                     accept(range)?;
                 }
             }
@@ -413,7 +418,7 @@ impl Document {
             let paragraph = paragraph_starts.partition_point(|start| *start <= byte) - 1;
             Position::new(paragraph, byte - paragraph_starts[paragraph])
         };
-        visit_text_matches(&source, false, needle, options, |bytes| {
+        visit_text_matches(&source, /* ascii */ false, needle, options, |bytes| {
             let range = position(bytes.start)..position(bytes.end);
             if self.is_grapheme_range(&range) {
                 accept(range).map_continue(|()| true)
@@ -425,7 +430,7 @@ impl Document {
 }
 
 fn search_needle(query: &str, options: SearchOptions) -> Cow<'_, str> {
-    let query = normalize_newlines(query);
+    let query = document::normalize_newlines(query);
     if options.case_sensitive {
         query
     } else {
@@ -595,15 +600,15 @@ fn ascii_word_boundary(text: &[u8], byte: usize) -> Option<bool> {
     Some(!joined)
 }
 
-struct WordBoundaries<'a> {
-    text: &'a str,
+struct WordBoundaries<'text> {
+    text: &'text str,
     start: usize,
     boundaries: Vec<usize>,
-    remaining: UWordBoundIndices<'a>,
+    remaining: UWordBoundIndices<'text>,
 }
 
-impl<'a> WordBoundaries<'a> {
-    fn new(text: &'a str, start: usize) -> Self {
+impl<'text> WordBoundaries<'text> {
+    fn new(text: &'text str, start: usize) -> Self {
         Self {
             text,
             start,
@@ -613,7 +618,12 @@ impl<'a> WordBoundaries<'a> {
     }
 
     fn contains(&mut self, byte: usize) -> bool {
-        debug_assert!(byte >= self.start);
+        debug_assert!(
+            byte >= self.start,
+            "callers segment from a restart at or before every byte they query, but byte {byte} \
+             precedes {}",
+            self.start
+        );
         if let Some(boundary) = ascii_word_boundary(self.text.as_bytes(), byte) {
             return boundary;
         }
@@ -631,14 +641,21 @@ impl<'a> WordBoundaries<'a> {
     }
 }
 
-struct LowercaseOffsets<'a> {
-    source: &'a str,
+struct LowercaseOffsets<'source> {
+    source: &'source str,
     folded: bool,
-    changes: Option<Vec<(Range<usize>, Range<usize>)>>,
+    changes: Option<Vec<LengthChange>>,
 }
 
-impl<'a> LowercaseOffsets<'a> {
-    fn new(source: &'a str, folded: bool) -> Self {
+// A character whose lowercase mapping has a different UTF-8 length, with its byte range in
+// the lowercased text and in the source.
+struct LengthChange {
+    lowered: Range<usize>,
+    original: Range<usize>,
+}
+
+impl<'source> LowercaseOffsets<'source> {
+    fn new(source: &'source str, folded: bool) -> Self {
         Self {
             source,
             folded,
@@ -660,25 +677,25 @@ impl<'a> LowercaseOffsets<'a> {
                         character.to_lowercase().map(char::len_utf8).sum::<usize>()
                     };
                     if lowered_len != character.len_utf8() {
-                        changes.push((
-                            lower_byte..lower_byte + lowered_len,
-                            byte..byte + character.len_utf8(),
-                        ));
+                        changes.push(LengthChange {
+                            lowered: lower_byte..lower_byte + lowered_len,
+                            original: byte..byte + character.len_utf8(),
+                        });
                     }
                     lower_byte += lowered_len;
                 }
             }
             changes
         });
-        let index = changes.partition_point(|(lowered, _)| lowered.end <= byte);
-        if let Some((lowered, original)) = changes.get(index)
-            && byte >= lowered.start
+        let index = changes.partition_point(|change| change.lowered.end <= byte);
+        if let Some(change) = changes.get(index)
+            && byte >= change.lowered.start
         {
-            return (byte == lowered.start).then_some(original.start);
+            return (byte == change.lowered.start).then_some(change.original.start);
         }
         let original = index.checked_sub(1).map_or(byte, |index| {
-            let (lowered, original) = &changes[index];
-            byte - lowered.end + original.end
+            let change = &changes[index];
+            byte - change.lowered.end + change.original.end
         });
         source.is_char_boundary(original).then_some(original)
     }
@@ -687,17 +704,16 @@ impl<'a> LowercaseOffsets<'a> {
 fn find_literal<T>(
     source: &str,
     needle: &str,
-    backward: bool,
+    direction: Direction,
     mut accept: impl FnMut(Range<usize>) -> Option<T>,
 ) -> Option<T> {
-    if backward {
-        source
+    match direction {
+        Direction::Backward => source
             .rmatch_indices(needle)
-            .find_map(|(start, _)| accept(start..start + needle.len()))
-    } else {
-        source
+            .find_map(|(start, _)| accept(start..start + needle.len())),
+        Direction::Forward => source
             .match_indices(needle)
-            .find_map(|(start, _)| accept(start..start + needle.len()))
+            .find_map(|(start, _)| accept(start..start + needle.len())),
     }
 }
 
@@ -903,23 +919,22 @@ mod tests {
                 "{range:?} {context}"
             );
             for wrap in [false, true] {
-                for backward in [false, true] {
-                    let expected = if backward {
-                        matches
+                for direction in [Direction::Forward, Direction::Backward] {
+                    let expected = match direction {
+                        Direction::Backward => matches
                             .iter()
                             .rev()
                             .find(|item| item.end <= range.start)
-                            .or_else(|| wrap.then(|| matches.last()).flatten())
-                    } else {
-                        matches
+                            .or_else(|| wrap.then(|| matches.last()).flatten()),
+                        Direction::Forward => matches
                             .iter()
                             .find(|item| item.start >= range.end)
-                            .or_else(|| wrap.then(|| matches.first()).flatten())
+                            .or_else(|| wrap.then(|| matches.first()).flatten()),
                     };
                     assert_eq!(
-                        document.find_relative(query, options, range.clone(), wrap, backward),
+                        document.find_relative(query, options, range.clone(), wrap, direction),
                         expected.cloned(),
-                        "{range:?} wrap={wrap} backward={backward} {context}"
+                        "{range:?} wrap={wrap} {direction:?} {context}"
                     );
                 }
             }
@@ -1135,7 +1150,8 @@ mod tests {
                 .map(|(byte, _)| byte)
                 .chain([text.len()])
                 .collect();
-            for byte in (0..=text.len()).filter(|byte| text.is_char_boundary(*byte)) {
+            let char_boundaries = (0..=text.len()).filter(|byte| text.is_char_boundary(*byte));
+            for byte in char_boundaries {
                 if let Some(boundary) = ascii_word_boundary(text.as_bytes(), byte) {
                     decided += 1;
                     assert_eq!(
@@ -1172,7 +1188,8 @@ mod tests {
                 .map(|(byte, _)| byte)
                 .chain([text.len()])
                 .collect();
-            for byte in (0..=text.len()).filter(|byte| text.is_char_boundary(*byte)) {
+            let char_boundaries = (0..=text.len()).filter(|byte| text.is_char_boundary(*byte));
+            for byte in char_boundaries {
                 let restart = word_restart(&text, byte);
                 assert!(restart <= byte, "byte {byte} in {text:?}");
                 let restarted: Vec<_> = text[restart..]

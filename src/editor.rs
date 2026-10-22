@@ -1,15 +1,16 @@
-use std::fmt;
+use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod composition;
 mod history;
 
 pub use composition::Composition;
 pub use history::HistoryLimits;
-use history::{EditState, Group, History, TransactionLevel};
+use history::{EditState, Group, History, OpenTransaction, TransactionLevel};
 
 use crate::document::Delta;
+use crate::types::Direction;
 use crate::{
     Document, Error, Fragment, InlineAttribute, InlineStyle, Link, Movement, Paragraph,
     ParagraphKind, Position, SearchOptions, Selection, SelectionStyle, StylePatch,
@@ -47,15 +48,19 @@ impl Clone for Editor {
             style_cache: Mutex::new(
                 self.style_cache
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
+                    .expect(STYLE_CACHE_LOCK_HEALTHY)
                     .clone(),
             ),
         }
     }
 }
 
-impl fmt::Debug for Editor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+// The style cache stays locked only while a selection's spans are scanned and the result is
+// stored, which does not panic, so no thread poisons the lock.
+const STYLE_CACHE_LOCK_HEALTHY: &str = "no panic occurs while the style cache is locked";
+
+impl Debug for Editor {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Editor")
             .field("paragraphs", &self.document.paragraphs().len())
@@ -129,25 +134,26 @@ impl Editor {
     pub fn from_text(text: &str) -> Self {
         Self::new(Document::from_text(text))
     }
+
     pub fn document(&self) -> &Document {
         &self.document
     }
+
     pub fn selection(&self) -> Selection {
         self.selection
     }
+
     pub fn typing_style(&self) -> InlineStyle {
         self.typing_style
     }
+
     #[must_use]
     pub fn selection_style(&self) -> SelectionStyle {
         if self.selection.is_caret() {
             return self.typing_style.into();
         }
         let identity = self.document.content_identity();
-        let mut cache = self
-            .style_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut cache = self.style_cache.lock().expect(STYLE_CACHE_LOCK_HEALTHY);
         let style = match cache.as_ref() {
             Some(cached)
                 if Arc::ptr_eq(&cached.identity, &identity)
@@ -181,6 +187,7 @@ impl Editor {
         }
         result
     }
+
     #[must_use]
     pub fn selected_link(&self) -> Option<Link> {
         if self.selection.is_caret() {
@@ -196,6 +203,7 @@ impl Editor {
         }
         shared.cloned()
     }
+
     #[must_use]
     pub fn selected_paragraphs(&self) -> Range<usize> {
         let range = self.selection.range();
@@ -206,6 +214,7 @@ impl Editor {
         };
         range.start.paragraph..end
     }
+
     #[must_use]
     pub fn selection_paragraph_kind(&self) -> Option<ParagraphKind> {
         let mut kinds = self.document.paragraphs()[self.selected_paragraphs()]
@@ -214,21 +223,27 @@ impl Editor {
         let first = kinds.next().expect("a selection covers a paragraph");
         kinds.all(|kind| same_block(first, kind)).then_some(first)
     }
+
     pub fn can_undo(&self) -> bool {
         self.undo_len() != 0
     }
+
     pub fn can_redo(&self) -> bool {
         self.redo_len() != 0
     }
+
     pub fn history_limits(&self) -> HistoryLimits {
         self.history.limits()
     }
+
     pub fn history_bytes(&self) -> usize {
         self.history.resolved(self.state()).bytes()
     }
+
     pub fn undo_len(&self) -> usize {
         self.history.resolved(self.state()).undo_len()
     }
+
     pub fn redo_len(&self) -> usize {
         self.history.resolved(self.state()).redo_len()
     }
@@ -350,7 +365,7 @@ impl Editor {
         options: SearchOptions,
         wrap: bool,
     ) -> Result<bool, Error> {
-        self.find_match(query, options, wrap, false)
+        self.find_match(query, options, wrap, Direction::Forward)
     }
 
     pub fn find_previous(
@@ -359,7 +374,7 @@ impl Editor {
         options: SearchOptions,
         wrap: bool,
     ) -> Result<bool, Error> {
-        self.find_match(query, options, wrap, true)
+        self.find_match(query, options, wrap, Direction::Backward)
     }
 
     fn find_match(
@@ -367,12 +382,12 @@ impl Editor {
         query: &str,
         options: SearchOptions,
         wrap: bool,
-        backward: bool,
+        direction: Direction,
     ) -> Result<bool, Error> {
         self.ensure_no_composition()?;
         let found =
             self.document
-                .find_relative(query, options, self.selection.range(), wrap, backward);
+                .find_relative(query, options, self.selection.range(), wrap, direction);
         if let Some(range) = found {
             self.set_selection(Selection::new(range.start, range.end))?;
             Ok(true)
@@ -499,11 +514,11 @@ impl Editor {
     }
 
     pub fn delete_word_backward(&mut self) -> Result<(), Error> {
-        self.delete_word(false)
+        self.delete_word(Direction::Backward)
     }
 
     pub fn delete_word_forward(&mut self) -> Result<(), Error> {
-        self.delete_word(true)
+        self.delete_word(Direction::Forward)
     }
 
     pub fn delete_to_paragraph_start(&mut self) -> Result<(), Error> {
@@ -515,16 +530,15 @@ impl Editor {
         self.delete_to(Position::new(focus.paragraph, 0), Group::None)
     }
 
-    fn delete_word(&mut self, forward: bool) -> Result<(), Error> {
+    fn delete_word(&mut self, direction: Direction) -> Result<(), Error> {
         self.ensure_no_composition()?;
         if !self.selection.is_caret() {
             return self.replace_selection("", Group::None);
         }
         let focus = self.selection.focus;
-        let target = if forward {
-            self.next_word(focus)
-        } else {
-            self.previous_word(focus)
+        let target = match direction {
+            Direction::Forward => self.next_word(focus),
+            Direction::Backward => self.previous_word(focus),
         };
         self.delete_to(target, Group::None)
     }
@@ -942,8 +956,8 @@ fn same_block(first: ParagraphKind, other: ParagraphKind) -> bool {
     }
 }
 
-struct TransactionGuard<'a> {
-    editor: &'a mut Editor,
+struct TransactionGuard<'editor> {
+    editor: &'editor mut Editor,
     level: TransactionLevel,
     _scope: Arc<()>,
     rollback: Option<Rollback>,
@@ -955,10 +969,10 @@ struct Rollback {
     composition: Option<Arc<Composition>>,
 }
 
-impl<'a> TransactionGuard<'a> {
-    fn begin(editor: &'a mut Editor) -> Self {
+impl<'editor> TransactionGuard<'editor> {
+    fn begin(editor: &'editor mut Editor) -> Self {
         let state = editor.state();
-        let (level, scope) = editor.history.begin_transaction(state);
+        let OpenTransaction { level, scope } = editor.history.begin_transaction(state);
         Self {
             level,
             _scope: scope,

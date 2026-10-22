@@ -1,9 +1,9 @@
 use std::borrow::Cow;
-use std::fmt;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 
 use crate::document::Levels;
-use crate::{Color, Document, InlineStyle, Link, Paragraph, ParagraphKind, Span};
+use crate::{Color, Document, InlineStyle, Link, Paragraph, ParagraphKind, Span, export};
 
 const MAGIC: &[u8; 4] = b"TLFR";
 const VERSION: u8 = 2;
@@ -15,7 +15,7 @@ enum Format {
 }
 
 impl Format {
-    fn new(version: u8) -> Result<Self, FragmentError> {
+    fn try_new(version: u8) -> Result<Self, FragmentError> {
         match version {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
@@ -73,8 +73,8 @@ impl PartialEq for Fragment {
 
 impl Eq for Fragment {}
 
-impl fmt::Debug for Fragment {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Fragment {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Fragment")
             .field("paragraphs", &self.paragraphs)
@@ -122,7 +122,7 @@ impl Fragment {
 
     #[must_use]
     pub fn plain_text(&self) -> String {
-        crate::export::plain_text(self.paragraphs())
+        export::plain_text(self.paragraphs())
     }
 
     #[must_use]
@@ -209,7 +209,7 @@ impl Fragment {
         if input.take(MAGIC.len())? != MAGIC {
             return Err(FragmentError::InvalidMagic);
         }
-        let format = Format::new(input.byte()?)?;
+        let format = Format::try_new(input.byte()?)?;
         let count = input.length()?;
         if count == 0 {
             return Err(FragmentError::InvalidParagraphCount);
@@ -261,7 +261,7 @@ impl Fragment {
             }
             let length = input.length()?;
             let text =
-                std::str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidUtf8)?;
+                str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidUtf8)?;
             if text.contains(['\r', '\n']) {
                 return Err(FragmentError::InvalidParagraphText);
             }
@@ -316,7 +316,7 @@ impl Fragment {
 
     #[must_use]
     pub fn to_html(&self) -> String {
-        crate::export::html(self.paragraphs(), self.numbering.clone())
+        export::html(self.paragraphs(), self.numbering.clone())
     }
 }
 
@@ -358,8 +358,8 @@ pub enum FragmentError {
     TrailingData,
 }
 
-impl fmt::Display for FragmentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for FragmentError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Truncated => formatter.write_str("rich-text fragment is truncated"),
             Self::InvalidMagic => formatter.write_str("invalid rich-text fragment signature"),
@@ -424,12 +424,12 @@ fn read_format(
         strikethrough: flags & 8 != 0,
         code: flags & 16 != 0,
         foreground: if flags & 32 != 0 {
-            Some(Color(input.take(4)?.try_into().unwrap()))
+            Some(Color(input.array()?))
         } else {
             None
         },
         background: if flags & 64 != 0 {
-            Some(Color(input.take(4)?.try_into().unwrap()))
+            Some(Color(input.array()?))
         } else {
             None
         },
@@ -441,8 +441,7 @@ fn read_format(
     if length > Link::MAX_LEN {
         return Err(FragmentError::InvalidLink);
     }
-    let target =
-        std::str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidLink)?;
+    let target = str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidLink)?;
     let link = match last_link {
         Some(link) if link.as_str() == target => link.clone(),
         _ => Link::new(target).map_err(|_| FragmentError::InvalidLink)?,
@@ -451,12 +450,12 @@ fn read_format(
     Ok((style, Some(link)))
 }
 
-struct Reader<'a> {
-    remaining: &'a [u8],
+struct Reader<'input> {
+    remaining: &'input [u8],
 }
 
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+impl<'input> Reader<'input> {
+    fn new(bytes: &'input [u8]) -> Self {
         Self { remaining: bytes }
     }
 
@@ -464,7 +463,7 @@ impl<'a> Reader<'a> {
         self.remaining.len()
     }
 
-    fn take(&mut self, length: usize) -> Result<&'a [u8], FragmentError> {
+    fn take(&mut self, length: usize) -> Result<&'input [u8], FragmentError> {
         if length > self.remaining.len() {
             return Err(FragmentError::Truncated);
         }
@@ -473,16 +472,25 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], FragmentError> {
+        let (bytes, remaining) = self
+            .remaining
+            .split_first_chunk()
+            .ok_or(FragmentError::Truncated)?;
+        self.remaining = remaining;
+        Ok(*bytes)
+    }
+
     fn byte(&mut self) -> Result<u8, FragmentError> {
         Ok(self.take(1)?[0])
     }
 
     fn u32(&mut self) -> Result<u32, FragmentError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.array()?))
     }
 
     fn length(&mut self) -> Result<usize, FragmentError> {
-        let value = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
+        let value = u64::from_le_bytes(self.array()?);
         usize::try_from(value).map_err(|_| FragmentError::LimitExceeded)
     }
 }

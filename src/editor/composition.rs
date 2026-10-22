@@ -22,13 +22,19 @@ impl Editor {
     }
     pub fn begin_composition(&mut self) {
         self.normalize_history();
-        if self.composition.is_none() {
-            self.composition = Some(Arc::new(Composition {
+        self.active_composition_mut();
+    }
+
+    // Returns the active composition, beginning one at the selection if there is none.
+    fn active_composition_mut(&mut self) -> &mut Arc<Composition> {
+        let replacement = self.selection;
+        self.composition.get_or_insert_with(|| {
+            Arc::new(Composition {
                 text: String::new(),
                 selection: None,
-                replacement: self.selection,
-            }));
-        }
+                replacement,
+            })
+        })
     }
 
     pub fn update_composition(
@@ -44,11 +50,8 @@ impl Editor {
         {
             return Err(Error::InvalidCompositionSelection);
         }
-        self.begin_composition();
-        let composition = self
-            .composition
-            .as_mut()
-            .expect("composition just initialized");
+        self.normalize_history();
+        let composition = self.active_composition_mut();
         let text_changed = composition.text != text;
         if text_changed || composition.selection != selection {
             if let Some(composition) = Arc::get_mut(composition) {
@@ -128,7 +131,7 @@ mod tests {
         let changed = Arc::clone(editor.composition.as_ref().unwrap());
         assert_eq!(changed.text, "日本");
         for snapshot in [&first, &moved, &changed] {
-            assert_eq!(snapshot.replacement, replacement);
+            assert_eq!(snapshot.replacement, replacement, "{snapshot:?}");
         }
         editor.commit_composition("日本語").unwrap();
         assert_eq!(editor.document().plain_text(), "a日本語");
@@ -155,7 +158,11 @@ mod tests {
         let storage = editor.composition().unwrap().text.as_ptr();
         for text in ["café 👩\u{200d}💻", "café", "café 👩\u{200d}💻"] {
             editor.update_composition(text, None).unwrap();
-            assert_eq!(editor.composition().unwrap().text.as_ptr(), storage);
+            assert_eq!(
+                editor.composition().unwrap().text.as_ptr(),
+                storage,
+                "{text:?}"
+            );
             assert_eq!(editor.composition().unwrap().text, text);
         }
         assert_eq!(editor.document().plain_text(), "");
