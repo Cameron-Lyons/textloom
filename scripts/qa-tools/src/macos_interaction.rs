@@ -17,7 +17,7 @@ use std::{env, thread};
 use serde_json::{Map, Value, json};
 
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
-use crate::{Context, Result, TempDir, repo_root, tail};
+use crate::{Result, ResultExt, TempDir, repo_root, tail};
 
 pub const TITLE: &str = "TextLoom native example";
 pub const ORIGINAL: &str = "TextLoom\nSelect text to format it, or start writing.\n\
@@ -1357,7 +1357,8 @@ fn run_probe(root: PathBuf, revision: &str) -> Result<bool> {
         signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
     }
     let parent = env::var_os("RUNNER_TEMP").map_or_else(env::temp_dir, PathBuf::from);
-    let work = TempDir::new_in(&parent, "textloom-macos-interaction-").context(parent.display())?;
+    let work =
+        TempDir::try_new_in(&parent, "textloom-macos-interaction-").context(parent.display())?;
     let mut probe = Probe::new(
         Machine::new(interrupted),
         root,

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::Arguments;
-use crate::{Context, Result, TempDir, repo_root};
+use crate::{Result, ResultExt, TempDir, repo_root};
 
 pub const USAGE: &str = "\
 usage: winvm create [--force|--resume]   install Windows unattended (about 30 minutes)
@@ -857,7 +857,7 @@ impl Qmp {
 
     /// The guest display's size in pixels.
     pub fn size(&mut self) -> Result<(u32, u32)> {
-        let directory = TempDir::new("textloom-winvm-")?;
+        let directory = TempDir::try_new("textloom-winvm-")?;
         let data = fs::read(self.screenshot(&directory.path().join("size.png"))?)?;
         png_size(&data).ok_or_else(|| "the screenshot is not a PNG".into())
     }
@@ -1056,7 +1056,7 @@ fn here() -> PathBuf {
 
 fn build_unattend(vm: &Vm) -> Result<()> {
     let config = vm.config()?;
-    let directory = TempDir::new("textloom-winvm-unattend-")?;
+    let directory = TempDir::try_new("textloom-winvm-unattend-")?;
     let root = directory.path();
     fs::copy(
         here().join("autounattend.xml"),
@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     fn harness() -> Harness {
-        let state = TempDir::new("textloom-winvm-test-").unwrap();
+        let state = TempDir::try_new("textloom-winvm-test-").unwrap();
         let vm = Vm {
             state: state.path().to_path_buf(),
         };

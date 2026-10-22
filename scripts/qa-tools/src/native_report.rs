@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::cli::Arguments;
 
+/// The `check-native-report` help text.
 pub const USAGE: &str = "\
 usage: check-native-report REPORT --revision REVISION --os {linux,macos,windows}
                            --mode {editable,read-only,disabled}
@@ -20,6 +21,7 @@ Validate native renderer/interaction observations without certifying manual QA.
   --interaction               check non-smoke report integrity; the interaction
                               driver asserts behavior";
 
+/// The operating system a report must come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
     Linux,
@@ -28,8 +30,11 @@ pub enum Os {
 }
 
 impl Os {
+    /// Every operating system, in the order the usage text lists them.
     pub const ALL: [Self; 3] = [Self::Linux, Self::Macos, Self::Windows];
 
+    /// The name used on the command line and in a report's `host.os`.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Linux => "linux",
@@ -39,6 +44,7 @@ impl Os {
     }
 }
 
+/// The editor configuration a native host session ran in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Editable,
@@ -47,8 +53,11 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// Every mode, in the order the usage text lists them.
     pub const ALL: [Self; 3] = [Self::Editable, Self::ReadOnly, Self::Disabled];
 
+    /// The name used on the command line and in file names.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Editable => "editable",
@@ -58,16 +67,24 @@ impl Mode {
     }
 }
 
+/// The clipboard configuration a native host session ran with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Clipboard {
+    /// The host's native rich clipboard (`--rich-clipboard`), with its
+    /// clipboard self-test in editable smoke runs.
     #[default]
     Rich,
+    /// The host's default clipboard, without `--rich-clipboard` or a clipboard
+    /// self-test.
     Default,
 }
 
 impl Clipboard {
+    /// Every configuration, in the order the usage text lists them.
     pub const ALL: [Self; 2] = [Self::Rich, Self::Default];
 
+    /// The name used on the command line.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Rich => "rich",
@@ -79,14 +96,19 @@ impl Clipboard {
 /// What a report must show for the run being checked.
 #[derive(Clone, Debug)]
 pub struct Expected {
+    /// The source revision the host must have been built from.
     pub revision: String,
     pub os: Os,
     pub mode: Mode,
+    /// Whether the report comes from an interaction session, driven by
+    /// another tool, rather than from a smoke test.
     pub interaction: bool,
     pub clipboard: Clipboard,
 }
 
 impl Expected {
+    /// The line printed when a report passes.
+    #[must_use]
     pub fn summary(&self) -> String {
         let kind = if self.interaction {
             "interaction"
@@ -104,6 +126,7 @@ impl Expected {
 // Every object rejects unknown fields, and derived structs reject duplicates,
 // so a report can carry only these content-free observations.
 
+/// A native host's `--qa-report` file.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
@@ -122,6 +145,7 @@ pub struct Report {
     pub final_typing_style: TypingStyle,
 }
 
+/// Which host build wrote the report.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Host {
@@ -133,6 +157,7 @@ pub struct Host {
     pub source_revision: String,
 }
 
+/// How the session ran: its timing, what was requested, and what it rendered.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
@@ -148,6 +173,7 @@ pub struct Session {
     pub bold_font_supplied: bool,
 }
 
+/// The display scales the host saw, in pixels per point.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Display {
@@ -163,6 +189,7 @@ fn nullable<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D
     Option::deserialize(deserializer)
 }
 
+/// How many input events of each kind the host received.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputEvents {
@@ -179,6 +206,7 @@ pub struct InputEvents {
     pub window_focus_lost: u64,
 }
 
+/// How many editor state changes of each kind the host observed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateChanges {
@@ -193,6 +221,7 @@ pub struct StateChanges {
     pub snapshot_restores: u64,
 }
 
+/// How many errors of each kind the host reported.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Errors {
@@ -202,6 +231,7 @@ pub struct Errors {
     pub clipboard_self_test: u64,
 }
 
+/// The editor widget's state when the session ended.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Widget {
@@ -213,6 +243,7 @@ pub struct Widget {
     pub composition_active: bool,
 }
 
+/// Content-free measurements of the final document.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
@@ -226,6 +257,7 @@ pub struct Document {
     pub tlfr_round_trip_equal: bool,
 }
 
+/// The final selection.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
@@ -233,6 +265,7 @@ pub struct Selection {
     pub focus: Position,
 }
 
+/// A document position: a paragraph index and a UTF-8 byte offset in it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Position {
@@ -240,6 +273,7 @@ pub struct Position {
     pub byte: u64,
 }
 
+/// The style that text typed next would get.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypingStyle {
@@ -657,7 +691,7 @@ mod tests {
 
     #[test]
     fn clipboard_cli_choice_preserves_rich_default() {
-        let directory = TempDir::new("textloom-report-test-").unwrap();
+        let directory = TempDir::try_new("textloom-report-test-").unwrap();
         let path = directory.path().join("report.json");
         for clipboard in Clipboard::ALL {
             fs::write(&path, specimen(Mode::Editable, clipboard).to_string()).unwrap();
@@ -678,7 +712,7 @@ mod tests {
 
     #[test]
     fn unknown_clipboard_configuration_and_missing_files_are_rejected() {
-        let directory = TempDir::new("textloom-report-test-").unwrap();
+        let directory = TempDir::try_new("textloom-report-test-").unwrap();
         let path = directory.path().join("report.json");
         fs::write(&path, rich(Mode::Editable).to_string()).unwrap();
         assert_eq!(cli(&path, &["--clipboard", "unknown"]), 2);

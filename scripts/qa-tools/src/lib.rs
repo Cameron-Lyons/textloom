@@ -2,10 +2,11 @@
 //! interaction probe, and the local Windows VM with its checks. None of it is
 //! part of the published crate.
 
+use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fmt, fs, io, process};
+use std::{env, fs, io, process};
 
 pub mod cli;
 pub mod native_report;
@@ -21,10 +22,11 @@ pub mod winvm_checks;
 #[derive(Debug)]
 pub struct Error(String);
 
+/// A result whose error defaults to the tools' [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Error {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
 }
@@ -55,18 +57,28 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// Names what was being done when an error occurred.
-pub trait Context<T> {
-    fn context(self, what: impl fmt::Display) -> Result<T>;
+/// Adds [`context`](ResultExt::context) to every `Result` with a displayable
+/// error.
+pub trait ResultExt<T> {
+    /// Turns the error into an [`Error`] that starts with `what`, naming what was
+    /// being done when it occurred, followed by `: ` and the original error.
+    fn context(self, what: impl Display) -> Result<T>;
 }
 
-impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
-    fn context(self, what: impl fmt::Display) -> Result<T> {
+impl<T, E: Display> ResultExt<T> for std::result::Result<T, E> {
+    fn context(self, what: impl Display) -> Result<T> {
         self.map_err(|error| Error(format!("{what}: {error}")))
     }
 }
 
 /// The repository checkout these tools were built from.
+///
+/// # Panics
+///
+/// Panics if the crate's manifest directory, fixed at build time, is less than
+/// two directories deep, which cannot happen while it is `scripts/qa-tools` in
+/// a checkout.
+#[must_use]
 pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -76,6 +88,7 @@ pub fn repo_root() -> PathBuf {
 }
 
 /// The last `count` characters of `text`.
+#[must_use]
 pub fn tail(text: &str, count: usize) -> &str {
     let skip = text.chars().count().saturating_sub(count);
     text.char_indices()
@@ -84,14 +97,18 @@ pub fn tail(text: &str, count: usize) -> &str {
 }
 
 /// A private directory that is removed with everything in it when dropped.
+#[derive(Debug)]
 pub struct TempDir(PathBuf);
 
 impl TempDir {
-    pub fn new(prefix: &str) -> io::Result<Self> {
-        Self::new_in(&std::env::temp_dir(), prefix)
+    /// Creates a directory whose name starts with `prefix` in the system's
+    /// temporary directory.
+    pub fn try_new(prefix: &str) -> io::Result<Self> {
+        Self::try_new_in(&env::temp_dir(), prefix)
     }
 
-    pub fn new_in(parent: &Path, prefix: &str) -> io::Result<Self> {
+    /// Creates a directory whose name starts with `prefix` in `parent`.
+    pub fn try_new_in(parent: &Path, prefix: &str) -> io::Result<Self> {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         loop {
             let nanos = SystemTime::now()
@@ -107,6 +124,7 @@ impl TempDir {
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.0
     }
@@ -120,8 +138,9 @@ impl Drop for TempDir {
 
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::fs::DirBuilder;
     use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().mode(0o700).create(path)
+    DirBuilder::new().mode(0o700).create(path)
 }
 
 #[cfg(not(unix))]
@@ -142,8 +161,8 @@ mod tests {
 
     #[test]
     fn temporary_directories_are_unique_and_removed() {
-        let first = TempDir::new("textloom-qa-test-").unwrap();
-        let second = TempDir::new("textloom-qa-test-").unwrap();
+        let first = TempDir::try_new("textloom-qa-test-").unwrap();
+        let second = TempDir::try_new("textloom-qa-test-").unwrap();
         assert_ne!(first.path(), second.path());
         let path = first.path().to_path_buf();
         fs::write(path.join("file"), "x").unwrap();

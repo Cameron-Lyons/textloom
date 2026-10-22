@@ -1,12 +1,14 @@
 //! Command-line arguments, taken by name so each tool can parse its own.
 
 /// Arguments not yet taken. Everything after `--` is positional.
+#[derive(Debug)]
 pub struct Arguments {
     options: Vec<String>,
     rest: Vec<String>,
 }
 
 impl Arguments {
+    /// Holds `arguments`, which exclude the program name.
     pub fn new(arguments: impl IntoIterator<Item = String>) -> Self {
         let mut options: Vec<String> = arguments.into_iter().collect();
         let rest = match options.iter().position(|argument| argument == "--") {

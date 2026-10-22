@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
 use crate::winvm::{Qmp, Vm};
-use crate::{Context, Result, repo_root};
+use crate::{Result, ResultExt, repo_root};
 
 pub const USAGE: &str = "\
 usage: winvm-checks build                  cross-compile the host, the winit harness, and the report validator for x86_64-pc-windows-gnu
@@ -1867,7 +1867,7 @@ mod tests {
 
     #[test]
     fn clips_are_playable_wav_files() {
-        let directory = TempDir::new("textloom-checks-test-").unwrap();
+        let directory = TempDir::try_new("textloom-checks-test-").unwrap();
         let path = directory.path().join("clip.wav");
         write_wav(&path, &pcm(&[1, 2, 3, 4, 5])).unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -1904,7 +1904,7 @@ mod tests {
             eprintln!("skipped: ImageMagick is not installed");
             return;
         }
-        let directory = TempDir::new("textloom-checks-test-").unwrap();
+        let directory = TempDir::try_new("textloom-checks-test-").unwrap();
         let (before, after) = (
             directory.path().join("before.png"),
             directory.path().join("after.png"),

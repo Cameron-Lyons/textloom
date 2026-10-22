@@ -370,8 +370,8 @@ struct Replay {
 
 impl Replay {
     fn new(fake: Fake) -> Self {
-        let work = TempDir::new("textloom-macos-test-work-").unwrap();
-        let output = TempDir::new("textloom-macos-test-output-").unwrap();
+        let work = TempDir::try_new("textloom-macos-test-work-").unwrap();
+        let output = TempDir::try_new("textloom-macos-test-output-").unwrap();
         let probe = Probe::new(
             fake,
             PathBuf::from("unused"),
@@ -510,7 +510,7 @@ fn copy_requires_fresh_generation_and_codepoint_exact_unicode_with_trailing_lf()
 #[test]
 fn binary_runner_preserves_unicode_crlf_cr_and_lf_without_a_desktop() {
     let payload = format!("e\u{301}{WOMAN_TECHNOLOGIST}\r\nx\ry\n").into_bytes();
-    let directory = TempDir::new("textloom-macos-test-").unwrap();
+    let directory = TempDir::try_new("textloom-macos-test-").unwrap();
     let path = directory.path().join("payload");
     fs::write(&path, &payload).unwrap();
     let mut machine = Machine::new(Arc::default());
