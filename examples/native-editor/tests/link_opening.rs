@@ -1,3 +1,6 @@
+//! Checks the build configuration that lets followed links open: without
+//! egui-winit's `links` feature, an `OpenUrl` command only logs a warning.
+
 use std::process::Command;
 
 #[test]

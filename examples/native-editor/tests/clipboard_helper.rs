@@ -1,3 +1,6 @@
+//! Checks that a Linux clipboard copy helper exits when its host process is
+//! killed, so a crashed host never leaves a helper serving the clipboard.
+
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Read};

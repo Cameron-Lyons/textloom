@@ -1,87 +1,153 @@
+//! A native desktop host for Textloom's egui widget, used for native QA.
+//!
+//! This eframe application opens a window with a rich text document, a
+//! formatting toolbar, a link field, and Find and Replace fields, on Linux,
+//! macOS, and Windows. Its flags (see [`qa::HELP`]) add a smoke test that
+//! closes the window after 20 frames, a content-free QA report, and a native
+//! rich clipboard. The same executable also runs the rich clipboard's helper
+//! processes (see [`clipboard::helper`]). CI workflows and `scripts/qa-tools`
+//! parse the host's output and reports, so their wording and fields must stay
+//! stable.
+
+use std::ffi::OsString;
+use std::fmt::Display;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{io, mem, process};
 
 use eframe::egui;
+use textloom::adapter::egui::RichTextEditor;
 use textloom::{
-    Color, Document, Editor, Link, ParagraphKind, Position, SearchOptions, Selection, StylePatch,
+    Color, DecodeLimits, Document, Editor, Link, ParagraphKind, Position, SearchOptions, Selection,
+    StylePatch,
 };
+
+use crate::clipboard::NativeClipboard;
+use crate::qa::{FocusState, ReportFile};
 
 mod clipboard;
 mod ime_handoff;
 mod qa;
 
+/// The host application: the document editor and the state of its controls
+/// and QA instrumentation.
 struct NativeEditor {
     editor: Editor,
+    /// The Find field's text.
     query: String,
+    /// The Replace field's text.
     replacement: String,
     case_sensitive: bool,
     whole_word: bool,
     read_only: bool,
     enabled: bool,
+    /// The document captured by Capture snapshot, as TLFR bytes.
     snapshot: Option<Vec<u8>>,
+    /// The status line's message.
     status: String,
+    /// Whether to give the document keyboard focus at the end of the pass.
     focus_editor: bool,
+    /// How many frames were rendered, in smoke test mode only.
     smoke_frames: Option<usize>,
+    /// Whether the widget or the clipboard self-test reported an error, which
+    /// fails a smoke test.
     smoke_error: bool,
+    /// The egui frame number of the latest UI pass, which tells a new frame
+    /// from another input pass of the same frame.
     last_frame: Option<u64>,
+    /// QA observations, with `--qa-report` only.
     qa: Option<qa::Session>,
+    /// Set when the smoke test, the clipboard self-test, or the report write
+    /// fails, so that `main` returns an error after the window closes.
     failed: Arc<AtomicBool>,
-    clipboard: Option<clipboard::NativeClipboard>,
+    /// The native rich clipboard, with `--rich-clipboard` only.
+    clipboard: Option<NativeClipboard>,
+    /// Whether the clipboard self-test still has to run on the next pass.
     clipboard_self_test: bool,
+    /// The document widget's ID, once it has been shown.
     document_id: Option<egui::Id>,
+    /// The color that the Fill Color swatch applies: the last one chosen.
     fill_color: Color,
+    /// The color that the Font Color swatch applies: the last one chosen.
     font_color: Color,
+    /// The link field's text while the field is open.
     link_url: Option<String>,
+    /// Whether to focus the link field when it is next shown.
     focus_link_field: bool,
+    /// Commands from this pass's controls, applied after the document widget
+    /// has consumed its queued input.
     commands: Vec<EditorCommand>,
+    /// The IDs of the Link, Find, and Replace fields, in that order. The Link
+    /// entry is `None` while that field is closed.
     text_field_ids: [Option<egui::Id>; 3],
+    /// While the document's composition is empty, the text it had before an
+    /// empty preedit cleared it, which a commit can still echo after focus
+    /// moves to a field.
     cleared_document_preedit: Option<String>,
+    /// Drops the document composition's commit echo from a newly focused
+    /// field.
     ime_handoff: Option<ime_handoff::Guard>,
 }
 
+/// A command from the toolbar, the link field, or the search fields, queued
+/// while the controls are shown and applied after the document widget.
 enum EditorCommand {
+    /// Applies a style to the selection, or to typing at a caret.
     Style(StylePatch),
     ClearFormatting,
     RemoveLink,
     Undo,
     Redo,
+    /// The kind chosen in the paragraph-kind menu. A numbered list extends a
+    /// list that ends right before the selection, or starts one at 1; choosing
+    /// the kind that every selected paragraph already has changes nothing.
     ParagraphKind(ParagraphKind),
     Indent,
     Outdent,
+    /// Sets the start number of the numbered item the toolbar shows:
+    /// `Some(1)` restarts at 1, and `None` continues the previous numbering.
     ItemStart(Option<u32>),
     CaptureSnapshot,
     RestoreSnapshot,
+    /// Applies the link field's URL; see [`apply_link`].
     ApplyLink(String),
+    /// Selects the next match of the Find field's text.
     Find {
+        /// Whether to select the previous match instead.
         previous: bool,
         options: SearchOptions,
     },
+    /// Replaces every match of the Find field's text with the Replace field's
+    /// text.
     ReplaceAll(SearchOptions),
 }
 
 impl NativeEditor {
+    /// Creates the host with its sample document: a heading, a body
+    /// paragraph, and a three-item bulleted list, with the caret at the start
+    /// of the body paragraph and no undo history.
     fn new(
         options: &qa::Options,
-        report: Option<qa::ReportFile>,
+        report: Option<ReportFile>,
         failed: Arc<AtomicBool>,
-        clipboard: Option<clipboard::NativeClipboard>,
+        clipboard: Option<NativeClipboard>,
     ) -> Self {
         let mut editor = Editor::from_text(
             "TextLoom\nSelect text to format it, or start writing.\nUnicode: café, 日本語, 👨\u{200d}👩\u{200d}👧\u{200d}👦.\nLists, undo, search, and rich snapshots.\nEnter continues a list; Enter on an empty item exits it.",
         );
         editor
             .set_paragraph_kind(ParagraphKind::Heading { level: 1 })
-            .unwrap();
+            .expect("a new editor has no composition");
         editor
             .set_selection(Selection::new(Position::new(2, 0), Position::new(4, 0)))
-            .unwrap();
+            .expect("the sample document has five paragraphs");
         editor
             .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
-            .unwrap();
+            .expect("a new editor has no composition");
         editor
             .set_selection(Selection::caret(Position::new(1, 0)))
-            .unwrap();
+            .expect("the sample document has five paragraphs");
         editor.clear_history();
         let qa = report.map(|report| qa::Session::new(options, report, &editor));
         Self {
@@ -114,13 +180,16 @@ impl NativeEditor {
         }
     }
 
-    fn command_error(&mut self, error: impl std::fmt::Display) {
+    /// Shows a failed command's error in the status line and counts it for
+    /// the QA report.
+    fn command_error(&mut self, error: impl Display) {
         self.status = error.to_string();
         if let Some(qa) = &mut self.qa {
             qa.host_command_error();
         }
     }
 
+    /// Reports a command's error, if any, and returns focus to the document.
     fn result(&mut self, result: Result<(), textloom::Error>) {
         if let Err(error) = result {
             self.command_error(error);
@@ -128,6 +197,10 @@ impl NativeEditor {
         self.focus_editor = self.enabled;
     }
 
+    /// Ends any IME composition before a command, as clicking outside the
+    /// document does: commits its visible preedit, without control characters
+    /// other than line breaks and tabs, or cancels it if that leaves nothing
+    /// or editing is not allowed. Then interrupts the platform IME.
     fn finish_composition(&mut self, ui: &egui::Ui) {
         let Some(mut text) = self
             .editor
@@ -145,12 +218,16 @@ impl NativeEditor {
         ui.memory_mut(|memory| memory.interrupt_ime());
     }
 
+    /// Applies the queued commands in order.
     fn apply_commands(&mut self, ui: &egui::Ui) {
-        for command in std::mem::take(&mut self.commands) {
+        for command in mem::take(&mut self.commands) {
             self.apply_command(ui, command);
         }
     }
 
+    /// Applies `command` unless the document's mode forbids it: a disabled
+    /// document only allows capturing a snapshot, and a read-only one also
+    /// allows Find.
     fn apply_command(&mut self, ui: &egui::Ui, command: EditorCommand) {
         if (!self.enabled && !matches!(command, EditorCommand::CaptureSnapshot))
             || (self.read_only
@@ -218,7 +295,7 @@ impl NativeEditor {
                 let Some(bytes) = &self.snapshot else {
                     return;
                 };
-                match Document::from_bytes_with_limits(bytes, textloom::DecodeLimits::UNLIMITED) {
+                match Document::from_bytes_with_limits(bytes, DecodeLimits::UNLIMITED) {
                     Ok(document) => {
                         self.editor = Editor::new(document);
                         if let Some(qa) = &mut self.qa {
@@ -264,6 +341,8 @@ impl NativeEditor {
         ui.ctx().request_repaint();
     }
 
+    /// Shows the formatting, history, mode, paragraph, and snapshot controls,
+    /// and queues their commands.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(self.enabled && !self.read_only, |ui| {
@@ -389,7 +468,12 @@ impl NativeEditor {
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(self.enabled && !self.read_only, |ui| {
                 let focused = kind_paragraph(self.editor.selection());
-                let current = self.editor.document().paragraph(focused).unwrap().kind();
+                let current = self
+                    .editor
+                    .document()
+                    .paragraph(focused)
+                    .expect("the selection's paragraphs exist")
+                    .kind();
                 let indent = match current {
                     ParagraphKind::Bullet { indent } | ParagraphKind::Ordered { indent, .. } => {
                         indent
@@ -430,10 +514,12 @@ impl NativeEditor {
                 }
                 let focused = kind_paragraph(self.editor.selection());
                 let document = self.editor.document();
-                if let ParagraphKind::Ordered { start, .. } =
-                    document.paragraph(focused).unwrap().kind()
+                if let ParagraphKind::Ordered { start, .. } = document
+                    .paragraph(focused)
+                    .expect("the selection's paragraphs exist")
+                    .kind()
+                    && let Some(number) = document.list_number(focused)
                 {
-                    let number = document.list_number(focused).unwrap();
                     ui.label(format!("Item {number}."));
                     let mut restart = None;
                     if ui
@@ -469,6 +555,7 @@ impl NativeEditor {
         });
     }
 
+    /// Opens the link field, prefilled with the selected link.
     fn open_link_field(&mut self) {
         self.link_url = Some(
             self.editor
@@ -479,6 +566,9 @@ impl NativeEditor {
         self.focus_link_field = true;
     }
 
+    /// Shows the link field while it is open. Enter or Apply link queues the
+    /// URL, which closes the field once applied; Escape, Cancel, or a disabled
+    /// or read-only document closes it.
     fn link_field(&mut self, ui: &mut egui::Ui) {
         self.text_field_ids[0] = None;
         let Some(mut url) = self.link_url.take() else {
@@ -496,7 +586,7 @@ impl NativeEditor {
                 )
                 .labelled_by(label.id);
             self.text_field_ids[0] = Some(response.id);
-            if std::mem::take(&mut self.focus_link_field) {
+            if mem::take(&mut self.focus_link_field) {
                 response.request_focus();
             }
             apply |= field_finished_with_key(ui, &response, field_focus, egui::Key::Enter);
@@ -514,6 +604,8 @@ impl NativeEditor {
         self.link_url = Some(url);
     }
 
+    /// Opens `link` in the system browser or mail client if it is a web or
+    /// mail link, and reports the outcome in the status line.
     fn follow_link(&mut self, context: &egui::Context, link: &Link) {
         if let Some(target) = followable(link) {
             context.open_url(egui::OpenUrl::new_tab(target));
@@ -523,6 +615,7 @@ impl NativeEditor {
         }
     }
 
+    /// Shows the Find and Replace rows and queues their commands.
     fn search(&mut self, ui: &mut egui::Ui) {
         let (next, previous) = ui
             .horizontal_wrapped(|ui| {
@@ -584,6 +677,15 @@ impl NativeEditor {
     }
 }
 
+/// Whether the first Enter or Escape that `response`'s field receives in this
+/// pass is `requested`.
+///
+/// The field owns the keyboard if it had focus at the start of the pass
+/// (`initial_focus`), or, for Escape, which can clear focus before the UI
+/// runs, if nothing has focus and the field had it in the previous frame.
+/// Events in the pass that move focus, namely a primary click, an
+/// accessibility focus request, or Tab, update that ownership in order, so a
+/// key that arrives after focus moved never counts for the field.
 fn field_finished_with_key(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -637,13 +739,17 @@ fn field_finished_with_key(
     })
 }
 
+/// One of the two color split buttons.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ColorTarget {
+    /// Fill Color, which sets the text's background.
     Fill,
+    /// Font Color, which sets the text's foreground.
     Font,
 }
 
 impl ColorTarget {
+    /// The swatch button's label.
     fn label(self) -> &'static str {
         match self {
             Self::Fill => "Fill Color",
@@ -651,6 +757,7 @@ impl ColorTarget {
         }
     }
 
+    /// The menu arrow's accessible label.
     fn menu_label(self) -> &'static str {
         match self {
             Self::Fill => "Fill Color menu",
@@ -658,6 +765,7 @@ impl ColorTarget {
         }
     }
 
+    /// The menu entry that removes the color.
     fn none_label(self) -> &'static str {
         match self {
             Self::Fill => "No Fill",
@@ -665,6 +773,7 @@ impl ColorTarget {
         }
     }
 
+    /// A patch that sets this color, or removes it with `None`.
     fn patch(self, color: Option<Color>) -> StylePatch {
         match self {
             Self::Fill => StylePatch {
@@ -679,6 +788,12 @@ impl ColorTarget {
     }
 }
 
+/// Shows a color split button for `target`. The swatch applies `last`, and
+/// the arrow opens a menu with no color and the standard colors; a standard
+/// color chosen there also becomes `last`.
+///
+/// Returns the chosen color, or `None` if nothing was chosen; `Some(None)`
+/// removes the color.
 fn color_control(
     ui: &mut egui::Ui,
     target: ColorTarget,
@@ -714,6 +829,8 @@ fn color_control(
     chosen
 }
 
+/// A button that shows a swatch of `color`, transparent for `None`, before
+/// `text`, and appears selected if `selected` is true.
 fn swatch_button(
     ui: &mut egui::Ui,
     color: Option<Color>,
@@ -741,6 +858,7 @@ fn swatch_button(
     response.response
 }
 
+/// A narrow button with a downward arrow, accessibly labelled `label`.
 fn menu_arrow(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let height = ui.spacing().interact_size.y;
     let (rect, response) =
@@ -771,6 +889,14 @@ fn menu_arrow(ui: &mut egui::Ui, label: &str) -> egui::Response {
     response
 }
 
+/// Applies the link field's `url`, trimmed. An empty URL removes the link
+/// (see [`link_selection`]); at a caret outside a link, the URL is inserted as
+/// linked text; otherwise the selection links to it.
+///
+/// # Errors
+///
+/// Returns [`textloom::Error::InvalidLink`] for an invalid URL, or the
+/// editor's error.
 fn apply_link(editor: &mut Editor, url: &str) -> Result<(), textloom::Error> {
     let url = url.trim();
     if url.is_empty() {
@@ -784,6 +910,9 @@ fn apply_link(editor: &mut Editor, url: &str) -> Result<(), textloom::Error> {
     }
 }
 
+/// Sets or, with `None`, removes the link of the selection, or of the link at
+/// a caret. A selection within one link that does not cover all of it changes
+/// that whole link instead, in one undo step, and keeps the selection.
 fn link_selection(editor: &mut Editor, link: Option<Link>) -> Result<(), textloom::Error> {
     let selection = editor.selection();
     let range = selection.range();
@@ -801,6 +930,9 @@ fn link_selection(editor: &mut Editor, link: Option<Link>) -> Result<(), textloo
     })
 }
 
+/// The target of `link` without surrounding whitespace, if it is an `http`,
+/// `https`, or `mailto` URL in any letter case. The host opens no other
+/// schemes.
 fn followable(link: &Link) -> Option<&str> {
     let target = link.as_str().trim();
     ["http://", "https://", "mailto:"]
@@ -813,6 +945,9 @@ fn followable(link: &Link) -> Option<&str> {
         .then_some(target)
 }
 
+/// The paragraph whose kind and numbering the toolbar shows: the selection's
+/// focus paragraph, or the one before it when a selection extends forward to
+/// the start of a paragraph.
 fn kind_paragraph(selection: Selection) -> usize {
     let focus = selection.focus;
     if focus.byte == 0 && focus.paragraph > selection.anchor.paragraph {
@@ -822,6 +957,9 @@ fn kind_paragraph(selection: Selection) -> usize {
     }
 }
 
+/// Sets the start number of paragraph `index` if it is a numbered item, in
+/// one undo step, and keeps the selection. `None` continues the previous
+/// numbering.
 fn set_item_start(
     editor: &mut Editor,
     index: usize,
@@ -843,6 +981,8 @@ fn set_item_start(
     })
 }
 
+/// Returns `chosen` unless every paragraph in `selected`, a range of
+/// paragraph indexes, already has that kind.
 fn chosen_kind(
     document: &Document,
     selected: Range<usize>,
@@ -855,6 +995,7 @@ fn chosen_kind(
     .then_some(chosen)
 }
 
+/// The paragraph-kind menu's name for `kind`.
 fn kind_name(kind: ParagraphKind) -> String {
     match kind {
         ParagraphKind::Body => "Body".into(),
@@ -909,6 +1050,31 @@ impl eframe::App for NativeEditor {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.smoke_frames.is_some() && self.smoke_error {
+            eprintln!("Native smoke test failed: {}", self.status);
+        }
+        if let Some(qa) = &mut self.qa {
+            match qa.write_report(&self.editor) {
+                Ok(path) => println!("Native QA observations written to {}", path.display()),
+                Err(error) => {
+                    eprintln!("Could not write native QA report: {error}");
+                    self.failed.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+impl NativeEditor {
+    /// Runs one UI pass: shows the window's contents, routes IME input
+    /// between the document and the fields, applies the queued commands, and
+    /// updates the QA observations and the smoke test. Input routing can run
+    /// several passes per frame.
+    fn show(&mut self, ui: &mut egui::Ui) {
         let frame = ui.ctx().cumulative_frame_nr();
         let new_frame = self.last_frame != Some(frame);
         if new_frame {
@@ -924,11 +1090,14 @@ impl eframe::App for NativeEditor {
         let document_was_focused = focused.is_some() && focused == self.document_id;
         // Backward keyboard focus traversal takes effect at the start of a frame.
         // The destination then owns fresh IME input before any widgets are rendered.
-        let field_owned_ime = focused.is_some_and(|id| self.text_field_ids.contains(&Some(id)))
-            && self
-                .document_id
-                .is_some_and(|id| ui.memory(|memory| memory.had_focus_last_frame(id)));
-        if field_owned_ime
+        let ime_field = focused.filter(|id| {
+            self.text_field_ids.contains(&Some(*id))
+                && self.document_id.is_some_and(|document| {
+                    ui.memory(|memory| memory.had_focus_last_frame(document))
+                })
+        });
+        let field_owned_ime = ime_field.is_some();
+        if let Some(field) = ime_field
             && let Some(candidate) = ime_handoff::candidate(
                 self.editor.composition(),
                 self.cleared_document_preedit.as_deref(),
@@ -937,7 +1106,7 @@ impl eframe::App for NativeEditor {
             )
         {
             self.ime_handoff = Some(ime_handoff::Guard::new(
-                focused.unwrap(),
+                field,
                 candidate,
                 ui.input(|input| input.time),
             ));
@@ -969,7 +1138,7 @@ impl eframe::App for NativeEditor {
                 .clipboard
                 .as_mut()
                 .ok_or_else(|| "Native rich clipboard was not enabled".to_owned())
-                .and_then(clipboard::NativeClipboard::self_test);
+                .and_then(NativeClipboard::self_test);
             if let Some(qa) = &mut self.qa {
                 qa.clipboard_self_test_result(result.is_ok());
             }
@@ -1052,11 +1221,10 @@ impl eframe::App for NativeEditor {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let output = ui
                     .add_enabled_ui(self.enabled, |ui| {
-                        let mut widget =
-                            textloom::adapter::egui::RichTextEditor::new(&mut self.editor)
-                                .id_salt("native-document")
-                                .min_rows(18)
-                                .read_only(self.read_only);
+                        let mut widget = RichTextEditor::new(&mut self.editor)
+                            .id_salt("native-document")
+                            .min_rows(18)
+                            .read_only(self.read_only);
                         if let Some(clipboard) = &mut self.clipboard {
                             widget = widget.rich_clipboard(clipboard);
                         }
@@ -1114,7 +1282,7 @@ impl eframe::App for NativeEditor {
         if let Some(qa) = &mut self.qa {
             qa.observe_editor(
                 &self.editor,
-                qa::FocusState {
+                FocusState {
                     window_focused: ui.input(|input| input.focused),
                     widget_focus_retained: self
                         .document_id
@@ -1151,29 +1319,21 @@ impl eframe::App for NativeEditor {
             }
         }
     }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.smoke_frames.is_some() && self.smoke_error {
-            eprintln!("Native smoke test failed: {}", self.status);
-        }
-        if let Some(qa) = &mut self.qa {
-            match qa.write_report(&self.editor) {
-                Ok(path) => println!("Native QA observations written to {}", path.display()),
-                Err(error) => {
-                    eprintln!("Could not write native QA report: {error}");
-                    self.failed.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-    }
 }
 
+/// Runs a clipboard helper if the arguments request one, and otherwise the
+/// host window.
+///
+/// Exits with status 1 when a clipboard helper fails, and with status 2 for
+/// invalid arguments or an unusable report path. Returns an error when a font
+/// cannot be read, the window cannot open, or the smoke test, clipboard
+/// self-test, or report write failed.
 fn main() -> eframe::Result {
-    let raw_arguments: Vec<_> = qa::arguments().collect();
+    let raw_arguments: Vec<OsString> = qa::arguments().collect();
     if let Some(result) = clipboard::helper(&raw_arguments) {
         if let Err(error) = result {
             eprintln!("{error}");
-            std::process::exit(1);
+            process::exit(1);
         }
         return Ok(());
     }
@@ -1181,7 +1341,7 @@ fn main() -> eframe::Result {
         Ok(arguments) => arguments,
         Err(error) => {
             eprintln!("{error}");
-            std::process::exit(2);
+            process::exit(2);
         }
     };
     if arguments.help {
@@ -1191,11 +1351,11 @@ fn main() -> eframe::Result {
     let regular_font = qa::read_font(arguments.regular_font.as_deref())?;
     let bold_font = qa::read_font(arguments.bold_font.as_deref())?;
     let report = match &arguments.qa_report {
-        Some(path) => match qa::ReportFile::create(path) {
+        Some(path) => match ReportFile::create(path) {
             Ok(report) => Some(report),
             Err(error) => {
                 eprintln!("Cannot create QA report {}: {error}", path.display());
-                std::process::exit(2);
+                process::exit(2);
             }
         },
         None => None,
@@ -1242,7 +1402,7 @@ fn main() -> eframe::Result {
             }
             context.egui_ctx.set_fonts(fonts);
             let clipboard = if arguments.rich_clipboard {
-                Some(clipboard::NativeClipboard::try_new(context).map_err(std::io::Error::other)?)
+                Some(NativeClipboard::try_new(context).map_err(io::Error::other)?)
             } else {
                 None
             };
@@ -1253,7 +1413,7 @@ fn main() -> eframe::Result {
     )?;
     if failed.load(Ordering::Relaxed) {
         return Err(eframe::Error::AppCreation(
-            std::io::Error::other("Native smoke test or QA report failed; see stderr").into(),
+            io::Error::other("Native smoke test or QA report failed; see stderr").into(),
         ));
     }
     Ok(())
@@ -1262,31 +1422,37 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
+    use std::ops::RangeInclusive;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, fs};
 
-    use eframe::App as _;
     use egui::accesskit::{Node, NodeId, Role};
 
     use super::*;
 
+    /// Runs the host without a window, one egui frame per step, and keeps the
+    /// latest AccessKit tree and the output commands.
     struct Harness {
         app: NativeEditor,
         context: egui::Context,
-        frame: eframe::Frame,
+        /// The simulated input time, in seconds.
         time: f64,
         nodes: HashMap<NodeId, Node>,
         commands: Vec<egui::OutputCommand>,
         viewport_commands: Vec<egui::ViewportCommand>,
+        /// The QA report file, removed on drop.
         report: PathBuf,
     }
 
     impl Harness {
         fn new(name: &str) -> Self {
-            let report = std::env::temp_dir().join(format!(
+            let report = env::temp_dir().join(format!(
                 "textloom-host-{name}-{}-{}.json",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
@@ -1294,7 +1460,7 @@ mod tests {
                 qa_report: Some(report.clone()),
                 ..qa::Options::default()
             };
-            let report_file = qa::ReportFile::create(&report).unwrap();
+            let report_file = ReportFile::create(&report).unwrap();
             let app = NativeEditor::new(
                 &options,
                 Some(report_file),
@@ -1307,7 +1473,6 @@ mod tests {
             let mut harness = Self {
                 app,
                 context,
-                frame: eframe::Frame::_new_kittest(),
                 time: 0.0,
                 nodes: HashMap::new(),
                 commands: Vec::new(),
@@ -1320,6 +1485,8 @@ mod tests {
         }
 
         fn step(&mut self, events: Vec<egui::Event>) {
+            use eframe::App as _;
+
             self.time += 0.016;
             let mut input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1332,8 +1499,8 @@ mod tests {
                 ..Default::default()
             };
             self.app.raw_input_hook(&self.context, &mut input);
-            let (app, frame) = (&mut self.app, &mut self.frame);
-            let mut output = self.context.run_ui(input, |ui| app.ui(ui, frame));
+            let app = &mut self.app;
+            let mut output = self.context.run_ui(input, |ui| app.show(ui));
             self.commands.append(&mut output.platform_output.commands);
             for viewport in output.viewport_output.values() {
                 self.viewport_commands
@@ -1422,13 +1589,13 @@ mod tests {
             assert_eq!(qa.host_command_errors(), 0, "{}", self.app.status);
         }
 
-        fn kinds(&self, paragraphs: std::ops::RangeInclusive<usize>) -> Vec<ParagraphKind> {
+        fn kinds(&self, paragraphs: RangeInclusive<usize>) -> Vec<ParagraphKind> {
             paragraphs
                 .map(|index| self.app.editor.document().paragraph(index).unwrap().kind())
                 .collect()
         }
 
-        fn numbers(&self, paragraphs: std::ops::RangeInclusive<usize>) -> Vec<Option<u32>> {
+        fn numbers(&self, paragraphs: RangeInclusive<usize>) -> Vec<Option<u32>> {
             paragraphs
                 .map(|index| self.app.editor.document().list_number(index))
                 .collect()
@@ -1444,7 +1611,7 @@ mod tests {
 
     impl Drop for Harness {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.report);
+            let _ = fs::remove_file(&self.report);
         }
     }
 
@@ -1459,10 +1626,13 @@ mod tests {
             assert_eq!(harness.app.status, "Ready", "{preedits:?}");
             harness.assert_no_command_errors();
             let editor = &harness.app.editor;
-            assert!(editor.composition().is_none());
-            assert!(editor.typing_style().bold);
+            assert!(editor.composition().is_none(), "{preedits:?}");
+            assert!(editor.typing_style().bold, "{preedits:?}");
             let paragraph = editor.document().paragraph(1).unwrap().text();
-            assert!(paragraph.starts_with(&format!("{committed}Select")));
+            assert!(
+                paragraph.starts_with(&format!("{committed}Select")),
+                "{preedits:?}"
+            );
         }
     }
 
@@ -1474,18 +1644,22 @@ mod tests {
             harness.app.editor.break_history_group();
             let before_composition = harness.app.editor.document().plain_text();
             harness.preedit("にほん");
-            let events = queued_commit
+            let events: Vec<egui::Event> = queued_commit
                 .map(|text| egui::Event::Ime(egui::ImeEvent::Commit(text.into())))
                 .into_iter()
                 .collect();
             harness.click_with_release_events("Undo", Role::Button, events);
             harness.assert_no_command_errors();
-            assert!(harness.app.editor.composition().is_none());
+            assert!(
+                harness.app.editor.composition().is_none(),
+                "{queued_commit:?}"
+            );
             assert_eq!(
                 harness.app.editor.document().plain_text(),
-                before_composition
+                before_composition,
+                "{queued_commit:?}"
             );
-            assert!(harness.editor_focused());
+            assert!(harness.editor_focused(), "{queued_commit:?}");
             harness.click("Redo", Role::Button);
             let committed = queued_commit.unwrap_or("にほん");
             assert!(
@@ -1494,7 +1668,8 @@ mod tests {
                     .editor
                     .document()
                     .plain_text()
-                    .contains(&format!("existing {committed}Select"))
+                    .contains(&format!("existing {committed}Select")),
+                "{queued_commit:?}"
             );
         }
     }
@@ -1532,8 +1707,12 @@ mod tests {
                     harness.click("Bold", Role::Button);
                 }
                 harness.assert_no_command_errors();
-                assert!(harness.app.editor.composition().is_none());
-                assert!(!harness.app.editor.document().plain_text().contains('\0'));
+                let case = format!("accessibility={accessibility} preedit={preedit:?}");
+                assert!(harness.app.editor.composition().is_none(), "{case}");
+                assert!(
+                    !harness.app.editor.document().plain_text().contains('\0'),
+                    "{case}"
+                );
             }
         }
     }
@@ -1553,7 +1732,11 @@ mod tests {
                 "にほん".into(),
             ))]);
             harness.assert_no_command_errors();
-            assert_eq!(harness.app.editor.document().plain_text(), committed);
+            assert_eq!(
+                harness.app.editor.document().plain_text(),
+                committed,
+                "accessibility={accessibility}"
+            );
         }
     }
 
@@ -1602,7 +1785,8 @@ mod tests {
                 editor
                     .set_selection(Selection::new(Position::new(0, 2), Position::new(2, 3)))
                     .unwrap();
-                assert!(harness.has_label("Item 7."));
+                let case = format!("{label} accessibility={accessibility}");
+                assert!(harness.has_label("Item 7."), "{case}");
                 harness.preedit("に");
                 if accessibility {
                     harness.accessibility_click(label);
@@ -1610,12 +1794,12 @@ mod tests {
                     harness.click(label, Role::Button);
                 }
                 harness.assert_no_command_errors();
-                assert_eq!(harness.app.editor.document().plain_text(), "fiにrd");
                 assert_eq!(
-                    harness.kinds(0..=0),
-                    [ParagraphKind::Body],
-                    "{label} accessibility={accessibility}"
+                    harness.app.editor.document().plain_text(),
+                    "fiにrd",
+                    "{case}"
                 );
+                assert_eq!(harness.kinds(0..=0), [ParagraphKind::Body], "{case}");
             }
         }
     }
@@ -1735,6 +1919,7 @@ mod tests {
                 "",
             ),
         ] {
+            let case = format!("{event:?}");
             let mut harness = Harness::new("ime-queued-snapshot");
             harness.preedit("に");
             harness.click_with_release_events(
@@ -1743,16 +1928,18 @@ mod tests {
                 vec![egui::Event::Ime(event)],
             );
             harness.assert_no_command_errors();
-            assert!(harness.app.editor.composition().is_none());
+            assert!(harness.app.editor.composition().is_none(), "{case}");
             let captured = Document::from_bytes(harness.app.snapshot.as_ref().unwrap()).unwrap();
             assert_eq!(
                 captured.plain_text(),
-                harness.app.editor.document().plain_text()
+                harness.app.editor.document().plain_text(),
+                "{case}"
             );
             assert!(
                 captured
                     .plain_text()
-                    .starts_with(&format!("TextLoom\n{committed}Select"))
+                    .starts_with(&format!("TextLoom\n{committed}Select")),
+                "{case}"
             );
         }
     }
@@ -1762,7 +1949,7 @@ mod tests {
         let mut harness = Harness::new("multiple-toolbar-commands");
         harness.app.editor.select_all();
         harness.step(Vec::new());
-        let events = ["Bold", "Italic"]
+        let events: Vec<egui::Event> = ["Bold", "Italic"]
             .map(|label| {
                 let (&target, _) = harness
                     .nodes
@@ -1796,7 +1983,7 @@ mod tests {
             harness.app.query = query.into();
             harness.app.replacement = "x".into();
             harness.step(Vec::new());
-            let events = [label, "Replace all"]
+            let events: Vec<egui::Event> = [label, "Replace all"]
                 .map(|label| {
                     let (&target, _) = harness
                         .nodes
@@ -1836,7 +2023,7 @@ mod tests {
                 }
                 harness.app.query = query.into();
                 harness.step(Vec::new());
-                let events = [label, button]
+                let events: Vec<egui::Event> = [label, button]
                     .map(|label| {
                         let (&target, _) = harness
                             .nodes
@@ -1858,7 +2045,8 @@ mod tests {
                     Selection::new(
                         Position::new(0, expected.start),
                         Position::new(0, expected.end)
-                    )
+                    ),
+                    "{label} {button}"
                 );
                 harness.assert_no_command_errors();
             }
@@ -1917,7 +2105,7 @@ mod tests {
             for (source, target) in [(1, 2), (2, 1), (0, 1), (1, 0)] {
                 let mut harness = Harness::new("field-focus-text");
                 harness.context.options_mut(|options| {
-                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                    options.max_passes = NonZeroUsize::new(max_passes).unwrap();
                 });
                 harness.app.editor = Editor::from_text("document");
                 harness.app.link_url = Some(String::new());
@@ -1936,10 +2124,18 @@ mod tests {
                 for _ in 0..3 {
                     harness.step(Vec::new());
                 }
-                assert_eq!(field_value(&harness.app, source), "before");
-                assert_eq!(field_value(&harness.app, target), "after");
-                assert_eq!(harness.app.editor.document().plain_text(), "document");
-                assert!(harness.context.memory(|memory| memory.has_focus(target_id)));
+                let case = format!("max_passes={max_passes} source={source} target={target}");
+                assert_eq!(field_value(&harness.app, source), "before", "{case}");
+                assert_eq!(field_value(&harness.app, target), "after", "{case}");
+                assert_eq!(
+                    harness.app.editor.document().plain_text(),
+                    "document",
+                    "{case}"
+                );
+                assert!(
+                    harness.context.memory(|memory| memory.has_focus(target_id)),
+                    "{case}"
+                );
                 harness.assert_no_command_errors();
             }
         }
@@ -1951,7 +2147,7 @@ mod tests {
             for from_document in [false, true] {
                 let mut harness = Harness::new("document-focus-text");
                 harness.context.options_mut(|options| {
-                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                    options.max_passes = NonZeroUsize::new(max_passes).unwrap();
                 });
                 harness.app.editor = Editor::default();
                 let document = harness.app.document_id.unwrap();
@@ -1980,9 +2176,17 @@ mod tests {
                 } else {
                     ("after", "before!")
                 };
-                assert_eq!(harness.app.editor.document().plain_text(), document_text);
-                assert_eq!(harness.app.query, query);
-                assert!(harness.context.memory(|memory| memory.has_focus(source)));
+                let case = format!("max_passes={max_passes} from_document={from_document}");
+                assert_eq!(
+                    harness.app.editor.document().plain_text(),
+                    document_text,
+                    "{case}"
+                );
+                assert_eq!(harness.app.query, query, "{case}");
+                assert!(
+                    harness.context.memory(|memory| memory.has_focus(source)),
+                    "{case}"
+                );
                 harness.assert_no_command_errors();
             }
         }
@@ -1995,7 +2199,7 @@ mod tests {
                 for fresh in [false, true] {
                     let mut harness = Harness::new("focus-ime-passes");
                     harness.context.options_mut(|options| {
-                        options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                        options.max_passes = NonZeroUsize::new(max_passes).unwrap();
                     });
                     harness.app.editor = Editor::from_text("original");
                     harness.app.editor.select_all();
@@ -2024,12 +2228,18 @@ mod tests {
                     for _ in 0..3 {
                         harness.step(Vec::new());
                     }
+                    let case = format!("max_passes={max_passes} cleared={cleared} fresh={fresh}");
                     assert_eq!(
                         harness.app.editor.document().plain_text(),
-                        if cleared { "original" } else { "한" }
+                        if cleared { "original" } else { "한" },
+                        "{case}"
                     );
-                    assert_eq!(harness.app.replacement, if fresh { "新" } else { "" });
-                    assert!(harness.app.editor.composition().is_none());
+                    assert_eq!(
+                        harness.app.replacement,
+                        if fresh { "新" } else { "" },
+                        "{case}"
+                    );
+                    assert!(harness.app.editor.composition().is_none(), "{case}");
                     harness.assert_no_command_errors();
                 }
             }
@@ -2071,20 +2281,26 @@ mod tests {
                         field_press(&harness, 2)
                     };
                     if separate_frame {
-                        harness.step(std::mem::take(&mut events));
+                        harness.step(mem::take(&mut events));
                     }
                     events.push(plain_key(key));
                     harness.step(events);
-                    assert_eq!(harness.app.editor.selection(), selection);
+                    let case = format!(
+                        "source={source} key={key:?} accessibility={accessibility} \
+                         separate_frame={separate_frame}"
+                    );
+                    assert_eq!(harness.app.editor.selection(), selection, "{case}");
                     assert_eq!(
                         harness.app.editor.document().plain_text(),
-                        "before target after"
+                        "before target after",
+                        "{case}"
                     );
-                    assert_ne!(harness.app.status, "Match selected");
+                    assert_ne!(harness.app.status, "Match selected", "{case}");
                     if source == 0 {
                         assert_eq!(
                             harness.app.link_url.as_deref(),
-                            Some("https://example.com/")
+                            Some("https://example.com/"),
+                            "{case}"
                         );
                     }
                     harness.assert_no_command_errors();
@@ -2120,15 +2336,17 @@ mod tests {
                     events.extend(field_press(&harness, 2));
                 }
                 harness.step(events);
+                let case = format!("field={field} entering={entering}");
                 if field == 0 {
-                    assert!(harness.app.link_url.is_none());
+                    assert!(harness.app.link_url.is_none(), "{case}");
                     assert_eq!(
                         harness.app.editor.selected_link().unwrap().as_str(),
-                        "https://example.com/"
+                        "https://example.com/",
+                        "{case}"
                     );
                 } else {
-                    assert_eq!(harness.app.status, "Match selected");
-                    assert_eq!(harness.app.editor.selected_text(), "target");
+                    assert_eq!(harness.app.status, "Match selected", "{case}");
+                    assert_eq!(harness.app.editor.selected_text(), "target", "{case}");
                 }
                 harness.assert_no_command_errors();
             }
@@ -2159,10 +2377,11 @@ mod tests {
             }]);
             let selection = harness.app.editor.selection();
             harness.step(vec![plain_key(egui::Key::Enter)]);
-            assert_eq!(harness.app.editor.selection(), selection);
+            assert_eq!(harness.app.editor.selection(), selection, "field {field}");
             assert_eq!(
                 harness.app.editor.document().plain_text(),
-                "before target after"
+                "before target after",
+                "field {field}"
             );
             if field == 0 {
                 assert_eq!(
@@ -2317,7 +2536,7 @@ mod tests {
         harness.choose_paragraph_kind("Quote", "Quote");
         assert_eq!(harness.app.editor.undo_len(), undo);
         harness.step(Vec::new());
-        let quotes: Vec<_> = harness
+        let quotes: Vec<&Node> = harness
             .nodes
             .values()
             .filter(|node| node.role() == Role::Blockquote)
@@ -2452,7 +2671,7 @@ mod tests {
         let mut harness = Harness::new("fill-and-font-color");
         harness.select(1, 0..6);
         harness.step(Vec::new());
-        let events = [ColorTarget::Fill, ColorTarget::Font]
+        let events: Vec<egui::Event> = [ColorTarget::Fill, ColorTarget::Font]
             .map(|target| {
                 let (&node, _) = harness
                     .nodes
@@ -2686,7 +2905,8 @@ mod tests {
         for byte in [0, 5] {
             assert_eq!(
                 harness.link_at(1, byte).as_deref(),
-                Some("https://example.com/b")
+                Some("https://example.com/b"),
+                "byte {byte}"
             );
         }
 
@@ -2751,8 +2971,12 @@ mod tests {
                 harness.app.link_url.is_none(),
                 "the link shortcut intercepted {modifiers:?}"
             );
-            assert_eq!(harness.app.editor.document().plain_text(), "ķ");
-            assert!(harness.editor_focused());
+            assert_eq!(
+                harness.app.editor.document().plain_text(),
+                "ķ",
+                "{modifiers:?}"
+            );
+            assert!(harness.editor_focused(), "{modifiers:?}");
             harness.assert_no_command_errors();
         }
     }
@@ -2779,7 +3003,7 @@ mod tests {
                     .contains(&egui::ViewportCommand::Close),
                 "{modifiers:?} closed the window"
             );
-            assert!(harness.editor_focused());
+            assert!(harness.editor_focused(), "{modifiers:?}");
         }
         let mut harness = Harness::new("quit");
         harness.step(vec![quit(egui::Modifiers::CTRL | egui::Modifiers::COMMAND)]);
@@ -2878,15 +3102,26 @@ mod tests {
                         events.push(egui::Event::Ime(egui::ImeEvent::Commit(candidate.into())));
                     }
                     harness.step(events);
-                    assert!(harness.context.memory(|memory| memory.has_focus(id)));
-                    assert_eq!(harness.app.editor.document().plain_text(), document);
+                    let case = format!(
+                        "field={field} prior_empty={prior_empty} queued={queued:?} \
+                         same_frame_echo={same_frame_echo}"
+                    );
+                    assert!(
+                        harness.context.memory(|memory| memory.has_focus(id)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        harness.app.editor.document().plain_text(),
+                        document,
+                        "{case}"
+                    );
                     if !same_frame_echo {
                         harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit(
                             candidate.into(),
                         ))]);
                     }
-                    assert!(harness.app.query.is_empty());
-                    assert!(harness.app.replacement.is_empty());
+                    assert!(harness.app.query.is_empty(), "{case}");
+                    assert!(harness.app.replacement.is_empty(), "{case}");
                     harness.assert_no_command_errors();
                 }
             }
@@ -2930,16 +3165,23 @@ mod tests {
                         events.push(egui::Event::Ime(egui::ImeEvent::Commit("한".into())));
                     }
                     harness.step(events);
-                    assert!(harness.context.memory(|memory| memory.has_focus(id)));
+                    let case = format!(
+                        "field={field} cleared={cleared} same_frame_echo={same_frame_echo}"
+                    );
+                    assert!(
+                        harness.context.memory(|memory| memory.has_focus(id)),
+                        "{case}"
+                    );
                     assert_eq!(
                         harness.app.editor.document().plain_text(),
-                        if cleared { "abc" } else { "한" }
+                        if cleared { "abc" } else { "한" },
+                        "{case}"
                     );
                     if !same_frame_echo {
                         harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
                     }
-                    assert!(harness.app.query.is_empty());
-                    assert!(harness.app.replacement.is_empty());
+                    assert!(harness.app.query.is_empty(), "{case}");
+                    assert!(harness.app.replacement.is_empty(), "{case}");
                     harness.assert_no_command_errors();
                 }
             }
@@ -2987,17 +3229,22 @@ mod tests {
                     repeat: false,
                     modifiers: egui::Modifiers::SHIFT,
                 }]);
+                let case = format!("cleared={cleared} transfer={transfer:?}");
                 let delayed_echo = transfer.is_empty();
-                harness.step(std::mem::take(&mut transfer));
+                harness.step(mem::take(&mut transfer));
                 let field = harness.app.text_field_ids[2].unwrap();
-                assert!(harness.context.memory(|memory| memory.has_focus(field)));
+                assert!(
+                    harness.context.memory(|memory| memory.has_focus(field)),
+                    "{case}"
+                );
                 if delayed_echo {
                     harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
                 }
-                assert_eq!(harness.app.replacement, expected);
+                assert_eq!(harness.app.replacement, expected, "{case}");
                 assert_eq!(
                     harness.app.editor.document().plain_text(),
-                    if cleared { "abc" } else { "한" }
+                    if cleared { "abc" } else { "한" },
+                    "{case}"
                 );
                 harness.assert_no_command_errors();
             }
@@ -3051,12 +3298,13 @@ mod tests {
                 harness.step(vec![key(egui::Key::K, egui::Modifiers::COMMAND)]);
                 let mut events = before_echo.clone();
                 if separate_frame {
-                    harness.step(std::mem::take(&mut events));
+                    harness.step(mem::take(&mut events));
                 }
                 events.push(egui::Event::Ime(egui::ImeEvent::Commit("한".into())));
                 harness.step(events);
-                assert_eq!(harness.app.link_url.as_deref(), Some(expected));
-                assert_eq!(harness.app.editor.document().plain_text(), "한");
+                let case = format!("before_echo={before_echo:?} separate_frame={separate_frame}");
+                assert_eq!(harness.app.link_url.as_deref(), Some(expected), "{case}");
+                assert_eq!(harness.app.editor.document().plain_text(), "한", "{case}");
                 harness.assert_no_command_errors();
             }
         }
@@ -3070,7 +3318,11 @@ mod tests {
                 harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
             }
             harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit("한".into()))]);
-            assert_eq!(harness.app.link_url.as_deref(), Some("한"));
+            assert_eq!(
+                harness.app.link_url.as_deref(),
+                Some("한"),
+                "expire={expire}"
+            );
         }
         let mut harness = Harness::new("handoff-pointer-input");
         harness.preedit("한");
