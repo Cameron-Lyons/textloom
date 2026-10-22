@@ -3,13 +3,16 @@ use std::{
     time::Duration,
 };
 
-use egui::{Context, Event, FullOutput, Plugin, RawInput, ViewportId};
+use egui::{Context, Event, FullOutput, Modifiers, Plugin, RawInput, ViewportId};
 
 /// Preserve input order around accessibility focus requests, including native
-/// egui widgets in the same context.
+/// egui widgets in the same context, and capture each pass's starting modifiers
+/// for plain-text paste shortcuts.
 ///
 /// Call this once when creating the context. [`super::RichTextEditor`] also
 /// installs it automatically when first shown, taking effect on the next pass.
+/// Installation in an already-running context cannot recover the starting
+/// modifiers of the pass in which it is installed.
 ///
 /// egui applies an accessibility focus request when its target widget is added.
 /// This plugin gives each focus request a separate pass so that input before and
@@ -25,7 +28,27 @@ pub fn install_input_routing(ctx: &Context) {
 #[derive(Default)]
 struct InputRouting {
     pending: HashMap<ViewportId, PendingInput>,
-    passes: Vec<ViewportId>,
+    passes: Vec<(ViewportId, Modifiers)>,
+}
+
+pub(super) fn modifiers_at_pass_start(ctx: &Context) -> Modifiers {
+    let modifiers = ctx
+        .plugin::<InputRouting>()
+        .lock()
+        .passes
+        .last()
+        .map(|&(_, modifiers)| modifiers);
+    modifiers.unwrap_or_else(|| {
+        // Automatic installation can miss this pass's input hook. The first
+        // pass starts with no modifiers; a later installation can only use the
+        // current state until its first hook. Install at context creation to
+        // capture the starting state even on that first displayed pass.
+        if ctx.cumulative_pass_nr() == 0 {
+            Modifiers::NONE
+        } else {
+            ctx.input(|input| input.modifiers)
+        }
+    })
 }
 
 struct PendingInput {
@@ -59,8 +82,11 @@ impl Plugin for InputRouting {
         "textloom input routing"
     }
 
-    fn input_hook(&mut self, _: &Context, input: &mut RawInput) {
-        self.passes.push(input.viewport_id);
+    fn input_hook(&mut self, ctx: &Context, input: &mut RawInput) {
+        // Read egui's previous state before it processes this routed segment.
+        // This also preserves held modifiers across frames and nested viewports.
+        let modifiers = ctx.input_for(input.viewport_id, |input| input.modifiers);
+        self.passes.push((input.viewport_id, modifiers));
         if !self.pending.contains_key(&input.viewport_id)
             && !input.events.iter().any(requests_focus)
         {
@@ -112,7 +138,7 @@ impl Plugin for InputRouting {
     fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput) {
         // Automatic installation may happen after this pass's input hook. The
         // stack also identifies the ended viewport after a nested viewport pass.
-        let Some(viewport) = self.passes.pop() else {
+        let Some((viewport, _)) = self.passes.pop() else {
             return;
         };
         if self.passes.is_empty() {

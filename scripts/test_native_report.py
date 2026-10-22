@@ -1,10 +1,16 @@
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from itertools import product
 import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from check_native_report import SCHEMA, reject_constant, unique_object, validate
+from check_native_report import SCHEMA, main, reject_constant, unique_object, validate
 
 
-def specimen(mode="editable"):
+def specimen(mode="editable", clipboard="rich"):
     def empty(spec):
         if isinstance(spec, dict):
             return {key: empty(value) for key, value in spec.items()}
@@ -19,8 +25,9 @@ def specimen(mode="editable"):
     )
     report["session"].update(
         graceful_exit=True, smoke_test_requested=True, rendered_frames=21,
-        rich_clipboard_requested=True, clipboard_self_test_requested=mode == "editable",
-        clipboard_self_test_passed=mode == "editable",
+        rich_clipboard_requested=clipboard == "rich",
+        clipboard_self_test_requested=clipboard == "rich" and mode == "editable",
+        clipboard_self_test_passed=clipboard == "rich" and mode == "editable",
     )
     report["display"].update(
         pixels_per_point=2, minimum_pixels_per_point=1,
@@ -36,6 +43,67 @@ class NativeReportTests(unittest.TestCase):
         for mode in ("editable", "read-only", "disabled"):
             with self.subTest(mode=mode):
                 validate(specimen(mode), "candidate", "linux", mode)
+
+    def test_explicit_clipboard_configuration_must_match_the_report(self):
+        for mode, interaction, clipboard in product(
+            ("editable", "read-only", "disabled"), (False, True), ("rich", "default")
+        ):
+            with self.subTest(mode=mode, interaction=interaction, clipboard=clipboard):
+                report = specimen(mode, clipboard)
+                report["session"]["smoke_test_requested"] = not interaction
+                validate(
+                    report, "candidate", "linux", mode,
+                    interaction=interaction, clipboard=clipboard,
+                )
+                with self.assertRaises(ValueError):
+                    validate(
+                        report, "candidate", "linux", mode,
+                        interaction=interaction,
+                        clipboard="default" if clipboard == "rich" else "rich",
+                    )
+                if clipboard == "default":
+                    with self.assertRaises(ValueError):
+                        validate(report, "candidate", "linux", mode, interaction=interaction)
+
+    def test_default_clipboard_rejects_every_rich_or_self_test_flag_combination(self):
+        fields = (
+            "rich_clipboard_requested", "clipboard_self_test_requested",
+            "clipboard_self_test_passed",
+        )
+        for mode, interaction, flags in product(
+            ("editable", "read-only", "disabled"),
+            (False, True), product((False, True), repeat=3),
+        ):
+            if not any(flags):
+                continue
+            with self.subTest(mode=mode, interaction=interaction, flags=flags):
+                report = specimen(mode, "default")
+                report["session"].update(zip(fields, flags))
+                report["session"]["smoke_test_requested"] = not interaction
+                with self.assertRaises(ValueError):
+                    validate(
+                        report, "candidate", "linux", mode,
+                        interaction=interaction, clipboard="default",
+                    )
+
+    def test_clipboard_cli_choice_preserves_rich_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            for clipboard, option in product(("rich", "default"), (None, "rich", "default")):
+                with self.subTest(clipboard=clipboard, option=option):
+                    report_path.write_text(json.dumps(specimen(clipboard=clipboard)), encoding="utf-8")
+                    arguments = [
+                        "check_native_report.py", str(report_path), "--revision", "candidate",
+                        "--os", "linux", "--mode", "editable",
+                    ]
+                    if option is not None:
+                        arguments.extend(("--clipboard", option))
+                    with patch("sys.argv", arguments), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                        self.assertEqual(main(), 0 if clipboard == (option or "rich") else 1)
+
+    def test_unknown_clipboard_configuration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate(specimen(), "candidate", "linux", "editable", clipboard="unknown")
 
     def test_interaction_reports_do_not_certify_smoke_completion(self):
         for mode in ("editable", "read-only", "disabled"):

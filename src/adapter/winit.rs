@@ -1,5 +1,5 @@
 use super::{Shortcut, clean_text, shortcut_key_name};
-use crate::{Editor, Error, Fragment, Movement, ParagraphKind};
+use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection};
 use winit::{
     dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, Ime, WindowEvent},
@@ -89,6 +89,8 @@ impl WinitAdapter {
         self
     }
 
+    /// Delegate Up/Down and macOS Control-P/N to the host for visual-line movement.
+    /// The host receives the original key event, including its Shift modifier.
     pub fn host_vertical_navigation(mut self, enabled: bool) -> Self {
         self.host_vertical_navigation = enabled;
         self
@@ -233,6 +235,8 @@ impl WinitAdapter {
             handled: true,
             ..InputOutcome::default()
         };
+        let control_key = self.macos_control_key(key, physical_key).map(Key::Named);
+        let key = control_key.as_ref().unwrap_or(key);
         let command = self.command_pressed();
         let shift = self.modifiers.shift_key();
         let mut shortcut = None;
@@ -256,12 +260,50 @@ impl WinitAdapter {
         }
 
         let word = self.modifiers.alt_key()
-            || (self.modifiers.control_key() && !self.modifiers.super_key());
+            || (self.modifiers.control_key()
+                && !self.modifiers.super_key()
+                && self.command_modifier == CommandModifier::Control
+                && control_key.is_none());
         let super_command = command && self.command_modifier == CommandModifier::Super;
+        let control_line = self.command_modifier == CommandModifier::Super
+            && self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.super_key()
+            && control_key.is_none();
+        if (super_command || control_line)
+            && matches!(key, Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight))
+        {
+            editor.cancel_composition();
+            let position = soft_line_boundary_position(
+                editor,
+                matches!(key, Key::Named(NamedKey::ArrowRight)),
+            );
+            let anchor = if shift {
+                editor.selection().anchor
+            } else {
+                position
+            };
+            editor.set_selection(Selection::new(anchor, position))?;
+            outcome.changed = before != editor.presentation();
+            return Ok(outcome);
+        }
+        if self.command_modifier == CommandModifier::Super
+            && self.modifiers.alt_key()
+            && !self.modifiers.control_key()
+            && !self.modifiers.super_key()
+            && matches!(key, Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown))
+        {
+            editor.cancel_composition();
+            move_paragraph_boundary(
+                editor,
+                matches!(key, Key::Named(NamedKey::ArrowDown)),
+                shift,
+            )?;
+            outcome.changed = before != editor.presentation();
+            return Ok(outcome);
+        }
         let paragraph_vertical = !self.host_vertical_navigation;
         let movement = match key {
-            Key::Named(NamedKey::ArrowLeft) if super_command => Some(Movement::ParagraphStart),
-            Key::Named(NamedKey::ArrowRight) if super_command => Some(Movement::ParagraphEnd),
             Key::Named(NamedKey::ArrowLeft) if word => Some(Movement::WordBackward),
             Key::Named(NamedKey::ArrowRight) if word => Some(Movement::WordForward),
             Key::Named(NamedKey::ArrowLeft) => Some(Movement::GraphemeBackward),
@@ -297,7 +339,14 @@ impl WinitAdapter {
                 }
                 Key::Named(NamedKey::Backspace) if super_command => {
                     editor.cancel_composition();
-                    editor.delete_to_paragraph_start()?;
+                    let range = if editor.selection().is_caret() {
+                        soft_line_boundary_position(editor, false)..editor.selection().focus
+                    } else {
+                        editor.selection().range()
+                    };
+                    if !range.is_empty() {
+                        editor.replace_range(range, "")?;
+                    }
                 }
                 Key::Named(NamedKey::Backspace) if word => {
                     editor.cancel_composition();
@@ -510,6 +559,27 @@ impl WinitAdapter {
         }
     }
 
+    fn macos_control_key(&self, key: &Key, physical_key: PhysicalKey) -> Option<NamedKey> {
+        if self.command_modifier != CommandModifier::Super
+            || !self.modifiers.control_key()
+            || self.modifiers.alt_key()
+            || self.modifiers.super_key()
+        {
+            return None;
+        }
+        Some(match shortcut_key(key, physical_key)? {
+            'a' => NamedKey::Home,
+            'e' => NamedKey::End,
+            'b' => NamedKey::ArrowLeft,
+            'f' => NamedKey::ArrowRight,
+            'p' => NamedKey::ArrowUp,
+            'n' => NamedKey::ArrowDown,
+            'h' => NamedKey::Backspace,
+            'd' => NamedKey::Delete,
+            _ => return None,
+        })
+    }
+
     fn focus_changed(&mut self, was_focused: bool, editor: &mut Editor) -> bool {
         if self.is_focused() {
             if !was_focused {
@@ -696,6 +766,60 @@ fn cancel_empty_composition(editor: &mut Editor) -> bool {
         }
         None => true,
     }
+}
+
+fn move_paragraph_boundary(editor: &mut Editor, end: bool, extend: bool) -> Result<(), Error> {
+    let focus = editor.selection().focus;
+    let document = editor.document();
+    let length = document
+        .paragraph(focus.paragraph)
+        .expect("valid selection")
+        .text()
+        .len();
+    let paragraph = if end && focus.byte == length {
+        (focus.paragraph + 1).min(document.paragraphs().len() - 1)
+    } else if !end && focus.byte == 0 {
+        focus.paragraph.saturating_sub(1)
+    } else {
+        focus.paragraph
+    };
+    let position = Position::new(
+        paragraph,
+        if end {
+            document
+                .paragraph(paragraph)
+                .expect("valid paragraph")
+                .text()
+                .len()
+        } else {
+            0
+        },
+    );
+    let anchor = if extend {
+        editor.selection().anchor
+    } else {
+        position
+    };
+    editor.set_selection(Selection::new(anchor, position))
+}
+
+fn soft_line_boundary_position(editor: &Editor, end: bool) -> Position {
+    let focus = editor.selection().focus;
+    let text = editor
+        .document()
+        .paragraph(focus.paragraph)
+        .expect("valid selection")
+        .text();
+    let byte = if end {
+        text[focus.byte..]
+            .find('\u{2028}')
+            .map_or(text.len(), |byte| focus.byte + byte)
+    } else {
+        text[..focus.byte]
+            .rfind('\u{2028}')
+            .map_or(0, |byte| byte + '\u{2028}'.len_utf8())
+    };
+    Position::new(focus.paragraph, byte)
 }
 
 fn selection_contains_list(editor: &Editor) -> bool {
@@ -2370,6 +2494,186 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn macos_control_letters_move_and_extend_without_splitting_graphemes() {
+        let text = "first\ncafé e\u{301}👩🏽‍💻\nthird";
+        let start = Position::new(1, "café e\u{301}".len());
+        for (letter, expected) in [
+            ("a", Position::new(1, 0)),
+            ("e", Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+            ("b", Position::new(1, "café ".len())),
+            ("f", Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+            ("p", Position::new(0, 5)),
+            ("n", Position::new(2, 5)),
+        ] {
+            for extend in [false, true] {
+                let mut editor = Editor::from_text(text);
+                editor.set_selection(Selection::caret(start)).unwrap();
+                let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+                adapter.set_focused(true, &mut editor);
+                adapter.set_modifiers(if extend {
+                    ModifiersState::CONTROL | ModifiersState::SHIFT
+                } else {
+                    ModifiersState::CONTROL
+                });
+                let outcome = key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Character(letter.into()),
+                    None,
+                );
+                assert!(outcome.handled && outcome.changed, "Control-{letter}");
+                assert_eq!(
+                    editor.selection(),
+                    Selection::new(if extend { start } else { expected }, expected)
+                );
+                assert_eq!(editor.document().plain_text(), text);
+                assert!(!editor.can_undo());
+            }
+        }
+    }
+
+    #[test]
+    fn macos_control_deletes_one_grapheme_and_respects_edit_guards() {
+        let text = "a e\u{301}👩🏽‍💻 z";
+        let caret = Selection::caret(Position::new(0, "a e\u{301}".len()));
+        for (logical, expected) in [
+            (Key::Character("h".into()), "a 👩🏽‍💻 z"),
+            (Key::Character("d".into()), "a e\u{301} z"),
+            (Key::Named(NamedKey::Backspace), "a 👩🏽‍💻 z"),
+        ] {
+            let mut editor = Editor::from_text(text);
+            editor.set_selection(caret).unwrap();
+            let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+            adapter.set_focused(true, &mut editor);
+            adapter.set_modifiers(ModifiersState::CONTROL);
+            let outcome = key(&mut adapter, &mut editor, logical.clone(), None);
+            assert!(outcome.handled && outcome.changed);
+            assert_eq!(editor.document().plain_text(), expected);
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), text);
+            assert_eq!(editor.selection(), caret);
+            adapter.set_read_only(true, &mut editor);
+            let outcome = key(&mut adapter, &mut editor, logical.clone(), None);
+            assert!(outcome.handled && !outcome.changed);
+            adapter.set_read_only(false, &mut editor);
+            editor.update_composition("候", None).unwrap();
+            let outcome = key(&mut adapter, &mut editor, logical, None);
+            assert!(outcome.handled && !outcome.changed);
+            assert_eq!(editor.composition().unwrap().text, "候");
+            assert_eq!(editor.document().plain_text(), text);
+        }
+    }
+
+    #[test]
+    fn macos_option_vertical_navigation_visits_and_selects_paragraph_boundaries() {
+        let text = "first\n\ncafé 👩🏽‍💻 tail\nlast";
+        for (named, start, targets) in [
+            (
+                NamedKey::ArrowUp,
+                Position::new(2, "café ".len()),
+                vec![
+                    Position::new(2, 0),
+                    Position::new(1, 0),
+                    Position::default(),
+                    Position::default(),
+                ],
+            ),
+            (
+                NamedKey::ArrowDown,
+                Position::new(0, 2),
+                vec![
+                    Position::new(0, 5),
+                    Position::new(1, 0),
+                    Position::new(2, "café 👩🏽‍💻 tail".len()),
+                    Position::new(3, 4),
+                    Position::new(3, 4),
+                ],
+            ),
+        ] {
+            for extend in [false, true] {
+                let mut editor = Editor::from_text(text);
+                editor.set_selection(Selection::caret(start)).unwrap();
+                let mut adapter = WinitAdapter::new()
+                    .command_modifier(CommandModifier::Super)
+                    .host_vertical_navigation(true);
+                adapter.set_focused(true, &mut editor);
+                adapter.set_modifiers(if extend {
+                    ModifiersState::ALT | ModifiersState::SHIFT
+                } else {
+                    ModifiersState::ALT
+                });
+                for target in &targets {
+                    let outcome = key(&mut adapter, &mut editor, Key::Named(named), None);
+                    assert!(outcome.handled);
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(if extend { start } else { *target }, *target)
+                    );
+                }
+                assert!(!editor.can_undo());
+            }
+        }
+    }
+
+    #[test]
+    fn macos_command_line_navigation_and_deletion_stop_at_soft_breaks() {
+        let text = "keep\u{2028}café e\u{301}👩🏽‍💻 tail";
+        let start = Position::new(0, "keep\u{2028}café e\u{301}".len());
+        let line_start = Position::new(0, "keep\u{2028}".len());
+        for modifiers in [ModifiersState::SUPER, ModifiersState::CONTROL] {
+            for extend in [false, true] {
+                let mut editor = Editor::from_text(text);
+                editor.set_selection(Selection::caret(start)).unwrap();
+                let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+                adapter.set_focused(true, &mut editor);
+                adapter.set_modifiers(if extend {
+                    modifiers | ModifiersState::SHIFT
+                } else {
+                    modifiers
+                });
+                key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Named(NamedKey::ArrowLeft),
+                    None,
+                );
+                assert_eq!(
+                    editor.selection(),
+                    Selection::new(if extend { start } else { line_start }, line_start)
+                );
+                editor
+                    .set_selection(Selection::caret(Position::new(0, 2)))
+                    .unwrap();
+                key(
+                    &mut adapter,
+                    &mut editor,
+                    Key::Named(NamedKey::ArrowRight),
+                    None,
+                );
+                assert_eq!(editor.selection().focus, Position::new(0, "keep".len()));
+            }
+        }
+        let mut editor = Editor::from_text(text);
+        editor.set_selection(Selection::caret(start)).unwrap();
+        let mut adapter = WinitAdapter::new().command_modifier(CommandModifier::Super);
+        adapter.set_focused(true, &mut editor);
+        adapter.set_modifiers(ModifiersState::SUPER);
+        key(
+            &mut adapter,
+            &mut editor,
+            Key::Named(NamedKey::Backspace),
+            None,
+        );
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().text(),
+            "keep\u{2028}👩🏽‍💻 tail"
+        );
+        assert!(editor.undo());
+        assert_eq!(editor.document().paragraph(0).unwrap().text(), text);
+        assert_eq!(editor.selection(), Selection::caret(start));
     }
 
     #[test]

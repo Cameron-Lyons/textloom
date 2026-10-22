@@ -39,6 +39,14 @@ an `e` followed by U+0301. For shortcuts below, use Command on macOS and Control
 on Linux/Windows. Use Command+Shift+Z for macOS redo; Control+Y or Control+Shift+Z
 for Linux/Windows redo.
 
+For macOS navigation, also check Option+Left/Right for words,
+Option+Up/Down for paragraph boundaries (including repeated presses and Shift
+selection), and Control+A/E, B/F, P/N for paragraph edges, graphemes, and vertical
+movement. Control+H/D delete one grapheme; Option+Delete deletes one word.
+Command+Delete deletes only to the current visual row's beginning, including
+inside a wrapped paragraph or after Shift+Enter. Undo must restore the exact
+text and selection. Repeat deletion in read-only mode to confirm it is blocked.
+
 | Check | Steps | Required observation |
 | --- | --- | --- |
 | Selection, typing, and history | Focus Document, select all, type a short word, undo, redo, then undo again. Repeat ordinary adjacent typing at a caret. | Exact original rich content and selection return after undo; redo restores the edit. Caret typing groups correctly. Replacing a selection and subsequent caret typing may be separate history entries. |

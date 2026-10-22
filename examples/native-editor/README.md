@@ -126,6 +126,13 @@ native windows on all three platforms. Smoke mode returns a failure if the widge
 reports an editing or accessibility error. It does not automate IME
 preedit/candidate windows or screen readers.
 
+macOS renderer CI exercises both the default and rich clipboard configurations
+in editable, read-only, and disabled modes. The report validator's
+`--clipboard default` option checks runs without either clipboard flag; its
+default remains strict rich clipboard validation. Native macOS clipboard unit
+tests use unique private pasteboards to verify Unicode, HTML/TLFR data, repeated
+publication, and plain fallback without reading or changing the system clipboard.
+
 `--clipboard-self-test` requires `--rich-clipboard` and **writes a deterministic
 fixture to the system clipboard**. Use it only in an isolated test session. It
 verifies rich/HTML/plain publication and read-back, then widget rich insertion and one-step

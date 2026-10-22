@@ -86,13 +86,14 @@ def check_schema(value, schema, path="report"):
         raise ValueError(f"{path}: expected a finite nonnegative number")
 
 
-def validate(report, revision, os_name, mode, interaction=False):
+def validate(report, revision, os_name, mode, interaction=False, clipboard="rich"):
     check_schema(report, SCHEMA)
 
     def require(condition, message):
         if not condition:
             raise ValueError(message)
 
+    require(clipboard in ("rich", "default"), "unsupported clipboard configuration")
     require(report["schema_version"] == 1, "unsupported report schema version")
     require(report["manual_signoff"] == "not_recorded", "smoke report claims manual signoff")
     require(not report["document_content_included"], "report claims document content")
@@ -115,17 +116,26 @@ def validate(report, revision, os_name, mode, interaction=False):
         session["rendered_frames"] >= (1 if interaction else 20),
         "insufficient native frames",
     )
-    require(session["rich_clipboard_requested"], "native rich clipboard was not requested")
-    if interaction:
+    if clipboard == "default":
         require(
-            not session["clipboard_self_test_requested"] or mode == "editable",
-            "clipboard self-test requested in a guarded interaction mode",
+            not any(session[field] for field in (
+                "rich_clipboard_requested", "clipboard_self_test_requested",
+                "clipboard_self_test_passed",
+            )),
+            "rich clipboard or clipboard self-test reported for the default configuration",
         )
     else:
-        require(
-            session["clipboard_self_test_requested"] == (mode == "editable"),
-            "unexpected clipboard self-test request for this mode",
-        )
+        require(session["rich_clipboard_requested"], "native rich clipboard was not requested")
+        if interaction:
+            require(
+                not session["clipboard_self_test_requested"] or mode == "editable",
+                "clipboard self-test requested in a guarded interaction mode",
+            )
+        else:
+            require(
+                session["clipboard_self_test_requested"] == (mode == "editable"),
+                "unexpected clipboard self-test request for this mode",
+            )
     require(
         session["clipboard_self_test_passed"] == session["clipboard_self_test_requested"],
         "missing or unexpected clipboard self-test completion",
@@ -179,6 +189,10 @@ def main():
     parser.add_argument("--os", required=True, choices=("linux", "macos", "windows"))
     parser.add_argument("--mode", required=True, choices=("editable", "read-only", "disabled"))
     parser.add_argument(
+        "--clipboard", choices=("rich", "default"), default="rich",
+        help="Expected clipboard configuration (default: rich)",
+    )
+    parser.add_argument(
         "--interaction", action="store_true",
         help="Check non-smoke report integrity; the interaction driver asserts behavior",
     )
@@ -189,7 +203,10 @@ def main():
             object_pairs_hook=unique_object,
             parse_constant=reject_constant,
         )
-        validate(report, arguments.revision, arguments.os, arguments.mode, arguments.interaction)
+        validate(
+            report, arguments.revision, arguments.os, arguments.mode,
+            arguments.interaction, arguments.clipboard,
+        )
     except (OSError, UnicodeError, ValueError) as error:
         print(f"Native report validation failed: {error}", file=sys.stderr)
         return 1

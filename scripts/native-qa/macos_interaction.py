@@ -20,6 +20,8 @@ ORIGINAL = (
     "Enter continues a list; Enter on an empty item exits it."
 )
 EXTERNAL = "external café 日本語👩🏽‍💻\nsecond"
+SHORTCUT_NAVIGATION = "top\ntip\nabc\n\nend"
+SHORTCUT_UNICODE = "a e\u0301👩🏽‍💻 z"
 MARKER = "Native rich clipboard roundtrip and undo/redo passed"
 
 APPLESCRIPT = r'''
@@ -104,8 +106,22 @@ on run argv
                 keystroke (item 4 of argv) using {command down}
             else if commandName is "shift-chord" then
                 keystroke (item 4 of argv) using {command down, shift down}
+            else if commandName is "control-chord" then
+                keystroke (item 4 of argv) using {control down}
+            else if commandName is "control-shift-chord" then
+                keystroke (item 4 of argv) using {control down, shift down}
             else if commandName is "keycode" then
                 key code ((item 4 of argv) as integer)
+            else if commandName is "command-keycode" then
+                key code ((item 4 of argv) as integer) using {command down}
+            else if commandName is "command-shift-keycode" then
+                key code ((item 4 of argv) as integer) using {command down, shift down}
+            else if commandName is "shift-keycode" then
+                key code ((item 4 of argv) as integer) using {shift down}
+            else if commandName is "option-keycode" then
+                key code ((item 4 of argv) as integer) using {option down}
+            else if commandName is "option-shift-keycode" then
+                key code ((item 4 of argv) as integer) using {option down, shift down}
             else if commandName is "type" then
                 keystroke (item 4 of argv)
             else if commandName is "close" then
@@ -154,10 +170,11 @@ class Probe:
             json.dumps(self.observations, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
-    def run(self, arguments, *, input_text=None, timeout=10, check=True):
+    def run(self, arguments, *, input_text=None, timeout=10, check=True, binary_output=False):
         result = subprocess.run(
             [str(argument) for argument in arguments], input=input_text,
-            capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+            capture_output=True, text=not binary_output,
+            encoding=None if binary_output else "utf-8", timeout=timeout,
         )
         if check and result.returncode:
             raise RuntimeError(
@@ -221,7 +238,18 @@ class Probe:
         if select_all:
             self.action(pid, window, "chord", "a")
         self.action(pid, window, "chord", "c")
-        return self.clipboard("fallback" if fallback else "plain", expected, changed_from=generation)
+        result = self.clipboard("fallback" if fallback else "plain", expected, changed_from=generation)
+        # Swift String == accepts canonical equivalence. Compare raw UTF-8 so
+        # normalization and line-ending changes cannot pass as exact restores.
+        # Pin only the clipboard subprocess encoding; Actions guards are untouched.
+        pasted = self.run(
+            ["/usr/bin/env", "LC_ALL=en_US.UTF-8", "/usr/bin/pbpaste", "-Prefer", "txt"],
+            binary_output=True,
+        )
+        if pasted.stdout != expected.encode("utf-8"):
+            raise RuntimeError("Native clipboard differs from the exact Unicode fixture")
+        result["plain_utf8_exact"] = True
+        return result
 
     def external_copy(self):
         self.focus(self.textedit_pid, self.external_file.stem)
@@ -303,6 +331,155 @@ class Probe:
         self.focus(self.textedit_pid, path.stem)
         self.note("TextEdit private document and foreground PID verified", pid=self.textedit_pid, window=path.stem)
 
+    def shortcut_fixture(self, pid, text):
+        # Only deterministic public text goes through the runner's pasteboard.
+        self.run(["/usr/bin/env", "LC_ALL=en_US.UTF-8", "/usr/bin/pbcopy"], input_text=text)
+        self.action(pid, TITLE, "chord", "a")
+        self.action(pid, TITLE, "chord", "v")
+        self.copy(pid, TITLE, text)
+
+    def shortcut_check(self, pid, name, expected, *actions, undo_to=None):
+        try:
+            for command, value in actions:
+                self.action(pid, TITLE, command, value)
+            # Navigation must copy its selection, never replace it with Select All.
+            result = self.copy(pid, TITLE, expected, select_all=undo_to is not None)
+            if undo_to is not None:
+                self.action(pid, TITLE, "chord", "z")
+                restored = self.copy(pid, TITLE, undo_to)
+                result["undo_plain_exact"] = restored["plain_exact"]
+        except Exception as error:
+            raise RuntimeError(f"Shortcut {name}: {error}") from error
+        self.note(f"editable: shortcut {name}", **result)
+
+    def shortcuts(self, pid):
+        # Keep lines short and vertical moves at column zero to avoid font metrics.
+        # Shift-Return creates a real soft break; exported plain text uses LF.
+        # No Control-arrow chords: macOS reserves them for Mission Control.
+        start = ("command-keycode", "126")  # Command-Up: document start.
+        end = ("command-keycode", "125")  # Command-Down: document end.
+        middle = (start, ("keycode", "125"))  # Plain Down: start of the soft line.
+        select_start = ("command-shift-keycode", "126")
+        select_end = ("command-shift-keycode", "125")
+        self.shortcut_fixture(pid, "top\nabc\n\nend")
+        self.action(pid, TITLE, *start)
+        self.action(pid, TITLE, "command-keycode", "124")
+        self.action(pid, TITLE, "shift-keycode", "36")
+        self.action(pid, TITLE, "type", "tip")
+        self.copy(pid, TITLE, SHORTCUT_NAVIGATION)
+
+        # Set up and witness each alias with independent native keys. Pairing
+        # aliases could hide a regression such as Control-P/N being swapped.
+        self.shortcut_check(
+            pid, "Control-A reaches the paragraph start across a soft break", SHORTCUT_NAVIGATION,
+            *middle, ("control-chord", "a"), select_end,
+        )
+        self.shortcut_check(
+            pid, "Control-E reaches the paragraph end", "top\ntip",
+            *middle, ("control-chord", "e"), select_start,
+        )
+        self.shortcut_check(
+            pid, "Shift-Control-A selects to the paragraph start", "top\n",
+            *middle, ("control-shift-chord", "a"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Control-E selects to the paragraph end", "tip",
+            *middle, ("control-shift-chord", "e"),
+        )
+        self.shortcut_check(
+            pid, "Control-P moves to the previous visual line", SHORTCUT_NAVIGATION,
+            *middle, ("control-chord", "p"), select_end,
+        )
+        self.shortcut_check(
+            pid, "Control-N moves to the next visual line", "tip\nabc\n\nend",
+            start, ("control-chord", "n"), select_end,
+        )
+        self.shortcut_check(
+            pid, "Shift-Control-P selects the previous visual line", "top\n",
+            *middle, ("control-shift-chord", "p"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Control-N selects the next visual line", "top\n",
+            start, ("control-shift-chord", "n"),
+        )
+
+        self.shortcut_check(
+            pid, "Option-Up reaches the paragraph start across a soft break", SHORTCUT_NAVIGATION,
+            *middle, ("option-keycode", "126"), select_end,
+        )
+        self.shortcut_check(
+            pid, "Option-Down reaches the paragraph end across a soft break", "top\ntip",
+            start, ("keycode", "124"), ("option-keycode", "125"), select_start,
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Down selects to the paragraph end", "top\ntip",
+            start, ("option-shift-keycode", "125"),
+        )
+        # Continue selections to check their anchors through empty paragraphs.
+        self.shortcut_check(
+            pid, "Shift-Option-Down extends into the next paragraph", "top\ntip\nabc",
+            ("option-shift-keycode", "125"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Down extends through an empty paragraph", "top\ntip\nabc\n",
+            ("option-shift-keycode", "125"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Down retains the anchor across paragraphs", SHORTCUT_NAVIGATION,
+            ("option-shift-keycode", "125"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Up selects to the paragraph start", "end",
+            end, ("option-shift-keycode", "126"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Up extends through an empty paragraph", "\nend",
+            ("option-shift-keycode", "126"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Up retains the anchor across paragraphs", "abc\n\nend",
+            ("option-shift-keycode", "126"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Option-Up reaches the document start", SHORTCUT_NAVIGATION,
+            ("option-shift-keycode", "126"),
+        )
+        self.copy(pid, TITLE, SHORTCUT_NAVIGATION)
+        self.shortcut_check(
+            pid, "Command-Backspace preserves the previous soft line / undo", "top\n\nabc\n\nend",
+            *middle, ("command-keycode", "124"), ("command-keycode", "51"),
+            undo_to=SHORTCUT_NAVIGATION,
+        )
+
+        self.shortcut_fixture(pid, SHORTCUT_UNICODE)
+        unicode_caret = (end,) + (("keycode", "123"),) * 3
+        self.shortcut_check(
+            pid, "Control-F moves over a whole ZWJ emoji", "👩🏽‍💻",
+            *unicode_caret, ("control-chord", "f"), ("shift-keycode", "123"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Control-F selects a whole ZWJ emoji", "👩🏽‍💻",
+            *unicode_caret, ("control-shift-chord", "f"),
+        )
+        self.shortcut_check(
+            pid, "Control-B moves over a combining grapheme", "e\u0301",
+            *unicode_caret, ("control-chord", "b"), ("shift-keycode", "124"),
+        )
+        self.shortcut_check(
+            pid, "Shift-Control-B selects a combining grapheme", "e\u0301",
+            *unicode_caret, ("control-shift-chord", "b"),
+        )
+        self.shortcut_check(
+            pid, "Control-H deletes a combining grapheme / undo", "a 👩🏽‍💻 z",
+            *unicode_caret, ("control-chord", "h"),
+            undo_to=SHORTCUT_UNICODE,
+        )
+        self.shortcut_check(
+            pid, "Control-D deletes a ZWJ emoji / undo", "a e\u0301 z",
+            *unicode_caret, ("control-chord", "d"),
+            undo_to=SHORTCUT_UNICODE,
+        )
+
     def editable(self):
         process, report = self.start("editable")
         self.note("editable: native fixture representations verified", **self.clipboard("native-fixture"))
@@ -340,6 +517,7 @@ class Probe:
         self.action(process.pid, TITLE, "chord", "z")
         self.copy(process.pid, TITLE, EXTERNAL)
         self.note("editable: native typing and focus-separated undo groups passed")
+        self.shortcuts(process.pid)
         self.finish("editable", process, report)
 
     def guarded(self, mode):

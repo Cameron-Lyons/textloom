@@ -282,6 +282,35 @@ pub(super) fn row_boundary_position(
     Some((Position::new(focus.paragraph, byte), x, prefer_next_row))
 }
 
+pub(super) fn paragraph_boundary_position(editor: &Editor, end: bool) -> Position {
+    let focus = editor.selection().focus;
+    let document = editor.document();
+    let length = document
+        .paragraph(focus.paragraph)
+        .expect("valid selection")
+        .text()
+        .len();
+    let paragraph = if end && focus.byte == length {
+        (focus.paragraph + 1).min(document.paragraphs().len() - 1)
+    } else if !end && focus.byte == 0 {
+        focus.paragraph.saturating_sub(1)
+    } else {
+        focus.paragraph
+    };
+    Position::new(
+        paragraph,
+        if end {
+            document
+                .paragraph(paragraph)
+                .expect("valid paragraph")
+                .text()
+                .len()
+        } else {
+            0
+        },
+    )
+}
+
 pub(super) fn snap_vertical_cursor(
     source: &Paragraph,
     galley: &Galley,

@@ -351,6 +351,264 @@ fn shifted_command_paste_pastes_plain_text_without_the_rich_clipboard() {
 }
 
 #[test]
+fn paste_uses_modifiers_before_the_event_and_ignores_later_changes() {
+    let fragment = styled_clipboard_editor().selected_fragment();
+    let text = fragment.plain_text();
+    for command in [Modifiers::CTRL, Modifiers::MAC_CMD] {
+        let plain = command | Modifiers::COMMAND | Modifiers::SHIFT;
+        for warm in [false, true] {
+            for rich in [false, true] {
+                let context = egui::Context::default();
+                let mut editor = Editor::from_text("original");
+                editor.select_all();
+                let mut clipboard = TestClipboard {
+                    fragment: Some(fragment.clone()),
+                    ..Default::default()
+                };
+                if warm {
+                    frame(&context, &mut editor, vec![], true);
+                }
+                let events = if rich {
+                    vec![Event::Paste(text.clone()), Event::ModifiersChanged(plain)]
+                } else {
+                    vec![
+                        Event::ModifiersChanged(plain),
+                        Event::Paste(text.clone()),
+                        Event::ModifiersChanged(Modifiers::NONE),
+                    ]
+                };
+                clipboard_frame(
+                    &context,
+                    &mut editor,
+                    events,
+                    true,
+                    false,
+                    true,
+                    Some(&mut clipboard),
+                );
+                let expected = if rich {
+                    assert_eq!(clipboard.calls, vec![ClipboardCall::Paste(text.clone())]);
+                    fragment.clone()
+                } else {
+                    assert!(clipboard.calls.is_empty());
+                    Fragment::from_text(&text)
+                };
+                assert_eq!(
+                    Fragment::from_document(editor.document()),
+                    expected,
+                    "{command:?}, warm={warm}, rich={rich}"
+                );
+                assert_eq!(editor.undo_len(), 1);
+                assert!(editor.undo());
+                assert_eq!(editor.document().plain_text(), "original");
+            }
+        }
+    }
+}
+
+#[test]
+fn paste_uses_separate_modifier_snapshots_within_one_batch() {
+    let fragment = styled_clipboard_editor().selected_fragment();
+    let text = fragment.plain_text();
+    let plain = Modifiers::MAC_CMD | Modifiers::COMMAND | Modifiers::SHIFT;
+    let context = egui::Context::default();
+    let mut editor = Editor::default();
+    let mut clipboard = TestClipboard {
+        fragment: Some(fragment.clone()),
+        ..Default::default()
+    };
+    clipboard_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::ModifiersChanged(plain),
+            Event::Paste(text.clone()),
+            Event::ModifiersChanged(Modifiers::NONE),
+            Event::Paste(text.clone()),
+            Event::ModifiersChanged(plain),
+            Event::Paste(text.clone()),
+            Event::WindowFocused(false),
+            Event::Paste(text.clone()),
+            Event::ModifiersChanged(plain),
+        ],
+        true,
+        false,
+        true,
+        Some(&mut clipboard),
+    );
+    assert_eq!(
+        clipboard.calls,
+        vec![
+            ClipboardCall::Paste(text.clone()),
+            ClipboardCall::Paste(text.clone()),
+        ]
+    );
+    let mut expected = Editor::default();
+    expected.insert_text(&text).unwrap();
+    expected.insert_fragment(&fragment).unwrap();
+    expected.insert_text(&text).unwrap();
+    expected.insert_fragment(&fragment).unwrap();
+    assert_eq!(editor.document(), expected.document());
+    assert_eq!(editor.undo_len(), 4);
+}
+
+#[test]
+fn paste_preserves_modifiers_held_across_unfocused_and_idle_frames() {
+    let fragment = styled_clipboard_editor().selected_fragment();
+    let text = fragment.plain_text();
+    for command in [Modifiers::CTRL, Modifiers::MAC_CMD] {
+        let plain = command | Modifiers::COMMAND | Modifiers::SHIFT;
+        let context = egui::Context::default();
+        let mut editor = Editor::default();
+        let mut clipboard = TestClipboard {
+            fragment: Some(fragment.clone()),
+            ..Default::default()
+        };
+        frame(
+            &context,
+            &mut editor,
+            vec![Event::ModifiersChanged(plain)],
+            false,
+        );
+        frame(&context, &mut editor, vec![], false);
+        clipboard_frame(
+            &context,
+            &mut editor,
+            vec![
+                Event::Paste(text.clone()),
+                Event::ModifiersChanged(Modifiers::NONE),
+            ],
+            true,
+            false,
+            true,
+            Some(&mut clipboard),
+        );
+        assert!(clipboard.calls.is_empty());
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            Fragment::from_text(&text)
+        );
+
+        editor.select_all();
+        clipboard_frame(
+            &context,
+            &mut editor,
+            vec![Event::Paste(text.clone())],
+            true,
+            false,
+            true,
+            Some(&mut clipboard),
+        );
+        assert_eq!(clipboard.calls, vec![ClipboardCall::Paste(text.clone())]);
+        assert_eq!(Fragment::from_document(editor.document()), fragment);
+    }
+}
+
+#[test]
+fn routed_paste_keeps_its_modifiers_across_focus_passes_and_queued_input() {
+    fn run(
+        context: &egui::Context,
+        editors: &mut [Editor; 2],
+        clipboards: &mut [TestClipboard; 2],
+        events: Vec<Event>,
+        reversed: bool,
+    ) {
+        context
+            .run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        for index in if reversed { [1, 0] } else { [0, 1] } {
+                            let output = RichTextEditor::new(&mut editors[index])
+                                .id(Id::unique(index))
+                                .rich_clipboard(&mut clipboards[index])
+                                .show(ui);
+                            assert!(output.errors.is_empty());
+                            assert!(output.accessibility_errors.is_empty());
+                        }
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+    }
+
+    let fragment = styled_clipboard_editor().selected_fragment();
+    let text = fragment.plain_text();
+    let plain = Modifiers::MAC_CMD | Modifiers::COMMAND | Modifiers::SHIFT;
+    for max_passes in [1, 2, 8] {
+        for reversed in [false, true] {
+            for rich in [false, true] {
+                let context = egui::Context::default();
+                context.enable_accesskit();
+                install_input_routing(&context);
+                context.options_mut(|options| {
+                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                });
+                let mut editors = [Editor::default(), Editor::default()];
+                let mut clipboards = std::array::from_fn(|_| TestClipboard {
+                    fragment: Some(fragment.clone()),
+                    ..Default::default()
+                });
+                context.memory_mut(|memory| memory.request_focus(Id::unique(0usize)));
+                run(&context, &mut editors, &mut clipboards, vec![], reversed);
+                let mut events = if rich {
+                    Vec::new()
+                } else {
+                    vec![Event::ModifiersChanged(plain)]
+                };
+                events.extend([
+                    Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target_node: Id::unique(1usize).accesskit_id(),
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        data: None,
+                    }),
+                    Event::Paste(text.clone()),
+                    Event::ModifiersChanged(if rich { plain } else { Modifiers::NONE }),
+                ]);
+                run(&context, &mut editors, &mut clipboards, events, reversed);
+                // This newer batch must stay after the earlier, possibly queued paste.
+                run(
+                    &context,
+                    &mut editors,
+                    &mut clipboards,
+                    vec![Event::ModifiersChanged(if rich {
+                        Modifiers::NONE
+                    } else {
+                        plain
+                    })],
+                    reversed,
+                );
+                for _ in 0..4 {
+                    run(&context, &mut editors, &mut clipboards, vec![], reversed);
+                }
+                assert_eq!(editors[0].document().plain_text(), "");
+                assert!(clipboards[0].calls.is_empty());
+                let expected = if rich {
+                    assert_eq!(
+                        clipboards[1].calls,
+                        vec![ClipboardCall::Paste(text.clone())]
+                    );
+                    fragment.clone()
+                } else {
+                    assert!(clipboards[1].calls.is_empty());
+                    Fragment::from_text(&text)
+                };
+                assert_eq!(
+                    Fragment::from_document(editors[1].document()),
+                    expected,
+                    "max_passes={max_passes}, reversed={reversed}, rich={rich}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn rich_clipboard_callbacks_follow_input_order_and_separate_typing_history() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("original");
@@ -2109,6 +2367,257 @@ fn command_navigation_and_altgr_preserve_platform_shortcut_semantics() {
 }
 
 #[test]
+fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
+    let context = egui::Context::default();
+    context.set_os(egui::os::OperatingSystem::Mac);
+    let text = "prefix\ncafé e\u{301}👩🏽‍💻\u{2028}tail\nlast";
+    let start = Position::new(1, "café e\u{301}".len());
+    for (key, expected) in [
+        (Key::A, Position::new(1, 0)),
+        (
+            Key::E,
+            Position::new(1, "café e\u{301}👩🏽‍💻\u{2028}tail".len()),
+        ),
+        (Key::B, Position::new(1, "café ".len())),
+        (Key::F, Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+        (Key::ArrowLeft, Position::new(1, 0)),
+        (Key::ArrowRight, Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+    ] {
+        for extend in [false, true] {
+            let mut editor = Editor::from_text(text);
+            editor.set_selection(Selection::caret(start)).unwrap();
+            let modifiers = if extend {
+                Modifiers::CTRL | Modifiers::SHIFT
+            } else {
+                Modifiers::CTRL
+            };
+            frame(&context, &mut editor, vec![self::key(key, modifiers)], true);
+            assert_eq!(
+                editor.selection(),
+                Selection::new(if extend { start } else { expected }, expected),
+                "{key:?} shift={extend}"
+            );
+            assert_eq!(
+                editor.document().plain_text(),
+                text.replace('\u{2028}', "\n")
+            );
+            assert!(!editor.can_undo());
+        }
+    }
+
+    // Control-P/N traverse visual lines, including a soft break within a paragraph.
+    let mut editor = Editor::from_text("aaa\u{2028}aaa\u{2028}aaa");
+    let start = Position::new(0, "aaa\u{2028}aa".len());
+    editor.set_selection(Selection::caret(start)).unwrap();
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::P, Modifiers::CTRL | Modifiers::SHIFT)],
+        true,
+    );
+    assert_eq!(
+        editor.selection(),
+        Selection::new(start, Position::new(0, 2))
+    );
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::N, Modifiers::CTRL)],
+        true,
+    );
+    assert_eq!(editor.selection(), Selection::caret(start));
+
+    // Runtime platform selection keeps Windows Control-A as Select All.
+    context.set_os(egui::os::OperatingSystem::Windows);
+    frame(
+        &context,
+        &mut editor,
+        vec![key(Key::A, Modifiers::CTRL | Modifiers::COMMAND)],
+        true,
+    );
+    assert_eq!(editor.selected_text(), editor.document().plain_text());
+}
+
+#[test]
+fn macos_control_deletion_is_grapheme_safe_undoable_and_guarded() {
+    let context = egui::Context::default();
+    context.set_os(egui::os::OperatingSystem::Mac);
+    let text = "a e\u{301}👩🏽‍💻 z";
+    let caret = Selection::caret(Position::new(0, "a e\u{301}".len()));
+    for (key, expected) in [
+        (Key::H, "a 👩🏽‍💻 z"),
+        (Key::D, "a e\u{301} z"),
+        (Key::Backspace, "a 👩🏽‍💻 z"),
+    ] {
+        let mut editor = Editor::from_text(text);
+        editor.set_selection(caret).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![self::key(key, Modifiers::CTRL)],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), expected, "{key:?}");
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().plain_text(), text);
+        assert_eq!(editor.selection(), caret);
+        frame_options(
+            &context,
+            &mut editor,
+            vec![self::key(key, Modifiers::CTRL)],
+            true,
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), text);
+        editor.update_composition("候", None).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![self::key(key, Modifiers::CTRL)],
+            true,
+        );
+        assert_eq!(editor.document().plain_text(), text);
+        assert_eq!(editor.composition().unwrap().text, "候");
+        editor.cancel_composition();
+    }
+}
+
+#[test]
+fn macos_option_vertical_navigation_visits_paragraph_boundaries() {
+    fn narrow(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+        widget.desired_width(120.0)
+    }
+    let context = egui::Context::default();
+    context.set_os(egui::os::OperatingSystem::Mac);
+    let text = "many words that wrap onto several visual lines\n\ncafé 👩🏽‍💻 tail\nlast";
+    for (key, start, targets) in [
+        (
+            Key::ArrowUp,
+            Position::new(2, "café ".len()),
+            vec![
+                Position::new(2, 0),
+                Position::new(1, 0),
+                Position::default(),
+                Position::default(),
+            ],
+        ),
+        (
+            Key::ArrowDown,
+            Position::new(0, 5),
+            vec![
+                Position::new(0, text.find('\n').unwrap()),
+                Position::new(1, 0),
+                Position::new(2, "café 👩🏽‍💻 tail".len()),
+                Position::new(3, 4),
+                Position::new(3, 4),
+            ],
+        ),
+    ] {
+        for extend in [false, true] {
+            let mut editor = Editor::from_text(text);
+            editor.set_selection(Selection::caret(start)).unwrap();
+            let modifiers = if extend {
+                Modifiers::ALT | Modifiers::SHIFT
+            } else {
+                Modifiers::ALT
+            };
+            for target in &targets {
+                widget_frame(
+                    &context,
+                    &mut editor,
+                    vec![self::key(key, modifiers)],
+                    None,
+                    true,
+                    narrow,
+                );
+                assert_eq!(
+                    editor.selection(),
+                    Selection::new(if extend { start } else { *target }, *target),
+                    "{key:?} shift={extend}"
+                );
+            }
+            assert!(!editor.can_undo());
+        }
+    }
+}
+
+#[test]
+fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
+    fn narrow(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+        widget.desired_width(140.0)
+    }
+    let command = Modifiers::MAC_CMD | Modifiers::COMMAND;
+    for text in [
+        "keep\u{2028}café e\u{301}👩🏽‍💻 tail",
+        "first second third fourth fifth sixth seventh eighth ninth tenth eleventh",
+    ] {
+        let context = egui::Context::default();
+        context.set_os(egui::os::OperatingSystem::Mac);
+        let mut editor = Editor::from_text(text);
+        widget_frame(&context, &mut editor, vec![], None, true, narrow);
+        let cache = widget_cache(&context);
+        let galley = &cache.layout.layouts.get(0).unwrap().galley;
+        assert!(galley.rows.len() > 1);
+        let last_scalar = galley.rows[..galley.rows.len() - 1]
+            .iter()
+            .map(|row| row.char_count_including_newline().0)
+            .sum();
+        let paragraph = editor.document().paragraph(0).unwrap();
+        let row_start =
+            paragraph.boundary_at_or_after(paragraph.byte_from_scalar(last_scalar).unwrap());
+        let focus = editor.document().end();
+        let selection = Selection::caret(focus);
+        editor.set_selection(selection).unwrap();
+        widget_frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Backspace, command)],
+            None,
+            true,
+            narrow,
+        );
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().text(),
+            &text[..row_start]
+        );
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().paragraph(0).unwrap().text(), text);
+        assert_eq!(editor.selection(), selection);
+    }
+
+    for reverse in [false, true] {
+        let context = egui::Context::default();
+        let text = "keep\u{2028}café 👩🏽‍💻 tail";
+        let mut editor = Editor::from_text(text);
+        let (a, b) = (
+            Position::new(0, "keep\u{2028}".len()),
+            Position::new(0, "keep\u{2028}café 👩🏽‍💻".len()),
+        );
+        let selection = if reverse {
+            Selection::new(b, a)
+        } else {
+            Selection::new(a, b)
+        };
+        editor.set_selection(selection).unwrap();
+        frame(
+            &context,
+            &mut editor,
+            vec![key(Key::Backspace, command)],
+            true,
+        );
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().text(),
+            "keep\u{2028} tail"
+        );
+        assert!(editor.undo());
+        assert_eq!(editor.document().paragraph(0).unwrap().text(), text);
+        assert_eq!(editor.selection(), selection);
+    }
+}
+
+#[test]
 fn command_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
     let text = "prefix\ncafé 👩🏽‍💻 tail";
     let end = Position::new(1, "café 👩🏽‍💻".len());
@@ -2191,7 +2700,14 @@ fn command_backspace_respects_read_only_ime_and_modifier_guards() {
             vec![key(Key::Backspace, modifiers)],
             true,
         );
-        assert_eq!(editor.document().plain_text(), "one ");
+        assert_eq!(
+            editor.document().plain_text(),
+            if context.os() == egui::os::OperatingSystem::Mac && !modifiers.alt {
+                "one tw"
+            } else {
+                "one "
+            }
+        );
         assert!(editor.undo());
     }
 }
@@ -2199,6 +2715,7 @@ fn command_backspace_respects_read_only_ime_and_modifier_guards() {
 #[test]
 fn modifier_delete_shortcuts_remove_whole_words_and_restore_selection_on_undo() {
     let context = egui::Context::default();
+    context.set_os(egui::os::OperatingSystem::Nix);
     let mut editor = Editor::from_text("café 東京 next");
     editor
         .set_selection(Selection::caret(editor.document().end()))
@@ -3130,6 +3647,45 @@ fn enter_then_movement_in_same_frame_uses_current_layout() {
 }
 
 #[test]
+fn paste_then_alt_vertical_navigation_uses_the_platforms_current_layout() {
+    for os in [
+        egui::os::OperatingSystem::Nix,
+        egui::os::OperatingSystem::Windows,
+    ] {
+        for shift in [false, true] {
+            let context = egui::Context::default();
+            context.set_os(os);
+            let mut editor = Editor::from_text("");
+            let modifiers = if shift {
+                Modifiers::ALT | Modifiers::SHIFT
+            } else {
+                Modifiers::ALT
+            };
+            frame(
+                &context,
+                &mut editor,
+                vec![
+                    Event::Paste("first\nsecond".into()),
+                    key(Key::ArrowUp, modifiers),
+                ],
+                true,
+            );
+            assert_eq!(editor.document().plain_text(), "first\nsecond");
+            assert_eq!(editor.selection().focus, Position::new(0, 5), "{os:?}");
+            assert_eq!(
+                editor.selection().anchor,
+                if shift {
+                    Position::new(1, 6)
+                } else {
+                    Position::new(0, 5)
+                },
+                "{os:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn typing_then_row_boundary_in_same_frame_uses_current_layout() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("");
@@ -3375,6 +3931,7 @@ fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() 
     ] {
         assert!(handle_key(
             &mut editor,
+            context.os(),
             key,
             None,
             Modifiers::NONE,
@@ -3435,6 +3992,7 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
     ] {
         assert!(handle_key(
             &mut editor,
+            context.os(),
             key,
             None,
             Modifiers::NONE,
@@ -3554,6 +4112,7 @@ fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_
         let mut errors = Vec::new();
         assert!(handle_key(
             &mut editor,
+            context.os(),
             key,
             None,
             Modifiers::NONE,
@@ -3596,6 +4155,7 @@ fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
     ] {
         assert!(handle_key(
             &mut editor,
+            context.os(),
             key,
             None,
             Modifiers::NONE,
@@ -7374,6 +7934,7 @@ fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
                 let mut egui_editor = start();
                 let handled = handle_key(
                     &mut egui_editor,
+                    egui::os::OperatingSystem::Nix,
                     key,
                     Some(position),
                     Modifiers {

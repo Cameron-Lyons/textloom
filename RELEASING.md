@@ -2,6 +2,50 @@
 
 ## 1.0 validation status
 
+Local macOS verification on 2026-10-22 used macOS 27.2 (26C111), Apple Silicon
+(`aarch64-apple-darwin`), Rust 1.99.1, and a 2x Retina display. This checked the
+uncommitted working tree based on
+`7512ce8b67ce461f2866e5a4b0a9f5e6f22be824`, labelled
+`7512ce8b67ce461f2866e5a4b0a9f5e6f22be824-macos-working-tree` in the rebuilt
+host reports. It is supporting evidence, not final clean-commit signoff.
+
+`scripts/check-release.sh --allow-dirty` passed on this Mac, including all eight
+feature combinations, release-mode search/replacement tests, strict Clippy for
+the library and native host, warning-free documentation, benchmark smoke runs,
+headless examples, and package inventory/build/test checks. The all-feature
+library run passed 632 unit/integration tests. All 26 Python QA regressions and
+the workflow `actionlint` checks passed. The complete release log was recorded
+in `/private/tmp/textloom-macos-release.log`; no package was published.
+
+The Mac compatibility changes cover Control+A/E/B/F/P/N and H/D,
+Option+Up/Down with Shift selection, visual-row Command+Backspace, and
+event-ordered plain paste modifiers. Layout refresh now uses the same platform
+as key execution; same-frame paste/Alt+Up regressions cover Linux and Windows
+as well. Native host tests passed all 71 cases, including three AppKit clipboard
+tests using private named pasteboards. These tests require access to the macOS
+pasteboard service; a filesystem sandbox that blocks that service cannot run
+them. They do not read or replace the general clipboard.
+
+Six rebuilt native rendering sessions passed: default and rich clipboard
+configurations, each editable, read-only, and disabled. Every session rendered
+21 frames at 2x, closed gracefully, reported zero errors, and preserved an equal
+TLFR round trip. No clipboard self-test was requested, so these runs did not
+publish a fixture to the system clipboard and do not establish native clipboard
+interoperability. Local reports and logs were recorded in
+`/private/tmp/textloom-macos-smoke/`.
+
+The hosted Mac interaction probe now includes Control/Option navigation,
+Shift selections, Unicode grapheme deletion, soft-line Command+Backspace, and
+exact copied-text/undo assertions. Its Python regressions run locally; the
+extended native probe still needs a hosted workflow run on the final candidate.
+Its new 25 shortcut checks and the workflow's interaction deadline have not yet
+been validated together on a hosted desktop. Forced-wrap deletion is covered
+by headless widget regressions and remains a native signoff check.
+Physical keyboards, Japanese/Chinese IMEs, VoiceOver, native winit input, and
+display-scale transitions remain pending. This local run does not establish
+Intel or older-macOS compatibility. Retain the platform signoff requirements
+below before publication.
+
 On 2026-10-21 the candidate moved to egui/eframe 0.37 and AccessKit 0.25 in
 [PR #8](https://github.com/Cameron-Lyons/textloom/pull/8). At its head
 `4e5a126628432eb021544d639b8d67666fb9f457`, `scripts/check-release.sh`, the Rust

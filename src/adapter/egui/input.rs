@@ -2,8 +2,8 @@ use super::{
     CommitEcho, RichClipboard,
     layout::ParagraphLayouts,
     navigation::{
-        VerticalNavigation, page_position, preedit_byte_range, row_boundary_position,
-        vertical_position,
+        VerticalNavigation, page_position, paragraph_boundary_position, preedit_byte_range,
+        row_boundary_position, vertical_position,
     },
     record,
 };
@@ -11,7 +11,7 @@ use crate::{
     Document, Editor, Error, Movement, ParagraphKind, Position, Selection,
     adapter::{Shortcut, clean_text, shortcut_key_name},
 };
-use egui::{Event, ImeEvent, Key, Modifiers, Ui};
+use egui::{Event, ImeEvent, Key, Modifiers, Ui, os::OperatingSystem};
 
 pub(super) fn copy_selection(
     editor: &Editor,
@@ -45,7 +45,7 @@ pub(super) struct InputOptions {
     pub(super) heading_shortcuts: bool,
 }
 
-pub(super) fn reads_layout(event: &Event, options: &InputOptions) -> bool {
+pub(super) fn reads_layout(os: OperatingSystem, event: &Event, options: &InputOptions) -> bool {
     match event {
         Event::Key {
             key,
@@ -54,9 +54,10 @@ pub(super) fn reads_layout(event: &Event, options: &InputOptions) -> bool {
             modifiers,
             ..
         } => matches!(
-            classify_key(*key, *physical_key, *modifiers, options),
+            classify_key(os, *key, *physical_key, *modifiers, options),
             Some(
                 KeyCommand::RowBoundary { .. }
+                    | KeyCommand::DeleteRowStart
                     | KeyCommand::Vertical { .. }
                     | KeyCommand::Page { .. }
                     | KeyCommand::ListEdit(_)
@@ -72,6 +73,7 @@ pub(super) fn handle_event(
     editor: &mut Editor,
     ui: &Ui,
     event: &Event,
+    event_modifiers: Modifiers,
     layouts: &ParagraphLayouts,
     navigation: &mut Option<VerticalNavigation>,
     commit_echo: &mut Option<CommitEcho>,
@@ -134,7 +136,7 @@ pub(super) fn handle_event(
         Event::Paste(_) => {
             if let Some((text, clean)) = &input_text {
                 *commit_echo = None;
-                let plain = ui.input(|input| input.modifiers.command && input.modifiers.shift);
+                let plain = event_modifiers.command && event_modifiers.shift;
                 let fragment = clipboard
                     .as_deref_mut()
                     .filter(|_| !plain)
@@ -249,6 +251,7 @@ pub(super) fn handle_event(
             let composing = editor.composition().is_some();
             let handled = handle_key(
                 editor,
+                ui.os(),
                 *key,
                 *physical_key,
                 *modifiers,
@@ -329,7 +332,9 @@ enum KeyCommand {
     Shortcut(Shortcut),
     ReadOnlyNoop,
     Move(Movement),
+    ParagraphBoundary { end: bool },
     RowBoundary { end: bool },
+    DeleteRowStart,
     Vertical { down: bool },
     Page { down: bool },
     Edit(fn(&mut Editor) -> Result<(), Error>),
@@ -337,11 +342,35 @@ enum KeyCommand {
 }
 
 fn classify_key(
-    key: Key,
+    os: OperatingSystem,
+    mut key: Key,
     physical_key: Option<Key>,
-    modifiers: Modifiers,
+    mut modifiers: Modifiers,
     options: &InputOptions,
 ) -> Option<KeyCommand> {
+    if os == OperatingSystem::Mac
+        && modifiers.ctrl
+        && !modifiers.command
+        && !modifiers.mac_cmd
+        && !modifiers.alt
+    {
+        let alias = match key {
+            Key::A => return Some(KeyCommand::Move(Movement::ParagraphStart)),
+            Key::E => return Some(KeyCommand::Move(Movement::ParagraphEnd)),
+            Key::B => Some(Key::ArrowLeft),
+            Key::F => Some(Key::ArrowRight),
+            Key::P => Some(Key::ArrowUp),
+            Key::N => Some(Key::ArrowDown),
+            Key::H => Some(Key::Backspace),
+            Key::D => Some(Key::Delete),
+            _ => None,
+        };
+        if let Some(alias) = alias {
+            key = alias;
+            // A Control character alias moves/deletes one grapheme, not a word.
+            modifiers.ctrl = false;
+        }
+    }
     let command = modifiers.command && !modifiers.alt && !(modifiers.mac_cmd && modifiers.ctrl);
     if command
         && let Some(shortcut) = resolve_shortcut(
@@ -353,10 +382,26 @@ fn classify_key(
     {
         return Some(KeyCommand::Shortcut(shortcut));
     }
-    let by_word = modifiers.ctrl || modifiers.alt;
+    let by_word = modifiers.alt || modifiers.ctrl && os != OperatingSystem::Mac;
     let row_command = command && modifiers.mac_cmd;
     let paging = !modifiers.command && !modifiers.alt;
+    let paragraph_command = os == OperatingSystem::Mac
+        && modifiers.alt
+        && !modifiers.ctrl
+        && !modifiers.command
+        && !modifiers.mac_cmd;
     Some(match key {
+        Key::ArrowLeft | Key::ArrowRight
+            if os == OperatingSystem::Mac
+                && modifiers.ctrl
+                && !modifiers.alt
+                && !modifiers.command
+                && !modifiers.mac_cmd =>
+        {
+            KeyCommand::RowBoundary {
+                end: key == Key::ArrowRight,
+            }
+        }
         Key::ArrowLeft | Key::ArrowRight if row_command => KeyCommand::RowBoundary {
             end: key == Key::ArrowRight,
         },
@@ -365,6 +410,9 @@ fn classify_key(
         },
         Key::ArrowUp if command => KeyCommand::Move(Movement::DocumentStart),
         Key::ArrowDown if command => KeyCommand::Move(Movement::DocumentEnd),
+        Key::ArrowUp | Key::ArrowDown if paragraph_command => KeyCommand::ParagraphBoundary {
+            end: key == Key::ArrowDown,
+        },
         Key::Home => KeyCommand::Move(Movement::DocumentStart),
         Key::End => KeyCommand::Move(Movement::DocumentEnd),
         Key::ArrowLeft if by_word => KeyCommand::Move(Movement::WordBackward),
@@ -379,7 +427,7 @@ fn classify_key(
         },
         Key::Backspace | Key::Delete if options.read_only => KeyCommand::ReadOnlyNoop,
         Key::Enter if options.read_only && !modifiers.command => KeyCommand::ReadOnlyNoop,
-        Key::Backspace if row_command => KeyCommand::Edit(Editor::delete_to_paragraph_start),
+        Key::Backspace if row_command => KeyCommand::DeleteRowStart,
         Key::Backspace if by_word => KeyCommand::Edit(Editor::delete_word_backward),
         Key::Backspace => KeyCommand::Edit(Editor::delete_backward),
         Key::Delete if by_word => KeyCommand::Edit(Editor::delete_word_forward),
@@ -404,6 +452,7 @@ fn classify_key(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_key(
     editor: &mut Editor,
+    os: OperatingSystem,
     key: Key,
     physical_key: Option<Key>,
     modifiers: Modifiers,
@@ -414,10 +463,12 @@ pub(super) fn handle_key(
 ) -> bool {
     // Keys delegated to the host and blocked edits keep the painted caret and
     // the column used by a later vertical movement.
-    let Some(key_command) = classify_key(key, physical_key, modifiers, options).filter(|command| {
-        !matches!(command, KeyCommand::ListEdit(_))
-            || layouts.contains_list(editor.selected_paragraphs())
-    }) else {
+    let Some(key_command) =
+        classify_key(os, key, physical_key, modifiers, options).filter(|command| {
+            !matches!(command, KeyCommand::ListEdit(_))
+                || layouts.contains_list(editor.selected_paragraphs())
+        })
+    else {
         return false;
     };
     match key_command {
@@ -448,6 +499,19 @@ pub(super) fn handle_key(
     }
     cancel_empty_composition(editor);
     let target = match key_command {
+        KeyCommand::ParagraphBoundary { end } => {
+            let position = paragraph_boundary_position(editor, end);
+            let anchor = if modifiers.shift {
+                editor.selection().anchor
+            } else {
+                position
+            };
+            record(
+                editor.set_selection(Selection::new(anchor, position)),
+                errors,
+            );
+            None
+        }
         KeyCommand::RowBoundary { end } => {
             let target = row_boundary_position(editor, layouts, prefer_next_row, end);
             if target.is_none() {
@@ -476,6 +540,19 @@ pub(super) fn handle_key(
         }
         KeyCommand::Edit(edit) | KeyCommand::ListEdit(edit) => {
             record(edit(editor), errors);
+            None
+        }
+        KeyCommand::DeleteRowStart => {
+            if editor.selection().is_caret() {
+                let focus = editor.selection().focus;
+                let start = row_boundary_position(editor, layouts, prefer_next_row, false)
+                    .map_or(Position::new(focus.paragraph, 0), |target| target.0);
+                if start < focus {
+                    record(editor.replace_range(start..focus, ""), errors);
+                }
+            } else {
+                record(editor.delete_backward(), errors);
+            }
             None
         }
         KeyCommand::Shortcut(_) | KeyCommand::ReadOnlyNoop => None,
