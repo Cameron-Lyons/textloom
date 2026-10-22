@@ -1,4 +1,18 @@
-use crate::{Document, Editor, Error, Fragment, Link, Position, Selection};
+//! An egui widget for editing a rich-text [`Editor`].
+//!
+//! [`RichTextEditor`] paints the document and applies egui's pointer, keyboard,
+//! clipboard, IME, and AccessKit input to the editor. It reports rejected
+//! commands, caret geometry, and activated links in a [`RichTextEditorOutput`]
+//! and publishes an AccessKit tree of paragraphs, text runs, links, and block
+//! quotes. Implement [`RichClipboard`] to exchange rich fragments with the
+//! system clipboard, and call [`install_input_routing`] when creating the egui
+//! context.
+//!
+//! The widget needs the `egui` feature, which does not enable egui's
+//! `default_fonts`: hosts that rely on egui's bundled fonts and do not use
+//! eframe, which enables them, must enable `egui/default_fonts` themselves.
+
+use crate::{Composition, Document, Editor, Error, Fragment, Link, Position, Selection};
 #[cfg(test)]
 use crate::{ParagraphKind, StylePatch};
 use egui::text::{CharIndex, LayoutJob};
@@ -8,7 +22,9 @@ use egui::{
 };
 #[cfg(test)]
 use egui::{Key, Modifiers, Stroke, text::CCursor};
+use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
+use std::ptr;
 use std::sync::Arc;
 #[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
@@ -20,36 +36,107 @@ mod input_routing;
 mod layout;
 mod navigation;
 mod paint;
-use super::clean_text;
 pub use accessibility::AccessibilityError;
 use composition::CompositionPreview;
-use input::{InputOptions, handle_event, reads_layout};
+use input::InputOptions;
 #[cfg(test)]
 use input::{handle_key, surrounding_position};
 pub use input_routing::install_input_routing;
 #[cfg(test)]
 use layout::paragraph_job;
 use layout::{Appearance, LayoutCache, ParagraphLayouts};
+use navigation::VerticalNavigation;
 #[cfg(test)]
-use navigation::preedit_byte_range;
-use navigation::{
-    VerticalNavigation, document_caret_rect, grapheme_at_point, hit_test, link_at_point,
-    pointer_navigation, selection_bounds,
-};
-use paint::{BackgroundRanges, PaintCache, paint_document};
+use navigation::{document_caret_rect, hit_test, preedit_byte_range};
+#[cfg(test)]
+use paint::paint_document;
+use paint::{BackgroundRanges, PaintCache};
 
+/// Exchanges rich [`Fragment`]s with the host's clipboard.
+///
+/// egui's clipboard carries only plain text. Attach an implementation with
+/// [`RichTextEditor::rich_clipboard`] to also publish and read rich formats,
+/// for example TLFR, HTML, and plain text from the fragment's export methods.
+/// Both methods have defaults that keep egui's plain-text behavior. The widget
+/// calls them in input order while it handles input, and follows its read-only
+/// and IME rules: a read-only cut copies without deleting, a read-only widget
+/// ignores pastes, and a nonempty preedit blocks paste and cut. Native clipboard
+/// access and its errors remain the host's responsibility.
 pub trait RichClipboard {
+    /// Called when the user copies or cuts a nonempty selection, with that
+    /// selection.
+    ///
+    /// Return `true` after placing `fragment` on the clipboard together with a
+    /// plain-text alternative: the widget then removes the text and image copy
+    /// commands already queued in egui's output for this frame, so that they
+    /// cannot overwrite the newer clipboard item. Return `false`, the default,
+    /// to have the widget copy the selection's plain text through egui.
     fn copy(&mut self, _fragment: &Fragment) -> bool {
         false
     }
 
+    /// Called for each paste event with the text egui pasted, unless it is a
+    /// plain-text paste (Command/Ctrl+Shift+V, which egui also delivers as a
+    /// paste) or contains nothing but control characters.
+    ///
+    /// Return the fragment this paste carries to insert it in place of the
+    /// selection as one undo step, or `None`, the default, to insert
+    /// `plain_text` without its control characters other than line breaks and
+    /// tabs. Rich data must belong to this paste event: capture the native rich
+    /// and plain representations together when producing the event, because
+    /// equal text cannot tell apart clipboard items with different formatting.
     fn paste(&mut self, _plain_text: &str) -> Option<Fragment> {
         None
     }
 }
 
-pub struct RichTextEditor<'a> {
-    editor: &'a mut Editor,
+/// An egui widget that displays and edits an [`Editor`].
+///
+/// Create it with [`new`](Self::new) every frame, configure it with the
+/// builder methods, and add it with [`show`](Self::show), which returns a
+/// [`RichTextEditorOutput`], or with `ui.add(...)`, which returns only the
+/// [`Response`]. The document, selection, and undo history live in the
+/// [`Editor`]; the widget keeps layouts, IME tracking, and its accessibility
+/// tree in egui's temporary memory under its ID until
+/// [`forget_state`](Self::forget_state) releases them. Give each independently
+/// stored editor a stable ID with [`id`](Self::id) or [`id_salt`](Self::id_salt).
+///
+/// The widget applies pointer input, AccessKit actions, and, while it has
+/// focus, keyboard, clipboard, and IME input to the editor in input order. It
+/// never opens links: it reports activated ones in
+/// [`RichTextEditorOutput::clicked_link`]. For a scrolling editor, place it
+/// inside an egui `ScrollArea`.
+///
+/// `'editor` is the lifetime of the borrowed editor, highlight ranges, and
+/// rich clipboard.
+///
+/// # Examples
+///
+/// ```
+/// use textloom::Editor;
+/// use textloom::adapter::egui::{RichTextEditor, install_input_routing};
+///
+/// let mut editor = Editor::from_text("Hello, world");
+/// let ctx = egui::Context::default();
+/// install_input_routing(&ctx);
+/// let matches = editor.document().find("world", Default::default());
+/// let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+///     egui::CentralPanel::default().show(ui, |ui| {
+///         let output = RichTextEditor::new(&mut editor)
+///             .id_salt("notes")
+///             .hint_text("Write something…")
+///             .highlight_ranges(&matches, egui::Color32::YELLOW)
+///             .show(ui);
+///         assert!(output.errors.is_empty());
+///         if let Some(link) = output.clicked_link {
+///             println!("open {}", link.as_str());
+///         }
+///     });
+/// });
+/// output.drop_without_applying_deltas();
+/// ```
+pub struct RichTextEditor<'editor> {
+    editor: &'editor mut Editor,
     id: Option<Id>,
     salt: Option<egui::IdSalt>,
     desired_width: Option<f32>,
@@ -59,12 +146,12 @@ pub struct RichTextEditor<'a> {
     hint: String,
     read_only: bool,
     heading_shortcuts: bool,
-    highlights: Vec<BackgroundRanges<'a>>,
-    rich_clipboard: Option<&'a mut dyn RichClipboard>,
+    highlights: Vec<BackgroundRanges<'editor>>,
+    rich_clipboard: Option<&'editor mut dyn RichClipboard>,
 }
 
-impl std::fmt::Debug for RichTextEditor<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for RichTextEditor<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RichTextEditor")
             .field("id", &self.id)
@@ -82,19 +169,42 @@ impl std::fmt::Debug for RichTextEditor<'_> {
     }
 }
 
+/// What [`RichTextEditor::show`] reports about one frame.
+///
+/// Every field is computed each frame, also while the widget is unfocused.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RichTextEditorOutput {
+    /// The widget's response. [`Response::changed`] reports whether the widget
+    /// changed the document this frame.
     pub response: Response,
+    /// Errors returned while applying this frame's input to the editor or
+    /// previewing its IME composition, in the order they occurred.
     pub errors: Vec<Error>,
+    /// Problems publishing the accessibility tree or applying AccessKit
+    /// actions this frame.
     pub accessibility_errors: Vec<AccessibilityError>,
+    /// The caret's rectangle in the coordinates of the `Ui` the widget was
+    /// shown in, inside the preedit during an IME composition. Pass it to
+    /// `ui.scroll_to_rect` after moving the selection programmatically, or
+    /// anchor pop-ups to it.
     pub caret_rect: Rect,
+    /// The bounds of the selected text in the same coordinates, or `None` when
+    /// nothing is selected. A selection spanning several rows covers the full
+    /// text width.
     pub selection_rect: Option<Rect>,
+    /// The link activated this frame, by a click that presses and releases on
+    /// the same link, with Command/Ctrl held unless the widget is read-only, or
+    /// by an AccessKit click action on it. The widget does not open it.
     pub clicked_link: Option<Link>,
 }
 
-impl<'a> RichTextEditor<'a> {
-    pub fn new(editor: &'a mut Editor) -> Self {
+impl<'editor> RichTextEditor<'editor> {
+    /// Creates a widget for `editor` that is editable, has heading shortcuts,
+    /// fills the available width, shows at least four rows, and uses the
+    /// `Ui`'s body text style.
+    #[must_use]
+    pub fn new(editor: &'editor mut Editor) -> Self {
         Self {
             editor,
             id: None,
@@ -111,78 +221,137 @@ impl<'a> RichTextEditor<'a> {
         }
     }
 
+    /// Uses `id` as the widget's ID, under which egui also stores its state.
+    ///
+    /// It takes precedence over [`id_salt`](Self::id_salt). Without either,
+    /// the widget takes the `Ui`'s next automatic ID, which changes when
+    /// widgets before it come and go.
     #[must_use]
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
         self
     }
 
+    /// Derives the widget's ID from `salt` and the parent `Ui`'s ID, as
+    /// `Ui::make_persistent_id` does.
     #[must_use]
     pub fn id_salt(mut self, salt: impl egui::AsIdSalt) -> Self {
         self.salt = Some(egui::IdSalt::new(salt));
         self
     }
 
+    /// Sets the widget's width in points, including its padding.
+    ///
+    /// The width is at least 32 points and never exceeds the available width,
+    /// which is also the default.
     #[must_use]
     pub fn desired_width(mut self, width: f32) -> Self {
         self.desired_width = Some(width.max(32.0));
         self
     }
 
+    /// Sets the number of body text rows the widget is tall enough for while
+    /// the document is shorter, at least one; the default is four. Longer
+    /// documents make the widget taller.
     #[must_use]
     pub fn min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
         self
     }
 
+    /// Sets the body text font, which headings scale up. The default is the
+    /// `Ui`'s body text style.
     #[must_use]
     pub fn font(mut self, font: FontId) -> Self {
         self.font = Some(font);
         self
     }
 
+    /// Selects a registered font family for bold glyphs.
+    ///
+    /// Bold text without a color of its own uses egui's strong text color.
+    /// Without this family, or when `family` is not registered with egui, bold
+    /// text keeps the body font's family.
     #[must_use]
     pub fn bold_font_family(mut self, family: FontFamily) -> Self {
         self.bold_family = Some(family);
         self
     }
 
+    /// Sets placeholder text that appears in the weak text color while the
+    /// document is a single empty paragraph and no IME composition is active.
+    /// The widget's egui `WidgetInfo` also reports it as the hint text.
     #[must_use]
     pub fn hint_text(mut self, hint: impl Into<String>) -> Self {
         self.hint = hint.into();
         self
     }
 
+    /// Makes the widget read-only, or editable again.
+    ///
+    /// A read-only widget keeps selection, navigation, copy, and accessibility
+    /// but ignores edits and IME, cancels any composition, activates links on a
+    /// plain click, and leaves Tab to focus traversal. It consumes only the
+    /// editing chords an editable widget would handle.
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
     }
 
+    /// Enables or disables the Command/Ctrl+0 (body text) and Command/Ctrl+1–6
+    /// (heading) shortcuts. Disable them to leave these chords to the host, for
+    /// example to egui's zoom reset. They are enabled by default.
     #[must_use]
     pub fn heading_shortcuts(mut self, enabled: bool) -> Self {
         self.heading_shortcuts = enabled;
         self
     }
 
+    /// Paints `color` behind the text in `ranges`, such as the results of
+    /// [`Document::find`].
+    ///
+    /// `ranges` must be sorted and nonoverlapping, as `find` returns them;
+    /// otherwise some may not be painted. Ranges that are empty or do not lie
+    /// on character boundaries of the document are skipped. Each call adds a
+    /// layer over the previous ones, and the selection is painted over all of
+    /// them. Highlights are hidden while an IME preedit is shown.
     #[must_use]
-    pub fn highlight_ranges(mut self, ranges: &'a [Range<Position>], color: Color32) -> Self {
+    pub fn highlight_ranges(mut self, ranges: &'editor [Range<Position>], color: Color32) -> Self {
         self.highlights.push((ranges, color));
         self
     }
 
+    /// Exchanges rich fragments with the host's clipboard through `clipboard`
+    /// instead of copying and pasting only plain text. See [`RichClipboard`].
     #[must_use]
-    pub fn rich_clipboard(mut self, clipboard: &'a mut dyn RichClipboard) -> Self {
+    pub fn rich_clipboard(mut self, clipboard: &'editor mut dyn RichClipboard) -> Self {
         self.rich_clipboard = Some(clipboard);
         self
     }
 
+    /// Releases the layouts, IME tracking, and accessibility tree that the
+    /// widget with `id` keeps in egui's temporary memory, for example when its
+    /// editor closes.
+    ///
+    /// `id` is the widget's ID, which `output.response.id` also reports when
+    /// the widget derived it from a salt or the `Ui`. Showing the widget again
+    /// rebuilds the state.
     pub fn forget_state(ctx: &egui::Context, id: Id) {
         ctx.data_mut(|data| data.remove::<Cache>(id));
     }
 
+    /// Adds the widget to `ui`, applies this frame's input to the editor, and
+    /// paints the document.
+    ///
+    /// It handles pointer input on the widget, keyboard, clipboard, and IME
+    /// input while the widget has focus, and AccessKit actions that target the
+    /// widget or its links. A disabled `Ui` shows the document without applying
+    /// input and cancels any composition. It also installs
+    /// [`install_input_routing`] if the context lacks it, taking effect on the
+    /// next pass.
     pub fn show(mut self, ui: &mut Ui) -> RichTextEditorOutput {
-        install_input_routing(ui.ctx());
+        input_routing::install_input_routing(ui.ctx());
         let id = self.id.unwrap_or_else(|| {
             self.salt
                 .map_or_else(|| ui.next_auto_id(), |salt| ui.make_persistent_id(salt))
@@ -241,9 +410,10 @@ impl<'a> RichTextEditor<'a> {
         let mut interrupted =
             (self.read_only || !ui.is_enabled()) && self.editor.cancel_composition();
         if interrupted && let Some(composition) = &old_composition {
-            cache
-                .interaction
-                .remember_composition_end(clean_text(&composition.text, true).into_owned(), now);
+            cache.interaction.remember_composition_end(
+                super::clean_text(&composition.text, true).into_owned(),
+                now,
+            );
         }
         if self
             .editor
@@ -379,11 +549,18 @@ impl<'a> RichTextEditor<'a> {
                     }
                     let single = !response.double_clicked() && !response.triple_clicked();
                     let link = (follows_links && single)
-                        .then(|| link_at_point(self.editor.document(), &layouts, pointer - origin))
+                        .then(|| {
+                            navigation::link_at_point(
+                                self.editor.document(),
+                                &layouts,
+                                pointer - origin,
+                            )
+                        })
                         .flatten();
                     if let Some(link) = link {
                         if pressed {
-                            let (anchor, _) = hit_test(self.editor, &layouts, pointer - origin);
+                            let (anchor, _) =
+                                navigation::hit_test(self.editor, &layouts, pointer - origin);
                             cache.interaction.link_press = Some(LinkPress {
                                 link,
                                 anchor,
@@ -394,12 +571,12 @@ impl<'a> RichTextEditor<'a> {
                         }
                     } else {
                         let (position, prefer_next_row) =
-                            hit_test(self.editor, &layouts, pointer - origin);
+                            navigation::hit_test(self.editor, &layouts, pointer - origin);
                         let shift = click_modifiers.shift;
                         let result = if response.triple_clicked() {
                             self.editor.select_paragraph(position.paragraph)
                         } else if response.double_clicked() {
-                            let under_pointer = grapheme_at_point(
+                            let under_pointer = navigation::grapheme_at_point(
                                 self.editor.document(),
                                 &layouts,
                                 pointer - origin,
@@ -415,8 +592,12 @@ impl<'a> RichTextEditor<'a> {
                             self.editor.set_selection(Selection::new(anchor, position))
                         };
                         record(result, &mut errors);
-                        cache.interaction.navigation =
-                            pointer_navigation(self.editor, &layouts, position, prefer_next_row);
+                        cache.interaction.navigation = navigation::pointer_navigation(
+                            self.editor,
+                            &layouts,
+                            position,
+                            prefer_next_row,
+                        );
                     }
                 }
             }
@@ -431,7 +612,8 @@ impl<'a> RichTextEditor<'a> {
                 && let Some(press) = link_press.take()
                 && press.revision == self.editor.document().revision()
                 && let Some(pointer) = released_pointer
-                && link_at_point(self.editor.document(), &layouts, pointer - origin).as_ref()
+                && navigation::link_at_point(self.editor.document(), &layouts, pointer - origin)
+                    .as_ref()
                     == Some(&press.link)
             {
                 clicked_link = Some(press.link);
@@ -444,7 +626,8 @@ impl<'a> RichTextEditor<'a> {
                     layouts = cache.layout(ui, self.editor, &appearance);
                     cache.interaction.remember_composition_end(committed, now);
                 }
-                let (position, prefer_next_row) = hit_test(self.editor, &layouts, pointer - origin);
+                let (position, prefer_next_row) =
+                    navigation::hit_test(self.editor, &layouts, pointer - origin);
                 let anchor = link_press
                     .take()
                     .filter(|press| press.revision == self.editor.document().revision())
@@ -453,8 +636,12 @@ impl<'a> RichTextEditor<'a> {
                     self.editor.set_selection(Selection::new(anchor, position)),
                     &mut errors,
                 );
-                cache.interaction.navigation =
-                    pointer_navigation(self.editor, &layouts, position, prefer_next_row);
+                cache.interaction.navigation = navigation::pointer_navigation(
+                    self.editor,
+                    &layouts,
+                    position,
+                    prefer_next_row,
+                );
             }
             if response.is_pointer_button_down_on() {
                 cache.interaction.link_press = link_press;
@@ -503,7 +690,7 @@ impl<'a> RichTextEditor<'a> {
                 {
                     continue;
                 }
-                if layout_stale && reads_layout(ui.os(), event, &options) {
+                if layout_stale && input::reads_layout(ui.os(), event, &options) {
                     layouts = cache.layout(ui, self.editor, &appearance);
                     layout_stale = false;
                 }
@@ -539,7 +726,7 @@ impl<'a> RichTextEditor<'a> {
                         &mut accessibility_errors,
                     )
                 } else if response.has_focus() {
-                    handle_event(
+                    input::handle_event(
                         self.editor,
                         ui,
                         event,
@@ -625,7 +812,7 @@ impl<'a> RichTextEditor<'a> {
             ui.ctx().request_repaint();
         }
         let composition_changed = match (old_composition.as_deref(), self.editor.composition()) {
-            (Some(before), Some(after)) => !std::ptr::eq(before, after) && before != after,
+            (Some(before), Some(after)) => !ptr::eq(before, after) && before != after,
             (None, None) => false,
             _ => true,
         };
@@ -666,7 +853,7 @@ impl<'a> RichTextEditor<'a> {
             } else {
                 &self.highlights[..]
             };
-            paint_document(
+            paint::paint_document(
                 &painter,
                 &mut cache.paint,
                 display_document,
@@ -690,7 +877,7 @@ impl<'a> RichTextEditor<'a> {
                 .navigation
                 .as_ref()
                 .is_none_or(|navigation| navigation.prefer_next_row);
-        let local_caret = document_caret_rect(
+        let local_caret = navigation::document_caret_rect(
             display_document,
             display_layouts,
             Pos2::ZERO,
@@ -699,7 +886,7 @@ impl<'a> RichTextEditor<'a> {
         );
         let caret = local_caret.translate(origin.to_vec2());
         let selection_rect = display_selection.and_then(|selection| {
-            selection_bounds(
+            navigation::selection_bounds(
                 display_document,
                 display_layouts,
                 origin,
@@ -759,12 +946,12 @@ impl<'a> RichTextEditor<'a> {
                 .unwrap_or_default();
             let mut ime_area = caret;
             if let Some(preview) = preview {
-                let start = document_caret_rect(
+                let start = navigation::document_caret_rect(
                     display_document,
                     display_layouts,
                     origin,
                     preview.composition.replacement.range().start,
-                    true,
+                    /* prefer_next_row= */ true,
                 );
                 if start.top() == caret.top() {
                     ime_area = ime_area.union(start);
@@ -783,7 +970,9 @@ impl<'a> RichTextEditor<'a> {
         let hovered_link = response
             .hover_pos()
             .filter(|_| preview.is_none() && ui.is_enabled())
-            .and_then(|pointer| link_at_point(self.editor.document(), &layouts, pointer - origin));
+            .and_then(|pointer| {
+                navigation::link_at_point(self.editor.document(), &layouts, pointer - origin)
+            });
         if response.hovered() {
             let follows_links = self.read_only || ui.input(|input| input.modifiers.command);
             ui.ctx()
@@ -839,8 +1028,11 @@ impl<'a> RichTextEditor<'a> {
                 accessibility_errors.push(error);
             }
             if let Some(snapshot) = &cache.accessibility {
-                let navigation = cache.interaction.navigation.as_ref();
-                let next_row = navigation.is_none_or(|nav| nav.prefer_next_row);
+                let next_row = cache
+                    .interaction
+                    .navigation
+                    .as_ref()
+                    .is_none_or(|navigation| navigation.prefer_next_row);
                 snapshot.publish(
                     ui,
                     id,
@@ -900,6 +1092,9 @@ impl<'a> RichTextEditor<'a> {
     }
 }
 
+/// Shows the widget with [`RichTextEditor::show`] and returns only its
+/// response, dropping the rest of the [`RichTextEditorOutput`], including any
+/// errors and activated link.
 impl Widget for RichTextEditor<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         self.show(ui).response
@@ -928,7 +1123,7 @@ struct InteractionState {
     focus_exit: Option<FocusExit>,
     last_interaction: f64,
     commit_echo: Option<CommitEcho>,
-    cleared_preedit: Option<Arc<crate::Composition>>,
+    cleared_preedit: Option<Arc<Composition>>,
     link_press: Option<LinkPress>,
 }
 
@@ -937,7 +1132,7 @@ impl InteractionState {
         if let Some(previous) = self.cleared_preedit.take()
             && text.is_empty()
         {
-            text = clean_text(&previous.text, true).into_owned();
+            text = super::clean_text(&previous.text, true).into_owned();
         }
         self.commit_echo = CommitEcho::new(text, time);
     }
@@ -1021,6 +1216,7 @@ enum PointerEventKind {
 
 fn primary_pointer_event(ui: &Ui, kind: PointerEventKind) -> Option<(Pos2, egui::Modifiers)> {
     let (position, modifiers) = ui.input(|input| {
+        // Each primary button event as (pressed, position, modifiers).
         let mut events = input.events.iter().filter_map(|event| match event {
             Event::PointerButton {
                 pos,
@@ -1045,7 +1241,8 @@ fn primary_pointer_event(ui: &Ui, kind: PointerEventKind) -> Option<(Pos2, egui:
                 events.find(|(pressed, _, _)| !*pressed)
             }
         }?;
-        Some((event.1, event.2))
+        let (_, position, modifiers) = event;
+        Some((position, modifiers))
     })?;
     let position = ui
         .ctx()
@@ -1056,7 +1253,7 @@ fn primary_pointer_event(ui: &Ui, kind: PointerEventKind) -> Option<(Pos2, egui:
 
 fn finish_composition(editor: &mut Editor, errors: &mut Vec<Error>) -> Option<String> {
     let composition = editor.composition()?;
-    let text = clean_text(&composition.text, true).into_owned();
+    let text = super::clean_text(&composition.text, true).into_owned();
     if text.is_empty() {
         editor.cancel_composition();
         return Some(text);
@@ -1082,7 +1279,7 @@ fn apply_queued_ime(
     options: &InputOptions,
     tab_moves_focus: bool,
 ) -> Vec<usize> {
-    let queued: Vec<_> = ui.input(|input| {
+    let queued: Vec<(usize, Event)> = ui.input(|input| {
         let end = input.events.iter().position(|event| match event {
             Event::PointerButton {
                 button: egui::PointerButton::Primary,
@@ -1103,7 +1300,7 @@ fn apply_queued_ime(
     let revision = editor.document().revision();
     for (index, event) in queued {
         let composition = composition_before_event(editor, &event);
-        if handle_event(
+        if input::handle_event(
             editor,
             ui,
             &event,
@@ -1162,7 +1359,7 @@ impl CommitEcho {
 }
 
 #[allow(deprecated)]
-fn composition_before_event(editor: &Editor, event: &Event) -> Option<Arc<crate::Composition>> {
+fn composition_before_event(editor: &Editor, event: &Event) -> Option<Arc<Composition>> {
     use egui::accesskit::Action;
 
     let preserve = match event {
@@ -1193,7 +1390,7 @@ fn composition_before_event(editor: &Editor, event: &Event) -> Option<Arc<crate:
 
 fn observe_composition_event(
     interaction: &mut InteractionState,
-    previous: Option<Arc<crate::Composition>>,
+    previous: Option<Arc<Composition>>,
     editor: &Editor,
     event: &Event,
     time: f64,
@@ -1209,7 +1406,8 @@ fn observe_composition_event(
         && editor.composition().is_none()
     {
         // Some input methods still send the old preedit while processing an interruption.
-        interaction.remember_composition_end(clean_text(&previous.text, true).into_owned(), time);
+        interaction
+            .remember_composition_end(super::clean_text(&previous.text, true).into_owned(), time);
     }
     if !empty {
         interaction.cleared_preedit = None;
@@ -1222,14 +1420,15 @@ fn handle_accessibility_action(
     request: &egui::accesskit::ActionRequest,
     snapshot: Option<&accessibility::Snapshot>,
     layouts: &ParagraphLayouts,
-    navigation: &mut Option<VerticalNavigation>,
+    vertical_navigation: &mut Option<VerticalNavigation>,
     read_only: bool,
     interrupted: &mut bool,
     errors: &mut Vec<Error>,
     accessibility_errors: &mut Vec<AccessibilityError>,
 ) -> bool {
-    use crate::accessibility::{AccessibleAction, apply_action};
+    use crate::accessibility::AccessibleAction;
     use egui::accesskit::{Action, ActionData};
+
     if read_only
         && matches!(
             request.action,
@@ -1257,7 +1456,8 @@ fn handle_accessibility_action(
                 *interrupted |= editor.cancel_composition();
                 let result = editor.set_selection(Selection::new(anchor, focus));
                 if result.is_ok() {
-                    *navigation = pointer_navigation(editor, layouts, focus, prefer_next_row);
+                    *vertical_navigation =
+                        navigation::pointer_navigation(editor, layouts, focus, prefer_next_row);
                 }
                 record(result, errors);
             } else {
@@ -1271,7 +1471,11 @@ fn handle_accessibility_action(
             } else {
                 AccessibleAction::ReplaceSelectedText(value)
             };
-            record(apply_action(editor, action).map(drop), errors);
+            // The core module shares this module's name, so name it in full.
+            record(
+                crate::accessibility::apply_action(editor, action).map(drop),
+                errors,
+            );
         }
         _ => accessibility_errors.push(AccessibilityError::InvalidActionData),
     }
