@@ -410,8 +410,8 @@ mod accesskit_bridge {
     pub enum AccessKitError {
         /// The editor rejected a position or the command that an action maps to.
         Editor(Error),
-        /// The adapter has run out of node IDs. It allocates them upward from its
-        /// root ID and never reuses them.
+        /// The adapter has run out of node IDs. It takes them in order upward from
+        /// its root ID and does not give out the IDs of removed nodes again.
         NodeIdExhausted,
         /// The text position is not in the published tree: its node is not a text
         /// run of the last update, or its character index is beyond the run's end.
@@ -631,11 +631,11 @@ mod accesskit_bridge {
     /// Publishes an [`Editor`] as an AccessKit tree and carries out AccessKit action
     /// requests on it.
     ///
-    /// The tree's root is a window, or a generic container in a subtree that
-    /// [`with_tree_id`](Self::with_tree_id) grafts into the host's tree. Its only
-    /// child is a multiline text input for the editor, whose children are the
-    /// paragraphs, with consecutive quote paragraphs grouped under one blockquote
-    /// node. A paragraph's role follows its kind, with the heading level,
+    /// The tree's root is a window, or a generic container in a subtree that the
+    /// host grafts into its own tree (see [`with_tree_id`](Self::with_tree_id)).
+    /// Its only child is a multiline text input for the editor, whose children are
+    /// the paragraphs, with consecutive quote paragraphs grouped under one
+    /// blockquote node. A paragraph's role follows its kind, with the heading level,
     /// or the list level and marker style, and its children are text runs:
     ///
     /// - A run holds at most 255 characters, each one grapheme, except that a
@@ -652,8 +652,9 @@ mod accesskit_bridge {
     /// that republish only what changed: unchanged paragraphs keep their node IDs
     /// and cached nodes, and a selection change republishes only the text input.
     /// Node IDs count up from the root ID given to [`new`](Self::new), which is 1
-    /// for [`Default`], and are never reused, so the host must not use them for
-    /// other nodes in the same tree.
+    /// for [`Default`], and the IDs of removed nodes are not given out again. The
+    /// adapter thus claims every ID from its root upward, so a host that adds its
+    /// own nodes to the same tree must give them lower IDs.
     ///
     /// The adapter publishes no geometry. A host that adds bounds or character
     /// positions must add them to every node of each update, including the root and
@@ -760,7 +761,7 @@ mod accesskit_bridge {
         /// change keep their IDs. Call this:
         ///
         /// - When the platform adapter asks for an initial tree, through
-        ///   `ActivationHandler::request_initial_tree` or accesskit_winit's
+        ///   `ActivationHandler::request_initial_tree` or `accesskit_winit`'s
         ///   `WindowEvent::InitialTreeRequested`, before building the update that
         ///   answers it.
         /// - After discarding an update instead of passing it to the platform
