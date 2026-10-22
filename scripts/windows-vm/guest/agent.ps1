@@ -1,8 +1,8 @@
 # Textloom QA agent: runs in the logged-in desktop session and executes
-# PowerShell jobs from winvm.py on the Linux host. It polls the host's job
+# PowerShell jobs from `cargo winvm` on the Linux host. It polls the host's job
 # server at 10.0.2.2 (QEMU user networking's address for the host), so the
 # guest needs no inbound firewall rule. Each request carries the token from
-# agent.json, which winvm.py generates per VM.
+# agent.json, which `cargo winvm` generates per VM.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $config = Get-Content -Raw -LiteralPath (Join-Path $root 'agent.json') | ConvertFrom-Json

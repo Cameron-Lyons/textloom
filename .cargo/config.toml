@@ -1,0 +1,5 @@
+# Repository QA tools; run from the repository root. They are not part of the
+# published crate.
+[alias]
+winvm = "run --quiet --locked --manifest-path scripts/qa-tools/Cargo.toml --bin winvm --"
+winvm-checks = "run --quiet --locked --manifest-path scripts/qa-tools/Cargo.toml --bin winvm-checks --"

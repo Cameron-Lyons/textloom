@@ -1,5 +1,5 @@
-# Prepares the evaluation VM for Textloom's native checks. winvm.py runs it
-# elevated through the agent; -Verify prints what is installed.
+# Prepares the evaluation VM for Textloom's native checks. `cargo winvm provision`
+# runs it elevated through the agent; -Verify prints what is installed.
 param([switch]$Verify)
 
 $ErrorActionPreference = 'Stop'
@@ -101,7 +101,7 @@ Step 'Input methods and keyboard layouts' {
     }
 }
 
-Step 'MSYS2, the Mesa software renderer, and Python' {
+Step 'MSYS2 and the Mesa software renderer' {
     if (-not (Test-Path 'C:\msys64\usr\bin\bash.exe')) {
         $archive = Download 'https://repo.msys2.org/distrib/msys2-x86_64-latest.sfx.exe' (Join-Path $downloads 'msys2.sfx.exe')
         Invoke-Native { & $archive '-y' '-oC:\' } | Out-Null
@@ -109,9 +109,8 @@ Step 'MSYS2, the Mesa software renderer, and Python' {
     # The first update replaces the MSYS2 runtime and exits; the second finishes.
     Invoke-Msys 'pacman -Syuu --noconfirm --disable-download-timeout' | Out-Null
     if ((Invoke-Msys 'pacman -Syuu --noconfirm --disable-download-timeout') -ne 0) { throw 'MSYS2 update failed' }
-    # Python runs the report validator that the hosted reader probe calls.
-    if ((Invoke-Msys 'pacman -S --needed --noconfirm --disable-download-timeout mingw-w64-ucrt-x86_64-mesa mingw-w64-ucrt-x86_64-python') -ne 0) {
-        throw 'Mesa or Python installation failed'
+    if ((Invoke-Msys 'pacman -S --needed --noconfirm --disable-download-timeout mingw-w64-ucrt-x86_64-mesa') -ne 0) {
+        throw 'Mesa installation failed'
     }
     Copy-Item 'C:\msys64\ucrt64\bin\opengl32.dll', 'C:\msys64\ucrt64\bin\libgallium_wgl.dll' -Destination $mesa -Force
 }
