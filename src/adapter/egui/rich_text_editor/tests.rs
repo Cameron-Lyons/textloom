@@ -11,15 +11,13 @@ use egui::{
     Color32, Event, FontFamily, FontId, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Stroke, Vec2,
 };
 
-use super::accessibility::AccessibilityError;
-use super::input::InputOptions;
-use super::layout::{Appearance, ParagraphLayouts};
-use super::navigation::CaretPlacement;
-use super::paint::{BackgroundRanges, PaintCache};
-use super::{
-    Cache, PADDING, PARAGRAPH_GAP, RichClipboard, RichTextEditor, RichTextEditorOutput, input,
-    input_routing, layout, navigation, paint,
-};
+use super::{Cache, PADDING, PARAGRAPH_GAP, RichClipboard, RichTextEditor, RichTextEditorOutput};
+use crate::adapter::egui::accessibility::AccessibilityError;
+use crate::adapter::egui::input::InputOptions;
+use crate::adapter::egui::layout::{Appearance, ParagraphLayouts};
+use crate::adapter::egui::navigation::CaretPlacement;
+use crate::adapter::egui::paint::{BackgroundRanges, PaintCache};
+use crate::adapter::egui::{input, input_routing, layout, navigation, paint};
 use crate::{
     Color, Document, Editor, Error, Fragment, InlineAttribute, Link, ParagraphKind, Position,
     SearchOptions, Selection, StylePatch,
