@@ -398,7 +398,6 @@ mod accesskit_bridge {
     use std::iter::{self, Peekable};
     use std::ops::Range;
     use std::sync::{Arc, OnceLock};
-    use unicode_segmentation::UnicodeSegmentation;
 
     // AccessKit stores a run's character lengths and its word starts, which are
     // character indices, as `u8`s.
@@ -1537,6 +1536,8 @@ mod accesskit_bridge {
     /// and link changes and after soft line breaks. There is always at least one
     /// run, and the last one never ends with a soft line break.
     fn split_runs(paragraph: &Paragraph, line_break: bool) -> Vec<RunPiece> {
+        use unicode_segmentation::UnicodeSegmentation;
+
         let text = paragraph.text();
         let spans = paragraph.spans();
         let limit = MAX_RUN_CHARACTERS - usize::from(line_break);
