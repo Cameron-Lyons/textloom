@@ -1242,7 +1242,7 @@ fn main() -> eframe::Result {
             }
             context.egui_ctx.set_fonts(fonts);
             let clipboard = if arguments.rich_clipboard {
-                Some(clipboard::NativeClipboard::new(context).map_err(std::io::Error::other)?)
+                Some(clipboard::NativeClipboard::try_new(context).map_err(std::io::Error::other)?)
             } else {
                 None
             };

@@ -1,16 +1,39 @@
+//! The example's native rich clipboard transport.
+//!
+//! A rich copy publishes three representations of the selection: plain text,
+//! HTML, and a TLFR fragment framed in a 32-byte envelope. Besides the
+//! fragment's length, the envelope carries a publication timestamp and
+//! sequence number, so that read-back verification can tell repeated copies of
+//! the same text apart.
+//!
+//! Platform clipboard access runs in helper processes: the host runs its own
+//! executable again with `--native-clipboard-copy` or
+//! `--native-clipboard-read` (see [`helper`]) and exchanges a [`NativeItem`]
+//! with it over pipes under a hard deadline. The platform modules implement
+//! the helpers' `publish` and `read`. On Linux, the copy helper keeps running
+//! to serve the clipboard until another application takes it over or the host
+//! replaces it.
+//!
+//! Pastes are captured as they arrive in raw input (see
+//! [`NativeClipboard::capture_pastes`]), so a paste that focus routing delivers
+//! later still inserts the formatting that was on the clipboard when it
+//! arrived.
+
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::env;
 use std::ffi::OsString;
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::{self, Read, Write};
+use std::process::{self, Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use textloom::{DecodeLimits, Fragment, ParagraphKind};
+use textloom::adapter::egui::{RichClipboard, RichTextEditor};
+use textloom::{Color, DecodeLimits, Editor, Fragment, ParagraphKind, StylePatch};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -25,6 +48,8 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
+/// Whether this platform has a rich clipboard backend. Elsewhere the host
+/// rejects `--rich-clipboard`.
 pub const SUPPORTED: bool = cfg!(any(
     target_os = "linux",
     target_os = "macos",
@@ -46,24 +71,53 @@ mod platform {
     }
 }
 
+/// The clipboard format name of the enveloped fragment on Linux and Windows.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub const MIME: &str = "application/x-textloom-fragment";
+/// The decode limits for clipboard fragments.
 const TLFR_LIMITS: DecodeLimits = DecodeLimits::DEFAULT;
+/// The largest native representation accepted, in bytes: the largest TLFR
+/// payload plus its envelope.
 pub const MAX_NATIVE_BYTES: usize = TLFR_LIMITS.max_bytes + ENVELOPE_SIZE;
+/// The envelope's first 8 bytes: a magic number and the envelope version.
 const ENVELOPE: &[u8; 8] = b"TLCL\x01\0\0\0";
+/// The envelope's size in bytes: [`ENVELOPE`], then the payload length, the
+/// publication timestamp in nanoseconds, and a sequence number mixed with the
+/// process ID, each a little-endian `u64`.
 const ENVELOPE_SIZE: usize = 32;
+/// Numbers this process's publications for the envelope's sequence number.
 static PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// The copy helper's acknowledgement on stdout once it has published the item
+/// (on Linux, once it is about to serve it).
 const READY: &[u8; 6] = b"READY\n";
+/// The deadline for one helper exchange, and separately for verifying a
+/// publication by reading it back.
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
 
+/// The three clipboard representations of one rich copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeItem {
+    /// Plain text, which matches the fragment's text up to line break
+    /// normalization.
     pub plain: String,
+    /// The HTML export, for other applications; it is never imported.
     pub html: String,
+    /// The enveloped TLFR fragment. Native clipboards may append padding.
     pub rich: Vec<u8>,
 }
 
-fn encoded_size(fragment: &Fragment) -> (usize, usize) {
+/// The size of a fragment's TLFR encoding, as predicted by [`encoded_size`].
+#[derive(Debug, PartialEq, Eq)]
+struct EncodedSize {
+    /// The length of `Fragment::to_bytes`, saturating at `usize::MAX`.
+    bytes: usize,
+    /// The number of spans across all paragraphs.
+    spans: usize,
+}
+
+/// Predicts the size of `fragment.to_bytes()` without encoding, so that a
+/// fragment over the transport limits is rejected before allocating it.
+fn encoded_size(fragment: &Fragment) -> EncodedSize {
     let mut size = 13usize;
     let mut spans = 0usize;
     for paragraph in fragment.paragraphs() {
@@ -83,16 +137,25 @@ fn encoded_size(fragment: &Fragment) -> (usize, usize) {
             size = size.saturating_add(9 + colors * 4).saturating_add(link);
         }
     }
-    (size, spans)
+    EncodedSize { bytes: size, spans }
 }
 
 impl NativeItem {
+    /// Builds the representations of `fragment` for a new publication, with a
+    /// fresh timestamp and sequence number in its envelope.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the fragment exceeds the TLFR decode limits, if its plain text
+    /// contains NUL, which native text clipboards cannot represent, if a
+    /// representation exceeds [`MAX_NATIVE_BYTES`], or if the system clock is
+    /// before the Unix epoch.
     fn from_fragment(fragment: &Fragment) -> Result<Self, String> {
         if fragment.paragraphs().len() > TLFR_LIMITS.max_paragraphs {
             return Err("Clipboard fragment exceeds the paragraph limit".into());
         }
-        let (encoded_size, spans) = encoded_size(fragment);
-        if encoded_size > TLFR_LIMITS.max_bytes || spans > TLFR_LIMITS.max_spans {
+        let size = encoded_size(fragment);
+        if size.bytes > TLFR_LIMITS.max_bytes || size.spans > TLFR_LIMITS.max_spans {
             return Err("Clipboard fragment exceeds the native transport limit".into());
         }
         let plain = fragment.plain_text();
@@ -111,14 +174,21 @@ impl NativeItem {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "Clipboard publication clock is unavailable")?
             .as_nanos() as u64;
-        let sequence = PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ^ (u64::from(std::process::id()) << 32);
+        let sequence =
+            PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed) ^ (u64::from(process::id()) << 32);
         rich.extend_from_slice(&timestamp.to_le_bytes());
         rich.extend_from_slice(&sequence.to_le_bytes());
         rich.extend_from_slice(&payload);
         Ok(Self { plain, html, rich })
     }
 
+    /// Returns the envelope and its payload, without any padding after them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the envelope is oversized, has the wrong magic number or
+    /// version, or is truncated, or if its payload length exceeds the TLFR
+    /// limit.
     fn envelope(&self) -> Result<&[u8], String> {
         if self.rich.len() > MAX_NATIVE_BYTES || self.rich.get(..8) != Some(ENVELOPE.as_slice()) {
             return Err("Clipboard fragment envelope was rejected".into());
@@ -137,6 +207,13 @@ impl NativeItem {
             .ok_or_else(|| "Clipboard fragment payload was truncated".into())
     }
 
+    /// Decodes the rich fragment.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the envelope or its TLFR payload is invalid, or if the
+    /// fragment's text differs from the plain representation after line break
+    /// normalization.
     fn fragment(&self) -> Result<Fragment, String> {
         let payload = &self.envelope()?[ENVELOPE_SIZE..];
         let fragment = Fragment::from_bytes_with_limits(payload, TLFR_LIMITS)
@@ -147,6 +224,10 @@ impl NativeItem {
         Ok(fragment)
     }
 
+    /// Whether `self`, read back from the clipboard, is the publication
+    /// `expected`: the same HTML, the same envelope and payload (which
+    /// identifies the publication), and the same plain text up to line break
+    /// normalization.
     fn same_publication(&self, expected: &Self) -> bool {
         (self.plain == expected.plain
             || normalize_text(&self.plain) == normalize_text(&expected.plain))
@@ -155,6 +236,8 @@ impl NativeItem {
     }
 }
 
+/// The HTML representation of `fragment`. On macOS it is a full document that
+/// declares UTF-8, so that other applications decode it correctly.
 fn native_html(fragment: &Fragment) -> String {
     let html = fragment.to_html();
     #[cfg(target_os = "macos")]
@@ -164,6 +247,7 @@ fn native_html(fragment: &Fragment) -> String {
     html
 }
 
+/// Converts CRLF and lone CR line breaks to LF.
 fn normalize_text(text: &str) -> Cow<'_, str> {
     if !text.contains('\r') {
         return Cow::Borrowed(text);
@@ -171,10 +255,27 @@ fn normalize_text(text: &str) -> Cow<'_, str> {
     Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
+/// A rich paste captured for one Paste event.
+struct CapturedPaste {
+    /// The Paste event's text after capture, which identifies the event when
+    /// the document handles it.
+    plain: String,
+    /// The fragment to insert instead of the plain text.
+    fragment: Fragment,
+}
+
+/// Captures the native item for the one Paste event in `events`, and replaces
+/// that event's text with the fragment's text, which equals it up to line
+/// break normalization.
+///
+/// Returns `None`, leaving `events` unchanged, when there is no Paste event or
+/// more than one, when the Paste is empty, when `capture` fails or finds no
+/// rich item, when its fragment is invalid, or when its text does not match the
+/// Paste. `capture` is only called for a single nonempty Paste.
 fn capture_paste(
     events: &mut [egui::Event],
     capture: impl FnOnce() -> Result<Option<NativeItem>, String>,
-) -> Option<(String, Fragment)> {
+) -> Option<CapturedPaste> {
     let mut pastes = events.iter_mut().filter_map(|event| match event {
         egui::Event::Paste(text) => Some(text),
         _ => None,
@@ -190,14 +291,26 @@ fn capture_paste(
         return None;
     }
     *plain = captured_plain;
-    Some((plain.clone(), fragment))
+    Some(CapturedPaste {
+        plain: plain.clone(),
+        fragment,
+    })
 }
 
+/// One slot per Paste event delivered in raw input, in order, holding its
+/// captured rich paste if there was one.
+///
+/// Input routing can split one raw input into several passes. Every Paste
+/// takes its slot when it reaches a pass, whoever handles it, so a later Paste
+/// never takes an earlier one's capture.
 #[derive(Default)]
-struct PendingPastes(VecDeque<Option<(String, Fragment)>>);
+struct PendingPastes(VecDeque<Option<CapturedPaste>>);
 
 impl PendingPastes {
-    fn record(&mut self, events: &[egui::Event], mut captured: Option<(String, Fragment)>) {
+    /// Adds a slot for each Paste in `events`, the raw input of one frame. Only
+    /// the first slot gets `captured`, as [`capture_paste`] only captures a
+    /// lone Paste.
+    fn record(&mut self, events: &[egui::Event], mut captured: Option<CapturedPaste>) {
         for event in events {
             if matches!(event, egui::Event::Paste(_)) {
                 self.0.push_back(captured.take());
@@ -205,7 +318,9 @@ impl PendingPastes {
         }
     }
 
-    fn take_pass(&mut self, events: &[egui::Event]) -> Option<(String, Fragment)> {
+    /// Takes the slots of the Paste events in one pass's `events`. Returns the
+    /// capture of a lone Paste if its text matches, or `None`.
+    fn take_pass(&mut self, events: &[egui::Event]) -> Option<CapturedPaste> {
         let mut pastes = events.iter().filter_map(|event| match event {
             egui::Event::Paste(text) => Some(text),
             _ => None,
@@ -215,7 +330,7 @@ impl PendingPastes {
             .0
             .pop_front()
             .flatten()
-            .filter(|(text, _)| text == plain);
+            .filter(|captured| captured.plain == *plain);
         for _ in pastes {
             self.0.pop_front();
             captured = None;
@@ -224,6 +339,13 @@ impl PendingPastes {
     }
 }
 
+/// Writes `item` to a helper pipe: its plain, HTML, and rich representations,
+/// each as a little-endian `u64` length followed by that many bytes.
+///
+/// # Errors
+///
+/// Fails if a representation exceeds [`MAX_NATIVE_BYTES`] or the pipe write
+/// fails.
 fn write_item(mut output: impl Write, item: &NativeItem) -> Result<(), String> {
     for bytes in [item.plain.as_bytes(), item.html.as_bytes(), &item.rich] {
         if bytes.len() > MAX_NATIVE_BYTES {
@@ -239,41 +361,62 @@ fn write_item(mut output: impl Write, item: &NativeItem) -> Result<(), String> {
         .map_err(|_| "Clipboard helper pipe flush failed".into())
 }
 
+/// Reads an item that [`write_item`] wrote.
+///
+/// # Errors
+///
+/// Fails if the pipe ends early, if a length exceeds [`MAX_NATIVE_BYTES`]
+/// (checked before allocating), or if the plain text or HTML is not UTF-8.
 fn read_item(mut input: impl Read) -> Result<NativeItem, String> {
-    let mut fields = Vec::with_capacity(3);
-    for _ in 0..3 {
-        let mut length = [0; 8];
-        input
-            .read_exact(&mut length)
-            .map_err(|_| "Clipboard helper pipe was truncated")?;
-        let length = usize::try_from(u64::from_le_bytes(length))
-            .ok()
-            .filter(|length| *length <= MAX_NATIVE_BYTES)
-            .ok_or("Clipboard helper advertised an oversized representation")?;
-        let mut bytes = vec![0; length];
-        input
-            .read_exact(&mut bytes)
-            .map_err(|_| "Clipboard helper pipe was truncated")?;
-        fields.push(bytes);
-    }
-    let rich = fields.pop().unwrap();
-    let html =
-        String::from_utf8(fields.pop().unwrap()).map_err(|_| "Clipboard HTML is not UTF-8")?;
-    let plain =
-        String::from_utf8(fields.pop().unwrap()).map_err(|_| "Clipboard text is not UTF-8")?;
+    let plain = read_field(&mut input)?;
+    let html = read_field(&mut input)?;
+    let rich = read_field(&mut input)?;
+    let html = String::from_utf8(html).map_err(|_| "Clipboard HTML is not UTF-8")?;
+    let plain = String::from_utf8(plain).map_err(|_| "Clipboard text is not UTF-8")?;
     Ok(NativeItem { plain, html, rich })
 }
 
+/// Reads one length-prefixed representation for [`read_item`].
+fn read_field(input: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut length = [0; 8];
+    input
+        .read_exact(&mut length)
+        .map_err(|_| "Clipboard helper pipe was truncated")?;
+    let length = usize::try_from(u64::from_le_bytes(length))
+        .ok()
+        .filter(|length| *length <= MAX_NATIVE_BYTES)
+        .ok_or("Clipboard helper advertised an oversized representation")?;
+    let mut bytes = vec![0; length];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| "Clipboard helper pipe was truncated")?;
+    Ok(bytes)
+}
+
+/// A helper's successful answer.
 enum Reply {
+    /// The copy helper acknowledged its item with [`READY`].
     Ready,
+    /// The read helper's capture: `None` when the clipboard holds no rich item.
     Item(Option<NativeItem>),
 }
 
+/// Kills `child`, if it is still running, and reaps it.
 fn stop_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
+/// Sends `item` to a copy helper and waits for its acknowledgement, or, with no
+/// item, waits for a read helper's capture. Pipe I/O runs on a worker thread so
+/// that the wait ends at `deadline`.
+///
+/// Returns the reply together with the helper, which may still be running.
+///
+/// # Errors
+///
+/// Fails if the helper's pipes are unavailable, the exchange fails or misses
+/// `deadline`, or the reply is invalid. The helper is then stopped and reaped.
 fn exchange(
     mut child: Child,
     item: Option<NativeItem>,
@@ -316,9 +459,12 @@ fn exchange(
     wait_for_reply(child, worker, receiver, deadline)
 }
 
+/// Waits until `deadline` for the reply that `worker` sends through
+/// `receiver`, and joins it. On any failure, stops and reaps `child` before
+/// returning the error.
 fn wait_for_reply(
     child: Child,
-    worker: std::io::Result<thread::JoinHandle<()>>,
+    worker: io::Result<JoinHandle<()>>,
     receiver: mpsc::Receiver<Result<Reply, String>>,
     deadline: Instant,
 ) -> Result<(Reply, Child), String> {
@@ -349,17 +495,32 @@ fn wait_for_reply(
     }
 }
 
+/// The host's rich clipboard, which the document widget uses through
+/// [`RichClipboard`].
 pub struct NativeClipboard {
+    /// The window handle that owns Windows clipboard publications, as an
+    /// integer; 0 on other platforms.
     owner: usize,
+    /// The Linux display backend of the window, `"wayland"` or `"x11"`, for
+    /// the helpers to use; `None` lets them choose from the environment.
     backend: Option<&'static str>,
+    /// The helper of the latest verified copy. On Linux it serves the
+    /// clipboard until replaced, so it is stopped only then or on drop.
     copy_owner: Option<Child>,
     pending_pastes: PendingPastes,
-    staged: Option<(String, Fragment)>,
+    /// The rich paste for the current pass, if the document owns its input.
+    staged: Option<CapturedPaste>,
+    /// Why the latest rich copy failed, until [`Self::take_error`] reports it.
     last_error: Option<String>,
 }
 
 impl NativeClipboard {
-    pub fn new(context: &eframe::CreationContext<'_>) -> Result<Self, String> {
+    /// Creates the clipboard for the window that `context` belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the native window or display handle is unavailable.
+    pub fn try_new(context: &eframe::CreationContext<'_>) -> Result<Self, String> {
         let window = context
             .window_handle()
             .map_err(|_| "Native window handle is unavailable")?;
@@ -385,9 +546,11 @@ impl NativeClipboard {
         })
     }
 
+    /// Prepares a helper process for `operation`, one of the flags that
+    /// [`helper`] accepts, with piped stdin and stdout.
     fn command(&self, operation: &str) -> Result<Command, String> {
         let executable =
-            std::env::current_exe().map_err(|_| "Clipboard helper executable is unavailable")?;
+            env::current_exe().map_err(|_| "Clipboard helper executable is unavailable")?;
         let mut command = Command::new(executable);
         command.arg(operation);
         if operation == "--native-clipboard-copy" {
@@ -397,7 +560,7 @@ impl NativeClipboard {
             command.env("TEXTLOOM_CLIPBOARD_BACKEND", backend);
         }
         #[cfg(target_os = "linux")]
-        command.env(linux::PARENT_VARIABLE, std::process::id().to_string());
+        command.env(linux::PARENT_VARIABLE, process::id().to_string());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -405,6 +568,7 @@ impl NativeClipboard {
         Ok(command)
     }
 
+    /// Reads the clipboard's rich item through a read helper, by `deadline`.
     fn capture_until(&self, deadline: Instant) -> Result<Option<NativeItem>, String> {
         let child = self
             .command("--native-clipboard-read")?
@@ -418,10 +582,19 @@ impl NativeClipboard {
         }
     }
 
+    /// Reads the clipboard's rich item within [`OPERATION_TIMEOUT`].
     fn capture(&self) -> Result<Option<NativeItem>, String> {
         self.capture_until(Instant::now() + OPERATION_TIMEOUT)
     }
 
+    /// Publishes `item` through a copy helper, then reads the clipboard until
+    /// it holds this publication. The verified helper replaces the previous
+    /// clipboard owner, which is stopped.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the copy helper fails or times out, or if reading back does
+    /// not find this publication within [`OPERATION_TIMEOUT`].
     fn publish(&mut self, item: NativeItem) -> Result<(), String> {
         let deadline = Instant::now() + OPERATION_TIMEOUT;
         let child = self
@@ -448,6 +621,9 @@ impl NativeClipboard {
         }
     }
 
+    /// Captures the native item for a lone Paste in `input` if `capture_native`
+    /// is true, and records a slot for every Paste. Call it from the raw input
+    /// hook, before egui routes the input.
     pub fn capture_pastes(&mut self, input: &mut egui::RawInput, capture_native: bool) {
         let captured = capture_native
             .then(|| capture_paste(&mut input.events, || self.capture()))
@@ -457,6 +633,8 @@ impl NativeClipboard {
         self.pending_pastes.record(&input.events, captured);
     }
 
+    /// Takes the slots of the Paste events in one pass's `events` and stages
+    /// their capture for the document, if `document_owns_input`.
     pub fn stage_paste(&mut self, events: &[egui::Event], document_owns_input: bool) {
         self.staged = self
             .pending_pastes
@@ -464,18 +642,28 @@ impl NativeClipboard {
             .filter(|_| document_owns_input);
     }
 
+    /// Discards a staged paste that the document did not use in this pass.
     pub fn clear_staged_paste(&mut self) {
         self.staged = None;
     }
 
+    /// Returns why the latest rich copy failed, once. The widget then copied
+    /// plain text instead.
     pub fn take_error(&mut self) -> Option<String> {
         self.last_error.take()
     }
 
+    /// Runs one frame of a document widget for `editor` with `input`, using this
+    /// clipboard, for [`Self::self_test`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the widget reports an error, falls back to egui's own copy, or
+    /// a rich copy fails.
     fn fixture_frame(
         &mut self,
         context: &egui::Context,
-        editor: &mut textloom::Editor,
+        editor: &mut Editor,
         mut input: egui::RawInput,
     ) -> Result<(), String> {
         let id = egui::Id::unique("native-clipboard-fixture");
@@ -485,7 +673,7 @@ impl NativeClipboard {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.memory_mut(|memory| memory.request_focus(id));
                 self.staged = captured.take();
-                let output = textloom::adapter::egui::RichTextEditor::new(editor)
+                let output = RichTextEditor::new(editor)
                     .id(id)
                     .rich_clipboard(self)
                     .show(ui);
@@ -509,15 +697,23 @@ impl NativeClipboard {
         Ok(())
     }
 
+    /// Copies a formatted fixture through the system clipboard, checks every
+    /// representation read back, then pastes it into another document and
+    /// checks the result and one-step undo/redo. This overwrites the system
+    /// clipboard.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first step that failed.
     pub fn self_test(&mut self) -> Result<(), String> {
-        let mut editor = textloom::Editor::from_text("café 日本語👩🏽\u{200d}💻\nsecond");
+        let mut editor = Editor::from_text("café 日本語👩🏽\u{200d}💻\nsecond");
         editor.select_all();
         editor
-            .apply_style(textloom::StylePatch {
+            .apply_style(StylePatch {
                 bold: Some(true),
                 italic: Some(true),
-                foreground: Some(Some(textloom::Color([42, 100, 200, 255]))),
-                background: Some(Some(textloom::Color::YELLOW)),
+                foreground: Some(Some(Color([42, 100, 200, 255]))),
+                background: Some(Some(Color::YELLOW)),
                 ..Default::default()
             })
             .map_err(|_| "Clipboard fixture formatting failed")?;
@@ -546,7 +742,7 @@ impl NativeClipboard {
         {
             return Err("Native clipboard rich/HTML/plain roundtrip failed".into());
         }
-        let mut destination = textloom::Editor::from_text("original");
+        let mut destination = Editor::from_text("original");
         destination.select_all();
         let input = egui::RawInput {
             events: vec![egui::Event::Paste(captured.plain)],
@@ -568,7 +764,7 @@ impl NativeClipboard {
     }
 }
 
-impl textloom::adapter::egui::RichClipboard for NativeClipboard {
+impl RichClipboard for NativeClipboard {
     fn copy(&mut self, fragment: &Fragment) -> bool {
         match NativeItem::from_fragment(fragment).and_then(|item| self.publish(item)) {
             Ok(()) => true,
@@ -580,8 +776,8 @@ impl textloom::adapter::egui::RichClipboard for NativeClipboard {
     }
 
     fn paste(&mut self, plain_text: &str) -> Option<Fragment> {
-        let (plain, fragment) = self.staged.take()?;
-        (plain == plain_text).then_some(fragment)
+        let captured = self.staged.take()?;
+        (captured.plain == plain_text).then_some(captured.fragment)
     }
 }
 
@@ -593,6 +789,15 @@ impl Drop for NativeClipboard {
     }
 }
 
+/// Runs a clipboard helper if `arguments`, the host's arguments without the
+/// program name, request one; returns `None` otherwise.
+///
+/// `--native-clipboard-copy OWNER` reads a [`NativeItem`] from stdin,
+/// publishes it with `OWNER` as the Windows clipboard owner, and writes
+/// [`READY`]; on Linux it then serves the clipboard until another application
+/// takes it over or the host stops it. `--native-clipboard-read` writes one
+/// byte, 1 if the clipboard holds a rich item and 0 if not, followed by the
+/// item. On Linux, both exit with the host process.
 pub fn helper(arguments: &[OsString]) -> Option<Result<(), String>> {
     let operation = arguments.first()?.to_str()?;
     if operation != "--native-clipboard-copy" && operation != "--native-clipboard-read" {
@@ -602,21 +807,21 @@ pub fn helper(arguments: &[OsString]) -> Option<Result<(), String>> {
         #[cfg(target_os = "linux")]
         linux::exit_with_parent()?;
         if operation == "--native-clipboard-copy" {
-            let owner = arguments
+            let owner: usize = arguments
                 .get(1)
                 .and_then(|value| value.to_str())
                 .and_then(|value| value.parse().ok())
                 .filter(|_| arguments.len() == 2)
                 .ok_or("Clipboard helper owner was invalid")?;
-            let item = read_item(std::io::stdin().lock())?;
+            let item = read_item(io::stdin().lock())?;
             item.fragment()?;
             platform::publish(&item, owner)?;
             #[cfg(not(target_os = "linux"))]
             {
-                std::io::stdout()
+                io::stdout()
                     .write_all(READY)
                     .map_err(|_| "Clipboard acknowledgement failed")?;
-                std::io::stdout()
+                io::stdout()
                     .flush()
                     .map_err(|_| "Clipboard acknowledgement failed")?;
             }
@@ -625,7 +830,7 @@ pub fn helper(arguments: &[OsString]) -> Option<Result<(), String>> {
                 return Err("Clipboard capture helper arguments were invalid".into());
             }
             let item = platform::read()?;
-            let mut output = std::io::stdout().lock();
+            let mut output = io::stdout().lock();
             output
                 .write_all(&[u8::from(item.is_some())])
                 .map_err(|_| "Clipboard response failed")?;
@@ -640,6 +845,10 @@ pub fn helper(arguments: &[OsString]) -> Option<Result<(), String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
+    use textloom::{Link, Position, Selection};
+
     use super::*;
 
     fn item() -> NativeItem {
@@ -648,7 +857,7 @@ mod tests {
 
     #[test]
     fn size_preflight_matches_the_encoding_of_every_paragraph_kind() {
-        let mut editor = textloom::Editor::from_text("body\nheading\nbullet\nitem\nnext\nquote\n");
+        let mut editor = Editor::from_text("body\nheading\nbullet\nitem\nnext\nquote\n");
         for (paragraph, kind) in [
             (1, ParagraphKind::Heading { level: 2 }),
             (5, ParagraphKind::Quote),
@@ -669,40 +878,38 @@ mod tests {
             ),
         ] {
             editor
-                .set_selection(textloom::Selection::caret(textloom::Position::new(
-                    paragraph, 0,
-                )))
+                .set_selection(Selection::caret(Position::new(paragraph, 0)))
                 .unwrap();
             editor.set_paragraph_kind(kind).unwrap();
         }
         editor
-            .set_selection(textloom::Selection::new(
-                textloom::Position::new(0, 0),
-                textloom::Position::new(3, 2),
-            ))
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(3, 2)))
             .unwrap();
         editor
-            .apply_style(textloom::StylePatch {
-                foreground: Some(Some(textloom::Color([1, 2, 3, 4]))),
+            .apply_style(StylePatch {
+                foreground: Some(Some(Color([1, 2, 3, 4]))),
                 ..Default::default()
             })
             .unwrap();
         editor
-            .set_selection(textloom::Selection::new(
-                textloom::Position::new(1, 2),
-                textloom::Position::new(2, 3),
-            ))
+            .set_selection(Selection::new(Position::new(1, 2), Position::new(2, 3)))
             .unwrap();
         editor
-            .set_link(Some(textloom::Link::new("https://example.com/é").unwrap()))
+            .set_link(Some(Link::new("https://example.com/é").unwrap()))
             .unwrap();
         let fragment = Fragment::from_document(editor.document());
-        let spans = fragment
+        let spans: usize = fragment
             .paragraphs()
             .iter()
             .map(|paragraph| paragraph.spans().len())
             .sum();
-        assert_eq!(encoded_size(&fragment), (fragment.to_bytes().len(), spans));
+        assert_eq!(
+            encoded_size(&fragment),
+            EncodedSize {
+                bytes: fragment.to_bytes().len(),
+                spans,
+            }
+        );
     }
 
     #[test]
@@ -746,13 +953,16 @@ mod tests {
             ..Default::default()
         };
         let captured = capture_paste(&mut input.events, || Ok(Some(native.clone()))).unwrap();
-        assert_eq!(captured.1, native.fragment().unwrap());
+        assert_eq!(captured.fragment, native.fragment().unwrap());
         assert_eq!(input.events, vec![egui::Event::Paste(native.plain.clone())]);
 
         for alternative in ["different clipboard", "same text, native format absent"] {
             let events = vec![egui::Event::Paste(alternative.into())];
             input.events.clone_from(&events);
-            assert!(capture_paste(&mut input.events, || Ok(Some(native.clone()))).is_none());
+            assert!(
+                capture_paste(&mut input.events, || Ok(Some(native.clone()))).is_none(),
+                "{alternative}"
+            );
             assert_eq!(input.events, events);
         }
         input.events = vec![egui::Event::Paste(native.plain.clone())];
@@ -777,7 +987,8 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                capture_paste(&mut input.events, || panic!("ambiguous native capture")).is_none()
+                capture_paste(&mut input.events, || panic!("ambiguous native capture")).is_none(),
+                "{events:?}"
             );
             assert_eq!(input.events, events);
         }
@@ -785,26 +996,27 @@ mod tests {
 
     #[test]
     fn deferred_paste_keeps_its_original_rich_snapshot_and_advances_field_slots() {
-        struct Staged(Option<(String, Fragment)>);
-        impl textloom::adapter::egui::RichClipboard for Staged {
+        struct Staged(Option<CapturedPaste>);
+        impl RichClipboard for Staged {
             fn copy(&mut self, _fragment: &Fragment) -> bool {
                 false
             }
 
             fn paste(&mut self, plain: &str) -> Option<Fragment> {
-                let (captured, fragment) = self.0.take()?;
-                assert_eq!(plain, captured);
-                Some(fragment)
+                let captured = self.0.take()?;
+                assert_eq!(plain, captured.plain);
+                Some(captured.fragment)
             }
         }
 
         for max_passes in [1, 2, 8] {
             for scenario in 0..3 {
+                let case = format!("max_passes={max_passes} scenario={scenario}");
                 let context = egui::Context::default();
                 textloom::adapter::egui::install_input_routing(&context);
                 context.enable_accesskit();
                 context.options_mut(|options| {
-                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                    options.max_passes = NonZeroUsize::new(max_passes).unwrap();
                 });
                 let field_id = egui::Id::unique("clipboard-source-field");
                 let document_id = egui::Id::unique("clipboard-target-document");
@@ -818,13 +1030,13 @@ mod tests {
                     })
                 };
                 let mut field = String::new();
-                let mut editor = textloom::Editor::from_text("original");
+                let mut editor = Editor::from_text("original");
                 editor.select_all();
                 let native = item();
-                let mut changed = textloom::Editor::from_text(&native.plain);
+                let mut changed = Editor::from_text(&native.plain);
                 changed.select_all();
                 changed
-                    .apply_style(textloom::StylePatch {
+                    .apply_style(StylePatch {
                         bold: Some(true),
                         ..Default::default()
                     })
@@ -886,29 +1098,31 @@ mod tests {
                         clipboard.0 =
                             captured.filter(|_| ui.memory(|memory| memory.has_focus(document_id)));
                         ui.add(egui::TextEdit::singleline(&mut field).id(field_id));
-                        let output = textloom::adapter::egui::RichTextEditor::new(&mut editor)
+                        let output = RichTextEditor::new(&mut editor)
                             .id(document_id)
                             .rich_clipboard(&mut clipboard)
                             .show(ui);
-                        assert!(output.errors.is_empty());
+                        assert!(output.errors.is_empty(), "{case}");
                         clipboard.0 = None;
                     });
                     output.drop_without_applying_deltas();
                 }
-                assert_eq!(captures, if scenario == 1 { 2 } else { 1 });
-                assert!(pending.0.is_empty());
-                assert_eq!(field, "field");
+                assert_eq!(captures, if scenario == 1 { 2 } else { 1 }, "{case}");
+                assert!(pending.0.is_empty(), "{case}");
+                assert_eq!(field, "field", "{case}");
                 assert_eq!(
                     Fragment::from_document(editor.document()),
-                    native.fragment().unwrap()
+                    native.fragment().unwrap(),
+                    "{case}"
                 );
                 assert_ne!(
                     Fragment::from_document(editor.document()),
-                    available_clipboard.fragment().unwrap()
+                    available_clipboard.fragment().unwrap(),
+                    "{case}"
                 );
-                assert_eq!(editor.undo_len(), 1);
-                assert!(editor.undo());
-                assert_eq!(editor.document().plain_text(), "original");
+                assert_eq!(editor.undo_len(), 1, "{case}");
+                assert!(editor.undo(), "{case}");
+                assert_eq!(editor.document().plain_text(), "original", "{case}");
             }
         }
     }
@@ -930,7 +1144,7 @@ mod tests {
         let captured = capture_paste(&mut events, || Ok(Some(native.clone())));
         pending.record(&events, captured);
         assert_eq!(
-            pending.take_pass(&events).unwrap().1,
+            pending.take_pass(&events).unwrap().fragment,
             native.fragment().unwrap()
         );
         assert!(pending.0.is_empty());
@@ -942,7 +1156,7 @@ mod tests {
         for end in [0, 7, 15, item.rich.len() - 1] {
             let mut bad = item.clone();
             bad.rich.truncate(end);
-            assert!(bad.fragment().is_err());
+            assert!(bad.fragment().is_err(), "truncated to {end} bytes");
         }
         let mut bad = item.clone();
         bad.rich[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -986,13 +1200,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn worker_start_failure_reaps_helper_and_preserves_plain_paste() {
+        use rustix::io::Errno;
+        use rustix::process::{Pid, WaitOptions};
+
         let child = Command::new("sh")
             .args(["-c", "exec sleep 30"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let pid = Pid::from_raw(child.id() as i32).unwrap();
         let (_sender, receiver) = mpsc::channel();
         let events = vec![egui::Event::Paste("plain fallback".into())];
         let mut input = egui::RawInput {
@@ -1002,7 +1219,7 @@ mod tests {
         let staged = capture_paste(&mut input.events, || {
             let result = wait_for_reply(
                 child,
-                Err(std::io::ErrorKind::WouldBlock.into()),
+                Err(io::ErrorKind::WouldBlock.into()),
                 receiver,
                 Instant::now() + OPERATION_TIMEOUT,
             );
@@ -1020,8 +1237,8 @@ mod tests {
         assert!(staged.is_none());
         assert_eq!(input.events, events);
         assert_eq!(
-            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
-            rustix::io::Errno::CHILD,
+            rustix::process::waitpid(Some(pid), WaitOptions::NOHANG).unwrap_err(),
+            Errno::CHILD,
             "the helper must be terminated and reaped on worker startup failure"
         );
     }
