@@ -6,9 +6,18 @@ use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 use crate::types::Direction;
 use crate::{Document, Position, document};
 
+/// Options for [`Document::find`] and the editor's search commands.
+///
+/// The default is a case-sensitive search that matches anywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
+    /// Whether matching distinguishes letter case. When `false`, the query
+    /// and the text are compared by their Unicode lowercase mappings, with
+    /// final sigma `ς` treated as `σ`, without normalization or full case
+    /// folding.
     pub case_sensitive: bool,
+    /// Whether a match must start and end at Unicode word boundaries
+    /// (UAX #29).
     pub whole_word: bool,
 }
 
@@ -22,6 +31,14 @@ impl Default for SearchOptions {
 }
 
 impl Document {
+    /// Returns the matches of `query` in document order.
+    ///
+    /// Matching is literal. LF, CRLF, a lone CR, or U+2029 in `query` matches
+    /// a paragraph break, and U+2028 matches a soft line break. A match always
+    /// covers complete graphemes, so an occurrence that would split one does
+    /// not match. Matches do not overlap: each is the first acceptable
+    /// occurrence that starts at or after the end of the previous match. An
+    /// empty query matches nothing.
     #[must_use]
     pub fn find(&self, query: &str, options: SearchOptions) -> Vec<Range<Position>> {
         let mut matches = Vec::new();
