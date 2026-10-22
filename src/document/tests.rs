@@ -1,3 +1,6 @@
+//! Unit tests for documents and paragraphs: newline normalization, Unicode indexing, formatting
+//! runs, replacements, list numbering, and the deltas that undo and redo edits.
+
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;

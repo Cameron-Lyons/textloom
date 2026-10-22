@@ -1,3 +1,6 @@
+//! Unit tests for the `RichTextEditor` widget: keyboard, pointer, clipboard, IME, and
+//! accessibility input, and the layout, painting, and scrolling built from the document.
+
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -4846,9 +4849,14 @@ fn ime_cursor_is_hidden_when_preedit_range_is_none() {
         true,
     );
     let vertical_lines = |output: &egui::FullOutput| {
-        output.shapes.iter().filter(|shape| {
-            matches!(&shape.shape, egui::epaint::Shape::LineSegment { points, .. } if points[0].x == points[1].x)
-        }).count()
+        output
+            .shapes
+            .iter()
+            .filter(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::LineSegment { points, .. }
+                    if points[0].x == points[1].x)
+            })
+            .count()
     };
     assert_eq!(vertical_lines(&hidden), 0);
     let visible = frame(
@@ -6053,7 +6061,7 @@ fn home_and_end_follow_wrapped_visual_rows_and_their_affinity() {
     let mut editor = Editor::from_text(text);
     widget_frame(&context, &mut editor, vec![], None, true, narrow);
     let cache = widget_cache(&context);
-    let galley = cache.layout.layouts.get(0).unwrap().galley.clone();
+    let galley = cache.layout.layouts.get(0).unwrap().galley;
     assert!(galley.rows.len() >= 3, "{}", galley.rows.len());
     let starts: Vec<usize> = galley
         .rows
@@ -9172,7 +9180,7 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
         Modifiers::COMMAND,
         false,
     );
-    assert_eq!(released.clicked_link, Some(link.clone()));
+    assert_eq!(released.clicked_link, Some(link));
     assert_eq!(editor.selection(), selection);
     assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
 
