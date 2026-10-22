@@ -14,7 +14,8 @@ use egui::{
 use super::accessibility::AccessibilityError;
 use super::input::InputOptions;
 use super::layout::{Appearance, ParagraphLayouts};
-use super::paint::PaintCache;
+use super::navigation::CaretPlacement;
+use super::paint::{BackgroundRanges, PaintCache};
 use super::{
     Cache, PADDING, PARAGRAPH_GAP, RichClipboard, RichTextEditor, RichTextEditorOutput, input,
     input_routing, layout, navigation, paint,
@@ -3481,8 +3482,9 @@ fn character_hit_positions_snap_to_whole_graphemes() {
         let mut previous = 0;
         let mut x = layout.rect.left() - 4.0;
         while x < layout.rect.left() + layout.galley.rect.right() + 4.0 {
-            let (position, _) =
-                navigation::hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y));
+            let position =
+                navigation::hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y))
+                    .position;
             assert!(
                 boundaries.contains(&position.byte) && position.byte >= previous,
                 "text={text:?}, x={x}, byte={}",
@@ -3516,7 +3518,7 @@ fn clicks_inside_multi_scalar_graphemes_snap_to_the_visually_nearer_edge() {
         for (fraction, expected) in [(0.25, 1), (0.75, end)] {
             let point = left.to_vec2() + (right - left) * fraction;
             assert_eq!(
-                navigation::hit_test(&editor, &layouts, point).0,
+                navigation::hit_test(&editor, &layouts, point).position,
                 Position::new(0, expected),
                 "text={text:?}, fraction={fraction}"
             );
@@ -3555,7 +3557,8 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
                 &layouts,
                 origin,
                 &[],
-                Some((selection, color)),
+                Some(selection),
+                color,
                 &FontFamily::Proportional,
                 Color32::WHITE,
                 Color32::GRAY,
@@ -4479,7 +4482,7 @@ fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
         } else {
             assert!(left < right, "{:?}", &text[pair[0]..pair[1]]);
             assert_eq!(
-                navigation::hit_test(&editor, &layouts, Vec2::new(left, y)).0,
+                navigation::hit_test(&editor, &layouts, Vec2::new(left, y)).position,
                 Position::new(0, pair[0]),
                 "{:?}",
                 &text[pair[0]..pair[1]]
@@ -8810,14 +8813,17 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
     let past = galley.rows[0].rect().right() + 20.0;
     assert_eq!(
         navigation::hit_test(&editor, &layouts, point(0, past)),
-        (Position::new(0, 2), false)
+        CaretPlacement {
+            position: Position::new(0, 2),
+            prefer_next_row: false,
+        }
     );
     assert_eq!(
-        navigation::hit_test(&editor, &layouts, point(2, past)).0,
+        navigation::hit_test(&editor, &layouts, point(2, past)).position,
         Position::new(0, 10)
     );
     assert_eq!(
-        navigation::hit_test(&editor, &layouts, point(1, 0.0)).0,
+        navigation::hit_test(&editor, &layouts, point(1, 0.0)).position,
         Position::new(0, 5)
     );
 }
@@ -8840,8 +8846,12 @@ fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
                 editor.document(),
                 &layouts,
                 origin,
-                &[(highlights, color)],
-                selection.map(|selection| (selection, color)),
+                &[BackgroundRanges {
+                    ranges: highlights,
+                    fill: color,
+                }],
+                selection,
+                color,
                 &FontFamily::Proportional,
                 Color32::WHITE,
                 Color32::GRAY,
@@ -8941,11 +8951,21 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
                     &layouts,
                     origin,
                     &[
-                        (&found, colors[0]),
-                        (&spans, colors[1]),
-                        (&scalars, colors[3]),
+                        BackgroundRanges {
+                            ranges: &found,
+                            fill: colors[0],
+                        },
+                        BackgroundRanges {
+                            ranges: &spans,
+                            fill: colors[1],
+                        },
+                        BackgroundRanges {
+                            ranges: &scalars,
+                            fill: colors[3],
+                        },
                     ],
-                    Some((selection, colors[2])),
+                    Some(selection),
+                    colors[2],
                     &FontFamily::Proportional,
                     Color32::WHITE,
                     Color32::GRAY,

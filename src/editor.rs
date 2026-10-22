@@ -9,7 +9,7 @@ pub use composition::Composition;
 pub use history::HistoryLimits;
 use history::{EditState, Group, History, OpenTransaction, TransactionLevel};
 
-use crate::document::Delta;
+use crate::document::{Delta, Indent, Replacement};
 use crate::types::Direction;
 use crate::{
     Document, Error, Fragment, InlineAttribute, InlineStyle, Link, Movement, Paragraph,
@@ -579,7 +579,7 @@ impl Editor {
     pub fn insert_fragment(&mut self, fragment: &Fragment) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let before = self.state();
-        let (delta, caret) = self
+        let Replacement { delta, caret } = self
             .document
             .replace_fragment(self.selection.range(), fragment)?;
         self.selection = Selection::caret(caret);
@@ -703,7 +703,7 @@ impl Editor {
 
     fn replace_matches(&mut self, matches: &[Range<Position>], replacement: &str) {
         let before = self.state();
-        let (delta, caret) = self.document.replace_matches(matches, replacement);
+        let Replacement { delta, caret } = self.document.replace_matches(matches, replacement);
         self.selection = Selection::caret(caret);
         self.typing_style = self.document.style_at(caret);
         self.preferred_column = None;
@@ -762,7 +762,7 @@ impl Editor {
         let start = Position::default();
         let style = self.document.style_at(start);
         let kind = self.document.paragraphs()[0].kind();
-        let (delta, caret) = self.document.replace_with_kind(
+        let Replacement { delta, caret } = self.document.replace_with_kind(
             start..self.document.end(),
             text,
             style,
@@ -1039,7 +1039,7 @@ impl Editor {
         let text = if text.is_empty() { link.as_str() } else { text };
         self.break_history_group();
         let before = self.state();
-        let (delta, caret) = self.document.replace_with_link(
+        let Replacement { delta, caret } = self.document.replace_with_link(
             self.selection.range(),
             text,
             self.typing_style,
@@ -1101,7 +1101,7 @@ impl Editor {
     ///
     /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn indent_list(&mut self) -> Result<(), Error> {
-        self.change_list_indent(true)
+        self.change_list_indent(Indent::Increase)
     }
 
     /// Outdents the selected list items by one level, in one undo step; items
@@ -1113,15 +1113,15 @@ impl Editor {
     ///
     /// Returns [`Error::CompositionActive`] during an IME composition.
     pub fn outdent_list(&mut self) -> Result<(), Error> {
-        self.change_list_indent(false)
+        self.change_list_indent(Indent::Decrease)
     }
 
-    fn change_list_indent(&mut self, increase: bool) -> Result<(), Error> {
+    fn change_list_indent(&mut self, indent: Indent) -> Result<(), Error> {
         self.ensure_no_composition()?;
         let before = self.state();
         let delta = self
             .document
-            .change_list_indent(self.selected_paragraphs(), increase);
+            .change_list_indent(self.selected_paragraphs(), indent);
         self.break_history_group();
         self.record(delta, before, Group::None);
         Ok(())
@@ -1306,7 +1306,7 @@ impl Editor {
         group: Group,
     ) -> Result<(), Error> {
         let before = self.state();
-        let (delta, caret) = self.document.replace(range, text, style)?;
+        let Replacement { delta, caret } = self.document.replace(range, text, style)?;
         self.typing_style = style;
         self.finish_replacement(delta, caret, group, before);
         Ok(())

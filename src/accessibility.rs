@@ -1730,6 +1730,7 @@ mod accesskit_bridge {
     mod tests {
         use super::*;
         use crate::accessibility::random_edits;
+        use crate::document::SparseCoverage;
         use crate::{Document, Fragment, StylePatch};
         use accesskit_consumer::{NodeRef as PublishedNode, TreeChangeHandler};
         use std::collections::HashSet;
@@ -3075,7 +3076,11 @@ mod accesskit_bridge {
                 random_edits::sparse_editor,
                 random_edits::apply_sparse,
             );
-            random_edits::assert_sparse_coverage([40, 20, 20]);
+            random_edits::assert_sparse_coverage(SparseCoverage {
+                recorded: 40,
+                replayed: 20,
+                shifted_tail: 20,
+            });
         }
 
         fn random_updates_match_fresh_trees<R: FnMut(usize) -> usize>(
@@ -3162,6 +3167,7 @@ pub use accesskit_bridge::{AccessKitAdapter, AccessKitError};
 pub(crate) mod random_edits {
     use std::ops::Range;
 
+    use crate::document::{self, SparseCoverage};
     use crate::{Editor, Link, ParagraphKind, Position, SearchOptions, Selection, StylePatch};
 
     pub(crate) fn seeded(mut seed: u64) -> impl FnMut(usize) -> usize {
@@ -3459,14 +3465,14 @@ pub(crate) mod random_edits {
         }
     }
 
-    pub(crate) fn assert_sparse_coverage(minimum: [usize; 3]) {
-        let coverage = crate::document::take_sparse_coverage();
+    pub(crate) fn assert_sparse_coverage(minimum: SparseCoverage) {
+        let coverage = document::take_sparse_coverage();
         assert!(
-            coverage
-                .iter()
-                .zip(minimum)
-                .all(|(count, minimum)| *count >= minimum),
-            "sparse deltas recorded, replayed, and applied with a shifted tail: {coverage:?}"
+            coverage.recorded >= minimum.recorded
+                && coverage.replayed >= minimum.replayed
+                && coverage.shifted_tail >= minimum.shifted_tail,
+            "too few sparse deltas recorded, replayed, or applied with a shifted tail: \
+             {coverage:?}, expected at least {minimum:?}"
         );
     }
 }

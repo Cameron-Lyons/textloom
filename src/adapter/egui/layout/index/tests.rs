@@ -1,6 +1,7 @@
 use super::{Children, Entry, LEAF_CAPACITY, Node, ParagraphLayouts};
 use crate::adapter::egui::PARAGRAPH_GAP;
 use crate::adapter::egui::layout::{ParagraphCache, ParagraphLayout};
+use crate::document::NumberedItem;
 use crate::{Document, Paragraph};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -630,7 +631,10 @@ fn renumbering_rebuilds_only_the_leaves_whose_numbers_change() {
     let snapshot = layouts.clone();
     let current: Vec<_> = (0..2048)
         .step_by(7)
-        .map(|index| (index, index as u32))
+        .map(|index| NumberedItem {
+            paragraph: index,
+            number: index as u32,
+        })
         .collect();
     layouts.renumber(&current, |_, _, _| unreachable!("numbers are current"));
     layouts.renumber(&[], |_, _, _| unreachable!("nothing to renumber"));
@@ -639,7 +643,8 @@ fn renumbering_rebuilds_only_the_leaves_whose_numbers_change() {
     let mut expected = original.clone();
     let mut created = Vec::new();
     layouts.renumber(
-        &[(3, 3), (5, 50), (6, 60), (900, 900), (1500, 7)],
+        &[(3, 3), (5, 50), (6, 60), (900, 900), (1500, 7)]
+            .map(|(paragraph, number)| NumberedItem { paragraph, number }),
         |index, cache, number| {
             created.push(index);
             assert!(Arc::ptr_eq(

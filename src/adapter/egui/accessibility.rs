@@ -1,4 +1,5 @@
 use super::layout::{self, LayoutIdentity, ParagraphLayouts};
+use super::navigation::CaretPlacement;
 use crate::accessibility::node_semantics;
 use crate::document::{self, LINE_SEPARATOR, SpanCursor};
 use crate::{Color, Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span};
@@ -706,16 +707,16 @@ impl Snapshot {
         None
     }
 
-    pub(super) fn decode_focus(
-        &self,
-        position: accesskit::TextPosition,
-    ) -> Option<(Position, bool)> {
+    pub(super) fn decode_focus(&self, position: accesskit::TextPosition) -> Option<CaretPlacement> {
         let decoded = self.decode(position)?;
         // Equivalent run boundaries use the usual downstream caret, except
         // when the request explicitly names the end of a soft-wrapped row.
         let prefer_next_row = self.position(decoded) == Some(position)
             || self.focus_position(decoded, false) != Some(position);
-        Some((decoded, prefer_next_row))
+        Some(CaretPlacement {
+            position: decoded,
+            prefer_next_row,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1086,6 +1087,7 @@ mod tests {
     use super::super::{Cache, PADDING, RichTextEditor};
     use super::*;
     use crate::accessibility::random_edits;
+    use crate::document::SparseCoverage;
     use crate::{Document, Fragment, Selection, StylePatch};
     use std::collections::HashSet;
     use unicode_segmentation::UnicodeSegmentation;
@@ -2224,7 +2226,11 @@ mod tests {
             random_edits::sparse_editor,
             random_edits::apply_sparse,
         );
-        random_edits::assert_sparse_coverage([20, 10, 10]);
+        random_edits::assert_sparse_coverage(SparseCoverage {
+            recorded: 20,
+            replayed: 10,
+            shifted_tail: 10,
+        });
     }
 
     fn random_frames_match_fresh_snapshots<R: FnMut(usize) -> usize>(
@@ -2876,7 +2882,10 @@ mod tests {
                 node: runs[0].id.accesskit_id(),
                 character_index: 2,
             }),
-            Some((after, true))
+            Some(CaretPlacement {
+                position: after,
+                prefer_next_row: true,
+            })
         );
         for prefer_next_row in [false, true] {
             assert_eq!(
@@ -3040,8 +3049,12 @@ mod tests {
         assert_eq!(snapshot.focus_position(seam, true), Some(lower));
         assert_eq!(snapshot.focus_position(seam, false), Some(upper));
         assert_eq!(snapshot.decode(upper), Some(seam));
-        assert_eq!(snapshot.decode_focus(upper), Some((seam, false)));
-        assert_eq!(snapshot.decode_focus(lower), Some((seam, true)));
+        let placement = |prefer_next_row| CaretPlacement {
+            position: seam,
+            prefer_next_row,
+        };
+        assert_eq!(snapshot.decode_focus(upper), Some(placement(false)));
+        assert_eq!(snapshot.decode_focus(lower), Some(placement(true)));
         for position in [Position::new(0, 1), Position::new(0, text.len())] {
             assert_eq!(
                 snapshot.focus_position(position, false),

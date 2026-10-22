@@ -12,6 +12,7 @@
 //! `default_fonts`: hosts that rely on egui's bundled fonts and do not use
 //! eframe, which enables them, must enable `egui/default_fonts` themselves.
 
+use super::ControlCharacters;
 use crate::{Composition, Document, Editor, Error, Fragment, Link, Position, Selection};
 use egui::text::{CharIndex, LayoutJob};
 use egui::{
@@ -35,7 +36,7 @@ use composition::CompositionPreview;
 use input::InputOptions;
 pub use input_routing::install_input_routing;
 use layout::{Appearance, LayoutCache, ParagraphLayouts};
-use navigation::VerticalNavigation;
+use navigation::{CaretPlacement, VerticalNavigation};
 use paint::{BackgroundRanges, PaintCache};
 
 /// Exchanges rich [`Fragment`]s with the host's clipboard.
@@ -304,7 +305,10 @@ impl<'editor> RichTextEditor<'editor> {
     /// them. Highlights are hidden while an IME preedit is shown.
     #[must_use]
     pub fn highlight_ranges(mut self, ranges: &'editor [Range<Position>], color: Color32) -> Self {
-        self.highlights.push((ranges, color));
+        self.highlights.push(BackgroundRanges {
+            ranges,
+            fill: color,
+        });
         self
     }
 
@@ -397,7 +401,8 @@ impl<'editor> RichTextEditor<'editor> {
             (self.read_only || !ui.is_enabled()) && self.editor.cancel_composition();
         if interrupted && let Some(composition) = &old_composition {
             cache.interaction.remember_composition_end(
-                super::clean_text(&composition.text, true).into_owned(),
+                super::clean_text(&composition.text, ControlCharacters::KeepWhitespace)
+                    .into_owned(),
                 now,
             );
         }
@@ -545,8 +550,9 @@ impl<'editor> RichTextEditor<'editor> {
                         .flatten();
                     if let Some(link) = link {
                         if pressed {
-                            let (anchor, _) =
-                                navigation::hit_test(self.editor, &layouts, pointer - origin);
+                            let anchor =
+                                navigation::hit_test(self.editor, &layouts, pointer - origin)
+                                    .position;
                             cache.interaction.link_press = Some(LinkPress {
                                 link,
                                 anchor,
@@ -556,8 +562,10 @@ impl<'editor> RichTextEditor<'editor> {
                             clicked_link = Some(link);
                         }
                     } else {
-                        let (position, prefer_next_row) =
-                            navigation::hit_test(self.editor, &layouts, pointer - origin);
+                        let CaretPlacement {
+                            position,
+                            prefer_next_row,
+                        } = navigation::hit_test(self.editor, &layouts, pointer - origin);
                         let shift = click_modifiers.shift;
                         let result = if response.triple_clicked() {
                             self.editor.select_paragraph(position.paragraph)
@@ -612,8 +620,10 @@ impl<'editor> RichTextEditor<'editor> {
                     layouts = cache.layout(ui, self.editor, &appearance);
                     cache.interaction.remember_composition_end(committed, now);
                 }
-                let (position, prefer_next_row) =
-                    navigation::hit_test(self.editor, &layouts, pointer - origin);
+                let CaretPlacement {
+                    position,
+                    prefer_next_row,
+                } = navigation::hit_test(self.editor, &layouts, pointer - origin);
                 let anchor = link_press
                     .take()
                     .filter(|press| press.revision == self.editor.document().revision())
@@ -846,7 +856,8 @@ impl<'editor> RichTextEditor<'editor> {
                 display_layouts,
                 origin,
                 highlights,
-                display_selection.map(|selection| (selection, ui.visuals().selection.bg_fill)),
+                display_selection,
+                ui.visuals().selection.bg_fill,
                 &appearance.font.family,
                 appearance.color,
                 ui.visuals().weak_text_color(),
@@ -1118,7 +1129,8 @@ impl InteractionState {
         if let Some(previous) = self.cleared_preedit.take()
             && text.is_empty()
         {
-            text = super::clean_text(&previous.text, true).into_owned();
+            text =
+                super::clean_text(&previous.text, ControlCharacters::KeepWhitespace).into_owned();
         }
         self.commit_echo = CommitEcho::new(text, time);
     }
@@ -1239,7 +1251,7 @@ fn primary_pointer_event(ui: &Ui, kind: PointerEventKind) -> Option<(Pos2, egui:
 
 fn finish_composition(editor: &mut Editor, errors: &mut Vec<Error>) -> Option<String> {
     let composition = editor.composition()?;
-    let text = super::clean_text(&composition.text, true).into_owned();
+    let text = super::clean_text(&composition.text, ControlCharacters::KeepWhitespace).into_owned();
     if text.is_empty() {
         editor.cancel_composition();
         return Some(text);
@@ -1392,8 +1404,10 @@ fn observe_composition_event(
         && editor.composition().is_none()
     {
         // Some input methods still send the old preedit while processing an interruption.
-        interaction
-            .remember_composition_end(super::clean_text(&previous.text, true).into_owned(), time);
+        interaction.remember_composition_end(
+            super::clean_text(&previous.text, ControlCharacters::KeepWhitespace).into_owned(),
+            time,
+        );
     }
     if !empty {
         interaction.cleared_preedit = None;
@@ -1435,7 +1449,13 @@ fn handle_accessibility_action(
     };
     match (&request.action, &request.data) {
         (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
-            if let (Some(anchor), Some((focus, prefer_next_row))) = (
+            if let (
+                Some(anchor),
+                Some(CaretPlacement {
+                    position: focus,
+                    prefer_next_row,
+                }),
+            ) = (
                 snapshot.decode(selection.anchor),
                 snapshot.decode_focus(selection.focus),
             ) {

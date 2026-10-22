@@ -1,7 +1,7 @@
 use super::layout::ParagraphLayouts;
 use super::navigation::{self, NavigationTarget, VerticalNavigation};
 use super::{CommitEcho, RichClipboard};
-use crate::adapter::{self, Shortcut};
+use crate::adapter::{self, ControlCharacters, Shortcut};
 use crate::{Document, Editor, Error, Movement, ParagraphKind, Position, Selection, SelectionMode};
 use egui::os::OperatingSystem;
 use egui::{Event, ImeEvent, Key, Modifiers, Ui};
@@ -96,8 +96,14 @@ pub(super) fn handle_event(
         return true;
     }
     let input_text = match event {
-        Event::Text(text) => Some((text, adapter::clean_text(text, false))),
-        Event::Paste(text) => Some((text, adapter::clean_text(text, true))),
+        Event::Text(text) => Some((
+            text,
+            adapter::clean_text(text, ControlCharacters::RemoveAll),
+        )),
+        Event::Paste(text) => Some((
+            text,
+            adapter::clean_text(text, ControlCharacters::KeepWhitespace),
+        )),
         _ => None,
     };
     if input_text
@@ -181,7 +187,7 @@ pub(super) fn handle_event(
             true
         }
         Event::Ime(ImeEvent::Commit(text)) => {
-            let clean = adapter::clean_text(text, true);
+            let clean = adapter::clean_text(text, ControlCharacters::KeepWhitespace);
             if !clean.is_empty() || editor.composition().is_some() {
                 *commit_echo = None;
             }
@@ -271,7 +277,7 @@ fn is_commit_echo(echo: &mut Option<CommitEcho>, event: &Event, editor: &Editor)
         Event::Ime(ImeEvent::Commit(text))
             if !matches!(text.as_str(), "\n" | "\r" | "\r\n")
                 && editor.composition().is_none()
-                && adapter::clean_text(text, true) == pending.text =>
+                && adapter::clean_text(text, ControlCharacters::KeepWhitespace) == pending.text =>
         {
             *echo = None;
             true

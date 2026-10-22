@@ -15,16 +15,36 @@ mod numbering;
 mod paragraph;
 mod words;
 
-pub(crate) use change::Delta;
+#[cfg(feature = "egui")]
+pub(crate) use change::ParagraphChange;
+pub(crate) use change::{Delta, Replay};
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-pub(crate) use change::take_sparse_coverage;
-pub(crate) use numbering::{Levels, same_effect as same_numbering_effect};
+pub(crate) use change::{SparseCoverage, take_sparse_coverage};
+pub(crate) use numbering::{Levels, NumberedItem, same_effect as same_numbering_effect};
 #[cfg(any(feature = "accesskit", feature = "egui"))]
 pub(crate) use paragraph::SpanCursor;
 pub use paragraph::{Paragraph, Span};
 
 #[cfg(any(feature = "egui", feature = "accesskit"))]
 use change::LastChange;
+
+/// The result of replacing part of a document: the change, for undo history,
+/// and where the caret goes afterward.
+#[derive(Debug)]
+pub(crate) struct Replacement {
+    pub(crate) delta: Delta,
+    /// The end of the inserted content.
+    pub(crate) caret: Position,
+}
+
+/// Which way [`Document::change_list_indent`] moves list items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Indent {
+    /// One level deeper.
+    Increase,
+    /// One level shallower; items at level 0 become body text.
+    Decrease,
+}
 
 /// A rich-text document: a nonempty sequence of [`Paragraph`]s.
 ///
@@ -43,7 +63,7 @@ pub struct Document {
     paragraphs: Vec<Arc<Paragraph>>,
     revision: u64,
     identity: Arc<()>,
-    numbers: OnceLock<Arc<[(usize, u32)]>>,
+    numbers: OnceLock<Arc<[NumberedItem]>>,
     #[cfg(any(feature = "egui", feature = "accesskit"))]
     last_change: Option<LastChange>,
 }
@@ -276,20 +296,20 @@ impl Document {
                     .numbers
                     .get_or_init(|| numbering::numbers(&self.paragraphs));
                 let position = numbers
-                    .binary_search_by_key(&index, |&(paragraph, _)| paragraph)
+                    .binary_search_by_key(&index, |item| item.paragraph)
                     .expect("ordered items are numbered");
-                Some(numbers[position].1)
+                Some(numbers[position].number)
             }
             _ => None,
         }
     }
 
     #[cfg(feature = "egui")]
-    pub(crate) fn numbered_items_from(&self, from: usize) -> &[(usize, u32)] {
+    pub(crate) fn numbered_items_from(&self, from: usize) -> &[NumberedItem] {
         let numbers = self
             .numbers
             .get_or_init(|| numbering::numbers(&self.paragraphs));
-        &numbers[numbers.partition_point(|&(index, _)| index < from)..]
+        &numbers[numbers.partition_point(|item| item.paragraph < from)..]
     }
 
     /// Returns the position at the end of the last paragraph.
@@ -483,7 +503,7 @@ impl Document {
         range: Range<Position>,
         text: &str,
         style: InlineStyle,
-    ) -> Result<(Delta, Position), Error> {
+    ) -> Result<Replacement, Error> {
         self.validate_range(&range)?;
         let link = self.inside_link(&range).cloned();
         self.replace_with_link(range, text, style, link.as_ref())
@@ -495,7 +515,7 @@ impl Document {
         text: &str,
         style: InlineStyle,
         link: Option<&Link>,
-    ) -> Result<(Delta, Position), Error> {
+    ) -> Result<Replacement, Error> {
         self.replace_with_kind(range, text, style, link, None)
     }
 
@@ -506,10 +526,13 @@ impl Document {
         style: InlineStyle,
         link: Option<&Link>,
         kind: Option<ParagraphKind>,
-    ) -> Result<(Delta, Position), Error> {
+    ) -> Result<Replacement, Error> {
         self.validate_range(&range)?;
         if range.is_empty() && text.is_empty() {
-            return Ok((Delta::empty(range.start.paragraph), range.start));
+            return Ok(Replacement {
+                delta: Delta::empty(range.start.paragraph),
+                caret: range.start,
+            });
         }
         let text = normalize_newlines(text);
         let first = &self.paragraphs[range.start.paragraph];
@@ -577,20 +600,23 @@ impl Document {
             caret_source.boundary_at_or_after(insertion_end),
         );
         let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
-        Ok((delta, caret))
+        Ok(Replacement { delta, caret })
     }
 
     pub(crate) fn replace_fragment(
         &mut self,
         range: Range<Position>,
         fragment: &Fragment,
-    ) -> Result<(Delta, Position), Error> {
+    ) -> Result<Replacement, Error> {
         self.validate_range(&range)?;
         if range.is_empty()
             && let [paragraph] = fragment.paragraphs()
             && paragraph.text.is_empty()
         {
-            return Ok((Delta::empty(range.start.paragraph), range.start));
+            return Ok(Replacement {
+                delta: Delta::empty(range.start.paragraph),
+                caret: range.start,
+            });
         }
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
@@ -656,10 +682,11 @@ impl Document {
                 .boundary_at_or_after(insertion_end),
         );
         let delta = self.change(range.start.paragraph..range.end.paragraph + 1, after);
-        Ok((delta, caret))
+        Ok(Replacement { delta, caret })
     }
 
-    pub(crate) fn change_list_indent(&mut self, range: Range<usize>, increase: bool) -> Delta {
+    pub(crate) fn change_list_indent(&mut self, range: Range<usize>, indent: Indent) -> Delta {
+        let increase = indent == Indent::Increase;
         let after: Vec<Arc<Paragraph>> = self.paragraphs[range.clone()]
             .iter()
             .map(|paragraph| {
@@ -711,7 +738,7 @@ impl Document {
         &mut self,
         matches: &[Range<Position>],
         replacement: &str,
-    ) -> (Delta, Position) {
+    ) -> Replacement {
         let first = matches.first().expect("callers replace at least one match");
         let last = matches.last().expect("callers replace at least one match");
         debug_assert!(
@@ -782,7 +809,10 @@ impl Document {
         caret.byte =
             after[caret.paragraph - first.start.paragraph].boundary_at_or_after(caret.byte);
         let range = first.start.paragraph..last.end.paragraph + 1;
-        (self.change(range, after), caret)
+        Replacement {
+            delta: self.change(range, after),
+            caret,
+        }
     }
 
     pub(crate) fn apply_style(

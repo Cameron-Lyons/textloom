@@ -10,7 +10,11 @@ use std::slice;
 use std::sync::Arc;
 
 // Sorted, nonoverlapping document ranges and the fill painted behind them.
-pub(super) type BackgroundRanges<'ranges> = (&'ranges [Range<Position>], Color32);
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BackgroundRanges<'ranges> {
+    pub(super) ranges: &'ranges [Range<Position>],
+    pub(super) fill: Color32,
+}
 
 #[derive(Clone, Default)]
 pub(super) struct PaintCache {
@@ -120,7 +124,8 @@ pub(super) fn paint_document(
     layouts: &ParagraphLayouts,
     origin: Pos2,
     backgrounds: &[BackgroundRanges<'_>],
-    selection: Option<(Selection, Color32)>,
+    selection: Option<Selection>,
+    selection_fill: Color32,
     family: &FontFamily,
     text_color: Color32,
     quote_color: Color32,
@@ -169,14 +174,14 @@ pub(super) fn paint_document(
             }
         }
     }
-    let selection_range = selection.map(|(selection, color)| (selection.range(), color));
-    let layers = backgrounds.iter().copied().chain(
-        selection_range
-            .as_ref()
-            .map(|(range, color)| (slice::from_ref(range), *color)),
-    );
+    let selection_range = selection.map(Selection::range);
+    let selection_layer = selection_range.as_ref().map(|range| BackgroundRanges {
+        ranges: slice::from_ref(range),
+        fill: selection_fill,
+    });
+    let layers = backgrounds.iter().copied().chain(selection_layer);
     let window = visible_window(document, &visible, first);
-    for (ranges, color) in layers {
+    for BackgroundRanges { ranges, fill } in layers {
         for range in visible_ranges(ranges, window.as_ref()) {
             if range.start >= range.end
                 || !fits(document, range.start)
@@ -210,7 +215,7 @@ pub(super) fn paint_document(
                     origin,
                     char_start..char_end,
                     includes_break,
-                    color,
+                    fill,
                 );
             }
         }

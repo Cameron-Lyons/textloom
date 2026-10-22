@@ -23,13 +23,23 @@ pub(super) struct LastChange {
     paragraphs: ParagraphChange,
 }
 
+/// Which way [`Document::replay`] applies a [`Delta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// Restores the paragraphs the delta replaced.
+    Undo,
+    /// Reapplies the delta's replacement paragraphs.
+    Redo,
+}
+
 impl Document {
-    pub(crate) fn replay(&mut self, delta: &Delta, forward: bool) {
+    pub(crate) fn replay(&mut self, delta: &Delta, step: Replay) {
+        let forward = step == Replay::Redo;
         if delta.is_empty() {
             return;
         }
         if !delta.rest.is_empty() {
-            count_sparse(1);
+            count_sparse(SparsePath::Replayed);
         }
         let extent = delta.extent();
         self.apply(delta, forward);
@@ -62,7 +72,7 @@ impl Document {
             }
             return;
         }
-        count_sparse(2);
+        count_sparse(SparsePath::ShiftedTail);
         // Splicing each run in place would shift the tail once per run.
         let mut tail = self.paragraphs.split_off(delta.start).into_iter();
         let mut end = delta.start;
@@ -108,7 +118,7 @@ impl Document {
         let new_len = after.len();
         let runs = changed_runs(&self.paragraphs[start..end], &after);
         let delta = if runs.len() > 1 {
-            count_sparse(0);
+            count_sparse(SparsePath::Recorded);
             let mut splices = runs.into_iter().map(|run| Delta {
                 start: start + run.after.start,
                 before: self.paragraphs[start + run.before.start..start + run.before.end].to_vec(),
@@ -180,28 +190,57 @@ impl Document {
 
 const SHARED_GAP: usize = 8;
 
-#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-thread_local! {
-    static SPARSE_COVERAGE: Cell<[usize; 3]> = const { Cell::new([0; 3]) };
+// A code path for deltas that keep only the changed runs of paragraphs, counted in
+// tests so that randomized tests can check that they exercised each one.
+#[derive(Clone, Copy)]
+enum SparsePath {
+    Recorded,
+    Replayed,
+    ShiftedTail,
 }
 
-// Sparse deltas recorded, sparse deltas replayed, and sparse applies that shift the tail.
+// How many times each sparse delta path ran on this thread.
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-pub(crate) fn take_sparse_coverage() -> [usize; 3] {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SparseCoverage {
+    pub(crate) recorded: usize,
+    pub(crate) replayed: usize,
+    // Sparse applies that shift the paragraphs after the change.
+    pub(crate) shifted_tail: usize,
+}
+
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+thread_local! {
+    static SPARSE_COVERAGE: Cell<SparseCoverage> = const {
+        Cell::new(SparseCoverage {
+            recorded: 0,
+            replayed: 0,
+            shifted_tail: 0,
+        })
+    };
+}
+
+// Returns the counts since the last call and resets them.
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+pub(crate) fn take_sparse_coverage() -> SparseCoverage {
     SPARSE_COVERAGE.take()
 }
 
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-fn count_sparse(kind: usize) {
+fn count_sparse(path: SparsePath) {
     SPARSE_COVERAGE.with(|coverage| {
         let mut counts = coverage.get();
-        counts[kind] += 1;
+        match path {
+            SparsePath::Recorded => counts.recorded += 1,
+            SparsePath::Replayed => counts.replayed += 1,
+            SparsePath::ShiftedTail => counts.shifted_tail += 1,
+        }
         coverage.set(counts);
     });
 }
 
 #[cfg(not(all(test, any(feature = "egui", feature = "accesskit"))))]
-fn count_sparse(_: usize) {}
+fn count_sparse(_: SparsePath) {}
 
 // A changed run of paragraphs in the old list and the run that replaces it in the new list.
 struct ChangedRun {
@@ -482,6 +521,7 @@ impl<'paragraphs> Allocations<'paragraphs> {
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
 mod tests {
     use super::*;
+    use crate::document::{Indent, Replacement};
     use crate::{InlineStyle, ParagraphKind, Position, StylePatch};
 
     fn assert_change(document: &Document, identity: &Arc<()>, range: Range<usize>, new_len: usize) {
@@ -496,7 +536,7 @@ mod tests {
         let mut document = Document::from_text("zero\none\ntwo");
         let original = document.content_identity();
         assert_change(&document, &original, 0..0, 0);
-        let (delta, _) = document
+        let Replacement { delta, .. } = document
             .replace(
                 Position::new(1, 0)..Position::new(1, 3),
                 "ONE",
@@ -505,7 +545,7 @@ mod tests {
             .unwrap();
         assert_change(&document, &original, 1..2, 1);
         let changed = document.content_identity();
-        let (empty, _) = document
+        let Replacement { delta: empty, .. } = document
             .replace(
                 Position::new(1, 0)..Position::new(1, 3),
                 "ONE",
@@ -513,7 +553,7 @@ mod tests {
             )
             .unwrap();
         assert!(empty.is_empty());
-        document.replay(&empty, true);
+        document.replay(&empty, Replay::Redo);
         assert!(
             document
                 .replace(
@@ -525,7 +565,7 @@ mod tests {
         );
         assert_change(&document, &original, 1..2, 1);
         assert_change(&document, &changed, 0..0, 0);
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_change(&document, &changed, 1..2, 1);
     }
 
@@ -533,7 +573,7 @@ mod tests {
     fn structural_edits_and_history_notify_in_their_own_paragraph_coordinates() {
         let mut document = Document::from_text("zero\none\ntwo");
         let original = document.content_identity();
-        let (delta, _) = document
+        let Replacement { delta, .. } = document
             .replace(
                 Position::new(1, 0)..Position::new(1, 3),
                 "first\nmiddle\nlast",
@@ -542,10 +582,10 @@ mod tests {
             .unwrap();
         assert_change(&document, &original, 1..2, 3);
         let inserted = document.content_identity();
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_change(&document, &inserted, 1..4, 1);
         let undone = document.content_identity();
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert_change(&document, &undone, 1..2, 3);
         assert!(document.change_since(&original).is_none());
         assert_eq!(document.plain_text(), "zero\nfirst\nmiddle\nlast\ntwo");
@@ -562,10 +602,10 @@ mod tests {
         assert_eq!(delta.rest.len(), 1);
         assert_change(&document, &original, 2..26, 24);
         let changed = document.content_identity();
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_change(&document, &changed, 2..26, 24);
         let undone = document.content_identity();
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert_change(&document, &undone, 2..26, 24);
     }
 
@@ -589,10 +629,14 @@ mod tests {
             .unwrap();
         assert_change(&document, &formatted, 1..2, 1);
         let listed = document.content_identity();
-        document.change_list_indent(0..3, true);
+        document.change_list_indent(0..3, Indent::Increase);
         assert_change(&document, &listed, 1..2, 1);
         let indented = document.content_identity();
-        assert!(document.change_list_indent(0..1, true).is_empty());
+        assert!(
+            document
+                .change_list_indent(0..1, Indent::Increase)
+                .is_empty()
+        );
         assert_change(&document, &listed, 1..2, 1);
         assert_change(&document, &indented, 0..0, 0);
     }

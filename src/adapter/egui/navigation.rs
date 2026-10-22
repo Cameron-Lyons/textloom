@@ -24,26 +24,38 @@ pub(super) struct NavigationTarget {
     pub(super) prefer_next_row: bool,
 }
 
-pub(super) fn hit_test(
-    editor: &Editor,
-    layouts: &ParagraphLayouts,
-    point: Vec2,
-) -> (Position, bool) {
+// A caret position, and which row shows it when it falls on a soft-wrap seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CaretPlacement {
+    pub(super) position: Position,
+    // Shows the caret at the start of the next row rather than the end of the
+    // previous one.
+    pub(super) prefer_next_row: bool,
+}
+
+pub(super) fn hit_test(editor: &Editor, layouts: &ParagraphLayouts, point: Vec2) -> CaretPlacement {
+    let document_start = CaretPlacement {
+        position: Position::default(),
+        prefer_next_row: true,
+    };
     let paragraph = layouts
         .paragraph_at_y(point.y)
         .min(layouts.len().saturating_sub(1));
     let Some(layout) = layouts.get(paragraph) else {
-        return (Position::default(), true);
+        return document_start;
     };
     let Some(source) = editor.document().paragraph(paragraph) else {
-        return (Position::default(), true);
+        return document_start;
     };
     let local = point - layout.rect.min.to_vec2();
     let cursor = layout.galley.cursor_from_pos(local);
     let (byte, prefer_next_row) =
         snap_vertical_cursor(source, &layout.galley, cursor, local.x, false)
             .unwrap_or((source.text().len(), cursor.prefer_next_row));
-    (Position::new(paragraph, byte), prefer_next_row)
+    CaretPlacement {
+        position: Position::new(paragraph, byte),
+        prefer_next_row,
+    }
 }
 
 pub(super) fn grapheme_at_point(

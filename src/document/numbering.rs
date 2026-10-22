@@ -92,12 +92,23 @@ impl Levels {
     }
 }
 
-pub(super) fn numbers(paragraphs: &[Arc<Paragraph>]) -> Arc<[(usize, u32)]> {
+/// An ordered list item and the number it displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NumberedItem {
+    /// The item's paragraph index in the document.
+    pub(crate) paragraph: usize,
+    pub(crate) number: u32,
+}
+
+pub(super) fn numbers(paragraphs: &[Arc<Paragraph>]) -> Arc<[NumberedItem]> {
     let mut levels = Levels::default();
     let mut numbers = Vec::new();
-    for (index, paragraph) in paragraphs.iter().enumerate() {
+    for (paragraph_index, paragraph) in paragraphs.iter().enumerate() {
         if let Some(number) = levels.push(paragraph.kind) {
-            numbers.push((index, number));
+            numbers.push(NumberedItem {
+                paragraph: paragraph_index,
+                number,
+            });
         }
     }
     numbers.into()

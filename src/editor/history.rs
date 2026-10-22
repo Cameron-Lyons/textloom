@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use crate::document::Delta;
+use crate::document::{Delta, Replay};
 use crate::{Document, InlineStyle, Selection};
 
 /// Bounds on retained undo and redo history, set with
@@ -247,7 +247,7 @@ impl History {
         }
         let entry = self.undo.pop_back()?;
         for delta in entry.deltas.iter().rev() {
-            document.replay(delta, false);
+            document.replay(delta, Replay::Undo);
         }
         let state = entry.before;
         self.redo.push_back(entry);
@@ -260,7 +260,7 @@ impl History {
         }
         let entry = self.redo.pop_back()?;
         for delta in &entry.deltas {
-            document.replay(delta, true);
+            document.replay(delta, Replay::Redo);
         }
         let state = entry.after;
         self.undo.push_back(entry);
@@ -400,7 +400,7 @@ impl History {
             .map_or(0, |mark| mark.deltas)
             .min(transaction.deltas.len());
         for delta in transaction.deltas.drain(mark..).rev() {
-            document.replay(&delta, false);
+            document.replay(&delta, Replay::Undo);
         }
         transaction.depth -= 1;
         if transaction.depth == 0 {

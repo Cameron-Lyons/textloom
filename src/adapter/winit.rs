@@ -69,7 +69,7 @@
 //!
 //! [`WinitAdapter`] shows the effect of individual key and IME events.
 
-use super::Shortcut;
+use super::{ControlCharacters, Shortcut};
 use crate::document::LINE_SEPARATOR;
 use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection, SelectionMode};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -706,7 +706,7 @@ impl WinitAdapter {
                         || CTRL_ALT_IS_ALTGR && self.modifiers.alt_key()) =>
                 {
                     let produced = text.unwrap_or("");
-                    let clean = super::clean_text(produced, false);
+                    let clean = super::clean_text(produced, ControlCharacters::RemoveAll);
                     if clean.is_empty() {
                         outcome.handled = false;
                     } else if !self.read_only {
@@ -822,7 +822,7 @@ impl WinitAdapter {
             }
             Ime::Commit(text) => {
                 self.ime.preedit = false;
-                let clean = super::clean_text(text, true);
+                let clean = super::clean_text(text, ControlCharacters::KeepWhitespace);
                 if clean.is_empty() && !text.is_empty() {
                     editor.cancel_composition();
                 } else if !clean.is_empty() || editor.composition().is_some() {
@@ -862,7 +862,7 @@ impl WinitAdapter {
         if self.read_only {
             return Ok(blocked);
         }
-        let clean = super::clean_text(text, true);
+        let clean = super::clean_text(text, ControlCharacters::KeepWhitespace);
         if clean.is_empty() {
             return Ok(blocked);
         }

@@ -8,7 +8,8 @@ use std::{iter, mem};
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::change::Delta;
+use super::change::{Delta, Replay};
+use super::{Indent, Replacement};
 use crate::{
     Color, Document, Editor, Error, Fragment, InlineStyle, Movement, Paragraph, ParagraphKind,
     Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,
@@ -110,7 +111,7 @@ fn soft_line_breaks_are_whitespace_graphemes_inside_one_paragraph() {
     );
 
     let mut document = Document::from_text("a");
-    let (_, caret) = document
+    let Replacement { caret, .. } = document
         .replace(
             Position::new(0, 1)..Position::new(0, 1),
             "\u{2028}\u{301}",
@@ -883,7 +884,7 @@ fn ascii_word_indexes_are_lazy_shared_and_invalidated_by_text_edits() {
     assert_eq!(formatted.next_word(3), 9);
     assert_eq!(formatted.word_ranges().as_ptr(), words);
 
-    let (delta, _) = document
+    let Replacement { delta, .. } = document
         .replace(
             document.end()..document.end(),
             " six",
@@ -894,7 +895,7 @@ fn ascii_word_indexes_are_lazy_shared_and_invalidated_by_text_edits() {
     assert!(edited.indices.get().is_none());
     assert_eq!(edited.next_word(15), 19);
     assert!(!Arc::ptr_eq(indices, edited.indices.get().unwrap()));
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert!(Arc::ptr_eq(
         indices,
         document.paragraph(0).unwrap().indices.get().unwrap()
@@ -1202,7 +1203,7 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
     let mut document = Document::from_text("text");
     let cloned = document.clone();
     assert!(Arc::ptr_eq(&document.identity, &cloned.identity));
-    let (noop, _) = document
+    let Replacement { delta: noop, .. } = document
         .replace(
             Position::default()..document.end(),
             "text",
@@ -1211,17 +1212,17 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
         .unwrap();
     assert!(noop.is_empty());
     assert!(Arc::ptr_eq(&document.identity, &cloned.identity));
-    let (delta, _) = document
+    let Replacement { delta, .. } = document
         .replace(document.end()..document.end(), "!", InlineStyle::default())
         .unwrap();
     assert!(!Arc::ptr_eq(&document.identity, &cloned.identity));
     let changed = Arc::clone(&document.identity);
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert!(!Arc::ptr_eq(&document.identity, &changed));
     assert!(!Arc::ptr_eq(&document.identity, &cloned.identity));
     assert_eq!(document.paragraphs(), cloned.paragraphs());
     let undone = Arc::clone(&document.identity);
-    document.replay(&delta, true);
+    document.replay(&delta, Replay::Redo);
     assert!(!Arc::ptr_eq(&document.identity, &undone));
 
     let before_kind = Arc::clone(&document.identity);
@@ -1250,7 +1251,7 @@ fn document_content_identity_tracks_changes_and_preserves_noops() {
             .is_empty()
     );
     assert!(Arc::ptr_eq(&document.identity, &styled));
-    document.replay(&noop, true);
+    document.replay(&noop, Replay::Redo);
     assert!(Arc::ptr_eq(&document.identity, &styled));
 }
 
@@ -1359,7 +1360,7 @@ fn replacing_preserves_styles_on_surviving_edges() {
             },
         )
         .unwrap();
-    let (delta, caret) = document
+    let Replacement { delta, caret } = document
         .replace(
             Position::new(0, 3)..Position::new(1, 2),
             "X",
@@ -1371,9 +1372,9 @@ fn replacing_preserves_styles_on_surviving_edges() {
     assert_eq!(document.paragraph(0).unwrap().spans().len(), 3);
     assert!(document.style_at(Position::new(0, 3)).bold);
     assert!(document.style_at(Position::new(0, 5)).italic);
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert_eq!(document.plain_text(), "before\nafter");
-    document.replay(&delta, true);
+    document.replay(&delta, Replay::Redo);
     assert_eq!(document.plain_text(), "befXter");
     assert_normalized(&document);
 }
@@ -1623,13 +1624,13 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
                         assert!(Arc::ptr_eq(before, after), "{start:?}..{end:?}, {patch:?}");
                     }
                 }
-                document.replay(&delta, false);
+                document.replay(&delta, Replay::Undo);
                 assert_eq!(
                     document.paragraphs(),
                     source.paragraphs(),
                     "{start:?}..{end:?}, {patch:?}"
                 );
-                document.replay(&delta, true);
+                document.replay(&delta, Replay::Redo);
                 assert_eq!(
                     document.paragraphs(),
                     expected,
@@ -1652,7 +1653,7 @@ fn inserted_combining_marks_cannot_split_formatting_runs() {
             },
         )
         .unwrap();
-    let (_, caret) = document
+    let Replacement { caret, .. } = document
         .replace(
             Position::new(0, 1)..Position::new(0, 1),
             "\u{301}",
@@ -1672,7 +1673,7 @@ fn inserted_combining_marks_cannot_split_formatting_runs() {
 #[test]
 fn emoji_joiner_insertion_snaps_caret_past_new_cluster() {
     let mut document = Document::from_text("👩👧");
-    let (_, caret) = document
+    let Replacement { caret, .. } = document
         .replace(Position::new(0, 4)..Position::new(0, 4), "\u{200d}", bold())
         .unwrap();
     assert_eq!(document.plain_text(), "👩\u{200d}👧");
@@ -1693,7 +1694,7 @@ fn joining_paragraphs_also_normalizes_clusters() {
             },
         )
         .unwrap();
-    let (_, caret) = document
+    let Replacement { caret, .. } = document
         .replace(
             Position::new(0, 1)..Position::new(1, 0),
             "",
@@ -1709,7 +1710,7 @@ fn joining_paragraphs_also_normalizes_clusters() {
 fn history_retains_only_changed_paragraphs_and_shares_others() {
     let mut document = Document::from_text("zero\none\ntwo\nthree");
     let unaffected = Arc::clone(&document.paragraphs()[3]);
-    let (delta, _) = document
+    let Replacement { delta, .. } = document
         .replace(Position::new(1, 1)..Position::new(1, 2), "N", bold())
         .unwrap();
     assert_eq!(delta.start, 1);
@@ -1718,7 +1719,7 @@ fn history_retains_only_changed_paragraphs_and_shares_others() {
     assert!(delta.retained_bytes() > 0);
     assert!(Arc::ptr_eq(&unaffected, &document.paragraphs()[3]));
     let revision = document.revision();
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert_eq!(document.revision(), revision + 1);
     assert!(Arc::ptr_eq(&unaffected, &document.paragraphs()[3]));
     assert_eq!(document.plain_text(), "zero\none\ntwo\nthree");
@@ -1732,7 +1733,7 @@ fn kind_changes_share_unchanged_paragraphs_inside_the_changed_range() {
             .map(|kind| Arc::new(Paragraph::plain("item")).with_kind(kind)),
     );
     let middle = Arc::clone(&document.paragraphs()[1]);
-    let delta = document.change_list_indent(0..3, true);
+    let delta = document.change_list_indent(0..3, Indent::Increase);
     assert_eq!((delta.start, delta.after.len()), (0, 3));
     assert!(Arc::ptr_eq(&middle, &document.paragraphs()[1]));
     let delta = document.set_kind(0..3, ParagraphKind::Body).unwrap();
@@ -1758,7 +1759,7 @@ fn sparse_changes_retain_only_their_changed_runs() {
         .iter()
         .map(|&paragraph| Position::new(paragraph, 0)..Position::new(paragraph, 5))
         .collect();
-    let (delta, _) = document.replace_matches(&matches, "swap");
+    let Replacement { delta, .. } = document.replace_matches(&matches, "swap");
     let splices: Vec<_> = iter::once(&delta)
         .chain(&delta.rest)
         .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
@@ -1786,10 +1787,10 @@ fn sparse_changes_retain_only_their_changed_runs() {
     assert_eq!(shared(&original, &document), unchanged);
     let replaced = document.paragraphs.clone();
     let revision = document.revision();
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert_eq!(document.revision(), revision + 1);
     assert_eq!(shared(&original, &document), [true; 40]);
-    document.replay(&delta, true);
+    document.replay(&delta, Replay::Redo);
     assert_eq!(shared(&replaced, &document), [true; 40]);
     assert_eq!(
         document.plain_text(),
@@ -1823,7 +1824,7 @@ fn sparse_changes_that_shift_paragraphs_retain_only_their_changed_runs() {
             Position::new(expanded, 0)..Position::new(expanded, 5),
             Position::new(last, 0)..Position::new(last, 5),
         ];
-        let (delta, _) = document.replace_matches(&matches, "x\ny");
+        let Replacement { delta, .. } = document.replace_matches(&matches, "x\ny");
         let splices: Vec<_> = iter::once(&delta)
             .chain(&delta.rest)
             .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
@@ -1858,7 +1859,7 @@ fn sparse_changes_that_shift_paragraphs_retain_only_their_changed_runs() {
         retained.push(delta.retained_bytes());
         let replaced = document.paragraphs.clone();
         let revision = document.revision();
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_eq!(
             document.revision(),
             revision + 1,
@@ -1868,7 +1869,7 @@ fn sparse_changes_that_shift_paragraphs_retain_only_their_changed_runs() {
             identical(&original, &document),
             "gaps {first_gap} and {second_gap}"
         );
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert!(
             identical(&replaced, &document),
             "gaps {first_gap} and {second_gap}"
@@ -1927,7 +1928,7 @@ fn shifting_sparse_changes_replay_exactly_with_repeated_paragraphs() {
             expected.replace_range(offset(range.start)..offset(range.end), replacement);
         }
         let original = document.paragraphs.clone();
-        let (delta, _) = document.replace_matches(&matches, replacement);
+        let Replacement { delta, .. } = document.replace_matches(&matches, replacement);
         assert_eq!(
             document.plain_text(),
             expected,
@@ -1941,12 +1942,12 @@ fn shifting_sparse_changes_replay_exactly_with_repeated_paragraphs() {
             split += 1;
         }
         let replaced = document.paragraphs.clone();
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert!(
             identical(&original, &document),
             "{matches:?} {replacement:?}"
         );
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert!(
             identical(&replaced, &document),
             "{matches:?} {replacement:?}"
@@ -1974,9 +1975,9 @@ fn sparse_kind_changes_renumber_lists_through_history() {
     assert_eq!(delta.rest.len(), 1);
     let expected: Vec<_> = (1..=30).map(Some).collect();
     assert_eq!(numbers(&document), expected);
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert_eq!(numbers(&document), interrupted);
-    document.replay(&delta, true);
+    document.replay(&delta, Replay::Redo);
     assert_eq!(numbers(&document), expected);
 }
 
@@ -1987,7 +1988,7 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
     let pointer = mem::size_of::<Arc<Paragraph>>();
     let text = "word ".repeat(1000);
     let mut document = Document::from_text(&format!("{text}\n{text}"));
-    let (typed, _) = document
+    let Replacement { delta: typed, .. } = document
         .replace(Position::new(0, 0)..Position::new(0, 0), "x", bold())
         .unwrap();
     assert_eq!(
@@ -2083,7 +2084,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
             expected,
             "paragraph {index} to {kind:?}"
         );
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_eq!(
             document.paragraphs[index].kind, before,
             "paragraph {index} to {kind:?}"
@@ -2092,7 +2093,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
             Arc::ptr_eq(document.numbers.get().unwrap(), &cached),
             "paragraph {index} to {kind:?}"
         );
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert_eq!(
             document.paragraphs[index].kind, kind,
             "paragraph {index} to {kind:?}"
@@ -2106,7 +2107,7 @@ fn numbering_cache_survives_equivalent_block_changes_and_replay() {
     let delta = document.set_kind(3..4, ParagraphKind::Quote).unwrap();
     assert!(document.numbers.get().is_none());
     assert_eq!(numbers(&document), [Some(7), None, Some(8), None, Some(9)]);
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert!(document.numbers.get().is_none());
     assert_eq!(numbers(&document), expected);
     document
@@ -2142,7 +2143,7 @@ fn list_edits_share_following_items_and_text_edits_keep_computed_numbers() {
     let expected: Vec<_> = (1..=10).chain(1..=90).map(Some).collect();
     assert_eq!(numbers(&document), expected);
     let before = document.paragraphs.clone();
-    let (delta, _) = document
+    let Replacement { delta, .. } = document
         .replace(
             Position::new(0, 4)..Position::new(0, 4),
             "\n",
@@ -2184,7 +2185,7 @@ fn list_edits_share_following_items_and_text_edits_keep_computed_numbers() {
     assert!(document.numbers.get().is_none());
     assert_eq!(document.list_number(10), Some(10));
     assert_eq!(numbers(&clone), expected);
-    let (delta, _) = document
+    let Replacement { delta, .. } = document
         .replace(
             Position::new(0, 4)..Position::new(1, 0),
             "",
@@ -2192,7 +2193,7 @@ fn list_edits_share_following_items_and_text_edits_keep_computed_numbers() {
         )
         .unwrap();
     assert_eq!(numbers(&document)[..4], [Some(1), Some(2), None, Some(3)]);
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert_eq!(
         numbers(&document)[..5],
         [Some(1), Some(2), Some(3), None, Some(4)]
@@ -2273,7 +2274,7 @@ fn deletion_of_a_complete_leading_paragraph_preserves_suffix_kind() {
 fn noops_do_not_change_revision_or_allocations() {
     let mut document = Document::from_text("unchanged");
     let original = Arc::clone(&document.paragraphs()[0]);
-    let (delta, caret) = document
+    let Replacement { delta, caret } = document
         .replace(
             Position::default()..document.end(),
             "unchanged",
@@ -2296,7 +2297,7 @@ fn noops_do_not_change_revision_or_allocations() {
             .unwrap()
             .is_empty()
     );
-    document.replay(&delta, false);
+    document.replay(&delta, Replay::Undo);
     assert_eq!(document.revision(), 0);
 }
 
@@ -2398,7 +2399,7 @@ fn unicode_replacements_preserve_text_invariants_and_replay_exactly() {
                         &super::normalize_newlines(insertion),
                     );
                     let mut edited = original.clone();
-                    let (delta, caret) = edited
+                    let Replacement { delta, caret } = edited
                         .replace(
                             *start..*end,
                             insertion,
@@ -2419,13 +2420,13 @@ fn unicode_replacements_preserve_text_invariants_and_replay_exactly() {
                     );
                     assert_normalized(&edited);
                     let result = edited.paragraphs().to_vec();
-                    edited.replay(&delta, false);
+                    edited.replay(&delta, Replay::Undo);
                     assert_eq!(
                         edited.paragraphs(),
                         original.paragraphs(),
                         "{input:?}, {start:?}..{end:?}, {insertion:?}"
                     );
-                    edited.replay(&delta, true);
+                    edited.replay(&delta, Replay::Redo);
                     assert_eq!(
                         edited.paragraphs(),
                         result,

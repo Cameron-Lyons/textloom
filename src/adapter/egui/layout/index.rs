@@ -6,6 +6,7 @@ use super::{ParagraphCache, ParagraphLayout, ParagraphLayoutView};
 use crate::Document;
 use crate::Paragraph;
 use crate::adapter::egui::PARAGRAPH_GAP;
+use crate::document::NumberedItem;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::{ptr, slice};
@@ -274,7 +275,7 @@ fn update(node: &Arc<Node>, at: usize, paragraphs: &[ParagraphCache]) -> Arc<Nod
 fn renumber(
     node: &Arc<Node>,
     offset: usize,
-    items: &[(usize, u32)],
+    items: &[NumberedItem],
     create: &mut impl FnMut(usize, &ParagraphCache, u32) -> ParagraphCache,
 ) -> Option<Arc<Node>> {
     if items.is_empty() {
@@ -284,15 +285,15 @@ fn renumber(
         Children::Leaf(entries) => {
             let mut changed = items
                 .iter()
-                .filter(|&&(index, number)| entries[index - offset].cache.number != Some(number))
+                .filter(|item| entries[item.paragraph - offset].cache.number != Some(item.number))
                 .peekable();
             changed.peek()?;
             let entries = entries
                 .iter()
                 .enumerate()
                 .map(|(position, entry)| {
-                    match changed.next_if(|&&(index, _)| index == offset + position) {
-                        Some(&(index, number)) => Entry::new(create(index, &entry.cache, number)),
+                    match changed.next_if(|item| item.paragraph == offset + position) {
+                        Some(item) => Entry::new(create(item.paragraph, &entry.cache, item.number)),
                         None => entry.clone(),
                     }
                 })
@@ -300,7 +301,7 @@ fn renumber(
             Some(leaf(entries))
         }
         Children::Branch(left, right) => {
-            let split = items.partition_point(|&(index, _)| index < offset + left.len);
+            let split = items.partition_point(|item| item.paragraph < offset + left.len);
             let next_left = renumber(left, offset, &items[..split], create);
             let next_right = renumber(right, offset + left.len, &items[split..], create);
             (next_left.is_some() || next_right.is_some()).then(|| {
@@ -598,7 +599,7 @@ impl ParagraphLayouts {
 
     pub(super) fn renumber(
         &mut self,
-        items: &[(usize, u32)],
+        items: &[NumberedItem],
         mut create: impl FnMut(usize, &ParagraphCache, u32) -> ParagraphCache,
     ) {
         if let Some(root) = self

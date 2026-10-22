@@ -1,10 +1,9 @@
-use crate::document::{self, LINE_SEPARATOR};
+use crate::document::{self, LINE_SEPARATOR, ParagraphChange};
 use crate::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
 use egui::epaint::{FontsView, TextOptions};
 use egui::text::{ByteIndex, LayoutJob, LayoutSection};
 use egui::{Color32, FontData, FontFamily, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Ui};
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
 mod index;
@@ -128,7 +127,7 @@ pub(super) struct LayoutCache {
 #[derive(Clone)]
 struct PendingChange {
     identity: Arc<()>,
-    paragraphs: Option<(Range<usize>, usize)>,
+    paragraphs: Option<ParagraphChange>,
 }
 
 pub(super) struct LayoutUpdate {
@@ -153,12 +152,13 @@ impl LayoutCache {
         if Arc::ptr_eq(base, &identity) {
             return;
         }
-        let step = document
-            .change_since(base)
-            .map(|change| (change.range, change.new_len));
+        let step = document.change_since(base);
         let paragraphs = match self.pending.take() {
             None => step,
-            Some(pending) => pending.paragraphs.zip(step).map(merge_changes),
+            Some(pending) => pending
+                .paragraphs
+                .zip(step)
+                .map(|(first, second)| merge_changes(first, second)),
         };
         self.pending = Some(PendingChange {
             identity,
@@ -218,7 +218,11 @@ impl LayoutCache {
                 self.layouts.rebuild(&caches);
             } else {
                 let source = document.paragraphs();
-                let (old, new) = if let Some((old, new_len)) = change {
+                let (old, new) = if let Some(ParagraphChange {
+                    range: old,
+                    new_len,
+                }) = change
+                {
                     let new = old.start..old.start + new_len;
                     (old, new)
                 } else {
@@ -290,9 +294,9 @@ impl LayoutCache {
                     let items = document.numbered_items_from(new.end);
                     let visited = items
                         .iter()
-                        .position(|&(index, _)| {
+                        .position(|item| {
                             matches!(
-                                source[index].kind(),
+                                source[item.paragraph].kind(),
                                 ParagraphKind::Ordered {
                                     indent: 0,
                                     start: Some(_)
@@ -318,14 +322,17 @@ impl LayoutCache {
 }
 
 // A change is a replaced range and its new length; `second` changes the result of `first`.
-fn merge_changes(
-    ((first, first_len), (second, second_len)): ((Range<usize>, usize), (Range<usize>, usize)),
-) -> (Range<usize>, usize) {
-    let start = first.start.min(second.start);
-    let end = (first.start + first_len).max(second.end);
-    let old_end = end - first_len + first.len();
-    let new_end = end - second.len() + second_len;
-    (start..old_end, new_end - start)
+// Combines two consecutive changes into one that covers both, in the
+// paragraph indices of the document before the first.
+fn merge_changes(first: ParagraphChange, second: ParagraphChange) -> ParagraphChange {
+    let start = first.range.start.min(second.range.start);
+    let end = (first.range.start + first.new_len).max(second.range.end);
+    let old_end = end - first.new_len + first.range.len();
+    let new_end = end - second.range.len() + second.new_len;
+    ParagraphChange {
+        range: start..old_end,
+        new_len: new_end - start,
+    }
 }
 
 // Identifies a paragraph's text and span storage by address, so that a new
@@ -711,6 +718,7 @@ mod tests {
     use egui::epaint::Shape;
     use egui::{Event, Key, Modifiers, Vec2};
     use std::collections::BTreeSet;
+    use std::ops::Range;
 
     fn appearance(size: f32) -> Appearance {
         Appearance {
@@ -1615,18 +1623,33 @@ mod tests {
             items.splice(range, (0..len).map(|index| id + index));
             items
         }
-        fn ranges(len: usize) -> impl Iterator<Item = (Range<usize>, usize)> {
+        fn ranges(len: usize) -> impl Iterator<Item = ParagraphChange> {
             (0..=len).flat_map(move |start| {
-                (start..=len).flat_map(move |end| (0..3).map(move |new| (start..end, new)))
+                (start..=len).flat_map(move |end| {
+                    (0..3).map(move |new_len| ParagraphChange {
+                        range: start..end,
+                        new_len,
+                    })
+                })
             })
         }
         let original: Vec<_> = (0..6).collect();
-        for (first, first_len) in ranges(original.len()) {
+        for first_change in ranges(original.len()) {
+            let ParagraphChange {
+                range: first,
+                new_len: first_len,
+            } = first_change.clone();
             let middle = replace(&original, first.clone(), first_len, 100);
-            for (second, second_len) in ranges(middle.len()) {
+            for second_change in ranges(middle.len()) {
+                let ParagraphChange {
+                    range: second,
+                    new_len: second_len,
+                } = second_change.clone();
                 let result = replace(&middle, second.clone(), second_len, 200);
-                let (old, new_len) =
-                    merge_changes(((first.clone(), first_len), (second.clone(), second_len)));
+                let ParagraphChange {
+                    range: old,
+                    new_len,
+                } = merge_changes(first_change.clone(), second_change);
                 assert_eq!(old.start, first.start.min(second.start));
                 assert_eq!(result.len(), original.len() - old.len() + new_len);
                 assert_eq!(result[..old.start], original[..old.start]);
