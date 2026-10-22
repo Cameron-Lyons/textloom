@@ -2,13 +2,10 @@
 //! interaction probe, and the local Windows VM with its checks. None of it is
 //! part of the published crate.
 
-use std::fmt;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fmt, fs, io, process};
 
 pub mod cli;
 pub mod native_report;

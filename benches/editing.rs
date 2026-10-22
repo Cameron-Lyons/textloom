@@ -1,7 +1,5 @@
-use std::{
-    hint::black_box,
-    time::{Duration, Instant},
-};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 use textloom::{
     Document, Editor, Fragment, HistoryLimits, Link, Movement, ParagraphKind, Position,
     SearchOptions, Selection, StylePatch,
@@ -60,7 +58,7 @@ fn transaction_edits() {
 
 fn fragment_capture() {
     for paragraphs in [100, 100_000] {
-        let source = "A short paragraph with Unicode café 👩‍💻.\n".repeat(paragraphs);
+        let source = "A short paragraph with Unicode café 👩\u{200d}💻.\n".repeat(paragraphs);
         let document = Document::from_text(&source);
         let range = Position::new(paragraphs - 1, 2)..Position::new(paragraphs - 1, 7);
         assert_eq!(
@@ -150,7 +148,7 @@ fn saved_state_checks() {
 }
 
 fn paragraph_import() {
-    let source = "A short paragraph with Unicode café 👩‍💻.\n".repeat(100_000);
+    let source = "A short paragraph with Unicode café 👩\u{200d}💻.\n".repeat(100_000);
     let bytes = Document::from_text(&source).to_bytes();
     measure("100000 paragraph fragment import", 20, || {
         let fragment = Fragment::from_text(black_box(&source));
@@ -163,7 +161,7 @@ fn paragraph_import() {
         assert_eq!(document.revision(), 0);
         black_box(document);
     });
-    let source = "café 👩‍💻. ".repeat(100_000);
+    let source = "café 👩\u{200d}💻. ".repeat(100_000);
     let bytes = Document::from_text(&source).to_bytes();
     measure("long Unicode paragraph snapshot import", 50, || {
         let document = Document::from_bytes(black_box(&bytes)).unwrap();
@@ -174,7 +172,7 @@ fn paragraph_import() {
 }
 
 fn serialization() {
-    let source = "A short paragraph with Unicode café 👩‍💻.\n".repeat(100_000);
+    let source = "A short paragraph with Unicode café 👩\u{200d}💻.\n".repeat(100_000);
     let document = Document::from_text(&source);
     let expected_bytes = document.to_bytes();
     let expected_html = document.to_html();
@@ -194,7 +192,7 @@ fn serialization() {
         black_box(html);
     });
 
-    let document = styled_repetitions("match café 👩‍💻 ", 10_000);
+    let document = styled_repetitions("match café 👩\u{200d}💻 ", 10_000);
     let expected_bytes = document.to_bytes();
     measure("10000 styled spans native snapshot export", 100, || {
         let bytes = black_box(&document).to_bytes();
@@ -248,7 +246,7 @@ fn caret_link_queries() {
 }
 
 fn formatting() {
-    let phrase = "match café 👩‍💻 ";
+    let phrase = "match café 👩\u{200d}💻 ";
     for repetitions in [1, 10_000] {
         let document = styled_repetitions(phrase, repetitions);
         let original = document.to_bytes();
@@ -340,7 +338,7 @@ fn empty_insertions() {
 
 fn cold_zero_index_navigation() {
     for repetitions in [100, 100_000] {
-        let source = format!("x\n{}", "é👩‍💻e\u{301}".repeat(repetitions));
+        let source = format!("x\n{}", "é👩\u{200d}💻e\u{301}".repeat(repetitions));
         for (operation, label) in [
             "grapheme zero conversion",
             "scalar zero conversion",
@@ -381,7 +379,7 @@ fn cold_zero_index_navigation() {
 }
 
 fn sparse_whole_word_search() {
-    let tail = "other café 👩‍💻. ".repeat(50_000);
+    let tail = "other café 👩\u{200d}💻. ".repeat(50_000);
     let source = format!("match {tail}");
     let document = Document::from_text(&source);
     let options = SearchOptions {
@@ -431,7 +429,7 @@ fn sparse_whole_word_search() {
 
 fn short_paragraph_edits() {
     for paragraphs in [100, 10_000, 100_000] {
-        let source = "A short paragraph with Unicode café 👩‍💻.\n".repeat(paragraphs);
+        let source = "A short paragraph with Unicode café 👩\u{200d}💻.\n".repeat(paragraphs);
         let mut editor = Editor::from_text(&source);
         editor
             .set_selection(Selection::caret(Position::new(paragraphs / 2, 5)))
@@ -451,7 +449,7 @@ fn short_paragraph_edits() {
 }
 
 fn unicode_navigation() {
-    let phrase = "café 👩‍💻 नमस्ते 🇺🇸 ";
+    let phrase = "café 👩\u{200d}💻 नमस्ते 🇺🇸 ";
     let source = phrase.repeat(10_000);
     let position = Position::new(0, phrase.len() * 9_000);
     println!("long Unicode paragraph: {} bytes", source.len());
@@ -521,7 +519,7 @@ fn word_pair(editor: &mut Editor) {
 }
 
 fn long_unicode_edits() {
-    let phrase = "café 👩‍💻 नमस्ते 🇺🇸 ";
+    let phrase = "café 👩\u{200d}💻 नमस्ते 🇺🇸 ";
     let source = phrase.repeat(10_000);
     let original = Selection::caret(Position::new(0, phrase.len() * 5_000));
     let mut editor = Editor::from_text(&source);
@@ -650,7 +648,7 @@ fn literal_search() {
         );
     });
     let document =
-        Document::from_text(&"A short paragraph with Unicode café 👩‍💻.\n".repeat(100_000));
+        Document::from_text(&"A short paragraph with Unicode café 👩\u{200d}💻.\n".repeat(100_000));
     measure("100000 paragraph literal matches", 20, || {
         let matches = document.find(black_box("Unicode"), SearchOptions::default());
         assert_eq!(matches.len(), 100_000);
@@ -754,7 +752,7 @@ fn batch_replacement() {
         black_box(editor.document().revision());
     });
 
-    let mut editor = Editor::new(styled_repetitions("match café 👩‍💻 ", 10_000));
+    let mut editor = Editor::new(styled_repetitions("match café 👩\u{200d}💻 ", 10_000));
     assert_eq!(
         editor
             .replace_all("match", "replacement", SearchOptions::default())
@@ -880,7 +878,7 @@ fn search_navigation() {
 }
 
 fn long_literal_navigation() {
-    let phrase = "café match 👩‍💻 ";
+    let phrase = "café match 👩\u{200d}💻 ";
     let mut editor = Editor::from_text(&phrase.repeat(50_000));
     let repetition = 45_000;
     let start = phrase.len() * repetition + "café ".len();
@@ -985,7 +983,7 @@ fn long_whole_word_navigation() {
 
 fn sparse_replacement() {
     for repeats in [1, 40] {
-        let paragraph = "untouched café 👩‍💻. ".repeat(repeats);
+        let paragraph = "untouched café 👩\u{200d}💻. ".repeat(repeats);
         let source = format!("match\n{}match", format!("{paragraph}\n").repeat(10_000));
         let mut editor = Editor::from_text(&source);
         assert_eq!(
@@ -1041,7 +1039,7 @@ fn accessibility_navigation() {
     use textloom::accessibility::AccessKitAdapter;
 
     for paragraphs in [100, 10_000] {
-        let mut editor = Editor::from_text(&"aé👩‍💻\n".repeat(paragraphs));
+        let mut editor = Editor::from_text(&"aé👩\u{200d}💻\n".repeat(paragraphs));
         let mut adapter = AccessKitAdapter::default();
         adapter.update(&editor, "Notes", true).unwrap();
         let position = Position::new(paragraphs - 1, 3);

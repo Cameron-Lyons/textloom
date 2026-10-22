@@ -3,10 +3,8 @@ mod tests;
 
 use super::{PARAGRAPH_GAP, ParagraphCache, ParagraphLayout, ParagraphLayoutView};
 use crate::Paragraph;
-use std::{
-    ops::Range,
-    sync::{Arc, Weak},
-};
+use std::ops::Range;
+use std::sync::{Arc, Weak};
 
 const LEAF_CAPACITY: usize = 32;
 

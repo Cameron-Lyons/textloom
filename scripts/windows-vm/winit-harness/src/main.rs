@@ -13,29 +13,23 @@
 //!        --preallow-ime  call Window::set_ime_allowed(true) once right after creating
 //!                        the window, before any focus event (diagnostic for X11 XIM).
 
-use std::{
-    io::Write as _,
-    num::NonZeroU32,
-    process::{Command, Stdio},
-    rc::Rc,
-    time::Instant,
-};
+use std::io::Write as _;
+use std::num::NonZeroU32;
+use std::process::{Command, Stdio};
+use std::rc::Rc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
-use textloom::{
-    Editor, Movement, Position, Selection,
-    adapter::winit::{ClipboardEvent, InputOutcome, WinitAdapter},
-};
+use textloom::adapter::winit::{ClipboardEvent, InputOutcome, WinitAdapter};
+use textloom::{Editor, Movement, Position, Selection};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::event::{Ime, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
 #[cfg(target_os = "linux")]
 use winit::platform::wayland::ActiveEventLoopExtWayland;
-use winit::{
-    application::ApplicationHandler,
-    dpi::{LogicalPosition, LogicalSize},
-    event::{Ime, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
-    raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Window, WindowId},
-};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::window::{Window, WindowId};
 
 const CELL_W: f64 = 10.0;
 const CELL_H: f64 = 24.0;
@@ -369,7 +363,7 @@ impl App {
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-        buffer.fill(0xFFFFFF);
+        buffer.fill(0xffffff);
         let scale = window.scale_factor();
         let (w, h) = (size.width as i64, size.height as i64);
         let mut fill = |x: f64, y: f64, rw: f64, rh: f64, color: u32| {
@@ -391,8 +385,8 @@ impl App {
                     ORIGIN.1 + line as f64 * CELL_H,
                 );
                 match cell {
-                    Cell::Selected => fill(x, y, CELL_W, CELL_H, 0xADD8E6),
-                    Cell::PreeditSelected => fill(x, y, CELL_W, CELL_H, 0xFFE0B0),
+                    Cell::Selected => fill(x, y, CELL_W, CELL_H, 0xadd8e6),
+                    Cell::PreeditSelected => fill(x, y, CELL_W, CELL_H, 0xffe0b0),
                     _ => {}
                 }
                 let preedit = matches!(cell, Cell::Preedit | Cell::PreeditSelected);
@@ -401,10 +395,10 @@ impl App {
                     y + 6.0,
                     6.0,
                     12.0,
-                    if preedit { 0xD02090 } else { 0x303030 },
+                    if preedit { 0xd02090 } else { 0x303030 },
                 );
                 if preedit {
-                    fill(x, y + 21.0, CELL_W, 2.0, 0xD02090);
+                    fill(x, y + 21.0, CELL_W, 2.0, 0xd02090);
                 }
             }
         }

@@ -1,19 +1,15 @@
-use super::{
-    ParagraphLayouts,
-    layout::{LayoutIdentity, is_layout_text},
-};
-use crate::{
-    Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span,
-    accessibility::node_semantics::{apply_text_style, set_paragraph_semantics},
-    document::{LINE_SEPARATOR, SpanCursor, same_numbering_effect},
-};
-use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, epaint::text::PlacedRow, text::CharIndex};
-use std::{
-    collections::HashMap,
-    fmt,
-    ops::Range,
-    sync::{Arc, OnceLock},
-};
+use super::ParagraphLayouts;
+use super::layout::{LayoutIdentity, is_layout_text};
+use crate::accessibility::node_semantics::{apply_text_style, set_paragraph_semantics};
+use crate::document::{LINE_SEPARATOR, SpanCursor, same_numbering_effect};
+use crate::{Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span};
+use egui::epaint::text::PlacedRow;
+use egui::text::CharIndex;
+use egui::{Galley, Id, Pos2, Rect, Ui, accesskit};
+use std::collections::HashMap;
+use std::fmt;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_RUN_CHARACTERS: usize = 255;
@@ -1187,7 +1183,7 @@ mod tests {
     fn incremental_updates_match_fresh_snapshots_and_preserve_retained_values() {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
-        let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
+        let mut editor = Editor::from_text("first\naé👩\u{200d}💻 second\nlast");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
@@ -1225,7 +1221,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
         let mut editor =
-            Editor::from_text("first second third fourth\naé👩‍💻 second\nlast words here");
+            Editor::from_text("first second third fourth\naé👩\u{200d}💻 second\nlast words here");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
@@ -1282,7 +1278,7 @@ mod tests {
     #[test]
     fn local_edits_reuse_unchanged_paragraph_runs_and_geometry() {
         let context = egui::Context::default();
-        let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
+        let mut editor = Editor::from_text("first\naé👩\u{200d}💻 second\nlast");
         let widget_id = Id::unique("editor");
         let layouts = layout_frame(&context, &editor, 500.0);
         let first = build(&editor, &layouts, widget_id).unwrap();
@@ -1436,7 +1432,7 @@ mod tests {
 
     #[test]
     fn emoji_and_combining_marks_expose_only_real_caret_stops() {
-        let (_, snapshot) = make_snapshot("a👩🏽‍💻e\u{301}", 500.0);
+        let (_, snapshot) = make_snapshot("a👩🏽\u{200d}💻e\u{301}", 500.0);
         let runs = &snapshot.paragraphs[0].runs;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].node.character_lengths(), [1, 15, 3]);
@@ -1555,7 +1551,7 @@ mod tests {
 
     #[test]
     fn snapshots_validate_cloned_content_and_decode_wrapped_paragraphs() {
-        let (editor, snapshot) = make_snapshot("first\naé👩‍💻 second third\n", 65.0);
+        let (editor, snapshot) = make_snapshot("first\naé👩\u{200d}💻 second third\n", 65.0);
         let cloned = Editor::new(editor.document().clone());
         assert!(snapshot.matches_document(&cloned));
         assert!(!snapshot.matches_document(&Editor::from_text("different\ntext\n")));
@@ -1589,7 +1585,7 @@ mod tests {
 
     #[test]
     fn cached_geometry_follows_the_widget_origin_when_published() {
-        let (editor, snapshot) = make_snapshot("a👩🏽‍💻e\u{301}", 500.0);
+        let (editor, snapshot) = make_snapshot("a👩🏽\u{200d}💻e\u{301}", 500.0);
         let context = egui::Context::default();
         context.enable_accesskit();
         let paragraph = &snapshot.paragraphs[0];
@@ -1786,7 +1782,8 @@ mod tests {
     #[test]
     fn run_registration_preserves_tree_geometry_and_hover_behavior() {
         let context = egui::Context::default();
-        let mut editor = Editor::from_text("first café e\u{301} 👩‍💻 second third fourth\n\nlast 🇺🇸");
+        let mut editor =
+            Editor::from_text("first café e\u{301} 👩\u{200d}💻 second third fourth\n\nlast 🇺🇸");
         editor
             .set_selection(crate::Selection::new(
                 Position::new(0, 0),
@@ -2450,7 +2447,7 @@ mod tests {
             String::new(),
             "first second third fourth fifth".to_owned(),
             "e\u{301}".repeat(40),
-            "a 👨‍👩‍👧‍👦 b 🇺🇸🇺🇸 c 👩🏽‍💻".to_owned(),
+            "a 👨\u{200d}👩\u{200d}👧\u{200d}👦 b 🇺🇸🇺🇸 c 👩🏽\u{200d}💻".to_owned(),
             "line\nbreaks\n\nend\n".to_owned(),
             "w".repeat(30),
         ];

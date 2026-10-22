@@ -1,5 +1,6 @@
 use super::*;
-use crate::{Editor, adapter::egui::RichTextEditor};
+use crate::Editor;
+use crate::adapter::egui::RichTextEditor;
 use egui::{Id, ImeEvent, Pos2, Rect, Ui};
 use std::num::NonZeroUsize;
 

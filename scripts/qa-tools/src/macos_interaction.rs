@@ -5,16 +5,14 @@
 //! Mac editing shortcuts. See `scripts/native-qa/README.md`.
 
 use std::collections::HashMap;
-use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::thread;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use std::{env, thread};
 
 use serde_json::{Map, Value, json};
 

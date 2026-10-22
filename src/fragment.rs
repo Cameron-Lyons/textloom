@@ -1,6 +1,9 @@
-use std::{borrow::Cow, fmt, sync::Arc};
+use std::borrow::Cow;
+use std::fmt;
+use std::sync::Arc;
 
-use crate::{Color, Document, InlineStyle, Link, Paragraph, ParagraphKind, Span, document::Levels};
+use crate::document::Levels;
+use crate::{Color, Document, InlineStyle, Link, Paragraph, ParagraphKind, Span};
 
 const MAGIC: &[u8; 4] = b"TLFR";
 const VERSION: u8 = 2;

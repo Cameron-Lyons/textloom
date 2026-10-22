@@ -1,14 +1,15 @@
 use crate::{Document, Editor, Error, Fragment, Link, Position, Selection};
 #[cfg(test)]
 use crate::{ParagraphKind, StylePatch};
+use egui::text::{CharIndex, LayoutJob};
 use egui::{
     Color32, Event, FontFamily, FontId, Galley, Id, ImeEvent, Pos2, Rect, Response, Sense,
     TextFormat, TextStyle, Ui, Vec2, Widget,
-    text::{CharIndex, LayoutJob},
 };
 #[cfg(test)]
 use egui::{Key, Modifiers, Stroke, text::CCursor};
-use std::{ops::Range, sync::Arc};
+use std::ops::Range;
+use std::sync::Arc;
 #[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
 

@@ -252,25 +252,19 @@ pub(crate) mod node_semantics {
 
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
-    use super::{
-        AccessibilityOutcome, AccessibleAction, apply_action,
-        node_semantics::{apply_text_style, set_paragraph_semantics},
-    };
-    use crate::{
-        Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection,
-        document::{LINE_SEPARATOR, SpanCursor},
-    };
+    use super::node_semantics::{apply_text_style, set_paragraph_semantics};
+    use super::{AccessibilityOutcome, AccessibleAction, apply_action};
+    use crate::document::{LINE_SEPARATOR, SpanCursor};
+    use crate::{Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
     use accesskit::{
         Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, TreeId,
         TreeInfo, TreeUpdate,
     };
-    use std::{
-        collections::HashMap,
-        fmt,
-        iter::Peekable,
-        ops::Range,
-        sync::{Arc, OnceLock},
-    };
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::iter::Peekable;
+    use std::ops::Range;
+    use std::sync::{Arc, OnceLock};
     use unicode_segmentation::UnicodeSegmentation;
 
     const MAX_RUN_CHARACTERS: usize = u8::MAX as usize;
@@ -1481,13 +1475,13 @@ mod accesskit_bridge {
 
         #[test]
         fn tree_uses_graphemes_line_breaks_and_incremental_updates() {
-            let mut editor = Editor::from_text("a👩🏽‍💻\nlast");
+            let mut editor = Editor::from_text("a👩🏽\u{200d}💻\nlast");
             let mut adapter = AccessKitAdapter::default();
             let tree = adapter.update(&editor, "Notes", true).unwrap();
             assert_eq!(tree.focus, adapter.editor_node());
             let first = adapter.text_runs(0).next().unwrap().0;
             let run = &tree.nodes.iter().find(|(id, _)| *id == first).unwrap().1;
-            assert_eq!(run.value(), Some("a👩🏽‍💻\n"));
+            assert_eq!(run.value(), Some("a👩🏽\u{200d}💻\n"));
             assert_eq!(run.character_lengths(), &[1, 15, 1]);
             let end = adapter
                 .to_text_position(&editor, Position::new(0, 16))
@@ -1815,7 +1809,7 @@ mod accesskit_bridge {
             adapter.update(&editor, "Notes", true).unwrap();
             let first = adapter.paragraph_node(0).unwrap();
             let last = adapter.paragraph_node(3).unwrap();
-            for text in ["é", "👩‍💻"] {
+            for text in ["é", "👩\u{200d}💻"] {
                 editor
                     .set_selection(Selection::caret(Position::new(1, 0)))
                     .unwrap();
@@ -2058,7 +2052,7 @@ mod accesskit_bridge {
 
         #[test]
         fn text_positions_track_structural_edits_and_reject_old_or_unknown_runs() {
-            let mut editor = Editor::from_text("first\naé👩‍💻\nlast");
+            let mut editor = Editor::from_text("first\naé👩\u{200d}💻\nlast");
             let mut adapter = AccessKitAdapter::default();
             adapter.update(&editor, "Notes", true).unwrap();
             let position = Position::new(1, 3);
@@ -2723,7 +2717,7 @@ pub(crate) mod random_edits {
             .map(|item| format!("item {item} alpha beta\u{2028}gamma delta epsilon"))
             .collect();
         let mut editor = Editor::from_text(&format!(
-            "intro é 👩‍💻 text\n{}\nquoted one\nquoted two\nlast",
+            "intro é 👩\u{200d}💻 text\n{}\nquoted one\nquoted two\nlast",
             items.join("\n")
         ));
         set_kinds(
@@ -2843,7 +2837,8 @@ pub(crate) mod random_edits {
         let range = Selection::new(anchor, focus);
         let _ = editor.set_selection(Selection::caret(focus));
         let _ = match random(16) {
-            0 => editor.insert_text(["x", "é", "ab cd", "👩‍💻", "x\ny", "a\u{2028}b"][random(6)]),
+            0 => editor
+                .insert_text(["x", "é", "ab cd", "👩\u{200d}💻", "x\ny", "a\u{2028}b"][random(6)]),
             1 => editor.insert_paragraph(),
             2 => editor.insert_line_break(),
             3 => editor.delete_backward(),
@@ -3021,7 +3016,7 @@ mod tests {
 
     #[test]
     fn snapshot_exposes_semantics_and_grapheme_selections() {
-        let mut editor = Editor::from_text("a👩🏽‍💻\nitem");
+        let mut editor = Editor::from_text("a👩🏽\u{200d}💻\nitem");
         editor
             .set_selection(Selection::new(Position::new(0, 1), Position::new(1, 4)))
             .unwrap();

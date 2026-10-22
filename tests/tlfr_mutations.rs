@@ -30,7 +30,9 @@ fn style(editor: &mut Editor, paragraph: usize, text: &str, patch: StylePatch) {
 }
 
 fn styled_fragment() -> Fragment {
-    let mut editor = Editor::from_text("<b>Hi</b> & \"世界\" e\u{301} 👨‍👩‍👧 🇺🇸\nitem\nnested\n\nlast");
+    let mut editor = Editor::from_text(
+        "<b>Hi</b> & \"世界\" e\u{301} 👨\u{200d}👩\u{200d}👧 🇺🇸\nitem\nnested\n\nlast",
+    );
     style(
         &mut editor,
         0,
@@ -55,7 +57,7 @@ fn styled_fragment() -> Fragment {
     style(
         &mut editor,
         0,
-        "👨‍👩‍👧",
+        "👨\u{200d}👩\u{200d}👧",
         StylePatch {
             strikethrough: Some(true),
             code: Some(true),

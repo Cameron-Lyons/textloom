@@ -133,9 +133,9 @@ fn indexed_unicode_offsets_match_extended_graphemes_and_scalars() {
         "",
         "plain ASCII",
         "café e\u{301}",
-        "👨‍👩‍👧‍👦🇺🇸🇨🇦🇯🇵",
-        "क्‍ष नमस्ते",
-        "a\u{301}\u{302}👩🏽‍💻z",
+        "👨\u{200d}👩\u{200d}👧\u{200d}👦🇺🇸🇨🇦🇯🇵",
+        "क्\u{200d}ष नमस्ते",
+        "a\u{301}\u{302}👩🏽\u{200d}💻z",
     ] {
         let paragraph = Paragraph::plain(text);
         let graphemes: Vec<_> = text
@@ -215,15 +215,15 @@ fn local_grapheme_checks_and_snapping_match_complete_segmentation() {
         "é",
         "café e\u{301}",
         "\u{600}e\u{301}z",
-        "👨‍👩‍👧‍👦🇺🇸🇨🇦🇯🇵",
-        "क्‍ष नमस्ते",
+        "👨\u{200d}👩\u{200d}👧\u{200d}👦🇺🇸🇨🇦🇯🇵",
+        "क्\u{200d}ष नमस्ते",
         "각나",
-        "a\t\u{301}\u{0000}👩🏽‍💻z",
+        "a\t\u{301}\u{0000}👩🏽\u{200d}💻z",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
-    texts.push(format!("a👩{}‍💻z", "\u{301}".repeat(64)));
+    texts.push(format!("a👩{}\u{200d}💻z", "\u{301}".repeat(64)));
     texts.push(format!("a{}z", "🇦".repeat(65)));
     texts.push(format!("aक{}षz", "\u{94d}\u{301}".repeat(33)));
 
@@ -347,7 +347,7 @@ fn trailing_grapheme_tracking_matches_complete_segmentation_while_text_grows() {
 fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
     use crate::{Editor, Movement, Selection};
 
-    let phrase = "café e\u{301} 👩🏽‍💻 🇺🇸 नमस्ते ";
+    let phrase = "café e\u{301} 👩🏽\u{200d}💻 🇺🇸 नमस्ते ";
     let text = phrase.repeat(256);
     let original = Selection::caret(Position::new(0, phrase.len() * 128));
     let mut editor = Editor::from_text(&text);
@@ -382,7 +382,7 @@ fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
 
 #[test]
 fn position_validation_and_style_lookup_leave_grapheme_indexes_lazy() {
-    let text = "café e\u{301} 👩🏽‍💻 🇦🇧🇨 क्‍ष ".repeat(16);
+    let text = "café e\u{301} 👩🏽\u{200d}💻 🇦🇧🇨 क्\u{200d}ष ".repeat(16);
     let mut document = Document::from_text(&text);
     document
         .apply_style(
@@ -418,8 +418,8 @@ fn long_grapheme_contexts_initialize_and_reuse_one_index() {
     for (text, byte) in [
         (format!("a{}z", "🇦".repeat(65)), 1 + 4 * 33),
         (
-            format!("a👩{}‍💻z", "\u{301}".repeat(64)),
-            "a👩‍".len() + "\u{301}".len() * 64,
+            format!("a👩{}\u{200d}💻z", "\u{301}".repeat(64)),
+            "a👩\u{200d}".len() + "\u{301}".len() * 64,
         ),
         (
             format!("aक{}षz", "\u{94d}\u{301}".repeat(33)),
@@ -486,16 +486,16 @@ fn unicode_editing_snaps_carets_and_indexes_only_long_contexts() {
         (
             "café 👩💻 e\u{301}".to_owned(),
             "café 👩".len(),
-            "‍",
-            "café 👩‍💻".len(),
+            "\u{200d}",
+            "café 👩\u{200d}💻".len(),
             false,
         ),
         ("a🇦🇧🇨🇩z".to_owned(), "a🇦🇧".len(), "🇪", "a🇦🇧🇪🇨".len(), false),
         (
             format!("a👩{}💻z", "\u{301}".repeat(64)),
             "a👩".len() + "\u{301}".len() * 64,
-            "‍",
-            "a👩‍💻".len() + "\u{301}".len() * 64,
+            "\u{200d}",
+            "a👩\u{200d}💻".len() + "\u{301}".len() * 64,
             true,
         ),
     ] {
@@ -547,12 +547,12 @@ fn word_navigation_stops_at_unicode_words_and_symbol_runs() {
         "one, two's!",
         "can't 123,456 12.34 under_score a:b; c.d 'word'",
         "\t  one\u{000b}two\u{000c}three \u{0000}four",
-        "café 👩‍💻 नमस्ते 🇺🇸",
+        "café 👩\u{200d}💻 नमस्ते 🇺🇸",
         "你好世界 e\u{301}",
         "!!!",
         "hello 🦀🦀🦀",
         "foo ---------- bar",
-        "a--b 👩‍💻!? c",
+        "a--b 👩\u{200d}💻!? c",
     ] {
         let paragraph = Paragraph::plain(text);
         let stops = stops(text);
@@ -681,7 +681,7 @@ fn word_stops_match_general_word_segmentation() {
 
 #[test]
 fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
-    for text in ["", "plain", "é👩‍💻", "e\u{301}🇦🇧क्‍ष"] {
+    for text in ["", "plain", "é👩\u{200d}💻", "e\u{301}🇦🇧क्\u{200d}ष"] {
         let paragraph = Paragraph::plain(text);
         assert_eq!(paragraph.byte_from_grapheme(0), Some(0));
         assert_eq!(paragraph.byte_from_scalar(0), Some(0));
@@ -695,7 +695,7 @@ fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
         }
     }
 
-    let paragraph = "é👩‍💻e\u{301}".repeat(256);
+    let paragraph = "é👩\u{200d}💻e\u{301}".repeat(256);
     let source = format!("start\n{paragraph}\n{paragraph}");
     let mut editor = crate::Editor::from_text(&source);
     editor
@@ -732,7 +732,7 @@ fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
 
 #[test]
 fn unicode_indexes_are_independently_lazy_and_shared_across_metadata_changes() {
-    let mut document = Document::from_text("café 👩‍💻");
+    let mut document = Document::from_text("café 👩\u{200d}💻");
     let original = Arc::clone(&document.paragraphs()[0]);
     assert!(original.indices.get().is_none());
     assert_eq!(original.scalar_count(), 8);
@@ -837,7 +837,7 @@ fn ascii_word_indexes_are_lazy_shared_and_invalidated_by_text_edits() {
 
 #[test]
 fn uniform_unicode_end_typing_does_not_build_text_indexes() {
-    let mut document = Document::from_text("café 👩‍💻");
+    let mut document = Document::from_text("café 👩\u{200d}💻");
     for _ in 0..3 {
         document
             .replace(document.end()..document.end(), "é", InlineStyle::default())
@@ -1086,8 +1086,8 @@ fn rich_unicode_run_validation_keeps_navigation_indexes_lazy() {
 #[test]
 fn rich_run_ends_match_complete_segmentation_beyond_local_context() {
     let texts = [
-        "café e\u{301}👨‍👩‍👧‍👦🇺🇸각나".to_owned(),
-        format!("a👩{}‍💻z", "\u{301}".repeat(64)),
+        "café e\u{301}👨\u{200d}👩\u{200d}👧\u{200d}👦🇺🇸각나".to_owned(),
+        format!("a👩{}\u{200d}💻z", "\u{301}".repeat(64)),
         format!("a{}z", "🇦".repeat(65)),
         format!("aक{}षz", "\u{94d}\u{301}".repeat(33)),
         format!("{}\u{1161}\u{11a8}é", "\u{1100}".repeat(40)),
@@ -1237,7 +1237,7 @@ fn plain_text_normalizes_newlines_and_preserves_empty_paragraphs() {
 
 #[test]
 fn positions_require_extended_grapheme_boundaries() {
-    let document = Document::from_text("e\u{301}👨‍👩‍👧‍👦🇺🇸");
+    let document = Document::from_text("e\u{301}👨\u{200d}👩\u{200d}👧\u{200d}👦🇺🇸");
     for (byte, _) in document.paragraph(0).unwrap().text().grapheme_indices(true) {
         assert!(document.validate_position(Position::new(0, byte)).is_ok());
     }
@@ -1377,7 +1377,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
             ..InlineStyle::default()
         },
     ];
-    let texts = ["ab e\u{301}👩‍💻cd 🇺🇸ef", "", "क्‍ष xyz"];
+    let texts = ["ab e\u{301}👩\u{200d}💻cd 🇺🇸ef", "", "क्\u{200d}ष xyz"];
     let source = Document::from_paragraphs(
         texts
             .iter()
@@ -1564,7 +1564,7 @@ fn emoji_joiner_insertion_snaps_caret_past_new_cluster() {
     let (_, caret) = document
         .replace(Position::new(0, 4)..Position::new(0, 4), "\u{200d}", bold())
         .unwrap();
-    assert_eq!(document.plain_text(), "👩‍👧");
+    assert_eq!(document.plain_text(), "👩\u{200d}👧");
     assert_eq!(caret, document.end());
     assert_eq!(document.paragraph(0).unwrap().spans().len(), 1);
     assert_normalized(&document);

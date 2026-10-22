@@ -1,15 +1,12 @@
 use super::PARAGRAPH_GAP;
-use crate::{Document, InlineStyle, Paragraph, ParagraphKind, document::LINE_SEPARATOR};
-use egui::{
-    Color32, FontData, FontFamily, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Ui,
-    epaint::{FontsView, TextOptions},
-    text::{ByteIndex, LayoutJob, LayoutSection},
-};
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::Range,
-    sync::Arc,
-};
+use crate::document::LINE_SEPARATOR;
+use crate::{Document, InlineStyle, Paragraph, ParagraphKind};
+use egui::epaint::{FontsView, TextOptions};
+use egui::text::{ByteIndex, LayoutJob, LayoutSection};
+use egui::{Color32, FontData, FontFamily, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Ui};
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+use std::sync::Arc;
 mod index;
 pub(super) use index::{LayoutIdentity, ParagraphLayouts};
 
@@ -699,7 +696,8 @@ mod tests {
     use super::super::{Cache, RichTextEditor};
     use super::*;
     use crate::{Editor, Position, Selection, StylePatch};
-    use egui::{Event, Key, Modifiers, Vec2, epaint::Shape};
+    use egui::epaint::Shape;
+    use egui::{Event, Key, Modifiers, Vec2};
 
     fn appearance(size: f32) -> Appearance {
         Appearance {
@@ -1018,7 +1016,7 @@ mod tests {
     fn layout_counts_scalars_without_indexing_paragraphs() {
         let context = egui::Context::default();
         let mut cache = LayoutCache::default();
-        let document = Document::from_text("café one\nnaïve 👩‍💻 two\nascii three");
+        let document = Document::from_text("café one\nnaïve 👩\u{200d}💻 two\nascii three");
         let (layouts, _) = layout_frame(&context, &mut cache, &document, &appearance(16.0));
         assert!(
             document

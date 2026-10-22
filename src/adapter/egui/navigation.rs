@@ -1,9 +1,7 @@
 use std::ops::Range;
 
-use egui::{
-    Galley, Pos2, Rect, Vec2,
-    text::{CCursor, CharIndex},
-};
+use egui::text::{CCursor, CharIndex};
+use egui::{Galley, Pos2, Rect, Vec2};
 
 use super::layout::ParagraphLayouts;
 use crate::{Document, Editor, Error, Link, Paragraph, Position, Selection};

@@ -5,14 +5,13 @@
 //! read through UI Automation. Results accumulate in results.json under the
 //! VM's state directory, with screenshots per check.
 
-use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{env, thread};
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;

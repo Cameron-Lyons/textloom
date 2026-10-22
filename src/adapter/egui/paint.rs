@@ -1,15 +1,12 @@
 use super::layout::{ParagraphLayoutView, ParagraphLayouts};
 use crate::{Document, Position, Selection};
-use egui::{
-    Color32, FontFamily, FontId, Galley, Pos2, Rect,
-    epaint::{FontsView, text::Glyph},
-    text::{CharIndex, LayoutJob},
-};
-use std::{
-    collections::HashMap,
-    ops::{Range, RangeInclusive},
-    sync::Arc,
-};
+use egui::epaint::FontsView;
+use egui::epaint::text::Glyph;
+use egui::text::{CharIndex, LayoutJob};
+use egui::{Color32, FontFamily, FontId, Galley, Pos2, Rect};
+use std::collections::HashMap;
+use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
 
 pub(super) type BackgroundRanges<'a> = (&'a [Range<Position>], Color32);
 

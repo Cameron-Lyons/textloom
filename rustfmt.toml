@@ -1,0 +1,7 @@
+# Formatting follows the Google Rust Style Guide
+# (https://google.github.io/styleguide/rustguide.html#use-the-appropriate-formatting-tool).
+# Its `imports_granularity = "Module"` and `format_macro_matchers = true` options
+# need nightly rustfmt, so they live in `scripts/format.sh` instead of here,
+# where stable `cargo fmt` would warn about them on every run.
+max_width = 100
+hex_literal_case = "Lower"

@@ -1,8 +1,7 @@
-use std::{
-    hint::black_box,
-    time::{Duration, Instant},
-};
-use textloom::{Editor, Position, Selection, adapter::egui::RichTextEditor};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+use textloom::adapter::egui::RichTextEditor;
+use textloom::{Editor, Position, Selection};
 
 fn scaled(iterations: usize) -> usize {
     let quick = std::env::var_os("TEXTLOOM_BENCH_QUICK").is_some_and(|value| !value.is_empty());
@@ -275,7 +274,7 @@ fn batched_typing_frames() {
 
 fn document_text(paragraphs: usize) -> String {
     (0..paragraphs)
-        .map(|index| format!("Paragraph {index}: Unicode café 👩‍💻, with some words.\n"))
+        .map(|index| format!("Paragraph {index}: Unicode café 👩\u{200d}💻, with some words.\n"))
         .collect()
 }
 
@@ -385,7 +384,7 @@ fn formatted_accessibility_frames() {
 }
 
 fn native_preedit_frames() {
-    let text = "café 👩‍💻 ".repeat(10_000);
+    let text = "café 👩\u{200d}💻 ".repeat(10_000);
     let scalars = text.chars().count();
     for (label, scalar, byte) in [("start", 0, 0), ("end", scalars, text.len())] {
         let context = egui::Context::default();
@@ -414,7 +413,7 @@ fn native_preedit_frames() {
 }
 
 fn long_preedit_frames() {
-    let text = "café 👩‍💻 ".repeat(10_000);
+    let text = "café 👩\u{200d}💻 ".repeat(10_000);
     let changed_text = format!("{text}x");
     let context = egui::Context::default();
     let mut editor = Editor::default();

@@ -9,10 +9,8 @@ use accesskit::{
 use accesskit_consumer::{
     FilterResult, NodeRef as Node, TextRangePropertyValue, Tree, TreeChangeHandler, common_filter,
 };
-use textloom::{
-    Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch,
-    accessibility::AccessKitAdapter,
-};
+use textloom::accessibility::AccessKitAdapter;
+use textloom::{Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch};
 
 struct Ignore;
 
@@ -160,7 +158,7 @@ fn word_navigation_follows_editor_words() {
 #[test]
 fn word_starts_match_editor_words_across_long_runs() {
     let mut editor = Editor::from_text(&format!(
-        "{}\n  h\u{e9}llo, w\u{f6}rld 👩‍💻 x\n{} tail\n",
+        "{}\n  h\u{e9}llo, w\u{f6}rld 👩\u{200d}💻 x\n{} tail\n",
         "ab, cd ".repeat(100),
         "\u{e9}".repeat(300)
     ));
@@ -362,7 +360,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
             2 => editor.insert_paragraph(),
             3 => editor.delete_backward(),
             4 => editor.delete_forward(),
-            5 => editor.insert_text("é👩‍💻 q\nr\u{2028}\n"),
+            5 => editor.insert_text("é👩\u{200d}💻 q\nr\u{2028}\n"),
             11 => editor.insert_line_break(),
             6 => {
                 editor.undo();

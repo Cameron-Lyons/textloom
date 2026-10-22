@@ -68,7 +68,7 @@ fn queries_normalize_newlines_and_preserve_empty_paragraph_coordinates() {
 
 #[test]
 fn only_complete_graphemes_match() {
-    let document = Document::from_text("e\u{301} e 👩‍💻 👩 🇺🇸 🇺");
+    let document = Document::from_text("e\u{301} e 👩\u{200d}💻 👩 🇺🇸 🇺");
     assert_eq!(
         document.find("e", default_options()),
         vec![Position::new(0, 4)..Position::new(0, 5)]
@@ -81,7 +81,7 @@ fn only_complete_graphemes_match() {
     let flags = document.find("🇺", default_options());
     assert_eq!(flags.len(), 1);
     assert_eq!(document.text(flags[0].clone()).unwrap(), "🇺");
-    assert_eq!(document.find("👩‍💻", default_options()).len(), 1);
+    assert_eq!(document.find("👩\u{200d}💻", default_options()).len(), 1);
     assert_eq!(
         Document::from_text("🇨🇺🇺🇺").find("🇺🇺", default_options()),
         vec![Position::new(0, 8)..Position::new(0, 16)]
@@ -628,7 +628,7 @@ fn generated_unicode_matches_agree_with_a_grapheme_reference() {
         "e\u{301}",
         "é",
         "🇨🇺🇺🇺",
-        "👩‍💻",
+        "👩\u{200d}💻",
         "\u{0600}word",
         "你好",
     ];
@@ -789,7 +789,7 @@ fn local_navigation_keeps_forward_nonoverlap_and_folds_final_sigma() {
 #[test]
 fn literal_navigation_agrees_with_forward_matches_around_rejected_unicode_candidates() {
     let mut editor = Editor::from_text(
-        "e\u{301} e e\u{301}\n👩‍💻 👩 👩‍💻\n🇺🇸 🇺 🇨🇺\ncafé café\n\u{0600}word word\nabca abcabca\nana banana\n",
+        "e\u{301} e e\u{301}\n👩\u{200d}💻 👩 👩\u{200d}💻\n🇺🇸 🇺 🇨🇺\ncafé café\n\u{0600}word word\nabca abcabca\nana banana\n",
     );
     let positions: Vec<_> = editor
         .document()
@@ -807,7 +807,7 @@ fn literal_navigation_agrees_with_forward_matches_around_rejected_unicode_candid
         "e",
         "\u{301}",
         "👩",
-        "👩‍💻",
+        "👩\u{200d}💻",
         "🇺",
         "café",
         "word",
@@ -942,7 +942,7 @@ fn nearby_navigation_in_long_paragraphs_matches_the_forward_match_stream() {
     for index in 0..420 {
         text.push_str(match index % 7 {
             0 => "\u{212A}elvin İ matches ",
-            1 => "café 👩‍💻 ",
+            1 => "café 👩\u{200d}💻 ",
             2 => "e\u{301}xmatch\u{2028}",
             3 => "ΣΟΣ, ",
             4 => "aab\u{3000}",
@@ -1149,7 +1149,7 @@ fn whole_word_navigation_in_long_non_latin_paragraphs_matches_the_forward_match_
 
 #[test]
 fn navigation_after_edits_between_presses_matches_document_search() {
-    let text = "Match matches aab ΣΟΣ café 👩‍💻 \u{212A}elvin. ".repeat(80);
+    let text = "Match matches aab ΣΟΣ café 👩\u{200d}💻 \u{212A}elvin. ".repeat(80);
     for case_sensitive in [false, true] {
         for whole_word in [false, true] {
             let options = SearchOptions {
@@ -1216,7 +1216,7 @@ fn navigation_after_edits_between_presses_matches_document_search() {
 
 #[test]
 fn cross_paragraph_navigation_after_edits_between_presses_matches_document_search() {
-    let text = "Match café 👩‍💻\nΣΟΣ matches \u{212A}elvin.\naab ΣΟΣ\n".repeat(12);
+    let text = "Match café 👩\u{200d}💻\nΣΟΣ matches \u{212A}elvin.\naab ΣΟΣ\n".repeat(12);
     let mut total = 0;
     for case_sensitive in [false, true] {
         for whole_word in [false, true] {
@@ -1225,9 +1225,9 @@ fn cross_paragraph_navigation_after_edits_between_presses_matches_document_searc
                 whole_word,
             };
             for query in [
-                "café 👩‍💻\r\nΣΟΣ",
+                "café 👩\u{200d}💻\r\nΣΟΣ",
                 "\u{212A}elvin.\naab",
-                "👩‍💻\nΣΟΣ matches \u{212A}elvin.\naab",
+                "👩\u{200d}💻\nΣΟΣ matches \u{212A}elvin.\naab",
                 "οσ\nmatch",
                 "\n",
                 "\nΣΟΣ matches \u{212A}elvin.\n",

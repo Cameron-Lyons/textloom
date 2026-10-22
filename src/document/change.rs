@@ -1,9 +1,7 @@
-use std::{
-    cell::OnceCell,
-    collections::{HashMap, HashSet},
-    ops::Range,
-    sync::{Arc, OnceLock},
-};
+use std::cell::OnceCell;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use super::{Document, Paragraph};
 

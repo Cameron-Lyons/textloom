@@ -1,7 +1,5 @@
-use super::{
-    Cache,
-    layout::{Appearance, LayoutCache, ParagraphLayouts},
-};
+use super::Cache;
+use super::layout::{Appearance, LayoutCache, ParagraphLayouts};
 use crate::{Composition, Document, Editor, Error, InlineStyle, Position, Selection};
 use egui::Ui;
 use std::sync::Arc;

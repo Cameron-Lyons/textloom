@@ -1,11 +1,9 @@
-use std::{
-    ffi::OsString,
-    fmt::Write as _,
-    fs::{File, OpenOptions},
-    io::{self, Write as _},
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::ffi::OsString;
+use std::fmt::Write as _;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use textloom::{Composition, Editor, InlineStyle, Selection};

@@ -170,7 +170,7 @@ mod tests {
     fn native_formats_preserve_unicode_styles_and_replaced_publications() {
         autoreleasepool(|_| {
             let board = TestPasteboard::new();
-            let mut editor = Editor::from_text("café 日本語 e\u{301} 👩🏽‍💻\nsecond");
+            let mut editor = Editor::from_text("café 日本語 e\u{301} 👩🏽\u{200d}💻\nsecond");
             editor.select_all();
             editor
                 .apply_style(StylePatch {

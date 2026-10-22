@@ -1,7 +1,5 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use textloom::{
     Color, Document, Editor, Error, Fragment, FragmentError, InlineStyle, Link, Movement,
@@ -76,8 +74,8 @@ fn link_targets_are_validated_and_compare_by_text() {
     assert_eq!(Link::new(&longest).unwrap().as_str().len(), 64 * 1024);
     assert_eq!(Link::new(&format!("{longest}a")), Err(Error::InvalidLink));
 
-    let unicode = link("https://例え.jp/パス?q=café#👩‍💻");
-    assert_eq!(unicode.as_str(), "https://例え.jp/パス?q=café#👩‍💻");
+    let unicode = link("https://例え.jp/パス?q=café#👩\u{200d}💻");
+    assert_eq!(unicode.as_str(), "https://例え.jp/パス?q=café#👩\u{200d}💻");
     assert_eq!(unicode.to_string(), unicode.as_str());
     assert_eq!(format!("{:?}", link("mailto:a@b")), "Link(\"mailto:a@b\")");
     let separate = link(unicode.as_str());
@@ -150,7 +148,7 @@ fn runs_merge_only_when_their_style_and_link_agree() {
         assert_eq!(document.link_range_at(missing), None);
     }
     let emoji = Document::from_paragraphs([Paragraph::new(
-        "👩‍💻",
+        "👩\u{200d}💻",
         vec![span(0..11, InlineStyle::default(), Some("https://a"))],
         ParagraphKind::Body,
     )
@@ -391,7 +389,7 @@ fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
         link,
     });
     let document = Document::from_paragraphs([
-        Paragraph::new("é👩‍💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
+        Paragraph::new("é👩\u{200d}💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
         Paragraph::new(
             "next",
             vec![Span {

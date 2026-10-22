@@ -88,7 +88,7 @@ impl RichClipboard for TestClipboard {
 }
 
 fn styled_clipboard_editor() -> Editor {
-    let mut editor = Editor::from_text("café 日本語👩🏽‍💻\nsecond");
+    let mut editor = Editor::from_text("café 日本語👩🏽\u{200d}💻\nsecond");
     editor.select_all();
     editor
         .apply_style(StylePatch {
@@ -1182,7 +1182,7 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
     editor
         .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 3)))
         .unwrap();
-    let text = "あ\r\n👩‍💻";
+    let text = "あ\r\n👩\u{200d}💻";
     editor.update_composition(text, Some(0..3)).unwrap();
     let first = cached_preview_frame(&context, &mut cache, &editor, &appearance);
     let identity = cache.preview.as_ref().unwrap().document.content_identity();
@@ -1231,7 +1231,10 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
     let preview = cache.preview.as_ref().unwrap();
     assert!(first.identity().ptr_eq(&restored.identity()));
     assert_eq!(preview.caret, Position::new(1, 0));
-    assert_eq!(preview.document.plain_text(), "first\nあ\n👩‍💻\nlast");
+    assert_eq!(
+        preview.document.plain_text(),
+        "first\nあ\n👩\u{200d}💻\nlast"
+    );
     assert_eq!(editor.document().plain_text(), "first\nOLD\nlast");
     assert!(!editor.can_undo());
 }
@@ -1744,7 +1747,7 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
 
     let context = egui::Context::default();
     let source = (0..160)
-        .map(|index| format!("{index}: café e\u{301} 👩‍💻 日本語 words\n"))
+        .map(|index| format!("{index}: café e\u{301} 👩\u{200d}💻 日本語 words\n"))
         .collect::<String>();
     let mut editor = Editor::from_text(&source);
     let mut retained = Cache::default();
@@ -1832,9 +1835,13 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             }
             12 => {
                 set_middle(&mut editor, index);
-                editor.update_composition("あ\n👩‍💻", Some(3..3)).unwrap();
+                editor
+                    .update_composition("あ\n👩\u{200d}💻", Some(3..3))
+                    .unwrap();
             }
-            13 => editor.update_composition("あ\n👩‍💻", Some(4..4)).unwrap(),
+            13 => editor
+                .update_composition("あ\n👩\u{200d}💻", Some(4..4))
+                .unwrap(),
             14 => editor
                 .update_composition("日本e\u{301}", Some(6..9))
                 .unwrap(),
@@ -2074,7 +2081,7 @@ fn malformed_shaping_retries_preserve_rendered_text_styles_and_widget_navigation
 fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
     let context = egui::Context::default();
     let mut cache = Cache::default();
-    let editor = Editor::from_text("atlas glyphs café 👩‍💻\nunchanged paragraph");
+    let editor = Editor::from_text("atlas glyphs café 👩\u{200d}💻\nunchanged paragraph");
     let appearance = appearance();
     let mut previous = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     for change_hinting in [true, false] {
@@ -2370,18 +2377,21 @@ fn command_navigation_and_altgr_preserve_platform_shortcut_semantics() {
 fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
     let context = egui::Context::default();
     context.set_os(egui::os::OperatingSystem::Mac);
-    let text = "prefix\ncafé e\u{301}👩🏽‍💻\u{2028}tail\nlast";
+    let text = "prefix\ncafé e\u{301}👩🏽\u{200d}💻\u{2028}tail\nlast";
     let start = Position::new(1, "café e\u{301}".len());
     for (key, expected) in [
         (Key::A, Position::new(1, 0)),
         (
             Key::E,
-            Position::new(1, "café e\u{301}👩🏽‍💻\u{2028}tail".len()),
+            Position::new(1, "café e\u{301}👩🏽\u{200d}💻\u{2028}tail".len()),
         ),
         (Key::B, Position::new(1, "café ".len())),
-        (Key::F, Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+        (Key::F, Position::new(1, "café e\u{301}👩🏽\u{200d}💻".len())),
         (Key::ArrowLeft, Position::new(1, 0)),
-        (Key::ArrowRight, Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+        (
+            Key::ArrowRight,
+            Position::new(1, "café e\u{301}👩🏽\u{200d}💻".len()),
+        ),
     ] {
         for extend in [false, true] {
             let mut editor = Editor::from_text(text);
@@ -2442,12 +2452,12 @@ fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
 fn macos_control_deletion_is_grapheme_safe_undoable_and_guarded() {
     let context = egui::Context::default();
     context.set_os(egui::os::OperatingSystem::Mac);
-    let text = "a e\u{301}👩🏽‍💻 z";
+    let text = "a e\u{301}👩🏽\u{200d}💻 z";
     let caret = Selection::caret(Position::new(0, "a e\u{301}".len()));
     for (key, expected) in [
-        (Key::H, "a 👩🏽‍💻 z"),
+        (Key::H, "a 👩🏽\u{200d}💻 z"),
         (Key::D, "a e\u{301} z"),
-        (Key::Backspace, "a 👩🏽‍💻 z"),
+        (Key::Backspace, "a 👩🏽\u{200d}💻 z"),
     ] {
         let mut editor = Editor::from_text(text);
         editor.set_selection(caret).unwrap();
@@ -2490,7 +2500,7 @@ fn macos_option_vertical_navigation_visits_paragraph_boundaries() {
     }
     let context = egui::Context::default();
     context.set_os(egui::os::OperatingSystem::Mac);
-    let text = "many words that wrap onto several visual lines\n\ncafé 👩🏽‍💻 tail\nlast";
+    let text = "many words that wrap onto several visual lines\n\ncafé 👩🏽\u{200d}💻 tail\nlast";
     for (key, start, targets) in [
         (
             Key::ArrowUp,
@@ -2508,7 +2518,7 @@ fn macos_option_vertical_navigation_visits_paragraph_boundaries() {
             vec![
                 Position::new(0, text.find('\n').unwrap()),
                 Position::new(1, 0),
-                Position::new(2, "café 👩🏽‍💻 tail".len()),
+                Position::new(2, "café 👩🏽\u{200d}💻 tail".len()),
                 Position::new(3, 4),
                 Position::new(3, 4),
             ],
@@ -2549,7 +2559,7 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
     }
     let command = Modifiers::MAC_CMD | Modifiers::COMMAND;
     for text in [
-        "keep\u{2028}café e\u{301}👩🏽‍💻 tail",
+        "keep\u{2028}café e\u{301}👩🏽\u{200d}💻 tail",
         "first second third fourth fifth sixth seventh eighth ninth tenth eleventh",
     ] {
         let context = egui::Context::default();
@@ -2589,11 +2599,11 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
 
     for reverse in [false, true] {
         let context = egui::Context::default();
-        let text = "keep\u{2028}café 👩🏽‍💻 tail";
+        let text = "keep\u{2028}café 👩🏽\u{200d}💻 tail";
         let mut editor = Editor::from_text(text);
         let (a, b) = (
             Position::new(0, "keep\u{2028}".len()),
-            Position::new(0, "keep\u{2028}café 👩🏽‍💻".len()),
+            Position::new(0, "keep\u{2028}café 👩🏽\u{200d}💻".len()),
         );
         let selection = if reverse {
             Selection::new(b, a)
@@ -2619,8 +2629,8 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
 
 #[test]
 fn command_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
-    let text = "prefix\ncafé 👩🏽‍💻 tail";
-    let end = Position::new(1, "café 👩🏽‍💻".len());
+    let text = "prefix\ncafé 👩🏽\u{200d}💻 tail";
+    let end = Position::new(1, "café 👩🏽\u{200d}💻".len());
     let caret = Selection::caret(end);
     for selection in [
         caret,
@@ -2917,7 +2927,7 @@ fn unfocused_widget_leaves_text_events_for_host() {
 fn ime_preedit_is_transient_then_commits_once() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("hello");
-    let preedit = "に\r\n👩‍💻e\u{301}";
+    let preedit = "に\r\n👩\u{200d}💻e\u{301}";
     frame(
         &context,
         &mut editor,
@@ -2949,9 +2959,15 @@ fn ime_preedit_is_transient_then_commits_once() {
 
 #[test]
 fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges() {
-    let long_unicode = "に\r\n👩‍💻e\u{301}".repeat(9);
+    let long_unicode = "に\r\n👩\u{200d}💻e\u{301}".repeat(9);
     let long_ascii = "a".repeat(65);
-    for text in ["", "plain", "に\r\n👩‍💻e\u{301}", &long_unicode, &long_ascii] {
+    for text in [
+        "",
+        "plain",
+        "に\r\n👩\u{200d}💻e\u{301}",
+        &long_unicode,
+        &long_ascii,
+    ] {
         let boundaries: Vec<_> = text
             .char_indices()
             .map(|(byte, _)| byte)
@@ -3006,7 +3022,7 @@ fn rejected_native_preedit_ranges_preserve_the_active_composition() {
             .run_ui(
                 egui::RawInput {
                     events: vec![Event::Ime(ImeEvent::Preedit {
-                        text: "changed\r\n👩‍💻".into(),
+                        text: "changed\r\n👩\u{200d}💻".into(),
                         active_range_chars: Some(range),
                     })],
                     ..Default::default()
@@ -3135,7 +3151,12 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
 #[test]
 fn character_hit_positions_snap_to_whole_graphemes() {
     let context = egui::Context::default();
-    for text in ["", "plain", "a👨‍👩‍👧‍👦e\u{301} 🇺🇸", "\u{600}a b"] {
+    for text in [
+        "",
+        "plain",
+        "a👨\u{200d}👩\u{200d}👧\u{200d}👦e\u{301} 🇺🇸",
+        "\u{600}a b",
+    ] {
         let editor = Editor::from_text(text);
         let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
         let layout = layouts.get(0).unwrap();
@@ -3548,7 +3569,7 @@ fn double_click_at_paragraph_end_selects_the_trailing_word() {
     };
     for (text, expected) in [
         ("hello café", "café"),
-        ("hello 👩🏽‍💻", "👩🏽‍💻"),
+        ("hello 👩🏽\u{200d}💻", "👩🏽\u{200d}💻"),
         ("hello 🇺🇸🇨🇦", "🇨🇦"),
         ("e\u{301}", "e\u{301}"),
         ("hello ", " "),
@@ -4465,9 +4486,9 @@ fn surrounding_deletion_expands_graphemes_and_undo_restores_caret() {
 
 #[test]
 fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
-    let editor = Editor::from_text("aé\n\ne\u{301}👩🏽‍💻!\nlast");
+    let editor = Editor::from_text("aé\n\ne\u{301}👩🏽\u{200d}💻!\nlast");
     let document = editor.document();
-    let focus = Position::new(2, "e\u{301}👩🏽‍💻".len());
+    let focus = Position::new(2, "e\u{301}👩🏽\u{200d}💻".len());
     for (count, expected) in [
         (0, focus),
         (1, Position::new(2, "e\u{301}".len())),
@@ -4492,7 +4513,7 @@ fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
         (3, Position::new(2, 0)),
         (4, Position::new(2, "e\u{301}".len())),
         (5, Position::new(2, "e\u{301}".len())),
-        (6, Position::new(2, "e\u{301}👩🏽‍💻".len())),
+        (6, Position::new(2, "e\u{301}👩🏽\u{200d}💻".len())),
         (usize::MAX, document.end()),
     ] {
         assert_eq!(surrounding_position(document, focus, count, true), expected);
@@ -4700,7 +4721,7 @@ fn accessibility_emoji_selection_and_replacement_use_graphemes() {
     use egui::accesskit::{Action, ActionData, ActionRequest, Role, TextSelection, TreeId};
     let context = egui::Context::default();
     context.enable_accesskit();
-    let mut editor = Editor::from_text("a👩🏽‍💻e\u{301}");
+    let mut editor = Editor::from_text("a👩🏽\u{200d}💻e\u{301}");
     let output = frame(&context, &mut editor, vec![], true);
     let update = output
         .platform_output
@@ -4739,7 +4760,7 @@ fn accessibility_emoji_selection_and_replacement_use_graphemes() {
         })],
         true,
     );
-    assert_eq!(editor.selected_text(), "👩🏽‍💻");
+    assert_eq!(editor.selected_text(), "👩🏽\u{200d}💻");
     frame(
         &context,
         &mut editor,
@@ -4753,7 +4774,7 @@ fn accessibility_emoji_selection_and_replacement_use_graphemes() {
     );
     assert_eq!(editor.document().plain_text(), "axe\u{301}");
     assert!(editor.undo());
-    assert_eq!(editor.selected_text(), "👩🏽‍💻");
+    assert_eq!(editor.selected_text(), "👩🏽\u{200d}💻");
 }
 
 #[test]
@@ -5873,14 +5894,14 @@ fn fills_paint_behind_glyphs_replace_code_backgrounds_and_keep_selection_visible
 #[test]
 fn retained_paint_reuses_galleys_until_the_font_cache_changes() {
     let context = egui::Context::default();
-    let mut editor = Editor::from_text("cached painted café 👩‍💻");
+    let mut editor = Editor::from_text("cached painted café 👩\u{200d}💻");
     let painted = |output: &egui::FullOutput| {
         output
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
                 egui::epaint::Shape::Text(text)
-                    if text.galley.job.text == "cached painted café 👩‍💻" =>
+                    if text.galley.job.text == "cached painted café 👩\u{200d}💻" =>
                 {
                     Some(text.galley.clone())
                 }
@@ -5912,7 +5933,7 @@ fn retained_paint_reuses_galleys_until_the_font_cache_changes() {
 fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes() {
     let contexts = [egui::Context::default(), egui::Context::default()];
     let mut editor = Editor::from_text(
-        "filled café and 👩‍💻 text\nordered words wrapping across several rows\nquote text",
+        "filled café and 👩\u{200d}💻 text\nordered words wrapping across several rows\nquote text",
     );
     editor
         .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 6)))
@@ -6944,7 +6965,7 @@ fn rejected_preedit_ranges_preserve_canceled_commit_echoes() {
                     time: Some(0.3),
                     events: vec![
                         Event::Ime(ImeEvent::Preedit {
-                            text: "changed\r\n👩‍💻".into(),
+                            text: "changed\r\n👩\u{200d}💻".into(),
                             active_range_chars: Some(range),
                         }),
                         Event::Ime(ImeEvent::Commit("한".into())),
@@ -7832,10 +7853,8 @@ fn shortcuts_follow_shift_layout_and_read_only_policies() {
 #[test]
 fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
     use crate::adapter::winit::{CommandModifier, WinitAdapter};
-    use winit::{
-        event::ElementState,
-        keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey},
-    };
+    use winit::event::ElementState;
+    use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
     type LayoutKey = (KeyCode, Key, char, char);
     let layouts: [(&str, &[LayoutKey]); 4] = [
         (
@@ -8269,7 +8288,7 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text(&format!(
         "{}\nmatch tail\n\nmatch",
-        "café 👩‍💻 match नमस्ते 🇺🇸 \u{2028}".repeat(16)
+        "café 👩\u{200d}💻 match नमस्ते 🇺🇸 \u{2028}".repeat(16)
     ));
     let mut cache = Cache::default();
     let mut appearance = appearance();

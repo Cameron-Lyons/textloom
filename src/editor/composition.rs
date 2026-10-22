@@ -1,4 +1,5 @@
-use std::{ops::Range, sync::Arc};
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::{Editor, typing_group};
 use crate::{Error, Selection};
@@ -148,9 +149,11 @@ mod tests {
     #[test]
     fn exclusive_composition_updates_reuse_text_storage() {
         let mut editor = Editor::default();
-        editor.update_composition("café 👩‍💻", None).unwrap();
+        editor
+            .update_composition("café 👩\u{200d}💻", None)
+            .unwrap();
         let storage = editor.composition().unwrap().text.as_ptr();
-        for text in ["café 👩‍💻", "café", "café 👩‍💻"] {
+        for text in ["café 👩\u{200d}💻", "café", "café 👩\u{200d}💻"] {
             editor.update_composition(text, None).unwrap();
             assert_eq!(editor.composition().unwrap().text.as_ptr(), storage);
             assert_eq!(editor.composition().unwrap().text, text);

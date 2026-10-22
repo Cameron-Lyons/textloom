@@ -1,17 +1,13 @@
-use super::{
-    CommitEcho, RichClipboard,
-    layout::ParagraphLayouts,
-    navigation::{
-        VerticalNavigation, page_position, paragraph_boundary_position, preedit_byte_range,
-        row_boundary_position, vertical_position,
-    },
-    record,
+use super::layout::ParagraphLayouts;
+use super::navigation::{
+    VerticalNavigation, page_position, paragraph_boundary_position, preedit_byte_range,
+    row_boundary_position, vertical_position,
 };
-use crate::{
-    Document, Editor, Error, Movement, ParagraphKind, Position, Selection,
-    adapter::{Shortcut, clean_text, shortcut_key_name},
-};
-use egui::{Event, ImeEvent, Key, Modifiers, Ui, os::OperatingSystem};
+use super::{CommitEcho, RichClipboard, record};
+use crate::adapter::{Shortcut, clean_text, shortcut_key_name};
+use crate::{Document, Editor, Error, Movement, ParagraphKind, Position, Selection};
+use egui::os::OperatingSystem;
+use egui::{Event, ImeEvent, Key, Modifiers, Ui};
 
 pub(super) fn copy_selection(
     editor: &Editor,

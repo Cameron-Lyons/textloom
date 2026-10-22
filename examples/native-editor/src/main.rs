@@ -1,10 +1,6 @@
-use std::{
-    ops::Range,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 use textloom::{
@@ -72,7 +68,7 @@ impl NativeEditor {
         clipboard: Option<clipboard::NativeClipboard>,
     ) -> Self {
         let mut editor = Editor::from_text(
-            "TextLoom\nSelect text to format it, or start writing.\nUnicode: café, 日本語, 👨‍👩‍👧‍👦.\nLists, undo, search, and rich snapshots.\nEnter continues a list; Enter on an empty item exits it.",
+            "TextLoom\nSelect text to format it, or start writing.\nUnicode: café, 日本語, 👨\u{200d}👩\u{200d}👧\u{200d}👦.\nLists, undo, search, and rich snapshots.\nEnter continues a list; Enter on an empty item exits it.",
         );
         editor
             .set_paragraph_kind(ParagraphKind::Heading { level: 1 })
@@ -1265,7 +1261,8 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use eframe::App as _;
     use egui::accesskit::{Node, NodeId, Role};

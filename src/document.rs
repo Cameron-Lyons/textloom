@@ -1,9 +1,7 @@
-use std::{
-    borrow::Cow,
-    fmt,
-    ops::Range,
-    sync::{Arc, OnceLock},
-};
+use std::borrow::Cow;
+use std::fmt;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 

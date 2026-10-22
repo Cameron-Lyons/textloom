@@ -1,7 +1,5 @@
-use std::{
-    borrow::Cow,
-    ops::{ControlFlow, Range},
-};
+use std::borrow::Cow;
+use std::ops::{ControlFlow, Range};
 
 use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
@@ -956,7 +954,7 @@ mod tests {
             "é",
             "🇨🇺",
             "🇺",
-            "👩‍💻",
+            "👩\u{200d}💻",
             "\u{200d}",
             "\u{2028}",
             "word",

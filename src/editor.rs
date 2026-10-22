@@ -1,8 +1,6 @@
-use std::{
-    fmt,
-    ops::Range,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
-};
+use std::fmt;
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 mod composition;
 mod history;

@@ -1,10 +1,6 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::document::Delta;
 use crate::{Document, InlineStyle, Selection};

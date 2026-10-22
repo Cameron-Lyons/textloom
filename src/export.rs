@@ -1,9 +1,8 @@
-use std::{fmt::Write, sync::Arc};
+use std::fmt::Write;
+use std::sync::Arc;
 
-use crate::{
-    Color, Link, Paragraph, ParagraphKind,
-    document::{LINE_SEPARATOR, Levels},
-};
+use crate::document::{LINE_SEPARATOR, Levels};
+use crate::{Color, Link, Paragraph, ParagraphKind};
 
 pub(crate) fn plain_text(paragraphs: &[Arc<Paragraph>]) -> String {
     let capacity = paragraphs

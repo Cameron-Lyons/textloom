@@ -1,11 +1,9 @@
 use super::{Shortcut, clean_text, shortcut_key_name};
 use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection};
-use winit::{
-    dpi::{LogicalPosition, LogicalSize},
-    event::{ElementState, Ime, WindowEvent},
-    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
-    window::Window,
-};
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::event::{ElementState, Ime, WindowEvent};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::window::Window;
 
 const CTRL_ALT_IS_ALTGR: bool = cfg!(windows);
 
@@ -1060,8 +1058,8 @@ mod tests {
 
     #[test]
     fn super_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
-        let text = "prefix\ncafé 👩🏽‍💻 tail";
-        let end = Position::new(1, "café 👩🏽‍💻".len());
+        let text = "prefix\ncafé 👩🏽\u{200d}💻 tail";
+        let end = Position::new(1, "café 👩🏽\u{200d}💻".len());
         let caret = Selection::caret(end);
         for selection in [
             caret,
@@ -1396,7 +1394,7 @@ mod tests {
 
     #[test]
     fn rich_clipboard_captures_styles_before_cut_and_pastes_atomically() {
-        let mut editor = Editor::from_text("café 👩‍💻");
+        let mut editor = Editor::from_text("café 👩\u{200d}💻");
         editor.select_all();
         editor
             .apply_style(StylePatch {
@@ -2498,13 +2496,13 @@ mod tests {
 
     #[test]
     fn macos_control_letters_move_and_extend_without_splitting_graphemes() {
-        let text = "first\ncafé e\u{301}👩🏽‍💻\nthird";
+        let text = "first\ncafé e\u{301}👩🏽\u{200d}💻\nthird";
         let start = Position::new(1, "café e\u{301}".len());
         for (letter, expected) in [
             ("a", Position::new(1, 0)),
-            ("e", Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+            ("e", Position::new(1, "café e\u{301}👩🏽\u{200d}💻".len())),
             ("b", Position::new(1, "café ".len())),
-            ("f", Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+            ("f", Position::new(1, "café e\u{301}👩🏽\u{200d}💻".len())),
             ("p", Position::new(0, 5)),
             ("n", Position::new(2, 5)),
         ] {
@@ -2537,12 +2535,12 @@ mod tests {
 
     #[test]
     fn macos_control_deletes_one_grapheme_and_respects_edit_guards() {
-        let text = "a e\u{301}👩🏽‍💻 z";
+        let text = "a e\u{301}👩🏽\u{200d}💻 z";
         let caret = Selection::caret(Position::new(0, "a e\u{301}".len()));
         for (logical, expected) in [
-            (Key::Character("h".into()), "a 👩🏽‍💻 z"),
+            (Key::Character("h".into()), "a 👩🏽\u{200d}💻 z"),
             (Key::Character("d".into()), "a e\u{301} z"),
-            (Key::Named(NamedKey::Backspace), "a 👩🏽‍💻 z"),
+            (Key::Named(NamedKey::Backspace), "a 👩🏽\u{200d}💻 z"),
         ] {
             let mut editor = Editor::from_text(text);
             editor.set_selection(caret).unwrap();
@@ -2569,7 +2567,7 @@ mod tests {
 
     #[test]
     fn macos_option_vertical_navigation_visits_and_selects_paragraph_boundaries() {
-        let text = "first\n\ncafé 👩🏽‍💻 tail\nlast";
+        let text = "first\n\ncafé 👩🏽\u{200d}💻 tail\nlast";
         for (named, start, targets) in [
             (
                 NamedKey::ArrowUp,
@@ -2587,7 +2585,7 @@ mod tests {
                 vec![
                     Position::new(0, 5),
                     Position::new(1, 0),
-                    Position::new(2, "café 👩🏽‍💻 tail".len()),
+                    Position::new(2, "café 👩🏽\u{200d}💻 tail".len()),
                     Position::new(3, 4),
                     Position::new(3, 4),
                 ],
@@ -2620,7 +2618,7 @@ mod tests {
 
     #[test]
     fn macos_command_line_navigation_and_deletion_stop_at_soft_breaks() {
-        let text = "keep\u{2028}café e\u{301}👩🏽‍💻 tail";
+        let text = "keep\u{2028}café e\u{301}👩🏽\u{200d}💻 tail";
         let start = Position::new(0, "keep\u{2028}café e\u{301}".len());
         let line_start = Position::new(0, "keep\u{2028}".len());
         for modifiers in [ModifiersState::SUPER, ModifiersState::CONTROL] {
@@ -2669,7 +2667,7 @@ mod tests {
         );
         assert_eq!(
             editor.document().paragraph(0).unwrap().text(),
-            "keep\u{2028}👩🏽‍💻 tail"
+            "keep\u{2028}👩🏽\u{200d}💻 tail"
         );
         assert!(editor.undo());
         assert_eq!(editor.document().paragraph(0).unwrap().text(), text);

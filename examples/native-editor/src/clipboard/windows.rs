@@ -327,11 +327,13 @@ mod tests {
 
     #[test]
     fn unicode_interoperates_with_crlf_and_allocation_padding() {
-        let mut native = encode_unicode("café 日本語 👨‍👩‍👧‍👦\nsecond\r\nthird").unwrap();
+        let mut native =
+            encode_unicode("café 日本語 👨\u{200d}👩\u{200d}👧\u{200d}👦\nsecond\r\nthird")
+                .unwrap();
         native.extend_from_slice(&[0; 8]);
         assert_eq!(
             decode_unicode(&native).unwrap(),
-            "café 日本語 👨‍👩‍👧‍👦\nsecond\nthird"
+            "café 日本語 👨\u{200d}👩\u{200d}👧\u{200d}👦\nsecond\nthird"
         );
         assert_eq!(encode_unicode("").unwrap(), [0, 0]);
         assert!(encode_unicode("before\0after").is_err());
@@ -346,7 +348,7 @@ mod tests {
 
     #[test]
     fn html_offsets_count_utf8_bytes_and_ignore_native_padding() {
-        let fragment = "<p>日本語 <strong>café 👨‍👩‍👧‍👦</strong></p>";
+        let fragment = "<p>日本語 <strong>café 👨\u{200d}👩\u{200d}👧\u{200d}👦</strong></p>";
         let mut native = encode_html(fragment).unwrap();
         native.extend_from_slice(&[0; 8]);
         assert_eq!(decode_html(&native).unwrap(), fragment);

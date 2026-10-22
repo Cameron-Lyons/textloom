@@ -403,7 +403,7 @@ fn rich_paste_normalizes_emoji_joins_without_splitting_style_runs() {
         .unwrap();
     let before = Fragment::from_document(editor.document());
     editor.insert_fragment(&source.selected_fragment()).unwrap();
-    assert_eq!(editor.document().plain_text(), "👩‍💻X");
+    assert_eq!(editor.document().plain_text(), "👩\u{200d}💻X");
     assert_eq!(editor.selection().focus, Position::new(0, 11));
     let spans = editor.document().paragraph(0).unwrap().spans();
     assert_eq!(spans[0].range, 0..11);
@@ -415,7 +415,7 @@ fn rich_paste_normalizes_emoji_joins_without_splitting_style_runs() {
     assert!(editor.undo());
     assert_eq!(Fragment::from_document(editor.document()), before);
     assert!(editor.redo());
-    assert_eq!(editor.document().plain_text(), "👩‍💻X");
+    assert_eq!(editor.document().plain_text(), "👩\u{200d}💻X");
 }
 
 fn header(paragraphs: u64) -> Vec<u8> {
@@ -495,7 +495,7 @@ fn version_two_encoding_has_fixed_architecture_independent_layout() {
 #[test]
 fn version_one_rich_fixture_remains_readable_and_reencodes_as_version_two() {
     let bytes = include_bytes!("fixtures/native-v1.tlfr");
-    let mut editor = Editor::from_text("\nAé👩‍💻\ne\u{301}\nZ\n");
+    let mut editor = Editor::from_text("\nAé👩\u{200d}💻\ne\u{301}\nZ\n");
     select_paragraph(&mut editor, 1);
     editor
         .set_paragraph_kind(ParagraphKind::Heading { level: 6 })

@@ -1,11 +1,7 @@
-use textloom::{
-    Editor,
-    adapter::winit::{ClipboardEvent, CommandModifier, WinitAdapter},
-};
-use winit::{
-    event::{ElementState, Ime},
-    keyboard::{Key, KeyCode, ModifiersState, PhysicalKey},
-};
+use textloom::Editor;
+use textloom::adapter::winit::{ClipboardEvent, CommandModifier, WinitAdapter};
+use winit::event::{ElementState, Ime};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut editor = Editor::from_text("Select and edit me");

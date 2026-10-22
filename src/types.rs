@@ -1,4 +1,6 @@
-use std::{fmt, ops::Range, sync::Arc};
+use std::fmt;
+use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position {

@@ -12,8 +12,8 @@ fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
 
 #[test]
 fn extended_graphemes_are_indivisible_for_movement_and_deletion() {
-    let mut editor = Editor::from_text("a👩‍💻e\u{301}🇺🇳z");
-    let clusters = ["a", "👩‍💻", "e\u{301}", "🇺🇳", "z"];
+    let mut editor = Editor::from_text("a👩\u{200d}💻e\u{301}🇺🇳z");
+    let clusters = ["a", "👩\u{200d}💻", "e\u{301}", "🇺🇳", "z"];
     let mut byte = 0;
     for cluster in clusters {
         editor
@@ -25,9 +25,9 @@ fn extended_graphemes_are_indivisible_for_movement_and_deletion() {
     editor.delete_backward().unwrap();
     editor.break_history_group();
     editor.delete_backward().unwrap();
-    assert_eq!(editor.document().plain_text(), "a👩‍💻e\u{301}");
+    assert_eq!(editor.document().plain_text(), "a👩\u{200d}💻e\u{301}");
     assert!(editor.undo());
-    assert_eq!(editor.document().plain_text(), "a👩‍💻e\u{301}🇺🇳");
+    assert_eq!(editor.document().plain_text(), "a👩\u{200d}💻e\u{301}🇺🇳");
     caret(&mut editor, 0, 1);
     editor.delete_forward().unwrap();
     assert_eq!(editor.document().plain_text(), "ae\u{301}🇺🇳");
@@ -54,7 +54,7 @@ fn invalid_selection_is_atomic() {
 
 #[test]
 fn style_lookup_rejects_invalid_utf8_and_grapheme_positions() {
-    let mut editor = Editor::from_text("é e\u{301} 👩‍💻");
+    let mut editor = Editor::from_text("é e\u{301} 👩\u{200d}💻");
     editor.select_all();
     editor
         .apply_style(StylePatch {
@@ -230,7 +230,7 @@ fn formatting_only_paragraph_breaks_updates_typing_style_without_history() {
 
 #[test]
 fn selection_style_reports_independent_mixed_attributes_inside_unicode_runs() {
-    let mut editor = Editor::from_text("a👩‍💻e\u{301}z");
+    let mut editor = Editor::from_text("a👩\u{200d}💻e\u{301}z");
     let red = Color([255, 0, 0, 255]);
     let blue = Color([0, 0, 255, 255]);
     editor
@@ -746,7 +746,7 @@ fn unicode_typing_coalesces_joined_graphemes_into_one_reversible_delta() {
     let after = Fragment::from_document(editor.document());
     let selection = editor.selection();
     let bytes = editor.history_bytes();
-    assert_eq!(editor.document().plain_text(), "a\u{301}👩‍💻");
+    assert_eq!(editor.document().plain_text(), "a\u{301}👩\u{200d}💻");
     assert!(editor.undo());
     assert_eq!(editor.document().plain_text(), "");
     assert_eq!(editor.selection(), Selection::default());
@@ -1279,10 +1279,10 @@ fn combining_insertions_and_joins_leave_valid_carets() {
             .validate_position(editor.selection().focus)
             .is_ok()
     );
-    let mut editor = Editor::from_text("👩\n‍💻");
+    let mut editor = Editor::from_text("👩\n\u{200d}💻");
     caret(&mut editor, 1, 0);
     editor.delete_backward().unwrap();
-    assert_eq!(editor.document().plain_text(), "👩‍💻");
+    assert_eq!(editor.document().plain_text(), "👩\u{200d}💻");
     assert!(
         editor
             .document()
@@ -1378,7 +1378,7 @@ fn invalid_selection_preserves_active_composition_and_history() {
 
 #[test]
 fn word_movement_remains_at_grapheme_boundaries_with_prepend_and_joiners() {
-    let mut editor = Editor::from_text("\u{600}one e\u{301}clair 👩‍💻 test\nनमस्ते world");
+    let mut editor = Editor::from_text("\u{600}one e\u{301}clair 👩\u{200d}💻 test\nनमस्ते world");
     for movement in [Movement::WordForward, Movement::WordBackward] {
         editor
             .move_cursor(
@@ -2799,7 +2799,7 @@ fn undo_redo_and_select_all_cancel_preedit_without_changing_content() {
 
 #[test]
 fn word_selection_expands_word_boundaries_inside_graphemes() {
-    for grapheme in ["\u{600}🦀", "\u{600}👩‍💻", "\u{600}🇺🇸", "\u{600}。"] {
+    for grapheme in ["\u{600}🦀", "\u{600}👩\u{200d}💻", "\u{600}🇺🇸", "\u{600}。"] {
         let mut editor = Editor::from_text(&format!("prefix {grapheme}"));
         let start = Position::new(0, "prefix ".len());
         let end = editor.document().end();
@@ -2827,7 +2827,7 @@ fn word_selection_expands_word_boundaries_inside_graphemes() {
 
 #[test]
 fn word_and_paragraph_selection_follow_pointer_conventions() {
-    let mut editor = Editor::from_text("cafe\u{301} 👩‍💻 end.\n\nnext");
+    let mut editor = Editor::from_text("cafe\u{301} 👩\u{200d}💻 end.\n\nnext");
     let word = |editor: &mut Editor, byte: usize| {
         editor.select_word_at(Position::new(0, byte)).unwrap();
         let range = editor.selection().range();

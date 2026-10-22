@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use egui::{Context, Event, FullOutput, Modifiers, Plugin, RawInput, ViewportId};
 

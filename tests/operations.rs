@@ -559,13 +559,13 @@ fn replace_sequentially(
 
 #[test]
 fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restore_metadata() {
-    let tokens = ["a", "b", "β", "🦀", "👩‍💻", "e\u{301}", "\n"];
+    let tokens = ["a", "b", "β", "🦀", "👩\u{200d}💻", "e\u{301}", "\n"];
     let queries = [
         "a",
         "b",
         "β",
         "🦀",
-        "👩‍💻",
+        "👩\u{200d}💻",
         "e\u{301}",
         "\n",
         "a\n",
@@ -578,7 +578,7 @@ fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restor
         "X",
         "x\ny",
         "\u{301}",
-        "👨‍💻",
+        "👨\u{200d}💻",
         "e\u{301}",
         "\r\nZ",
         "\n\nX\n",
@@ -822,9 +822,9 @@ fn word_deletion_includes_intervening_whitespace_and_remains_one_undo_step() {
 
 #[test]
 fn word_deletion_preserves_unicode_graphemes_and_selection_direction_on_undo() {
-    let mut editor = Editor::from_text("cafe\u{301}  👩‍💻 word");
+    let mut editor = Editor::from_text("cafe\u{301}  👩\u{200d}💻 word");
     editor.delete_word_forward().unwrap();
-    assert_eq!(editor.document().plain_text(), "  👩‍💻 word");
+    assert_eq!(editor.document().plain_text(), "  👩\u{200d}💻 word");
     assert!(
         editor
             .document()
@@ -837,7 +837,7 @@ fn word_deletion_preserves_unicode_graphemes_and_selection_direction_on_undo() {
     assert_eq!(editor.document().plain_text(), "");
     assert!(editor.undo());
     assert!(editor.undo());
-    assert_eq!(editor.document().plain_text(), "  👩‍💻 word");
+    assert_eq!(editor.document().plain_text(), "  👩\u{200d}💻 word");
     let mut editor = Editor::from_text("abc def");
     let selection = Selection::new(Position::new(0, 6), Position::new(0, 1));
     editor.set_selection(selection).unwrap();
@@ -863,7 +863,7 @@ fn word_deletion_and_movement_stop_at_symbol_and_emoji_runs() {
         editor.delete_word_backward().unwrap();
         assert_eq!(editor.document().plain_text(), expected, "{text:?}");
     }
-    let mut editor = Editor::from_text("a, 👩‍💻 b");
+    let mut editor = Editor::from_text("a, 👩\u{200d}💻 b");
     let mut stops = Vec::new();
     loop {
         let before = editor.selection().focus;

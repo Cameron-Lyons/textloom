@@ -1,14 +1,12 @@
-use std::{
-    borrow::Cow,
-    collections::VecDeque,
-    ffi::OsString,
-    io::{Read, Write},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
@@ -512,7 +510,7 @@ impl NativeClipboard {
     }
 
     pub fn self_test(&mut self) -> Result<(), String> {
-        let mut editor = textloom::Editor::from_text("café 日本語👩🏽‍💻\nsecond");
+        let mut editor = textloom::Editor::from_text("café 日本語👩🏽\u{200d}💻\nsecond");
         editor.select_all();
         editor
             .apply_style(textloom::StylePatch {
@@ -645,7 +643,7 @@ mod tests {
     use super::*;
 
     fn item() -> NativeItem {
-        NativeItem::from_fragment(&Fragment::from_text("café 日本語👩🏽‍💻\nsecond")).unwrap()
+        NativeItem::from_fragment(&Fragment::from_text("café 日本語👩🏽\u{200d}💻\nsecond")).unwrap()
     }
 
     #[test]
