@@ -8,7 +8,6 @@
 
 use std::time::{Duration, Instant};
 use std::{env, hint, slice};
-use textloom::accessibility::Focus;
 use textloom::{
     Document, Editor, Fragment, HistoryLimits, Link, Movement, ParagraphKind, Position,
     SearchOptions, SearchWrap, Selection, SelectionMode, StylePatch,
@@ -1376,7 +1375,7 @@ fn measure(label: &str, iterations: usize, mut operation: impl FnMut()) {
 
 #[cfg(feature = "accesskit")]
 fn accessibility_navigation() {
-    use textloom::accessibility::AccessKitAdapter;
+    use textloom::accessibility::{AccessKitAdapter, Focus};
 
     const TREE_UPDATE: &str =
         "the editor's selection is valid, and a benchmark-sized tree cannot exhaust node IDs";

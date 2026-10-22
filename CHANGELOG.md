@@ -7,6 +7,11 @@ Unreleased. The code follows the
 which changes some public API names and types from 1.0.0-rc.1. Every public
 item is documented.
 
+- `Error`, `FragmentError`, `AccessKitError`, and the egui
+  `AccessibilityError` implement `Copy`. `AccessibilitySnapshot` implements
+  `Clone` and `Copy`; `AccessKitAdapter`, `WinitAdapter`, and
+  `RichTextEditorOutput` implement `Clone`; `Movement` implements `Hash`.
+
 ### Migration from 1.0.0-rc.1
 
 - `Editor::move_cursor` takes a `SelectionMode` instead of a `bool`:

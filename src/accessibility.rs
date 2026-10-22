@@ -100,7 +100,7 @@ pub enum Focus {
 /// The snapshot borrows the editor, so its contents always match the editor, and
 /// the editor cannot change until the snapshot is dropped. Take a new snapshot
 /// after each change.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct AccessibilitySnapshot<'editor> {
     label: &'editor str,
     focused: bool,
@@ -420,7 +420,7 @@ mod accesskit_bridge {
 
     /// An error from [`AccessKitAdapter`].
     #[non_exhaustive]
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AccessKitError {
         /// The editor rejected a position or the command that an action maps to.
         Editor(Error),
@@ -580,7 +580,7 @@ mod accesskit_bridge {
     }
 
     /// A published blockquote node around consecutive quote paragraphs.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct CachedQuote {
         id: NodeId,
         node: Node,
@@ -594,7 +594,7 @@ mod accesskit_bridge {
     }
 
     /// The published text input node and the selection it shows.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct PublishedEditor {
         node: Node,
         selection: Selection,
@@ -704,7 +704,7 @@ mod accesskit_bridge {
     /// assert!(adapter.handle_action(&focus, &mut editor)?.focus_requested);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub struct AccessKitAdapter {
         root_id: NodeId,
         editor_id: NodeId,

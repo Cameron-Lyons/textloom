@@ -21,7 +21,7 @@ const MAX_CHARACTER_BYTES: usize = 255;
 /// [`RichTextEditorOutput::accessibility_errors`](super::RichTextEditorOutput::accessibility_errors);
 /// none of them changes the editor.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessibilityError {
     /// The widget's text layout did not match the document, so this frame
     /// publishes the widget without its text.

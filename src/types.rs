@@ -407,7 +407,7 @@ pub enum ParagraphKind {
 ///
 /// New movements may be added in minor releases, so a `match` needs a
 /// wildcard arm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Movement {
     /// To the previous grapheme boundary, or from a paragraph start to the end
@@ -493,7 +493,7 @@ pub(crate) enum Direction {
 /// that returns an error leaves the document, selection, and history as they
 /// were. New variants may be added in minor releases, so a `match` needs a
 /// wildcard arm.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// The position is past the last paragraph, past the end of its paragraph,

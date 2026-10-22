@@ -429,7 +429,7 @@ impl Document {
 ///
 /// New variants may be added in minor releases, so a `match` needs a wildcard
 /// arm.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FragmentError {
     /// The input ends before the data it declares, or declares more

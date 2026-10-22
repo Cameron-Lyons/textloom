@@ -130,27 +130,19 @@ pub struct InputOutcome {
 /// [`Default`] gives [`Super`](Self::Super) on macOS and
 /// [`Control`](Self::Control) elsewhere. In both modes, Alt (Option) moves and
 /// deletes by words.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CommandModifier {
     /// Control, as on Windows and Linux. Control also moves and deletes by words,
     /// and Control+Insert, Shift+Insert, and Shift+Delete copy, paste, and cut.
+    #[cfg_attr(not(target_os = "macos"), default)]
     Control,
     /// Super (Command), as on macOS. Command+Left and Command+Right, and Control+Left
     /// and Control+Right, move to the edges of the line, Option+Up and Option+Down to
     /// the edges of the paragraph, and Command+Backspace deletes back to the start of
     /// the line. Control+A, E, B, F, P, N, H, and D act as Home, End, Left, Right,
     /// Up, Down, Backspace, and Delete.
+    #[cfg_attr(target_os = "macos", default)]
     Super,
-}
-
-impl Default for CommandModifier {
-    fn default() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Super
-        } else {
-            Self::Control
-        }
-    }
 }
 
 /// Routes winit keyboard, focus, and IME events to an [`Editor`] that the host
@@ -195,7 +187,7 @@ impl Default for CommandModifier {
 /// assert_eq!(editor.document().plain_text(), "日本語");
 /// # Ok::<(), textloom::Error>(())
 /// ```
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WinitAdapter {
     focused: bool,
     window_unfocused: bool,
@@ -218,7 +210,7 @@ struct ImeArea {
 
 /// What the window was last told about IME, so that [`WinitAdapter::sync_ime`] sends
 /// only changes.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ImeSync {
     /// Whether IME is allowed on the window.
     allowed: bool,

@@ -5394,11 +5394,7 @@ fn malformed_and_stale_accessibility_actions_are_consumed_without_edits() {
                     let id = ui.make_persistent_id("editor");
                     let output = RichTextEditor::new(editor).id(id).show(ui);
                     assert!(output.errors.is_empty(), "{action:?}: {:?}", output.errors);
-                    assert_eq!(
-                        output.accessibility_errors,
-                        vec![expected.clone()],
-                        "{action:?}"
-                    );
+                    assert_eq!(output.accessibility_errors, vec![expected], "{action:?}");
                     assert!(ui.input(|input| input.events.is_empty()), "{action:?}");
                 });
             })

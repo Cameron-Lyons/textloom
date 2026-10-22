@@ -158,7 +158,7 @@ impl Debug for RichTextEditor<'_> {
 /// What [`RichTextEditor::show`] reports about one frame.
 ///
 /// Every field is computed each frame, also while the widget is unfocused.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RichTextEditorOutput {
     /// The widget's response. [`Response::changed`] reports whether the widget
