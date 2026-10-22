@@ -27,12 +27,23 @@ full run, among them the hosted NVDA probe (all 15 checks) and NVDA's default
 voice reaching the virtual sound card; each had also passed in at least one
 earlier run. The second table records the results. The failure: on a German
 layout, Ctrl+Alt+Q, Windows' alternative to AltGr+Q for `@`, closed the native
-host. egui's default quit shortcut is Ctrl+Q matched with extra Alt ignored,
-and egui-winit drops typed text while Ctrl is held, so egui hosts never type
-Ctrl+Alt characters; AltGr itself typed `@€`, and the winit adapter typed `@`
-for Ctrl+Alt+Q. The first dead key after a programmatic layout switch was also
-lost in every run of the check, and in one of two tries in egui's own
-`TextEdit`, while Notepad kept it; later dead keys worked.
+host, because egui's default quit shortcut is Ctrl+Q matched with extra Alt
+ignored. The host now handles Q itself and leaves Alt chords alone, as its
+Ctrl+K link shortcut does; at `786edfb27b7a25e529bad8ceee997330a1b14b74` all
+14 checks passed. egui-winit still drops text typed while Ctrl is held, so
+egui hosts never type Ctrl+Alt characters; AltGr itself typed `@€`, and the
+winit adapter typed `@` for Ctrl+Alt+Q.
+
+The first dead key after a layout switch was lost in every run of the check,
+and in one of two tries in egui's own `TextEdit`, while Notepad kept it; later
+dead keys worked. winit 0.30.13 prepares a newly selected layout on the next
+key press by translating every key with `ToUnicodeEx`, which consumes the
+pending dead key. winit 0.31 prepares it on `WM_INPUTLANGCHANGE` instead
+([rust-windowing/winit#4582](https://github.com/rust-windowing/winit/pull/4582)),
+which 0.30 does not have. That change applied to 0.30.13 kept the first dead
+key in 3 of 3 native host runs and 5 of 5 tries in egui's Find field, and the
+layout and IME checks still passed. egui and winit hosts keep the loss until
+they move to a winit with the change.
 
 Local macOS verification on 2026-10-22 used macOS 27.2 (26C111), Apple Silicon
 (`aarch64-apple-darwin`), Rust 1.99.1, and a 2x Retina display. This checked the
@@ -355,8 +366,8 @@ signoff remain pending.
 | Native read-only selection/copy | Passed; exact clipboard content verified |
 | Native read-only editing suppression | Passed; typing, Backspace/Delete, Enter, paste, and undo preserve the document; cut copies without deleting |
 | Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input under Wayland and, from 2026-10-22, X11. In the Windows 11 VM, the Microsoft Japanese IME passed replacement, one-step undo/redo, and commits on focus changes, Microsoft Pinyin committed at the caret with one-step undo, and both candidate lists opened beside the composition; physical-keyboard and macOS signoff pending |
-| Dead keys and Compose | German XKB virtual sequences on clean `f05a518` produced visible `é`, exact copied bytes, and complete undo restoration. In the Windows 11 VM, dead acute + `e` typed `é` and QWERTZ Ctrl+Z undid it, though the first dead key after a layout switch was lost (see above); physical-keyboard and macOS signoff pending |
-| AltGr | German XKB virtual AltGr on clean `f05a518` produced visible `@€`, exact copied bytes, and complete undo restoration without focus loss. In the Windows 11 VM, AltGr+Q/E typed `@€` in the native host, but Ctrl+Alt+Q closed it (see above); physical-keyboard and macOS signoff pending |
+| Dead keys and Compose | German XKB virtual sequences on clean `f05a518` produced visible `é`, exact copied bytes, and complete undo restoration. In the Windows 11 VM, dead acute + `e` typed `é` and QWERTZ Ctrl+Z undid it, though winit 0.30 loses the first dead key after a layout switch (see above); physical-keyboard and macOS signoff pending |
+| AltGr | German XKB virtual AltGr on clean `f05a518` produced visible `@€`, exact copied bytes, and complete undo restoration without focus loss. In the Windows 11 VM, AltGr+Q/E typed `@€` in the native host; Ctrl+Alt+Q closed it until the host stopped using egui's default quit shortcut (see above); physical-keyboard and macOS signoff pending |
 | Screen-reader selection and replacement | Linux Orca and hosted Windows NVDA generated speech, accessible selection/caret, native replacement and undo/redo passed; direct AT-SPI EditableText unavailable then, since added by `accesskit_unix` 0.24 (see above); in the Windows 11 VM the hosted NVDA probe passed all 15 checks, and NVDA's default voice produced about 2 s of sound after Down, recorded for listening but not yet heard; VoiceOver and full manual signoff pending |
 | Rich clipboard MIME transport | Widget fixtures passed on all platforms; Linux Qt and macOS TextEdit interoperability passed; Windows external applications and full manual signoff pending |
 | macOS and Windows native host checks | Hosted macOS native editing/focus/guard checks and Windows NVDA interaction passed; physical keyboards, IMEs, VoiceOver, scale changes, and full manual signoff pending |

@@ -335,9 +335,10 @@ def german_dead_keys_and_altgr():
         before = s.state()
         offset = before["selection"][0]
         layout = s.input_method("de-DE")
-        # ´ is a dead key at the US = position. egui and winit sometimes lose the
-        # first dead key after a layout switch, in egui's own TextEdit too, while
-        # Notepad keeps it; that is recorded but not required here.
+        # ´ is a dead key at the US = position. winit 0.30 loses the first dead key
+        # after a layout switch (it prepares the new layout on that key press and
+        # consumes the key's state; see RELEASING.md), so that is recorded but not
+        # required here.
         s.keys("equal", "e")
         first = s.wait_state(lambda state: state["text"] != before["text"])["text"][offset:offset + 1]
         guest(f"Select-HostRange {utf16(before['text'], offset)} {utf16(before['text'], offset) + 1}; Out-Json @{{}}")
