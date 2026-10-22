@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::change::Delta;
 use crate::{
     Color, Document, Editor, Error, Fragment, InlineStyle, Movement, Paragraph, ParagraphKind,
-    Position, SearchOptions, Selection, Span, StylePatch,
+    Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,
 };
 
 #[test]
@@ -400,10 +400,10 @@ fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
     editor.set_selection(original).unwrap();
     for _ in 0..3 {
         editor
-            .move_cursor(Movement::GraphemeBackward, false)
+            .move_cursor(Movement::GraphemeBackward, SelectionMode::Move)
             .unwrap();
         editor
-            .move_cursor(Movement::GraphemeForward, false)
+            .move_cursor(Movement::GraphemeForward, SelectionMode::Move)
             .unwrap();
         assert_eq!(editor.selection(), original);
         editor.insert_text("é").unwrap();
@@ -767,9 +767,13 @@ fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
     let paragraph = "é👩\u{200d}💻e\u{301}".repeat(256);
     let source = format!("start\n{paragraph}\n{paragraph}");
     let mut editor = Editor::from_text(&source);
-    editor.move_cursor(Movement::ParagraphDown, false).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Move)
+        .unwrap();
     assert_eq!(editor.selection(), Selection::caret(Position::new(1, 0)));
-    editor.move_cursor(Movement::ParagraphDown, true).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Extend)
+        .unwrap();
     let selection = Selection::new(Position::new(1, 0), Position::new(2, 0));
     assert_eq!(editor.selection(), selection);
     assert!(

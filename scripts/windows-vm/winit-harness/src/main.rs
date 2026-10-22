@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 use textloom::adapter::winit::{ClipboardEvent, InputOutcome, WinitAdapter};
-use textloom::{Editor, Movement, Position, Selection};
+use textloom::{Editor, Movement, Position, Selection, SelectionMode};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{Ime, WindowEvent};
@@ -459,7 +459,7 @@ impl ApplicationHandler for App {
         );
         if self.caret_end {
             self.editor
-                .move_cursor(Movement::DocumentEnd, false)
+                .move_cursor(Movement::DocumentEnd, SelectionMode::Move)
                 .expect("moving the caret only fails during a composition, and none has begun");
         }
         let focus = self.adapter.set_focused(true, &mut self.editor);

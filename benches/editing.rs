@@ -8,9 +8,10 @@
 
 use std::time::{Duration, Instant};
 use std::{env, hint, slice};
+use textloom::accessibility::Focus;
 use textloom::{
     Document, Editor, Fragment, HistoryLimits, Link, Movement, ParagraphKind, Position,
-    SearchOptions, Selection, StylePatch,
+    SearchOptions, SearchWrap, Selection, SelectionMode, StylePatch,
 };
 
 /// `expect` message for editing calls, which fail only while an IME
@@ -526,7 +527,10 @@ fn cold_zero_index_navigation() {
                         "a paragraph's first scalar starts at its first byte"
                     ),
                     _ => editor
-                        .move_cursor(hint::black_box(Movement::ParagraphDown), false)
+                        .move_cursor(
+                            hint::black_box(Movement::ParagraphDown),
+                            SelectionMode::Move,
+                        )
                         .expect(NO_COMPOSITION),
                 }
                 elapsed += start.elapsed();
@@ -572,7 +576,7 @@ fn sparse_whole_word_search() {
                 .expect(VALID_POSITION);
             assert!(
                 editor
-                    .find_next(hint::black_box("match"), options, false)
+                    .find_next(hint::black_box("match"), options, SearchWrap::Stop)
                     .expect(NO_COMPOSITION),
                 "the document starts with \"match\""
             );
@@ -691,10 +695,10 @@ fn unicode_navigation() {
 fn grapheme_pair(editor: &mut Editor) {
     let original = editor.selection();
     editor
-        .move_cursor(Movement::GraphemeBackward, false)
+        .move_cursor(Movement::GraphemeBackward, SelectionMode::Move)
         .expect(NO_COMPOSITION);
     editor
-        .move_cursor(Movement::GraphemeForward, false)
+        .move_cursor(Movement::GraphemeForward, SelectionMode::Move)
         .expect(NO_COMPOSITION);
     assert_eq!(
         editor.selection(),
@@ -706,10 +710,10 @@ fn grapheme_pair(editor: &mut Editor) {
 /// Moves the caret one word backward and forward again.
 fn word_pair(editor: &mut Editor) {
     editor
-        .move_cursor(Movement::WordBackward, false)
+        .move_cursor(Movement::WordBackward, SelectionMode::Move)
         .expect(NO_COMPOSITION);
     editor
-        .move_cursor(Movement::WordForward, false)
+        .move_cursor(Movement::WordForward, SelectionMode::Move)
         .expect(NO_COMPOSITION);
     hint::black_box(editor.selection());
 }
@@ -852,10 +856,10 @@ fn contextual_unicode_search() {
 /// Moves the caret one paragraph down and up again.
 fn paragraph_pair(editor: &mut Editor) {
     editor
-        .move_cursor(Movement::ParagraphDown, false)
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Move)
         .expect(NO_COMPOSITION);
     editor
-        .move_cursor(Movement::ParagraphUp, false)
+        .move_cursor(Movement::ParagraphUp, SelectionMode::Move)
         .expect(NO_COMPOSITION);
     hint::black_box(editor.selection());
 }
@@ -1062,7 +1066,7 @@ fn search_navigation() {
             .expect(VALID_POSITION);
         assert!(
             editor
-                .find_next(hint::black_box("match"), options, true)
+                .find_next(hint::black_box("match"), options, SearchWrap::Around)
                 .expect(NO_COMPOSITION),
             "every nonempty paragraph contains \"match\""
         );
@@ -1078,7 +1082,7 @@ fn search_navigation() {
             .expect(VALID_POSITION);
         assert!(
             editor
-                .find_previous(hint::black_box("match"), options, true)
+                .find_previous(hint::black_box("match"), options, SearchWrap::Around)
                 .expect(NO_COMPOSITION),
             "every nonempty paragraph contains \"match\""
         );
@@ -1098,7 +1102,7 @@ fn search_navigation() {
                     .expect(VALID_POSITION);
                 assert!(
                     editor
-                        .find_next(hint::black_box("match"), options, false)
+                        .find_next(hint::black_box("match"), options, SearchWrap::Stop)
                         .expect(NO_COMPOSITION),
                     "paragraph {paragraph} has a match after its first word"
                 );
@@ -1118,7 +1122,7 @@ fn search_navigation() {
                     .expect(VALID_POSITION);
                 assert!(
                     editor
-                        .find_previous(hint::black_box("match"), options, false)
+                        .find_previous(hint::black_box("match"), options, SearchWrap::Stop)
                         .expect(NO_COMPOSITION),
                     "paragraph {paragraph} has a match before its second word"
                 );
@@ -1139,7 +1143,7 @@ fn search_navigation() {
                 .expect("the document end is always a valid caret position");
             assert!(
                 editor
-                    .find_next(hint::black_box("match"), options, true)
+                    .find_next(hint::black_box("match"), options, SearchWrap::Around)
                     .expect(NO_COMPOSITION),
                 "the search wraps, and the document contains matches"
             );
@@ -1159,7 +1163,7 @@ fn search_navigation() {
                 .expect(VALID_POSITION);
             assert!(
                 editor
-                    .find_previous(hint::black_box("match"), options, true)
+                    .find_previous(hint::black_box("match"), options, SearchWrap::Around)
                     .expect(NO_COMPOSITION),
                 "the search wraps, and the document contains matches"
             );
@@ -1190,7 +1194,11 @@ fn long_literal_navigation() {
                 .expect(VALID_POSITION);
             assert!(
                 editor
-                    .find_next(hint::black_box("match"), SearchOptions::default(), false)
+                    .find_next(
+                        hint::black_box("match"),
+                        SearchOptions::default(),
+                        SearchWrap::Stop
+                    )
                     .expect(NO_COMPOSITION),
                 "later repetitions of the phrase contain \"match\""
             );
@@ -1213,7 +1221,11 @@ fn long_literal_navigation() {
                 .expect(VALID_POSITION);
             assert!(
                 editor
-                    .find_previous(hint::black_box("match"), SearchOptions::default(), false)
+                    .find_previous(
+                        hint::black_box("match"),
+                        SearchOptions::default(),
+                        SearchWrap::Stop
+                    )
                     .expect(NO_COMPOSITION),
                 "earlier repetitions of the phrase contain \"match\""
             );
@@ -1260,7 +1272,7 @@ fn long_whole_word_navigation() {
                     .expect(VALID_POSITION);
                 assert!(
                     editor
-                        .find_next(hint::black_box(&query), options, false)
+                        .find_next(hint::black_box(&query), options, SearchWrap::Stop)
                         .expect(NO_COMPOSITION),
                     "every cycle starts with the {script} target word"
                 );
@@ -1280,7 +1292,7 @@ fn long_whole_word_navigation() {
                     .expect(VALID_POSITION);
                 assert!(
                     editor
-                        .find_previous(hint::black_box(&query), options, false)
+                        .find_previous(hint::black_box(&query), options, SearchWrap::Stop)
                         .expect(NO_COMPOSITION),
                     "every cycle starts with the {script} target word"
                 );
@@ -1371,7 +1383,9 @@ fn accessibility_navigation() {
     for paragraphs in [100, 10_000] {
         let mut editor = Editor::from_text(&"aé👩\u{200d}💻\n".repeat(paragraphs));
         let mut adapter = AccessKitAdapter::default();
-        adapter.update(&editor, "Notes", true).expect(TREE_UPDATE);
+        adapter
+            .update(&editor, "Notes", Focus::Focused)
+            .expect(TREE_UPDATE);
         let position = Position::new(paragraphs - 1, 3);
         let text_position = adapter
             .to_text_position(&editor, position)
@@ -1401,13 +1415,21 @@ fn accessibility_navigation() {
             200,
             || {
                 editor
-                    .move_cursor(Movement::GraphemeForward, false)
+                    .move_cursor(Movement::GraphemeForward, SelectionMode::Move)
                     .expect(NO_COMPOSITION);
-                hint::black_box(adapter.update(&editor, "Notes", true).expect(TREE_UPDATE));
+                hint::black_box(
+                    adapter
+                        .update(&editor, "Notes", Focus::Focused)
+                        .expect(TREE_UPDATE),
+                );
                 editor
-                    .move_cursor(Movement::GraphemeBackward, false)
+                    .move_cursor(Movement::GraphemeBackward, SelectionMode::Move)
                     .expect(NO_COMPOSITION);
-                hint::black_box(adapter.update(&editor, "Notes", true).expect(TREE_UPDATE));
+                hint::black_box(
+                    adapter
+                        .update(&editor, "Notes", Focus::Focused)
+                        .expect(TREE_UPDATE),
+                );
             },
         );
         measure(
@@ -1417,10 +1439,18 @@ fn accessibility_navigation() {
                 editor
                     .insert_text(hint::black_box("x"))
                     .expect(NO_COMPOSITION);
-                hint::black_box(adapter.update(&editor, "Notes", true).expect(TREE_UPDATE));
+                hint::black_box(
+                    adapter
+                        .update(&editor, "Notes", Focus::Focused)
+                        .expect(TREE_UPDATE),
+                );
                 editor.break_history_group();
                 assert!(editor.undo(), "the insertion should be on the undo stack");
-                hint::black_box(adapter.update(&editor, "Notes", true).expect(TREE_UPDATE));
+                hint::black_box(
+                    adapter
+                        .update(&editor, "Notes", Focus::Focused)
+                        .expect(TREE_UPDATE),
+                );
             },
         );
     }

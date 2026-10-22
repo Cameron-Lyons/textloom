@@ -440,6 +440,23 @@ pub enum Movement {
     ParagraphDown,
 }
 
+/// What [`Editor::move_cursor`](crate::Editor::move_cursor) does with the
+/// selection's anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "a movement either keeps the anchor or moves it; there is no third mode"
+)]
+pub enum SelectionMode {
+    /// Moves the caret and collapses any range selection, as an arrow key does.
+    /// A grapheme or word movement from a range selection collapses it to its
+    /// start (backward movements) or end (forward movements) instead of moving.
+    Move,
+    /// Moves only the selection's focus and keeps its anchor, as Shift with an
+    /// arrow key does.
+    Extend,
+}
+
 /// An on/off character attribute for
 /// [`Editor::toggle_style`](crate::Editor::toggle_style).
 ///

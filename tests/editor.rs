@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use textloom::{
     Color, Document, Editor, Error, Fragment, HistoryLimits, InlineAttribute, InlineStyle,
-    Movement, Paragraph, ParagraphKind, Position, Selection, SelectionStyle, Span, StylePatch,
+    Movement, Paragraph, ParagraphKind, Position, Selection, SelectionMode, SelectionStyle, Span,
+    StylePatch,
 };
 
 fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
@@ -25,7 +26,7 @@ fn extended_graphemes_are_indivisible_for_movement_and_deletion() {
     let mut byte = 0;
     for cluster in clusters {
         editor
-            .move_cursor(Movement::GraphemeForward, false)
+            .move_cursor(Movement::GraphemeForward, SelectionMode::Move)
             .unwrap();
         byte += cluster.len();
         assert_eq!(editor.selection().focus.byte, byte, "after {cluster:?}");
@@ -1289,11 +1290,17 @@ fn joining_and_splitting_paragraphs_are_reversible() {
 fn vertical_movement_preserves_grapheme_column_across_short_paragraph() {
     let mut editor = Editor::from_text("abcdef\nx\n🦀🦀🦀🦀🦀🦀");
     caret(&mut editor, 0, 5);
-    editor.move_cursor(Movement::ParagraphDown, false).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Move)
+        .unwrap();
     assert_eq!(editor.selection().focus, Position::new(1, 1));
-    editor.move_cursor(Movement::ParagraphDown, false).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Move)
+        .unwrap();
     assert_eq!(editor.selection().focus, Position::new(2, 20));
-    editor.move_cursor(Movement::ParagraphUp, true).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphUp, SelectionMode::Extend)
+        .unwrap();
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(2, 20), Position::new(1, 1))
@@ -1421,12 +1428,12 @@ fn word_movement_remains_at_grapheme_boundaries_with_prepend_and_joiners() {
                 } else {
                     Movement::DocumentEnd
                 },
-                false,
+                SelectionMode::Move,
             )
             .unwrap();
         for step in 0..20 {
             let old = editor.selection().focus;
-            editor.move_cursor(movement, false).unwrap();
+            editor.move_cursor(movement, SelectionMode::Move).unwrap();
             let new = editor.selection().focus;
             assert!(
                 editor.document().validate_position(new).is_ok(),
@@ -1719,7 +1726,7 @@ fn typing_over_a_selection_uses_its_first_grapheme_style_in_either_direction() {
     caret(&mut editor, 0, 3);
     for _ in 0..2 {
         editor
-            .move_cursor(Movement::GraphemeBackward, true)
+            .move_cursor(Movement::GraphemeBackward, SelectionMode::Extend)
             .unwrap();
     }
     assert_eq!(
@@ -1754,12 +1761,14 @@ fn no_op_moves_keep_a_pending_caret_style() {
         Movement::DocumentEnd,
         Movement::ParagraphDown,
     ] {
-        editor.move_cursor(movement, false).unwrap();
+        editor.move_cursor(movement, SelectionMode::Move).unwrap();
         assert!(editor.typing_style().bold, "{movement:?}");
     }
     editor.insert_text("!").unwrap();
     assert_eq!(span_bold(&editor), [(0..5, false), (5..6, true)]);
-    editor.move_cursor(Movement::DocumentStart, false).unwrap();
+    editor
+        .move_cursor(Movement::DocumentStart, SelectionMode::Move)
+        .unwrap();
     assert!(!editor.typing_style().bold);
 }
 
@@ -3331,20 +3340,48 @@ fn soft_line_breaks_keep_paragraph_kinds_and_join_typing_undo() {
 #[test]
 fn movement_and_deletion_cross_soft_line_breaks_as_whitespace_graphemes() {
     let mut editor = Editor::from_text("ab\u{2028}cd");
-    let focus = |editor: &mut Editor, movement, extend| {
-        editor.move_cursor(movement, extend).unwrap();
+    let focus = |editor: &mut Editor, movement, mode| {
+        editor.move_cursor(movement, mode).unwrap();
         editor.selection().focus.byte
     };
     caret(&mut editor, 0, 5);
-    assert_eq!(focus(&mut editor, Movement::GraphemeBackward, false), 2);
-    assert_eq!(focus(&mut editor, Movement::GraphemeForward, true), 5);
+    assert_eq!(
+        focus(&mut editor, Movement::GraphemeBackward, SelectionMode::Move),
+        2
+    );
+    assert_eq!(
+        focus(
+            &mut editor,
+            Movement::GraphemeForward,
+            SelectionMode::Extend
+        ),
+        5
+    );
     assert_eq!(editor.selected_text(), "\n");
-    assert_eq!(focus(&mut editor, Movement::ParagraphEnd, false), 7);
-    assert_eq!(focus(&mut editor, Movement::WordBackward, false), 5);
-    assert_eq!(focus(&mut editor, Movement::WordBackward, false), 0);
-    assert_eq!(focus(&mut editor, Movement::WordForward, false), 2);
-    assert_eq!(focus(&mut editor, Movement::WordForward, false), 7);
-    assert_eq!(focus(&mut editor, Movement::ParagraphStart, false), 0);
+    assert_eq!(
+        focus(&mut editor, Movement::ParagraphEnd, SelectionMode::Move),
+        7
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordBackward, SelectionMode::Move),
+        5
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordBackward, SelectionMode::Move),
+        0
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordForward, SelectionMode::Move),
+        2
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordForward, SelectionMode::Move),
+        7
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::ParagraphStart, SelectionMode::Move),
+        0
+    );
     assert_eq!(
         editor.document().word_range_at(Position::new(0, 2)),
         Ok(Position::new(0, 0)..Position::new(0, 2))

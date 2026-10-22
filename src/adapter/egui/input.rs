@@ -2,7 +2,7 @@ use super::layout::ParagraphLayouts;
 use super::navigation::{self, NavigationTarget, VerticalNavigation};
 use super::{CommitEcho, RichClipboard};
 use crate::adapter::{self, Shortcut};
-use crate::{Document, Editor, Error, Movement, ParagraphKind, Position, Selection};
+use crate::{Document, Editor, Error, Movement, ParagraphKind, Position, Selection, SelectionMode};
 use egui::os::OperatingSystem;
 use egui::{Event, ImeEvent, Key, Modifiers, Ui};
 
@@ -491,6 +491,11 @@ pub(super) fn handle_key(
         *vertical_navigation = None;
     }
     cancel_empty_composition(editor);
+    let selection_mode = if modifiers.shift {
+        SelectionMode::Extend
+    } else {
+        SelectionMode::Move
+    };
     let target = match key_command {
         KeyCommand::ParagraphBoundary { end } => {
             let position = navigation::paragraph_boundary_position(editor, end);
@@ -513,7 +518,7 @@ pub(super) fn handle_key(
                 } else {
                     Movement::ParagraphStart
                 };
-                super::record(editor.move_cursor(movement, modifiers.shift), errors);
+                super::record(editor.move_cursor(movement, selection_mode), errors);
             }
             target
         }
@@ -528,7 +533,7 @@ pub(super) fn handle_key(
             options.page_height,
         ),
         KeyCommand::Move(movement) => {
-            super::record(editor.move_cursor(movement, modifiers.shift), errors);
+            super::record(editor.move_cursor(movement, selection_mode), errors);
             None
         }
         KeyCommand::Edit(edit) | KeyCommand::ListEdit(edit) => {

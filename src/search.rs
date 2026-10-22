@@ -30,6 +30,22 @@ impl Default for SearchOptions {
     }
 }
 
+/// What [`Editor::find_next`](crate::Editor::find_next) and
+/// [`find_previous`](crate::Editor::find_previous) do when no match remains
+/// before the end (or start) of the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "a search either wraps or stops; there is no third behavior"
+)]
+pub enum SearchWrap {
+    /// Continues the search from the other end of the document.
+    Around,
+    /// Stops at the end of the document (or its start, for `find_previous`)
+    /// and reports no match.
+    Stop,
+}
+
 impl Document {
     /// Returns the matches of `query` in document order.
     ///
@@ -102,12 +118,13 @@ impl Document {
         query: &str,
         options: SearchOptions,
         selection: Range<Position>,
-        wrap: bool,
+        wrap: SearchWrap,
         direction: Direction,
     ) -> Option<Range<Position>> {
         if query.is_empty() {
             return None;
         }
+        let wrap = wrap == SearchWrap::Around;
         let needle = search_needle(query, options);
         let lines = paragraph_lines(&needle);
         if lines.is_none() && needle.contains('\n') {
@@ -935,23 +952,31 @@ mod tests {
                 matches.iter().find(|item| item.start >= range.start) == Some(&range),
                 "{range:?} {context}"
             );
-            for wrap in [false, true] {
+            for wrap in [SearchWrap::Stop, SearchWrap::Around] {
                 for direction in [Direction::Forward, Direction::Backward] {
                     let expected = match direction {
                         Direction::Backward => matches
                             .iter()
                             .rev()
                             .find(|item| item.end <= range.start)
-                            .or_else(|| wrap.then(|| matches.last()).flatten()),
+                            .or_else(|| {
+                                (wrap == SearchWrap::Around)
+                                    .then(|| matches.last())
+                                    .flatten()
+                            }),
                         Direction::Forward => matches
                             .iter()
                             .find(|item| item.start >= range.end)
-                            .or_else(|| wrap.then(|| matches.first()).flatten()),
+                            .or_else(|| {
+                                (wrap == SearchWrap::Around)
+                                    .then(|| matches.first())
+                                    .flatten()
+                            }),
                     };
                     assert_eq!(
                         document.find_relative(query, options, range.clone(), wrap, direction),
                         expected.cloned(),
-                        "{range:?} wrap={wrap} {direction:?} {context}"
+                        "{range:?} wrap={wrap:?} {direction:?} {context}"
                     );
                 }
             }

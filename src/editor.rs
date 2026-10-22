@@ -13,7 +13,8 @@ use crate::document::Delta;
 use crate::types::Direction;
 use crate::{
     Document, Error, Fragment, InlineAttribute, InlineStyle, Link, Movement, Paragraph,
-    ParagraphKind, Position, SearchOptions, Selection, SelectionStyle, StylePatch,
+    ParagraphKind, Position, SearchOptions, SearchWrap, Selection, SelectionMode, SelectionStyle,
+    StylePatch,
 };
 
 /// An editing session over a [`Document`]: the document with a selection, a
@@ -39,14 +40,14 @@ use crate::{
 /// # Examples
 ///
 /// ```
-/// use textloom::{Editor, InlineAttribute, Movement, Position, Selection};
+/// use textloom::{Editor, InlineAttribute, Movement, Position, Selection, SelectionMode};
 ///
 /// let mut editor = Editor::from_text("Hello world");
 /// editor.set_selection(Selection::new(Position::new(0, 6), Position::new(0, 11)))?;
 /// editor.toggle_style(InlineAttribute::Bold)?;
 /// assert_eq!(editor.selection_style().bold, Some(true));
 ///
-/// editor.move_cursor(Movement::DocumentEnd, false)?;
+/// editor.move_cursor(Movement::DocumentEnd, SelectionMode::Move)?;
 /// editor.insert_text("!")?;
 /// assert_eq!(editor.document().plain_text(), "Hello world!");
 /// assert!(editor.undo());
@@ -593,7 +594,7 @@ impl Editor {
     /// the selection, and returns whether there was one.
     ///
     /// Starting from the selection's end skips a selected match, so repeated
-    /// calls step through the matches. With `wrap`, the search continues from
+    /// calls step through the matches. With [`SearchWrap::Around`], the search continues from
     /// the start of the document when no later match exists. The match is
     /// selected from its start to its end; without a match, the selection
     /// stays as it is. Matching follows [`Document::find`].
@@ -605,7 +606,7 @@ impl Editor {
         &mut self,
         query: &str,
         options: SearchOptions,
-        wrap: bool,
+        wrap: SearchWrap,
     ) -> Result<bool, Error> {
         self.find_match(query, options, wrap, Direction::Forward)
     }
@@ -613,7 +614,7 @@ impl Editor {
     /// Selects the last match of `query` that ends at or before the start of
     /// the selection, and returns whether there was one.
     ///
-    /// With `wrap`, the search continues from the end of the document when no
+    /// With [`SearchWrap::Around`], the search continues from the end of the document when no
     /// earlier match exists. The match is selected from its start to its end;
     /// without a match, the selection stays as it is. Matching follows
     /// [`Document::find`].
@@ -625,7 +626,7 @@ impl Editor {
         &mut self,
         query: &str,
         options: SearchOptions,
-        wrap: bool,
+        wrap: SearchWrap,
     ) -> Result<bool, Error> {
         self.find_match(query, options, wrap, Direction::Backward)
     }
@@ -634,7 +635,7 @@ impl Editor {
         &mut self,
         query: &str,
         options: SearchOptions,
-        wrap: bool,
+        wrap: SearchWrap,
         direction: Direction,
     ) -> Result<bool, Error> {
         self.ensure_no_composition()?;
@@ -1126,11 +1127,11 @@ impl Editor {
         Ok(())
     }
 
-    /// Moves the caret by `movement`, or with `extend`, moves only the
-    /// selection's focus and keeps its anchor, as Shift does.
+    /// Moves the caret by `movement`, or with [`SelectionMode::Extend`], moves
+    /// only the selection's focus and keeps its anchor, as Shift does.
     ///
-    /// Without `extend`, a grapheme or word movement from a range selection
-    /// collapses it to its start (backward movements) or end (forward
+    /// With [`SelectionMode::Move`], a grapheme or word movement from a range
+    /// selection collapses it to its start (backward movements) or end (forward
     /// movements) instead. A changed selection updates the typing style as
     /// [`set_selection`](Editor::set_selection) does. Ends the current undo
     /// group.
@@ -1142,7 +1143,8 @@ impl Editor {
         clippy::missing_panics_doc,
         reason = "the expects check an internal invariant: the editor's selection is valid"
     )]
-    pub fn move_cursor(&mut self, movement: Movement, extend: bool) -> Result<(), Error> {
+    pub fn move_cursor(&mut self, movement: Movement, mode: SelectionMode) -> Result<(), Error> {
+        let extend = mode == SelectionMode::Extend;
         self.ensure_no_composition()?;
         self.break_history_group();
         let vertical = matches!(movement, Movement::ParagraphUp | Movement::ParagraphDown);

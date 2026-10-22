@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use textloom::{
     Document, Editor, Error, Fragment, HistoryLimits, InlineStyle, Movement, Paragraph,
-    ParagraphKind, Position, SearchOptions, Selection, Span, StylePatch,
+    ParagraphKind, Position, SearchOptions, SearchWrap, Selection, SelectionMode, Span, StylePatch,
 };
 
 const H1: ParagraphKind = ParagraphKind::Heading { level: 1 };
@@ -866,33 +866,45 @@ fn replace_all_no_matches_and_identical_replacement_do_not_add_history_or_revisi
 fn find_next_and_previous_skip_selected_matches_wrap_and_leave_misses_unchanged() {
     let mut editor = Editor::from_text("a x a\na");
     let options = SearchOptions::default();
-    assert!(editor.find_next("a", options, false).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Stop).unwrap());
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 0), Position::new(0, 1))
     );
-    assert!(editor.find_next("a", options, false).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Stop).unwrap());
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 4), Position::new(0, 5))
     );
-    assert!(editor.find_next("a", options, false).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Stop).unwrap());
     let last = editor.selection();
     assert_eq!(
         last,
         Selection::new(Position::new(1, 0), Position::new(1, 1))
     );
-    assert!(!editor.find_next("a", options, false).unwrap());
+    assert!(!editor.find_next("a", options, SearchWrap::Stop).unwrap());
     assert_eq!(editor.selection(), last);
-    assert!(editor.find_next("a", options, true).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Around).unwrap());
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 0), Position::new(0, 1))
     );
-    assert!(!editor.find_previous("a", options, false).unwrap());
-    assert!(editor.find_previous("a", options, true).unwrap());
+    assert!(
+        !editor
+            .find_previous("a", options, SearchWrap::Stop)
+            .unwrap()
+    );
+    assert!(
+        editor
+            .find_previous("a", options, SearchWrap::Around)
+            .unwrap()
+    );
     assert_eq!(editor.selection(), last);
-    assert!(editor.find_previous("a", options, false).unwrap());
+    assert!(
+        editor
+            .find_previous("a", options, SearchWrap::Stop)
+            .unwrap()
+    );
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 4), Position::new(0, 5))
@@ -900,11 +912,15 @@ fn find_next_and_previous_skip_selected_matches_wrap_and_leave_misses_unchanged(
     let selected = editor.selection();
     for query in ["missing", ""] {
         assert!(
-            !editor.find_next(query, options, true).unwrap(),
+            !editor
+                .find_next(query, options, SearchWrap::Around)
+                .unwrap(),
             "{query:?}"
         );
         assert!(
-            !editor.find_previous(query, options, true).unwrap(),
+            !editor
+                .find_previous(query, options, SearchWrap::Around)
+                .unwrap(),
             "{query:?}"
         );
         assert_eq!(editor.selection(), selected, "{query:?}");
@@ -921,7 +937,7 @@ fn find_navigation_handles_backward_selections_and_crossparagraph_matches() {
         .unwrap();
     assert!(
         editor
-            .find_next("one\ntwo", SearchOptions::default(), false)
+            .find_next("one\ntwo", SearchOptions::default(), SearchWrap::Stop)
             .unwrap()
     );
     assert_eq!(
@@ -930,7 +946,7 @@ fn find_navigation_handles_backward_selections_and_crossparagraph_matches() {
     );
     assert!(
         editor
-            .find_previous("one\ntwo", SearchOptions::default(), false)
+            .find_previous("one\ntwo", SearchOptions::default(), SearchWrap::Stop)
             .unwrap()
     );
     assert_eq!(
@@ -1006,7 +1022,9 @@ fn word_deletion_and_movement_stop_at_symbol_and_emoji_runs() {
     let mut stops = Vec::new();
     loop {
         let before = editor.selection().focus;
-        editor.move_cursor(Movement::WordForward, false).unwrap();
+        editor
+            .move_cursor(Movement::WordForward, SelectionMode::Move)
+            .unwrap();
         if editor.selection().focus == before {
             break;
         }
@@ -1159,11 +1177,11 @@ fn operations_reject_active_ime_without_mutating_content_selection_or_history() 
     let selection = editor.selection();
     let options = SearchOptions::default();
     assert_eq!(
-        editor.find_next("word", options, true),
+        editor.find_next("word", options, SearchWrap::Around),
         Err(Error::CompositionActive)
     );
     assert_eq!(
-        editor.find_previous("word", options, true),
+        editor.find_previous("word", options, SearchWrap::Around),
         Err(Error::CompositionActive)
     );
     assert_eq!(
@@ -2257,7 +2275,9 @@ fn replace_all_matches_at_paragraph_ends_take_styles_like_sequential_replacement
         );
         for _ in 0..2 {
             assert!(
-                sequential.find_next(query, options, false).unwrap(),
+                sequential
+                    .find_next(query, options, SearchWrap::Stop)
+                    .unwrap(),
                 "{text:?}"
             );
             assert!(
@@ -2317,7 +2337,10 @@ fn replace_all_joining_many_paragraphs_into_growing_clusters_styles_like_sequent
             assert_eq!(spans, expected, "{unit:?}");
             if count < 16 {
                 caret(&mut sequential, 0, 0);
-                while sequential.find_next("\n", options, false).unwrap() {
+                while sequential
+                    .find_next("\n", options, SearchWrap::Stop)
+                    .unwrap()
+                {
                     assert!(
                         sequential
                             .replace_selected_match("\n", replacement, options)

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.0
+
+Unreleased. The code follows the
+[Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html),
+which changes some public API names and types from 1.0.0-rc.1. Every public
+item is documented.
+
+### Migration from 1.0.0-rc.1
+
+- `Editor::move_cursor` takes a `SelectionMode` instead of a `bool`:
+  `SelectionMode::Extend` for `true` and `SelectionMode::Move` for `false`.
+- `Editor::find_next` and `find_previous` take a `SearchWrap` instead of a
+  `bool`: `SearchWrap::Around` for `true` and `SearchWrap::Stop` for `false`.
+- `AccessibilitySnapshot::new` and `AccessKitAdapter::update` take an
+  `accessibility::Focus` instead of a `bool`: `Focus::Focused` for `true` and
+  `Focus::Unfocused` for `false`.
+
 ## 1.0.0-rc.1
 
 2026-10-22. Release candidate for 1.0.0, the first stable release of the native

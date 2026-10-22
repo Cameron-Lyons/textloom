@@ -23,13 +23,13 @@
 //! # Example
 //!
 //! ```
-//! use textloom::accessibility::{AccessibilitySnapshot, AccessibleAction, apply_action};
+//! use textloom::accessibility::{AccessibilitySnapshot, AccessibleAction, Focus, apply_action};
 //! use textloom::{Editor, ParagraphKind};
 //!
 //! let mut editor = Editor::from_text("Title\nBody");
 //! editor.set_paragraph_kind(ParagraphKind::Heading { level: 1 })?;
 //!
-//! let snapshot = AccessibilitySnapshot::new(&editor, "Notes", true);
+//! let snapshot = AccessibilitySnapshot::new(&editor, "Notes", Focus::Focused);
 //! let kinds: Vec<ParagraphKind> = snapshot.paragraphs().map(|paragraph| paragraph.kind).collect();
 //! assert_eq!(kinds, [ParagraphKind::Heading { level: 1 }, ParagraphKind::Body]);
 //!
@@ -81,6 +81,20 @@ pub struct AccessibleParagraph<'document> {
     pub spans: &'document [Span],
 }
 
+/// Whether the host gives an editor keyboard focus, for
+/// [`AccessibilitySnapshot::new`] and the AccessKit adapter's `update`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "an editor either has keyboard focus or does not"
+)]
+pub enum Focus {
+    /// The editor has keyboard focus.
+    Focused,
+    /// The editor does not have keyboard focus.
+    Unfocused,
+}
+
 /// A read-only view of an [`Editor`] for describing it to assistive technology.
 ///
 /// The snapshot borrows the editor, so its contents always match the editor, and
@@ -98,12 +112,12 @@ pub struct AccessibilitySnapshot<'editor> {
 
 impl<'editor> AccessibilitySnapshot<'editor> {
     /// Takes a snapshot of `editor`, with `label` as its accessible name and
-    /// `focused` saying whether the host considers it focused.
+    /// `focus` saying whether the host considers it focused.
     #[must_use]
-    pub fn new(editor: &'editor Editor, label: &'editor str, focused: bool) -> Self {
+    pub fn new(editor: &'editor Editor, label: &'editor str, focus: Focus) -> Self {
         Self {
             label,
-            focused,
+            focused: focus == Focus::Focused,
             selection: editor.selection(),
             composition: editor.composition(),
             revision: editor.document().revision(),
@@ -386,7 +400,7 @@ pub(crate) mod node_semantics {
 
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
-    use super::{AccessibilityOutcome, AccessibleAction, node_semantics};
+    use super::{AccessibilityOutcome, AccessibleAction, Focus, node_semantics};
     use crate::document::{LINE_SEPARATOR, SpanCursor};
     use crate::{Editor, Error, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
     use accesskit::{
@@ -666,18 +680,18 @@ mod accesskit_bridge {
     /// ```
     /// use accesskit::{Action, ActionRequest, TreeId};
     /// use textloom::Editor;
-    /// use textloom::accessibility::AccessKitAdapter;
+    /// use textloom::accessibility::{AccessKitAdapter, Focus};
     ///
     /// let mut editor = Editor::from_text("Hello");
     /// let mut adapter = AccessKitAdapter::default();
     ///
     /// // The first update holds the whole tree for the platform adapter.
-    /// let initial = adapter.update(&editor, "Notes", true)?;
+    /// let initial = adapter.update(&editor, "Notes", Focus::Focused)?;
     /// assert!(initial.tree.is_some());
     ///
     /// // Later updates hold only the nodes that changed.
     /// editor.insert_text("Oh, ")?;
-    /// let update = adapter.update(&editor, "Notes", true)?;
+    /// let update = adapter.update(&editor, "Notes", Focus::Focused)?;
     /// assert!(update.tree.is_none() && !update.nodes.is_empty());
     ///
     /// // Action requests from the platform adapter go back to the editor.
@@ -879,7 +893,7 @@ mod accesskit_bridge {
         /// Builds the tree update that brings the platform adapter's tree in line
         /// with `editor`.
         ///
-        /// `label` is the text input's accessible name. `focused` says whether the
+        /// `label` is the text input's accessible name. `focus` says whether the
         /// editor has keyboard focus, which makes the text input, rather than the
         /// root, the update's focus. The first update, and the first after
         /// [`invalidate`](Self::invalidate), holds the whole tree. Later ones hold
@@ -901,14 +915,13 @@ mod accesskit_bridge {
             &mut self,
             editor: &Editor,
             label: &str,
-            focused: bool,
+            focus: Focus,
         ) -> Result<TreeUpdate, AccessKitError> {
             let document_identity = editor.document().content_identity();
             let selection = editor.selection();
-            let focus = if focused {
-                self.editor_id
-            } else {
-                self.root_id
+            let focus = match focus {
+                Focus::Focused => self.editor_id,
+                Focus::Unfocused => self.root_id,
             };
             let same_document = self
                 .document_identity
@@ -1768,7 +1781,7 @@ mod accesskit_bridge {
 
         fn assert_matches_fresh_tree(adapter: &AccessKitAdapter, editor: &Editor) {
             let mut fresh = AccessKitAdapter::default();
-            fresh.update(editor, "Notes", true).unwrap();
+            fresh.update(editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(quote_groups(adapter), quote_groups(&fresh));
             assert_eq!(
                 adapter
@@ -1807,7 +1820,7 @@ mod accesskit_bridge {
         fn assert_published_tree_matches_fresh(tree: &accesskit_consumer::Tree, editor: &Editor) {
             let mut fresh = AccessKitAdapter::default();
             let expected: HashMap<_, _> = fresh
-                .update(editor, "Notes", true)
+                .update(editor, "Notes", Focus::Focused)
                 .unwrap()
                 .nodes
                 .into_iter()
@@ -1919,7 +1932,7 @@ mod accesskit_bridge {
         fn tree_uses_graphemes_line_breaks_and_incremental_updates() {
             let mut editor = Editor::from_text("a👩🏽\u{200d}💻\nlast");
             let mut adapter = AccessKitAdapter::default();
-            let tree = adapter.update(&editor, "Notes", true).unwrap();
+            let tree = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(tree.focus, adapter.editor_node());
             let first = adapter.text_runs(0).next().unwrap().0;
             let run = &tree.nodes.iter().find(|(id, _)| *id == first).unwrap().1;
@@ -1947,7 +1960,7 @@ mod accesskit_bridge {
             );
             assert!(
                 adapter
-                    .update(&editor, "Notes", true)
+                    .update(&editor, "Notes", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
@@ -1955,7 +1968,7 @@ mod accesskit_bridge {
             editor
                 .set_selection(Selection::caret(Position::new(1, 1)))
                 .unwrap();
-            let selection_only = adapter.update(&editor, "Notes", true).unwrap();
+            let selection_only = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(selection_only.nodes.len(), 1);
             assert_eq!(selection_only.nodes[0].0, adapter.editor_node());
         }
@@ -1964,21 +1977,21 @@ mod accesskit_bridge {
         fn idle_updates_keep_focus_and_refresh_labels_and_replacement_documents() {
             let editor = Editor::from_text("original");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
 
-            let blurred = adapter.update(&editor, "Notes", false).unwrap();
+            let blurred = adapter.update(&editor, "Notes", Focus::Unfocused).unwrap();
             assert!(blurred.nodes.is_empty());
             assert_eq!(blurred.focus, adapter.root_node());
-            let focused = adapter.update(&editor, "Notes", true).unwrap();
+            let focused = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert!(focused.nodes.is_empty());
             assert_eq!(focused.focus, adapter.editor_node());
 
-            let renamed = adapter.update(&editor, "Renamed", true).unwrap();
+            let renamed = adapter.update(&editor, "Renamed", Focus::Focused).unwrap();
             assert_eq!(renamed.nodes.len(), 1);
             assert_eq!(renamed.nodes[0].1.label(), Some("Renamed"));
             assert!(
                 adapter
-                    .update(&editor, "Renamed", true)
+                    .update(&editor, "Renamed", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
@@ -1990,7 +2003,9 @@ mod accesskit_bridge {
                 editor.document().revision()
             );
             assert_eq!(replacement.selection(), editor.selection());
-            let update = adapter.update(&replacement, "Renamed", true).unwrap();
+            let update = adapter
+                .update(&replacement, "Renamed", Focus::Focused)
+                .unwrap();
             assert!(
                 update
                     .nodes
@@ -2003,7 +2018,7 @@ mod accesskit_bridge {
         fn accesskit_actions_validate_data_and_preserve_direction() {
             let mut editor = Editor::from_text("aé\nhello");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", false).unwrap();
+            adapter.update(&editor, "Notes", Focus::Unfocused).unwrap();
             let focus = request(&adapter, Action::Focus, None);
             assert!(
                 adapter
@@ -2055,7 +2070,7 @@ mod accesskit_bridge {
             let selection = Selection::new(Position::new(1, 2), Position::new(0, 1));
             editor.set_selection(selection).unwrap();
             let mut adapter = AccessKitAdapter::default();
-            let tree = adapter.update(&editor, "Notes", true).unwrap();
+            let tree = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let node = &tree
                 .nodes
                 .iter()
@@ -2093,7 +2108,7 @@ mod accesskit_bridge {
         fn read_only_updates_capabilities_without_republishing_paragraphs() {
             let mut editor = Editor::from_text("original");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let paragraph_id = adapter.paragraph_node(0);
             editor.update_composition("candidate", None).unwrap();
             let outcome = adapter.set_read_only(true, &mut editor);
@@ -2102,7 +2117,7 @@ mod accesskit_bridge {
             assert!(editor.composition().is_none());
             let outcome = adapter.set_read_only(true, &mut editor);
             assert!(!outcome.changed && !outcome.composition_canceled);
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(update.nodes.len(), 1);
             let (id, node) = &update.nodes[0];
             assert_eq!(*id, adapter.editor_node());
@@ -2137,7 +2152,7 @@ mod accesskit_bridge {
             assert_eq!(editor.selection(), selection);
             assert!(!editor.can_undo());
             assert!(adapter.set_read_only(false, &mut editor).changed);
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(update.nodes.len(), 1);
             let node = &update.nodes[0].1;
             assert!(!node.is_read_only());
@@ -2158,7 +2173,7 @@ mod accesskit_bridge {
                 })
                 .unwrap();
             let mut adapter = AccessKitAdapter::default();
-            let tree = adapter.update(&editor, "Notes", true).unwrap();
+            let tree = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let runs: Vec<_> = adapter.text_runs(0).collect();
             assert_eq!(runs.len(), 3);
             assert_runs_form_lines(&adapter);
@@ -2186,7 +2201,7 @@ mod accesskit_bridge {
             }
             let unchanged_id = adapter.paragraph_node(1).unwrap();
             editor.insert_text("q").unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(adapter.paragraph_node(1), Some(unchanged_id));
         }
 
@@ -2208,7 +2223,7 @@ mod accesskit_bridge {
                     .unwrap();
             }
             let mut adapter = AccessKitAdapter::default();
-            let tree = adapter.update(&editor, "Notes", true).unwrap();
+            let tree = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let runs: Vec<_> = adapter.text_runs(0).collect();
             assert_eq!(
                 runs.iter()
@@ -2248,7 +2263,7 @@ mod accesskit_bridge {
         fn consecutive_and_skipped_edits_publish_current_runs_and_keep_untouched_ids() {
             let mut editor = Editor::from_text("first\nsecond\nthird\nlast");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let first = adapter.paragraph_node(0).unwrap();
             let last = adapter.paragraph_node(3).unwrap();
             for text in ["é", "👩\u{200d}💻"] {
@@ -2256,7 +2271,7 @@ mod accesskit_bridge {
                     .set_selection(Selection::caret(Position::new(1, 0)))
                     .unwrap();
                 editor.insert_text(text).unwrap();
-                adapter.update(&editor, "Notes", true).unwrap();
+                adapter.update(&editor, "Notes", Focus::Focused).unwrap();
                 assert_eq!(adapter.paragraph_node(0), Some(first));
                 assert_eq!(adapter.paragraph_node(3), Some(last));
             }
@@ -2269,7 +2284,7 @@ mod accesskit_bridge {
                     .unwrap();
                 editor.insert_text("changed ").unwrap();
             }
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(adapter.paragraph_node(0), Some(first));
             assert_eq!(adapter.paragraph_node(3), Some(last));
             assert_eq!(
@@ -2293,7 +2308,7 @@ mod accesskit_bridge {
         fn local_rich_paste_keeps_untouched_duplicate_occurrences_and_run_locations() {
             let mut editor = Editor::from_text("copy\n\nlast");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let storage = adapter.paragraphs.as_ptr();
             let before = adapter.paragraphs.clone();
             let removed = adapter
@@ -2312,7 +2327,7 @@ mod accesskit_bridge {
                 &editor.document().paragraphs()[1]
             ));
 
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(update.nodes.len(), 3);
             assert_eq!(adapter.paragraphs.as_ptr(), storage);
             for index in [0, 2] {
@@ -2357,7 +2372,7 @@ mod accesskit_bridge {
             let mut editor = Editor::from_text("first\nmiddle\nlast");
             let published_editor = Editor::new(editor.document().clone());
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let before = adapter.paragraphs.clone();
             let storage = adapter.paragraphs.as_ptr();
             let position = Position::new(1, 2);
@@ -2380,7 +2395,7 @@ mod accesskit_bridge {
                 }
                 adapter.next_id = Some(u64::MAX);
                 assert_eq!(
-                    adapter.update(&editor, "Failed", false),
+                    adapter.update(&editor, "Failed", Focus::Unfocused),
                     Err(AccessKitError::NodeIdExhausted)
                 );
                 assert_eq!(adapter.next_id, Some(u64::MAX));
@@ -2408,7 +2423,7 @@ mod accesskit_bridge {
             adapter.next_id = next_id;
             assert!(
                 adapter
-                    .update(&published_editor, "Notes", true)
+                    .update(&published_editor, "Notes", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
@@ -2419,7 +2434,7 @@ mod accesskit_bridge {
         fn same_count_reordering_keeps_ids_and_moves_run_locations() {
             let editor = Editor::from_text("first\nsecond\nlast");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let first = adapter
                 .to_text_position(&editor, Position::new(0, 2))
                 .unwrap();
@@ -2434,7 +2449,7 @@ mod accesskit_bridge {
                 Arc::clone(&source[2]),
             ]);
             let reordered = Editor::new(Document::from_fragment(&fragment));
-            let update = adapter.update(&reordered, "Notes", true).unwrap();
+            let update = adapter.update(&reordered, "Notes", Focus::Focused).unwrap();
             assert_eq!(update.nodes.len(), 1);
             assert!(Arc::ptr_eq(&before[0], &adapter.paragraphs[1]));
             assert!(Arc::ptr_eq(&before[1], &adapter.paragraphs[0]));
@@ -2453,30 +2468,30 @@ mod accesskit_bridge {
         fn reinitializing_an_unchanged_tree_republishes_cached_nodes() {
             let editor = Editor::from_text("first\nlast");
             let mut adapter = AccessKitAdapter::default();
-            let initial = adapter.update(&editor, "Notes", true).unwrap();
+            let initial = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let storage = adapter.paragraphs.as_ptr();
             let next_id = adapter.next_id;
             adapter = adapter.with_tree_id(TreeId::ROOT);
-            let rebuilt = adapter.update(&editor, "Notes", true).unwrap();
+            let rebuilt = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(rebuilt.nodes, initial.nodes);
             assert!(rebuilt.tree.is_some());
             assert_eq!(adapter.next_id, next_id);
             assert_eq!(adapter.paragraphs.as_ptr(), storage);
             assert!(
                 adapter
-                    .update(&editor, "Notes", true)
+                    .update(&editor, "Notes", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
             );
 
             adapter.invalidate();
-            let reactivated = adapter.update(&editor, "Notes", true).unwrap();
+            let reactivated = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(reactivated, initial);
             assert_eq!(adapter.next_id, next_id);
             assert!(
                 adapter
-                    .update(&editor, "Notes", true)
+                    .update(&editor, "Notes", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
@@ -2484,7 +2499,7 @@ mod accesskit_bridge {
 
             let subtree = TreeId(accesskit::Uuid::from_u128(1));
             let mut grafted = AccessKitAdapter::default().with_tree_id(subtree);
-            let update = grafted.update(&editor, "Notes", true).unwrap();
+            let update = grafted.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(update.tree_id, subtree);
             let (_, root) = update
                 .nodes
@@ -2499,7 +2514,7 @@ mod accesskit_bridge {
         fn text_positions_track_structural_edits_and_reject_old_or_unknown_runs() {
             let mut editor = Editor::from_text("first\naé👩\u{200d}💻\nlast");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let position = Position::new(1, 3);
             let published = adapter.to_text_position(&editor, position).unwrap();
 
@@ -2519,7 +2534,7 @@ mod accesskit_bridge {
                 adapter.from_text_position(&editor, published),
                 Err(AccessKitError::StaleDocument)
             );
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(
                 adapter.from_text_position(&editor, published).unwrap(),
                 Position::new(2, 3)
@@ -2543,7 +2558,7 @@ mod accesskit_bridge {
             );
             assert!(
                 adapter
-                    .update(&editor, "Notes", true)
+                    .update(&editor, "Notes", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
@@ -2554,7 +2569,7 @@ mod accesskit_bridge {
         fn rich_paste_of_shared_paragraphs_keeps_each_accessible_occurrence_distinct() {
             let mut editor = Editor::from_text("copy\n\n");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let original_id = adapter.paragraph_node(0).unwrap();
             let fragment = editor
                 .document()
@@ -2569,7 +2584,7 @@ mod accesskit_bridge {
                 &editor.document().paragraphs()[1]
             ));
 
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(adapter.paragraph_node(0), Some(original_id));
             let paragraph_ids: Vec<_> = (0..editor.document().paragraphs().len())
                 .map(|index| adapter.paragraph_node(index).unwrap())
@@ -2590,7 +2605,7 @@ mod accesskit_bridge {
             }
             assert!(
                 adapter
-                    .update(&editor, "Notes", true)
+                    .update(&editor, "Notes", Focus::Focused)
                     .unwrap()
                     .nodes
                     .is_empty()
@@ -2612,7 +2627,7 @@ mod accesskit_bridge {
             let mut exhausted = AccessKitAdapter::new(NodeId(u64::MAX - 1)).unwrap();
             for _ in 0..2 {
                 assert_eq!(
-                    exhausted.update(&Editor::from_text("a"), "Notes", true),
+                    exhausted.update(&Editor::from_text("a"), "Notes", Focus::Focused),
                     Err(AccessKitError::NodeIdExhausted)
                 );
                 assert!(exhausted.paragraphs.is_empty() && exhausted.published_editor.is_none());
@@ -2623,14 +2638,14 @@ mod accesskit_bridge {
         fn oversized_graphemes_publish_as_several_characters() {
             let mut editor = Editor::from_text("first\nmiddle\nlast");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             editor
                 .set_selection(Selection::caret(Position::new(1, 3)))
                 .unwrap();
             editor
                 .insert_text(&format!("x{}", "\u{301}".repeat(200)))
                 .unwrap();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let (run, _) = adapter.text_runs(1).next().unwrap();
             let (_, node) = update.nodes.iter().find(|(id, _)| *id == run).unwrap();
             assert_eq!(node.character_lengths(), &[1, 1, 1, 255, 146, 1, 1, 1, 1]);
@@ -2652,13 +2667,17 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(0, 2)))
                 .unwrap();
             assert_eq!(
-                adapter.update(&editor, "Notes", true).unwrap().nodes.len(),
+                adapter
+                    .update(&editor, "Notes", Focus::Focused)
+                    .unwrap()
+                    .nodes
+                    .len(),
                 1
             );
 
             let editor = Editor::from_text(&format!("a{}b", "\u{301}".repeat(40_000)));
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_runs_form_lines(&adapter);
             assert_positions_roundtrip(&adapter, &editor);
             let runs: Vec<_> = adapter.text_runs(0).collect();
@@ -2687,7 +2706,7 @@ mod accesskit_bridge {
                 })
                 .unwrap();
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_runs_form_lines(&adapter);
             assert_positions_roundtrip(&adapter, &editor);
             let values = |adapter: &AccessKitAdapter, paragraph: usize| {
@@ -2741,7 +2760,7 @@ mod accesskit_bridge {
                     2 => editor.delete_backward().unwrap(),
                     _ => editor.delete_backward().unwrap(),
                 }
-                adapter.update(&editor, "Notes", true).unwrap();
+                adapter.update(&editor, "Notes", Focus::Focused).unwrap();
                 assert_matches_fresh_tree(&adapter, &editor);
                 assert_runs_form_lines(&adapter);
                 assert_positions_roundtrip(&adapter, &editor);
@@ -2755,7 +2774,7 @@ mod accesskit_bridge {
             let unicode = "é ".repeat(300);
             let editor = Editor::from_text(&format!("{ascii}\n{unicode}"));
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_runs_form_lines(&adapter);
             assert_positions_roundtrip(&adapter, &editor);
             let ranges: Vec<_> = adapter.text_runs(0).map(|(_, range)| range).collect();
@@ -2783,7 +2802,7 @@ mod accesskit_bridge {
                 .unwrap();
             editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
             let mut adapter = AccessKitAdapter::default();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let quote = adapter.quotes[0].id;
             let editor_node = update
                 .nodes
@@ -2807,7 +2826,7 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(3, 1)))
                 .unwrap();
             editor.insert_text("x").unwrap();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(
                 roles(&update),
                 [Role::Paragraph, Role::TextRun, Role::MultilineTextInput]
@@ -2816,7 +2835,7 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(2, 1)))
                 .unwrap();
             editor.insert_text("x").unwrap();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(
                 roles(&update),
                 [Role::Paragraph, Role::TextRun, Role::MultilineTextInput]
@@ -2824,7 +2843,7 @@ mod accesskit_bridge {
             assert_eq!(adapter.quotes[0].id, quote);
             assert_matches_fresh_tree(&adapter, &editor);
             editor.select_all();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(roles(&update), [Role::MultilineTextInput]);
 
             editor
@@ -2832,7 +2851,7 @@ mod accesskit_bridge {
                 .unwrap();
             editor.insert_paragraph().unwrap();
             editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(quote_groups(&adapter), [vec![1, 2], vec![4]]);
             assert_eq!(adapter.quotes[0].id, quote);
             assert_ne!(adapter.quotes[1].id, quote);
@@ -2840,13 +2859,13 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(3, 0)))
                 .unwrap();
             editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(quote_groups(&adapter), [vec![1, 2, 3, 4]]);
             assert_eq!(adapter.quotes[0].id, quote);
             assert_matches_fresh_tree(&adapter, &editor);
             assert_positions_roundtrip(&adapter, &editor);
             while editor.undo() {
-                adapter.update(&editor, "Notes", true).unwrap();
+                adapter.update(&editor, "Notes", Focus::Focused).unwrap();
                 assert_matches_fresh_tree(&adapter, &editor);
             }
             assert!(adapter.quotes.is_empty());
@@ -2867,12 +2886,12 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(0, 8)))
                 .unwrap();
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let paragraph_id = adapter.paragraph_node(0);
 
             editor.insert_text("!").unwrap();
             assert!(adapter.set_read_only(true, &mut editor).changed);
-            let update = adapter.update(&editor, "Draft", true).unwrap();
+            let update = adapter.update(&editor, "Draft", Focus::Focused).unwrap();
             assert_eq!(adapter.paragraph_node(0), paragraph_id);
             let node = editor_node(&adapter, &update);
             assert_eq!(node.label(), Some("Draft"));
@@ -2889,7 +2908,7 @@ mod accesskit_bridge {
 
             editor.insert_text("?").unwrap();
             assert!(adapter.set_read_only(false, &mut editor).changed);
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(adapter.paragraph_node(0), paragraph_id);
             let node = editor_node(&adapter, &update);
             assert_eq!(node.label(), Some("Notes"));
@@ -2910,7 +2929,7 @@ mod accesskit_bridge {
                 .unwrap();
             editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_positions_roundtrip(&adapter, &editor);
             let ids: Vec<_> = (0..4)
                 .map(|index| adapter.paragraph_node(index).unwrap())
@@ -2931,7 +2950,7 @@ mod accesskit_bridge {
                 .set_selection(Selection::new(Position::new(1, 1), Position::new(2, 1)))
                 .unwrap();
             editor.insert_text("x\ny").unwrap();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(
                 roles(&update),
                 [
@@ -2953,7 +2972,7 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(0, 0)))
                 .unwrap();
             editor.insert_text("x").unwrap();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(
                 roles(&update),
                 [Role::Paragraph, Role::TextRun, Role::MultilineTextInput]
@@ -2977,14 +2996,14 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(3, 0)))
                 .unwrap();
             editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_ne!(adapter.paragraph_node(3), Some(ids[3]));
             assert_eq!(quote_groups(&adapter), [vec![1, 2, 3]]);
             assert_eq!(adapter.quotes[0].id, quote);
             assert_matches_fresh_tree(&adapter, &editor);
             assert_positions_roundtrip(&adapter, &editor);
             while editor.undo() {
-                adapter.update(&editor, "Notes", true).unwrap();
+                adapter.update(&editor, "Notes", Focus::Focused).unwrap();
                 assert_matches_fresh_tree(&adapter, &editor);
                 assert_positions_roundtrip(&adapter, &editor);
             }
@@ -2995,7 +3014,7 @@ mod accesskit_bridge {
         fn structural_edits_rebuild_only_inserted_paragraphs() {
             let mut editor = Editor::from_text("zero\none\ntwo\nthree");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let ids: Vec<_> = (0..4)
                 .map(|index| adapter.paragraph_node(index).unwrap())
                 .collect();
@@ -3005,7 +3024,7 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(2, 1)))
                 .unwrap();
             editor.insert_text("w").unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert!(adapter.run_locations.get().is_some());
             assert_positions_roundtrip(&adapter, &editor);
 
@@ -3013,7 +3032,7 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(Position::new(1, 1)))
                 .unwrap();
             editor.insert_paragraph().unwrap();
-            let update = adapter.update(&editor, "Notes", true).unwrap();
+            let update = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(update.nodes.len(), 5);
             assert_eq!(adapter.paragraph_node(0), Some(ids[0]));
             assert_eq!(adapter.paragraph_node(4), Some(ids[3]));
@@ -3025,21 +3044,21 @@ mod accesskit_bridge {
                 .set_selection(Selection::caret(editor.document().end()))
                 .unwrap();
             editor.insert_paragraph().unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_ne!(adapter.paragraph_node(4), Some(ids[3]));
             assert_matches_fresh_tree(&adapter, &editor);
             editor.delete_backward().unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_matches_fresh_tree(&adapter, &editor);
 
             while editor.undo() {
-                adapter.update(&editor, "Notes", true).unwrap();
+                adapter.update(&editor, "Notes", Focus::Focused).unwrap();
                 assert_matches_fresh_tree(&adapter, &editor);
                 assert_positions_roundtrip(&adapter, &editor);
             }
             assert_eq!(adapter.paragraph_node(0), Some(ids[0]));
             while editor.redo() {
-                adapter.update(&editor, "Notes", true).unwrap();
+                adapter.update(&editor, "Notes", Focus::Focused).unwrap();
                 assert_matches_fresh_tree(&adapter, &editor);
                 assert_positions_roundtrip(&adapter, &editor);
             }
@@ -3081,7 +3100,7 @@ mod accesskit_bridge {
                 let mut editor = editor();
                 let mut adapter = AccessKitAdapter::default();
                 let mut tree = accesskit_consumer::Tree::new(
-                    adapter.update(&editor, "Notes", true).unwrap(),
+                    adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
                     true,
                 );
                 for _ in 0..50 {
@@ -3092,7 +3111,7 @@ mod accesskit_bridge {
                         adapter.invalidate();
                     }
                     tree.update_and_process_changes(
-                        adapter.update(&editor, "Notes", true).unwrap(),
+                        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
                         &mut Ignore,
                     );
                     assert_matches_fresh_tree(&adapter, &editor);
@@ -3116,11 +3135,11 @@ mod accesskit_bridge {
         fn text_runs_can_be_located_for_host_scrolling() {
             let mut editor = Editor::from_text("first\nsecond");
             let mut adapter = AccessKitAdapter::default();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let (run, range) = adapter.text_runs(1).next().unwrap();
             assert_eq!(adapter.locate_text_run(run), Some((1, range)));
             editor.insert_paragraph().unwrap();
-            adapter.update(&editor, "Notes", true).unwrap();
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             assert_eq!(adapter.locate_text_run(run), Some((2, 0..6)));
             assert_eq!(adapter.locate_text_run(adapter.editor_node()), None);
         }
@@ -3471,7 +3490,7 @@ mod tests {
         editor
             .set_paragraph_kind(ParagraphKind::Bullet { indent: 1 })
             .unwrap();
-        let snapshot = AccessibilitySnapshot::new(&editor, "Notes", true);
+        let snapshot = AccessibilitySnapshot::new(&editor, "Notes", Focus::Focused);
         assert_eq!(snapshot.label(), "Notes");
         assert!(snapshot.is_focused());
         assert_eq!(snapshot.selection(), editor.selection());
@@ -3504,7 +3523,7 @@ mod tests {
     #[test]
     fn invalid_grapheme_positions_report_grapheme_coordinates() {
         let editor = Editor::from_text("h\u{e9}llo");
-        let snapshot = AccessibilitySnapshot::new(&editor, "Notes", true);
+        let snapshot = AccessibilitySnapshot::new(&editor, "Notes", Focus::Focused);
         let caret = |paragraph, grapheme| {
             let position = AccessiblePosition {
                 paragraph,

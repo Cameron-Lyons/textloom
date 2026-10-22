@@ -14,7 +14,7 @@ use accesskit::{
 use accesskit_consumer::{
     FilterResult, NodeRef as Node, TextRangePropertyValue, Tree, TreeChangeHandler,
 };
-use textloom::accessibility::{AccessKitAdapter, AccessKitError};
+use textloom::accessibility::{AccessKitAdapter, AccessKitError, Focus};
 use textloom::{Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch};
 
 /// A tree change handler for updates whose individual changes the tests don't inspect.
@@ -75,7 +75,10 @@ fn styled_runs_share_their_paragraph_line() {
         .set_selection(Selection::caret(Position::new(0, 6)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(adapter.text_runs(0).count(), 3);
     let node = text_input(&tree, &adapter);
     assert_eq!(
@@ -104,7 +107,10 @@ fn fills_are_formatting_boundaries_that_ranges_report() {
         })
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     let yellow = accesskit::Color {
         red: 255,
@@ -137,7 +143,10 @@ fn fills_are_formatting_boundaries_that_ranges_report() {
             ..StylePatch::default()
         })
         .unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter)
             .document_range()
@@ -150,7 +159,10 @@ fn fills_are_formatting_boundaries_that_ranges_report() {
 fn word_navigation_follows_editor_words() {
     let editor = Editor::from_text("Hello world again\nsecond");
     let mut adapter = AccessKitAdapter::default();
-    let tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     let mut position = node.document_start();
     let mut ends = Vec::new();
@@ -172,7 +184,10 @@ fn word_starts_match_editor_words_across_long_runs() {
     ));
     bold(&mut editor, Position::new(0, 8)..Position::new(0, 400));
     let mut adapter = AccessKitAdapter::default();
-    let tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(node.document_range().text(), editor.document().plain_text());
     let document_end = node.document_range().text().chars().count();
@@ -221,35 +236,47 @@ fn word_starts_match_editor_words_across_long_runs() {
 fn invalidated_adapters_reinitialize_platform_trees() {
     let mut editor = Editor::from_text("Hello\nworld");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
-    let incremental = adapter.update(&editor, "Notes", true).unwrap();
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
+    let incremental = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
     assert!(incremental.tree.is_none() && incremental.nodes.is_empty());
 
     adapter.invalidate();
-    let restarted = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let restarted = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(
         text_input(&restarted, &adapter).document_range().text(),
         "Hello\nworld"
     );
     assert!(
         adapter
-            .update(&editor, "Notes", true)
+            .update(&editor, "Notes", Focus::Focused)
             .unwrap()
             .nodes
             .is_empty()
     );
 
     editor.insert_text("> ").unwrap();
-    let _discarded = adapter.update(&editor, "Notes", true).unwrap();
+    let _discarded = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
     editor.insert_paragraph().unwrap();
     adapter.invalidate();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter).document_range().text(),
         editor.document().plain_text()
     );
     editor.insert_text("more").unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter).document_range().text(),
         editor.document().plain_text()
@@ -260,14 +287,20 @@ fn invalidated_adapters_reinitialize_platform_trees() {
 fn oversized_graphemes_keep_the_tree_accessible() {
     let mut editor = Editor::from_text("first\nmiddle\nlast");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     editor
         .set_selection(Selection::caret(Position::new(1, 3)))
         .unwrap();
     editor
         .insert_text(&format!("x{}", "\u{301}".repeat(200)))
         .unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(node.document_range().text(), editor.document().plain_text());
     assert_eq!(
@@ -292,7 +325,10 @@ fn oversized_graphemes_keep_the_tree_accessible() {
             .changed
     );
     assert_eq!(editor.selection(), Selection::caret(Position::new(1, 3)));
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter)
             .text_selection_focus()
@@ -320,7 +356,10 @@ fn grafted_subtrees_are_transparent_in_the_host_tree() {
     );
     let editor = Editor::from_text("grafted");
     let mut adapter = AccessKitAdapter::default().with_tree_id(subtree);
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     let state = tree.state();
     let input = state
         .node_by_tree_local_id(adapter.editor_node(), subtree)
@@ -344,7 +383,10 @@ fn grafted_subtrees_are_transparent_in_the_host_tree() {
 fn consumer_tracks_the_editor_through_incremental_updates() {
     let mut editor = Editor::from_text("alpha beta\ngamma\n\ndelta");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let mut seed = 0x1234_5678_9abc_def0_u64;
     let mut random = |limit: usize| {
         seed ^= seed << 13;
@@ -411,7 +453,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
             adapter.invalidate();
         }
         tree.update_and_process_changes(
-            adapter.update(&editor, "Notes", true).unwrap(),
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
             &mut Ignore,
         );
         let node = text_input(&tree, &adapter);
@@ -475,7 +517,10 @@ fn soft_line_breaks_are_lines_within_one_paragraph() {
         .set_selection(Selection::caret(Position::new(0, 8)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(node.document_range().text(), "Hello\n  world\n\nnext");
     assert_eq!(node.document_range().text(), editor.document().plain_text());
@@ -502,7 +547,7 @@ fn soft_line_breaks_are_lines_within_one_paragraph() {
         let position = Position::new(0, paragraph.byte_from_grapheme(grapheme).unwrap());
         editor.set_selection(Selection::caret(position)).unwrap();
         tree.update_and_process_changes(
-            adapter.update(&editor, "Notes", true).unwrap(),
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
             &mut Ignore,
         );
         let node = text_input(&tree, &adapter);
@@ -605,7 +650,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .set_selection(Selection::caret(Position::new(0, 11)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(
         link_nodes(node),
@@ -674,7 +722,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
             .unwrap();
         assert_eq!(editor.selection().focus, Position::new(0, byte), "{byte}");
     }
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
 
     let (link_id, _) = text_input(&tree, &adapter)
         .children()
@@ -723,7 +774,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         adapter.handle_action(&click, &mut editor),
         Err(AccessKitError::StaleDocument)
     ));
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(link_nodes(node).len(), 1);
     assert_eq!(node.document_range().text(), editor.document().plain_text());
@@ -862,7 +916,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(1, 4)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(
         blocks(&tree, &adapter, &editor),
         [
@@ -917,7 +974,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(1, 0)))
         .unwrap();
     editor.insert_text("x").unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(container(&tree, &adapter, 1), first);
     assert_eq!(container(&tree, &adapter, 2), first);
     let last = container(&tree, &adapter, 4);
@@ -927,7 +987,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(3, 0)))
         .unwrap();
     editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         blocks(&tree, &adapter, &editor),
         [Block::Paragraph(0), Block::Quote(vec![1, 2, 3, 4])]
@@ -947,7 +1010,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(2, 0)))
         .unwrap();
     editor.delete_backward().unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         blocks(&tree, &adapter, &editor),
         [
@@ -959,12 +1025,18 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
     );
     assert_eq!(container(&tree, &adapter, 1), first);
     assert!(editor.undo());
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(blocks(&tree, &adapter, &editor), expected_blocks(&editor));
     assert_eq!(container(&tree, &adapter, 4), first);
 
     adapter.invalidate();
-    let restarted = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let restarted = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(
         blocks(&restarted, &adapter, &editor),
         expected_blocks(&editor)
@@ -979,7 +1051,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
 fn consumer_tracks_blockquote_containers_through_incremental_updates() {
     let mut editor = Editor::from_text("alpha\nbeta\ngamma\ndelta\nepsilon");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let mut seed = 0x0dd5_eed5_ba5e_ba11_u64;
     let mut random = |limit: usize| {
         seed ^= seed << 13;
@@ -1032,7 +1107,7 @@ fn consumer_tracks_blockquote_containers_through_incremental_updates() {
             adapter.invalidate();
         }
         tree.update_and_process_changes(
-            adapter.update(&editor, "Notes", true).unwrap(),
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
             &mut Ignore,
         );
         assert_eq!(

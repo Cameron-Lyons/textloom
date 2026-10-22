@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use textloom::{
     Color, Document, Editor, Error, Fragment, FragmentError, InlineStyle, Link, Movement,
-    Paragraph, ParagraphKind, Position, SearchOptions, Selection, Span, StylePatch,
+    Paragraph, ParagraphKind, Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,
 };
 
 fn link(target: &str) -> Link {
@@ -797,7 +797,9 @@ fn history_charges_a_link_shared_by_many_paragraphs_once() {
     let target = format!("https://example.com/{}", "x".repeat(Link::MAX_LEN - 20));
     let long = link(&target);
     let mut editor = Editor::from_text(&vec!["word"; 200].join("\n"));
-    editor.move_cursor(Movement::DocumentEnd, false).unwrap();
+    editor
+        .move_cursor(Movement::DocumentEnd, SelectionMode::Move)
+        .unwrap();
     editor.insert_text(" earlier").unwrap();
     editor.select_all();
     editor.set_link(Some(long)).unwrap();

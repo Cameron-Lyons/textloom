@@ -71,7 +71,7 @@
 
 use super::Shortcut;
 use crate::document::LINE_SEPARATOR;
-use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection};
+use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection, SelectionMode};
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, WindowEvent};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
@@ -641,7 +641,12 @@ impl WinitAdapter {
         };
         if let Some(movement) = movement {
             editor.cancel_composition();
-            editor.move_cursor(movement, shift)?;
+            let mode = if shift {
+                SelectionMode::Extend
+            } else {
+                SelectionMode::Move
+            };
+            editor.move_cursor(movement, mode)?;
         } else {
             match key {
                 Key::Named(
@@ -2897,10 +2902,11 @@ mod tests {
                 cases.push((command, NamedKey::ArrowRight, ParagraphEnd));
             }
             for (modifiers, named, movement) in cases {
-                for extend in [false, true] {
+                for mode in [SelectionMode::Move, SelectionMode::Extend] {
+                    let extend = mode == SelectionMode::Extend;
                     let mut expected = Editor::from_text(text);
                     expected.set_selection(Selection::caret(start)).unwrap();
-                    expected.move_cursor(movement, extend).unwrap();
+                    expected.move_cursor(movement, mode).unwrap();
                     let mut editor = Editor::from_text(text);
                     editor.set_selection(Selection::caret(start)).unwrap();
                     let mut adapter = WinitAdapter::new().command_modifier(command_modifier);

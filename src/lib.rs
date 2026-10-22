@@ -59,10 +59,10 @@ mod types;
 pub use document::{Document, Paragraph, Span};
 pub use editor::{Composition, Editor, HistoryLimits};
 pub use fragment::{DecodeLimits, Fragment, FragmentError};
-pub use search::SearchOptions;
+pub use search::{SearchOptions, SearchWrap};
 pub use types::{
     Color, Error, InlineAttribute, InlineStyle, Link, Movement, ParagraphKind, Position, Selection,
-    SelectionStyle, StylePatch,
+    SelectionMode, SelectionStyle, StylePatch,
 };
 
 const _: () = {

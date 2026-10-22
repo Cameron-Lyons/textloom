@@ -44,14 +44,14 @@ assert!(editor.redo());
 - LF, CRLF, lone CR, and U+2029 are paragraph breaks on import and insertion. U+2028 LINE SEPARATOR is a soft line break within a paragraph: `insert_line_break()` (Shift+Enter) inserts one in the typing style, keeping the paragraph's kind and the typing undo step. Plain-text export and selected text write soft breaks as LF and HTML as `<br>`; a search query's U+2028 matches soft breaks, while its LF, CRLF, CR, or U+2029 matches only paragraph breaks.
 
 ```rust
-use textloom::{Editor, SearchOptions, StylePatch};
+use textloom::{Editor, SearchOptions, SearchWrap, StylePatch};
 
 let mut editor = Editor::from_text("one two one");
 let options = SearchOptions::default();
 // A Replace button replaces the current match, then selects the next one.
-assert!(editor.find_next("one", options, true).unwrap());
+assert!(editor.find_next("one", options, SearchWrap::Around).unwrap());
 assert!(editor.replace_selected_match("one", "1", options).unwrap());
-assert!(editor.find_next("one", options, true).unwrap());
+assert!(editor.find_next("one", options, SearchWrap::Around).unwrap());
 editor.mark_saved(); // For example, after writing the document to a file.
 
 editor

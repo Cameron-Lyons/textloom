@@ -19,8 +19,8 @@ use std::{io, mem, process};
 use eframe::egui;
 use textloom::adapter::egui::RichTextEditor;
 use textloom::{
-    Color, DecodeLimits, Document, Editor, Link, ParagraphKind, Position, SearchOptions, Selection,
-    StylePatch,
+    Color, DecodeLimits, Document, Editor, Link, ParagraphKind, Position, SearchOptions,
+    SearchWrap, Selection, StylePatch,
 };
 
 use crate::clipboard::NativeClipboard;
@@ -316,9 +316,11 @@ impl NativeEditor {
             },
             EditorCommand::Find { previous, options } => {
                 let found = if previous {
-                    self.editor.find_previous(&self.query, options, true)
+                    self.editor
+                        .find_previous(&self.query, options, SearchWrap::Around)
                 } else {
-                    self.editor.find_next(&self.query, options, true)
+                    self.editor
+                        .find_next(&self.query, options, SearchWrap::Around)
                 };
                 match found {
                     Ok(true) => self.status = "Match selected".into(),
