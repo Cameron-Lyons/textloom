@@ -2,6 +2,18 @@
 
 ## 1.0 validation status
 
+On 2026-10-22, version 1.0.0-rc.1 was prepared as a release candidate, because
+no Windows desktop is available for the hands-on checks below. Its commit
+`d7f2feec05ec599af280f64645c95fdd1b44c86e` is `main` at
+`3d4c5ab0ab93e7bb379958e59562dd651274af34` plus the version change. The
+isolated Linux checks described below were repeated on it: all 27 interaction
+checks, the light- and dark-theme block quote check, and the seven X11 IME
+checks passed. The winit adapter checks passed twice each under Wayland and
+X11, except the X11 candidate placement diagnostic, which again found the list
+10 px below the top of a 24 px caret (see the second table). The open Windows,
+macOS, and physical-device checks are listed in the release candidate's notes;
+1.0.0 still requires them.
+
 Local macOS verification on 2026-10-22 used macOS 27.2 (26C111), Apple Silicon
 (`aarch64-apple-darwin`), Rust 1.99.1, and a 2x Retina display. This checked the
 uncommitted working tree based on
@@ -36,11 +48,13 @@ interoperability. Local reports and logs were recorded in
 
 The hosted Mac interaction probe now includes Control/Option navigation,
 Shift selections, Unicode grapheme deletion, soft-line Command+Backspace, and
-exact copied-text/undo assertions. Its Python regressions run locally; the
-extended native probe still needs a hosted workflow run on the final candidate.
-Its new 25 shortcut checks and the workflow's interaction deadline have not yet
-been validated together on a hosted desktop. Forced-wrap deletion is covered
-by headless widget regressions and remains a native signoff check.
+exact copied-text/undo assertions. Its Python regressions run locally. On PR
+#10's head `2acb5842d1bae8dc7eede35be89215fa310680b3`, the
+[hosted run](https://github.com/Cameron-Lyons/textloom/actions/runs/39793426804)
+passed all 25 new shortcut checks within the workflow's interaction deadline,
+along with the existing editable, read-only, and disabled checks. Forced-wrap
+deletion is covered by headless widget regressions and remains a native signoff
+check.
 Physical keyboards, Japanese/Chinese IMEs, VoiceOver, native winit input, and
 display-scale transitions remain pending. This local run does not establish
 Intel or older-macOS compatibility. Retain the platform signoff requirements
@@ -367,7 +381,8 @@ non-exhaustive structs that may gain fields. `InlineStyle`,
 a major release. `Editor`, `Document`, `Paragraph`, and `Fragment` must remain
 `Send + Sync`, which `src/lib.rs` checks at compile time.
 Exact error messages, private implementation details, cache layouts, and benchmark
-timings are not API guarantees.
+timings are not API guarantees. Release candidates, such as 1.0.0-rc.1, precede
+this contract: their API may still change before 1.0.0.
 
 Rust 1.95 is the minimum supported compiler for 1.0. The locked dependency graph
 is tested on that compiler, and a CI job also compiles the lowest direct
@@ -486,8 +501,9 @@ malformed-input regression tests when changing the codec.
    services. Record the host/platform results in the release notes. Any failed
    host behavior claimed by this release is a release blocker. Use the native
    signoff protocol in `examples/native-editor/NATIVE_QA.md` and record unavailable
-   checks explicitly. Test desktops are currently unavailable, so these human
-   gates remain open and the candidate remains unreleased.
+   checks explicitly. No Windows desktop is available, so these human gates
+   remain open. A release candidate may be published with them open if its
+   GitHub release lists them; 1.0.0 may not.
 
 Re-apply `.github/branch-protection.json` to `main` whenever its required checks
 change, as they did with the "Dependency policy (bans licenses sources)" job:
@@ -515,6 +531,17 @@ and CI never publish to crates.io or create a GitHub release.
 4. The tag workflow runs the complete CI matrix and hosted native interaction
    probes, rejects a version/tag mismatch, and uploads the verified `.crate` archive and its SHA-256 checksum. Confirm it
    passes before creating a GitHub release using the matching changelog entry.
+
+For a release candidate, substitute its tag in these steps and in
+`check-release.sh --tag`, and mark its GitHub release as a pre-release:
+
+```sh
+git tag -a v1.0.0-rc.1 -m 'Textloom 1.0.0-rc.1'
+git push origin v1.0.0-rc.1
+```
+
+Cargo selects a release candidate only for requirements that name one, such as
+`textloom = "1.0.0-rc.1"`.
 
 Crates.io versions cannot be overwritten. Fix a published defect in a new patch
 release; consider yanking a defective version where appropriate. Do not move an
