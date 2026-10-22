@@ -1,6 +1,17 @@
+//! Embeds a `RichTextEditor` with a formatting toolbar in an egui UI.
+//!
+//! The example renders a single headless frame from default input, so it needs no
+//! window: a real host calls `editor_ui` from its own egui update loop. Run it with
+//! `cargo run --example egui_editor --features egui`.
+
 use textloom::adapter::egui::{RichTextEditor, install_input_routing};
 use textloom::{Editor, ParagraphKind, StylePatch};
 
+/// Shows a toolbar of formatting buttons above a scrollable editor.
+///
+/// Errors are shown in red rather than dropped: errors from toolbar commands
+/// appear between the toolbar and the editor, and errors reported by the editor
+/// widget appear below it.
 fn editor_ui(ui: &mut egui::Ui, editor: &mut Editor) {
     let mut errors = Vec::new();
     ui.horizontal(|ui| {
@@ -67,6 +78,8 @@ fn main() {
         "Textloom\nSelect text to format it. Native input stays in your GUI host.\nUnicode: 日本語, café, 👨\u{200d}👩\u{200d}👧\u{200d}👦",
     );
     let context = egui::Context::default();
+    // Install input routing once, when creating the context. `RichTextEditor`
+    // would otherwise install it on its first frame, taking effect only on the next.
     install_input_routing(&context);
     let output = context.run_ui(egui::RawInput::default(), |ui| {
         egui::CentralPanel::default().show(ui, |ui| editor_ui(ui, &mut editor));
@@ -76,5 +89,7 @@ fn main() {
         output.shapes.len(),
         editor.document().plain_text()
     );
+    // Without a renderer there is nowhere to upload font textures, and dropping
+    // unapplied texture deltas would panic.
     output.drop_without_applying_deltas();
 }
