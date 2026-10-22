@@ -33,6 +33,10 @@ First stable release of the native Rust rich-text editing library.
   is still inserted by the editor, like text, because egui moves focus for
   Shift+Tab only in the next pass. The editor still commits its visible preedit
   on blur.
+- Egui keeps requesting IME while the window is in the background, as egui's
+  `TextEdit` does. With winit 0.30's X11 backend, switching to another
+  application and back reset the input method to direct input, so the next
+  keys went into the editor as plain Latin text.
 - Egui clicks, drags, Up/Down, and PageUp/PageDown on the right half of a wide
   grapheme, such as a flag, a skin-toned emoji, or a letter with combining
   marks, place the caret after it. Double-clicking the right half of a word's
@@ -55,6 +59,8 @@ First stable release of the native Rust rich-text editing library.
   item after an IME commit or a batched caret move. Restoring a snapshot and the
   QA report's TLFR round trip accept the host's own snapshots beyond the default
   decode limits. Fill Color and Font Color activated in one frame both apply.
+  `--theme light|dark` overrides the system theme, which winit does not report
+  on Linux.
 - Find next/previous and `replace_selected_match()` search outward from the
   selection for every query that cannot overlap itself, including
   case-insensitive and whole-word queries, so a press costs time proportional
