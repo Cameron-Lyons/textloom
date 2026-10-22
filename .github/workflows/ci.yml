@@ -146,6 +146,25 @@ jobs:
       - name: Build native renderer
         if: runner.os == 'macOS'
         run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Native rendering smoke with default clipboard (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mkdir -p native-observations
+          for mode in editable read-only disabled; do
+            args=(--smoke-test --qa-report "native-observations/default-$mode.json")
+            case "$mode" in
+              read-only) args+=(--read-only) ;;
+              disabled) args+=(--disabled) ;;
+            esac
+            smoke_status=0
+            ./target/debug/textloom-native-example "${args[@]}" 2> "native-smoke-default-$mode.log" | tee "native-smoke-default-$mode.stdout" || smoke_status=$?
+            cat "native-smoke-default-$mode.stdout" >> "native-smoke-default-$mode.log"
+            if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
+            grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-default-$mode.stdout"
+            python3 scripts/check_native_report.py "native-observations/default-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode" --clipboard default
+          done
       - name: Native rendering smoke (macOS)
         if: runner.os == 'macOS'
         timeout-minutes: 2
@@ -178,6 +197,7 @@ jobs:
           path: |
             native-observations/*.json
             native-smoke-*.log
+            native-smoke-*.stdout
           if-no-files-found: warn
           retention-days: 14
 

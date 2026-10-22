@@ -488,7 +488,13 @@ impl<'a> RichTextEditor<'a> {
             let mut consumed = Vec::new();
             let mut layout_stale = false;
             let mut traversed = false;
+            let mut event_modifiers = input_routing::modifiers_at_pass_start(ui.ctx());
             for (index, event) in events.iter().enumerate() {
+                match event {
+                    Event::ModifiersChanged(modifiers) => event_modifiers = *modifiers,
+                    Event::WindowFocused(false) => event_modifiers = egui::Modifiers::NONE,
+                    _ => {}
+                }
                 // egui moves focus for Shift+Tab next pass; a later preedit belongs to that widget,
                 // while commits stay here like Text.
                 if applied.binary_search(&index).is_ok()
@@ -496,7 +502,7 @@ impl<'a> RichTextEditor<'a> {
                 {
                     continue;
                 }
-                if layout_stale && reads_layout(event, &options) {
+                if layout_stale && reads_layout(ui.os(), event, &options) {
                     layouts = cache.layout(ui, self.editor, &appearance);
                     layout_stale = false;
                 }
@@ -536,6 +542,7 @@ impl<'a> RichTextEditor<'a> {
                         self.editor,
                         ui,
                         event,
+                        event_modifiers,
                         &layouts,
                         &mut cache.interaction.navigation,
                         &mut cache.interaction.commit_echo,
@@ -1100,6 +1107,7 @@ fn apply_queued_ime(
             editor,
             ui,
             &event,
+            egui::Modifiers::NONE, // Queued IME input cannot contain a paste.
             layouts,
             &mut cache.interaction.navigation,
             &mut cache.interaction.commit_echo,

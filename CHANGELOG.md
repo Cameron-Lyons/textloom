@@ -6,6 +6,17 @@ Unreleased. Native host checks and publication steps are tracked in `RELEASING.m
 
 First stable release of the native Rust rich-text editing library.
 
+- macOS input supports Control+A/E/B/F/P/N navigation, Control+H/D deletion,
+  and Option+Up/Down paragraph navigation with Shift selection. The egui
+  widget's Command+Backspace deletes to the current visual row's start,
+  preserving earlier wrapped lines and soft breaks. Native macOS clipboard
+  tests use private pasteboards to check Unicode, rich formats, replacement,
+  and plain fallback without changing the system clipboard. Mac renderer CI
+  also checks the default clipboard configuration in all three editing modes.
+- Egui plain-text paste uses the modifiers held when each paste arrives, so
+  releasing or pressing Command/Ctrl+Shift later in the same input batch no
+  longer changes whether formatting is pasted. Held modifiers remain correct
+  across frames and routed accessibility focus passes.
 - `apply_numbered_list()` continues a list whose last item is a nested
   sub-item instead of restarting at 1. `replace_all()` styles a match that
   starts with a paragraph break as step-by-step replacement does, instead of
