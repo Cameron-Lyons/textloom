@@ -3,11 +3,11 @@
 use std::ops::Range;
 
 use accesskit::{
-    Action, ActionData, ActionRequest, Node as NodeData, NodeId, Role, TextSelection,
-    Tree as TreeData, TreeId, TreeUpdate, Uuid,
+    Action, ActionData, ActionRequest, Node as NodeData, NodeId, Role, TextSelection, TreeId,
+    TreeInfo as TreeData, TreeUpdate, Uuid,
 };
 use accesskit_consumer::{
-    FilterResult, Node, TextRangePropertyValue, Tree, TreeChangeHandler, common_filter,
+    FilterResult, NodeRef as Node, TextRangePropertyValue, Tree, TreeChangeHandler, common_filter,
 };
 use textloom::{
     Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch,

@@ -311,7 +311,7 @@ impl Session {
                 "  \"schema_version\": 1,\n",
                 "  \"manual_signoff\": \"not_recorded\",\n",
                 "  \"document_content_included\": false,\n",
-                "  \"host\": {{\"name\": \"textloom-native-example\", \"egui_api_version\": \"0.36\", \"eframe_api_version\": \"0.36\", \"os\": {os}, \"architecture\": {arch}, \"source_revision\": {source_revision}}},\n",
+                "  \"host\": {{\"name\": \"textloom-native-example\", \"egui_api_version\": \"0.37\", \"eframe_api_version\": \"0.37\", \"os\": {os}, \"architecture\": {arch}, \"source_revision\": {source_revision}}},\n",
                 "  \"session\": {{\"started_unix_seconds\": {started}, \"ended_unix_seconds\": {ended}, \"graceful_exit\": true, \"smoke_test_requested\": {smoke}, \"rich_clipboard_requested\": {rich_clipboard}, \"clipboard_self_test_requested\": {clipboard_test}, \"clipboard_self_test_passed\": {clipboard_passed}, \"rendered_frames\": {frames}, \"regular_font_supplied\": {regular_font}, \"bold_font_supplied\": {bold_font}}},\n",
                 "  \"display\": {{\"pixels_per_point\": {scale}, \"minimum_pixels_per_point\": {minimum_scale}, \"maximum_pixels_per_point\": {maximum_scale}, \"native_pixels_per_point\": {native_scale}}},\n",
                 "  \"host_input_events\": {{\"text\": {text}, \"key_press\": {key}, \"paste\": {paste}, \"copy\": {copy}, \"cut\": {cut}, \"ime_preedit\": {preedit}, \"ime_commit\": {commit}, \"ime_delete_surrounding\": {delete_surrounding}, \"accessibility_action\": {accessibility_action}, \"window_focus_gained\": {window_focus_gained}, \"window_focus_lost\": {window_focus_lost}}},\n",
@@ -636,8 +636,8 @@ mod tests {
             context.options_mut(|options| {
                 options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
             });
-            let first_id = egui::Id::new("qa-first-field");
-            let second_id = egui::Id::new("qa-second-field");
+            let first_id = egui::Id::unique("qa-first-field");
+            let second_id = egui::Id::unique("qa-second-field");
             context.memory_mut(|memory| memory.request_focus(first_id));
             let focus = |id: egui::Id| {
                 egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {

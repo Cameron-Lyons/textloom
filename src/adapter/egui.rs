@@ -792,7 +792,7 @@ impl<'a> RichTextEditor<'a> {
         let char_range = CharIndex(char_start)..CharIndex(char_end);
         let text = publish_text.then(|| cache.plain_text(self.editor.document()));
         response.widget_info(|| {
-            let mut info = egui::WidgetInfo::new(egui::WidgetType::TextEdit);
+            let mut info = egui::WidgetInfo::new(egui::Role::TextInput);
             info.enabled = ui.is_enabled();
             info.hint_text = Some(self.hint.clone());
             if let Some(text) = &text {
@@ -805,7 +805,7 @@ impl<'a> RichTextEditor<'a> {
             info
         });
         if old_selection != self.editor.selection() {
-            let mut info = egui::WidgetInfo::new(egui::WidgetType::TextEdit);
+            let mut info = egui::WidgetInfo::new(egui::Role::TextInput);
             info.enabled = ui.is_enabled();
             info.text_selection = Some(char_range);
             info.current_text_value = text.as_ref().map(ToString::to_string);

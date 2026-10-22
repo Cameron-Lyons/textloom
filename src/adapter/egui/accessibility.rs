@@ -1028,7 +1028,7 @@ mod tests {
         let editor = Editor::from_text(text);
         let context = egui::Context::default();
         let layouts = layout_frame(&context, &editor, width);
-        let snapshot = build(&editor, &layouts, Id::new("editor")).unwrap();
+        let snapshot = build(&editor, &layouts, Id::unique("editor")).unwrap();
         (editor, snapshot)
     }
 
@@ -1188,7 +1188,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
         let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -1226,7 +1226,7 @@ mod tests {
         let mut cache = super::super::Cache::default();
         let mut editor =
             Editor::from_text("first second third fourth\naé👩‍💻 second\nlast words here");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -1255,7 +1255,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
         let mut editor = Editor::from_text("first\nvalid\nlast");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -1283,7 +1283,7 @@ mod tests {
     fn local_edits_reuse_unchanged_paragraph_runs_and_geometry() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = layout_frame(&context, &editor, 500.0);
         let first = build(&editor, &layouts, widget_id).unwrap();
         let idle = build_cached(&editor, &layouts, widget_id, Some(&first)).unwrap();
@@ -1316,7 +1316,7 @@ mod tests {
                 );
             }
         }
-        let other_id = build_cached(&editor, &layouts, Id::new("other"), Some(&edited)).unwrap();
+        let other_id = build_cached(&editor, &layouts, Id::unique("other"), Some(&edited)).unwrap();
         assert!(
             edited
                 .paragraphs
@@ -1330,7 +1330,7 @@ mod tests {
     fn cached_paragraphs_refresh_when_the_final_separator_changes() {
         let context = egui::Context::default();
         let editor = Editor::from_text("first\nlast");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = layout_frame(&context, &editor, 500.0);
         let first = build(&editor, &layouts, widget_id).unwrap();
         let mut paragraphs = editor.document().paragraphs().to_vec();
@@ -1373,7 +1373,7 @@ mod tests {
     fn cached_paragraphs_refresh_for_width_and_font_changes() {
         let context = egui::Context::default();
         let editor = Editor::from_text("first second third fourth\nlast words here");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = layout_frame(&context, &editor, 500.0);
         let wide = build(&editor, &layouts, widget_id).unwrap();
         let layouts = layout_frame(&context, &editor, 65.0);
@@ -1407,7 +1407,7 @@ mod tests {
     fn failed_rebuilds_leave_the_previous_snapshot_intact() {
         let context = egui::Context::default();
         let editor = Editor::from_text("first\nvalid\nlast");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = layout_frame(&context, &editor, 500.0);
         let snapshot = build(&editor, &layouts, widget_id).unwrap();
         let position = snapshot.position(Position::new(1, 2)).unwrap();
@@ -1518,7 +1518,7 @@ mod tests {
 
         let context = egui::Context::default();
         context.enable_accesskit();
-        let id = Id::new("editor");
+        let id = Id::unique("editor");
         let mut editor = Editor::from_text(&text);
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(5000.0, 400.0))),
@@ -1605,7 +1605,7 @@ mod tests {
             let mut output = context.run_ui(egui::RawInput::default(), |ui| {
                 snapshot.publish(
                     ui,
-                    Id::new("editor"),
+                    Id::unique("editor"),
                     &editor,
                     &layouts,
                     origin,
@@ -1646,7 +1646,7 @@ mod tests {
         let (origin, transform) = placement;
         let context = egui::Context::default();
         context.enable_accesskit();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         context.memory_mut(|memory| memory.request_focus(widget_id));
         let mut responses = Vec::new();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
@@ -1805,7 +1805,7 @@ mod tests {
             })
             .unwrap();
         let layouts = layout_frame(&context, &editor, 65.0);
-        let snapshot = build(&editor, &layouts, Id::new("editor")).unwrap();
+        let snapshot = build(&editor, &layouts, Id::unique("editor")).unwrap();
         let layouts: Vec<_> = snapshot
             .paragraphs
             .iter()
@@ -1849,7 +1849,7 @@ mod tests {
             assert_eq!(published.focus, reference.focus);
             let old_nodes: HashMap<_, _> = reference.nodes.into_iter().collect();
             let nodes: HashMap<_, _> = published.nodes.into_iter().collect();
-            let widget = &nodes[&Id::new("editor").accesskit_id()];
+            let widget = &nodes[&Id::unique("editor").accesskit_id()];
             let children: Vec<_> = snapshot
                 .paragraphs
                 .iter()
@@ -1858,7 +1858,7 @@ mod tests {
             assert_eq!(widget.children(), children);
             assert_eq!(
                 widget.children(),
-                old_nodes[&Id::new("editor").accesskit_id()].children()
+                old_nodes[&Id::unique("editor").accesskit_id()].children()
             );
             assert_eq!(
                 widget.supports_action(accesskit::Action::SetTextSelection),
@@ -1931,7 +1931,7 @@ mod tests {
 
     fn snapshot_for(editor: &Editor, width: f32) -> (ParagraphLayouts, Snapshot) {
         let layouts = layout_frame(&egui::Context::default(), editor, width);
-        let snapshot = build(editor, &layouts, Id::new("editor")).unwrap();
+        let snapshot = build(editor, &layouts, Id::unique("editor")).unwrap();
         (layouts, snapshot)
     }
 
@@ -1943,7 +1943,7 @@ mod tests {
     ) -> HashMap<accesskit::NodeId, accesskit::Node> {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             ui.interact(
                 Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 500.0)),
@@ -1980,7 +1980,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
         let mut editor = Editor::from_text("zero zero\none\ntwo\nthree\nfour");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -2029,7 +2029,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
         let mut editor = Editor::from_text("zero\none\ntwo\nthree\nfour\nfive\nsix");
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -2110,7 +2110,7 @@ mod tests {
         apply: fn(&mut Editor, &mut R),
     ) {
         let context = egui::Context::default();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         for _ in 0..editors {
             let mut cache = super::super::Cache::default();
             let mut editor = editor();
@@ -2166,7 +2166,7 @@ mod tests {
         let mut cache = super::super::Cache::default();
         let long = "zero ".repeat(30);
         let mut editor = Editor::from_text(&format!("{long}\none\ntwo\nthree\nfour"));
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -2232,7 +2232,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let first = build(&editor, &layouts, widget_id).unwrap();
         assert_matches_fresh(&first, &editor, &layouts, widget_id);
         let rebuilt = build_cached(&editor, &layouts, widget_id, Some(&first)).unwrap();
@@ -2255,7 +2255,7 @@ mod tests {
                 start: None,
             })
             .unwrap();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -2299,7 +2299,7 @@ mod tests {
                 start: None,
             })
             .unwrap();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 400.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -2345,7 +2345,7 @@ mod tests {
                 start: None,
             })
             .unwrap();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
@@ -2547,7 +2547,7 @@ mod tests {
         use accesskit::{Action, ActionData, ActionRequest, TreeId};
         let context = egui::Context::default();
         context.enable_accesskit();
-        let id = Id::new("editor");
+        let id = Id::unique("editor");
         let mut editor = Editor::from_text(&format!("valid\nx{}", "\u{301}".repeat(200)));
         let frame = |editor: &mut Editor, events| {
             let mut errors = Vec::new();
@@ -2737,11 +2737,11 @@ mod tests {
             .abs()
                 < 0.01
         );
-        assert_matches_fresh(&snapshot, &editor, &layouts, Id::new("editor"));
+        assert_matches_fresh(&snapshot, &editor, &layouts, Id::unique("editor"));
 
         let context = egui::Context::default();
         let mut cache = super::super::Cache::default();
-        let widget_id = Id::new("editor");
+        let widget_id = Id::unique("editor");
         let mut published = None;
         for edit in 0..3 {
             match edit {
@@ -2762,7 +2762,7 @@ mod tests {
     fn soft_line_breaks_are_lines_for_platform_adapters() {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let id = Id::new("editor");
+        let id = Id::unique("editor");
         let mut editor = Editor::from_text("one\u{2028}two\u{2028}\nthree");
         select(&mut editor, (0, 6), (0, 6));
         let input = egui::RawInput {
@@ -2796,7 +2796,7 @@ mod tests {
     fn consecutive_quotes_publish_one_blockquote_that_navigation_passes_through() {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let id = Id::new("editor");
+        let id = Id::unique("editor");
         let mut editor = Editor::from_text("intro\none two\nthree\nbody\nlast");
         for (start, end) in [((1, 0), (2, 1)), ((4, 0), (4, 0))] {
             select(&mut editor, start, end);
@@ -2894,7 +2894,7 @@ mod tests {
             .unwrap();
         for (prefer_next_row, focus) in [(true, lower), (false, upper)] {
             let nodes = published_nodes(&editor, &snapshot, &layouts, prefer_next_row);
-            let selection = nodes[&Id::new("editor").accesskit_id()]
+            let selection = nodes[&Id::unique("editor").accesskit_id()]
                 .text_selection()
                 .unwrap();
             assert_eq!(selection.focus, focus);
@@ -2915,7 +2915,7 @@ mod tests {
         editor.set_selection(crate::Selection::caret(seam)).unwrap();
         for prefer_next_row in [true, false] {
             let nodes = published_nodes(&editor, &snapshot, &layouts, prefer_next_row);
-            let selection = nodes[&Id::new("editor").accesskit_id()]
+            let selection = nodes[&Id::unique("editor").accesskit_id()]
                 .text_selection()
                 .unwrap();
             let caret = snapshot.focus_position(seam, prefer_next_row).unwrap();
@@ -2927,7 +2927,7 @@ mod tests {
     fn clicking_a_wrap_seam_publishes_the_caret_on_the_clicked_row() {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let id = Id::new("wrap seam");
+        let id = Id::unique("wrap seam");
         let mut editor = Editor::from_text("first second third fourth fifth sixth seventh");
         let mut run_frame = |events| {
             let mut rect = Rect::NOTHING;
@@ -3292,7 +3292,7 @@ mod tests {
 
         let context = egui::Context::default();
         context.enable_accesskit();
-        let id = Id::new("editor");
+        let id = Id::unique("editor");
         let mut output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 400.0))),

@@ -36,13 +36,13 @@ impl Field {
             FieldKind::Native => {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.native)
-                        .id(Id::new(name))
+                        .id(Id::unique(name))
                         .cursor_at_end(false),
                 );
             }
             FieldKind::Rich => {
                 let output = RichTextEditor::new(&mut self.rich)
-                    .id(Id::new(name))
+                    .id(Id::unique(name))
                     .show(ui);
                 assert!(output.errors.is_empty());
                 assert!(output.accessibility_errors.is_empty());
@@ -83,7 +83,7 @@ impl Fields {
     }
 
     fn warm(&mut self, ctx: &Context) {
-        ctx.memory_mut(|memory| memory.request_focus(Id::new(self.names[0])));
+        ctx.memory_mut(|memory| memory.request_focus(Id::unique(self.names[0])));
         self.frame(ctx, vec![]).drop_without_applying_deltas();
         self.frame(ctx, vec![]).drop_without_applying_deltas();
     }
@@ -110,7 +110,7 @@ fn raw(events: Vec<Event>) -> RawInput {
 fn focus(name: &str) -> Event {
     Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
         action: egui::accesskit::Action::Focus,
-        target_node: Id::new(name).accesskit_id(),
+        target_node: Id::unique(name).accesskit_id(),
         target_tree: egui::accesskit::TreeId::ROOT,
         data: None,
     })
@@ -189,7 +189,7 @@ fn focus_actions_route_each_input_segment_to_its_field() {
                         assert_eq!(fields.fields.each_ref().map(Field::text), expected);
                         assert_eq!(
                             ctx.memory(|memory| memory.focused()),
-                            Some(Id::new(focused))
+                            Some(Id::unique(focused))
                         );
                     }
                 }
@@ -224,7 +224,7 @@ fn ime_input_after_a_focus_request_reaches_the_newly_focused_field() {
                     }
                     assert_eq!(
                         ctx.memory(|memory| memory.focused()),
-                        Some(Id::new("second"))
+                        Some(Id::unique("second"))
                     );
                 }
             }
@@ -253,7 +253,7 @@ fn ime_input_after_tab_reaches_the_next_field() {
         .drop_without_applying_deltas();
     assert_eq!(
         ctx.memory(|memory| memory.focused()),
-        Some(Id::new("second"))
+        Some(Id::unique("second"))
     );
     assert_eq!(fields.fields[0].text(), "xabc");
     assert!(fields.fields[0].rich.composition().is_none());
@@ -303,7 +303,7 @@ fn ime_input_after_shift_tab_reaches_the_previous_field() {
                 };
                 assert_eq!(
                     ctx.memory(|memory| memory.focused()),
-                    Some(Id::new(focused)),
+                    Some(Id::unique(focused)),
                     "list={list}, reversed={reversed}"
                 );
                 assert!(fields.fields[0].rich.composition().is_none());
@@ -341,7 +341,7 @@ fn ime_commits_in_the_shift_tab_batch_stay_with_the_editor_like_text() {
             fields.flush(&ctx);
             assert_eq!(
                 ctx.memory(|memory| memory.focused()),
-                Some(Id::new("second")),
+                Some(Id::unique("second")),
                 "reversed={reversed}, {input:?}"
             );
             assert_eq!(
@@ -382,7 +382,7 @@ fn rejected_focus_requests_keep_the_original_composition_and_input() {
         assert!(fields.fields[0].rich.composition().is_some());
         assert_eq!(
             ctx.memory(|memory| memory.focused()),
-            Some(Id::new("first"))
+            Some(Id::unique("first"))
         );
         fields
             .frame(&ctx, vec![Event::Ime(ImeEvent::Commit("한".into()))])
@@ -428,7 +428,11 @@ fn queued_input_keeps_its_window_focus_and_precedes_later_pointer_input() {
                 .drop_without_applying_deltas();
             let mut input = raw(vec![]);
             if click {
-                let position = ctx.read_response(Id::new("first")).unwrap().rect.center();
+                let position = ctx
+                    .read_response(Id::unique("first"))
+                    .unwrap()
+                    .rect
+                    .center();
                 input.events = vec![
                     Event::PointerMoved(position),
                     Event::PointerButton {
@@ -461,7 +465,7 @@ fn queued_input_keeps_its_window_focus_and_precedes_later_pointer_input() {
             if click {
                 assert_eq!(
                     ctx.memory(|memory| memory.focused()),
-                    Some(Id::new("first"))
+                    Some(Id::unique("first"))
                 );
             }
             assert!(ctx.plugin::<InputRouting>().lock().pending.is_empty());
@@ -479,7 +483,11 @@ fn automatic_installation_and_manual_passes_preserve_focus_order() {
     assert!(ctx.plugin::<InputRouting>().lock().passes.is_empty());
     for events in [vec![focus("second"), text("x")], vec![]] {
         ctx.begin_pass(raw(events));
-        let mut ui = Ui::new(ctx.clone(), Id::new("manual root"), egui::UiBuilder::new());
+        let mut ui = Ui::new(
+            ctx.clone(),
+            Id::unique("manual root"),
+            egui::UiBuilder::new(),
+        );
         fields.show(&mut ui);
         ctx.end_pass().drop_without_applying_deltas();
     }
@@ -511,9 +519,9 @@ fn nested_viewports_keep_their_own_queued_events_and_repaint_requests() {
         );
         ctx.begin_pass(parent_input.clone());
         if pass == 0 {
-            ctx.memory_mut(|memory| memory.request_focus(Id::new("first")));
+            ctx.memory_mut(|memory| memory.request_focus(Id::unique("first")));
         }
-        let mut parent_ui = Ui::new(ctx.clone(), Id::new("parent ui"), egui::UiBuilder::new());
+        let mut parent_ui = Ui::new(ctx.clone(), Id::unique("parent ui"), egui::UiBuilder::new());
         parent.show(&mut parent_ui);
         ctx.show_viewport_deferred(child_id, egui::ViewportBuilder::default(), |_, _| {});
 
@@ -526,9 +534,9 @@ fn nested_viewports_keep_their_own_queued_events_and_repaint_requests() {
         };
         ctx.begin_pass(child_input);
         if pass == 0 {
-            ctx.memory_mut(|memory| memory.request_focus(Id::new("child first")));
+            ctx.memory_mut(|memory| memory.request_focus(Id::unique("child first")));
         }
-        let mut child_ui = Ui::new(ctx.clone(), Id::new("child ui"), egui::UiBuilder::new());
+        let mut child_ui = Ui::new(ctx.clone(), Id::unique("child ui"), egui::UiBuilder::new());
         child.show(&mut child_ui);
         let output = ctx.end_pass();
         if pass == 2 {

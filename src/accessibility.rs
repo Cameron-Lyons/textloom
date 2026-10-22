@@ -261,8 +261,8 @@ mod accesskit_bridge {
         document::{LINE_SEPARATOR, SpanCursor},
     };
     use accesskit::{
-        Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, Tree,
-        TreeId, TreeUpdate,
+        Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, TreeId,
+        TreeInfo, TreeUpdate,
     };
     use std::{
         collections::HashMap,
@@ -745,7 +745,7 @@ mod accesskit_bridge {
                 });
                 root.set_children(vec![self.editor_id]);
                 nodes.push((self.root_id, root));
-                let mut tree = Tree::new(self.root_id);
+                let mut tree = TreeInfo::new(self.root_id);
                 tree.toolkit_name = Some("textloom".into());
                 tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
                 tree
@@ -1281,7 +1281,7 @@ mod accesskit_bridge {
     mod tests {
         use super::*;
         use crate::accessibility::random_edits;
-        use accesskit_consumer::{Node as PublishedNode, TreeChangeHandler};
+        use accesskit_consumer::{NodeRef as PublishedNode, TreeChangeHandler};
 
         struct Ignore;
 

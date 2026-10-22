@@ -236,10 +236,8 @@ First stable release of the native Rust rich-text editing library.
 - The native host forwards the composing caret rectangle to winit so Japanese
   and Chinese candidate windows follow the caret. It retires processed IME events
   after rendering its text fields to prevent a Fcitx preedit/redraw feedback loop
-  in Find and Replace. Its Linux example workspace
-  backports upstream AccessKit activation and application-parent fixes for
-  current AT-SPI and Orca while retaining the documented AccessKit 0.24 API.
-  The vendored dependency and its licenses remain outside the library archive.
+  in Find and Replace. On Linux, AccessKit's Unix adapter activates with current
+  AT-SPI and gives Orca the application's desktop parent.
 - Bold, italic, and underline shortcuts in both input adapters apply emphasis
   uniformly to mixed selections, matching toolbar behavior, and disable it only
   when the whole selection already has that emphasis.
@@ -562,12 +560,18 @@ Library behavior changes relative to 0.1 come first, then host and CI changes.
   widget blur. `sync_ime` sends only changes, allows IME after focus gain or
   `Ime::Disabled`, releases it once after blur or read-only mode, and
   interrupts preedits the editor dropped.
-- The `egui` feature no longer enables `egui/default_fonts`; eframe enables it by
-  default. The minimum AccessKit version is 0.24.1.
+- The `egui` feature uses egui 0.37 and the `accesskit` feature uses AccessKit
+  0.25; 0.1 used egui 0.36 and AccessKit 0.24. The `egui` feature no longer
+  enables `egui/default_fonts`; eframe enables it by default.
+- With egui 0.37's text shaping, the egui widget renders kerning and the font's
+  ligatures. Carets, clicks, selections, and accessibility character bounds
+  divide a ligature's width evenly among its letters, so the caret moves through
+  "ffi" one letter at a time instead of jumping over it.
 - Native host: toolbar and search commands commit an active preedit instead of
   failing with `CompositionActive`. The paragraph-kind choice keeps indentation
   and numbering and shows the kind of a paragraph that commands change; its
   "Numbered list" uses `apply_numbered_list()`, as Ctrl/Command+Shift+7 does.
+  Its list shows every kind without scrolling.
   The rich clipboard preflights the exact TLFR version 2 size.
   `--qa-report` claims its path at startup and exits with status 2 if the file
   exists or cannot be created. Linux clipboard helpers exit when the host dies.
@@ -640,6 +644,8 @@ Timings were measured informally during development; see `BENCHMARKS.md`.
 
 Update the dependency to `textloom = "1.0"`.
 
+- Move to egui and eframe 0.37 and AccessKit 0.25 at the same time. The adapter
+  types take and return types from those versions.
 - Add a fallback arm when matching the error enums, `ParagraphKind`, `Movement`,
   `InlineAttribute`, `AccessibleAction`, or winit `ClipboardEvent`.
   `Composition`, `DecodeLimits`, `AccessibleParagraph`, `AccessibilityOutcome`,

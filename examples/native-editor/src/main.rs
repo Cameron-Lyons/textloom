@@ -411,6 +411,7 @@ impl NativeEditor {
                 let mut chosen = None;
                 egui::ComboBox::from_id_salt("paragraph-kind")
                     .selected_text(kind_name(current))
+                    .height(f32::INFINITY)
                     .show_ui(ui, |ui| {
                         for kind in choices {
                             let label = kind_name(kind);
@@ -723,7 +724,7 @@ fn swatch_button(
     text: &str,
     selected: bool,
 ) -> egui::Response {
-    let swatch = egui::Id::new("swatch");
+    let swatch = egui::IdSalt::new("swatch");
     let size = egui::Vec2::splat(ui.text_style_height(&egui::TextStyle::Button));
     let response = egui::Button::new((egui::Atom::custom(swatch, size), text))
         .selected(selected)
@@ -748,9 +749,7 @@ fn menu_arrow(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let height = ui.spacing().interact_size.y;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(height * 0.75, height), egui::Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
         let painter = ui.painter();
@@ -1112,11 +1111,6 @@ impl eframe::App for NativeEditor {
                 self.read_only,
             );
         }
-        ui.ctx().output_mut(|output| {
-            if let Some(ime) = &mut output.ime {
-                ime.rect = ime.cursor_rect;
-            }
-        });
         ui.input_mut(|input| {
             input
                 .events

@@ -2,6 +2,26 @@
 
 ## 1.0 validation status
 
+On 2026-10-21 the candidate moved to egui/eframe 0.37 and AccessKit 0.25 in
+[PR #8](https://github.com/Cameron-Lyons/textloom/pull/8). At its head
+`4e5a126628432eb021544d639b8d67666fb9f457`, `scripts/check-release.sh`, the Rust
+1.95.0 test and native host commands from step 4, and all eleven CI checks
+passed, including both hosted interaction jobs. The hosted macOS TextEdit probe
+found the host's missing system clipboard (eframe 0.37 moved it behind a
+default feature), which that PR restores.
+
+The same build then passed 27 interaction checks in isolated Linux sessions:
+headless Sway 1.12 (wlroots 0.20.2, pixman) and Xvfb 21.1.25, each with its own
+HOME, runtime directory, and D-Bus session, driven by wlroots virtual pointer
+and keyboard clients and `wtype`. They used Fcitx 5.1.23 with Mozc 3.35.6354.2
+and Pinyin 5.1.15, Orca 51.1 with AT-SPI 2.62.1, Speech Dispatcher 0.12.1, and
+espeak-ng 1.52.0, and LibreOffice 26.8.1 Writer as the external rich editor.
+Results are in the second table below. AT-SPI document text, caret, selection,
+attributes, and links verified each outcome; screenshots verified painting.
+This is virtual-input evidence, not physical-keyboard or platform manual
+signoff, and the speech was synthesized, not heard. The evidence that follows
+predates this candidate.
+
 Clean implementation candidate `5f8ccfbb83279d962f8c5a16d6b9d80673bd88e8`
 passed all six [release CI jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/37931457171)
 and both [hosted interaction jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/37931457145)
@@ -119,11 +139,13 @@ with the intended desktop and physical keyboard.
   selection and caret requests, and native typing over the accessible selection.
   One-character replacement, undo, redo, and final undo restored the exact
   fixture. Speech logs and synthesized nonzero PCM captured the document and
-  selection announcements through a private file sink. The example's compatible
-  [AccessKit backports](examples/native-editor/vendor/accesskit_unix/BACKPORT.md)
-  fix current AT-SPI activation and the application's desktop parent.
-  This Unix adapter exposes `Text` but does not expose `EditableText`; direct
-  AT-SPI text replacement is unsupported and was not certified.
+  selection announcements through a private file sink. These sessions used the
+  example's former backport of the upstream AT-SPI activation and desktop-parent
+  fixes that `accesskit_unix` 0.24 now includes. That adapter exposed `Text` but
+  not `EditableText`, so direct AT-SPI text replacement was not certified.
+  With `accesskit_unix` 0.24, AT-SPI `set_text_contents` replaced the document
+  and one undo restored it on 2026-10-21; AccessKit does not support the other
+  `EditableText` operations.
 - A separate Qt 6.12 text editor received the native HTML/plain offer with exact
   Unicode multiline text, bold/italic emphasis, list structure, and foreground
   RGBA preserved. Its external HTML/plain offer without TLFR used the host's plain
@@ -144,7 +166,7 @@ the final clean commit remain required. Publish only after these checks pass.
 
 ## Native host validation record
 
-The standalone host in `examples/native-editor` uses eframe/egui 0.36.2 and
+The standalone host in `examples/native-editor` uses eframe/egui 0.37.0 and
 winit 0.30.13. It is available from a repository checkout and is intentionally
 excluded from the published library archive. Its renderer, window, clipboard,
 and platform accessibility dependencies remain outside the library's dependency
@@ -238,35 +260,36 @@ signoff remain pending.
 | Japanese/Chinese IME preedit, replacement, focus loss, and candidate placement | Real Linux Mozc/Pinyin sessions passed with virtual input; physical-keyboard and macOS/Windows signoff pending |
 | Dead keys and Compose | German XKB virtual sequences on clean `f05a518` produced visible `é`, exact copied bytes, and complete undo restoration; physical-keyboard/platform signoff pending |
 | AltGr | German XKB virtual AltGr on clean `f05a518` produced visible `@€`, exact copied bytes, and complete undo restoration without focus loss; physical-keyboard/platform signoff pending |
-| Screen-reader selection and replacement | Linux Orca and hosted Windows NVDA generated speech, accessible selection/caret, native replacement and undo/redo passed; direct AT-SPI EditableText unavailable; VoiceOver, audible Windows speech, and full manual signoff pending |
+| Screen-reader selection and replacement | Linux Orca and hosted Windows NVDA generated speech, accessible selection/caret, native replacement and undo/redo passed; direct AT-SPI EditableText unavailable then, since added by `accesskit_unix` 0.24 (see above); VoiceOver, audible Windows speech, and full manual signoff pending |
 | Rich clipboard MIME transport | Widget fixtures passed on all platforms; Linux Qt and macOS TextEdit interoperability passed; Windows external applications and full manual signoff pending |
 | macOS and Windows native host checks | Hosted macOS native editing/focus/guard checks and Windows NVDA interaction passed; physical keyboards, IMEs, VoiceOver, scale changes, and full manual signoff pending |
 
-Checks added by the later improvement and feature passes have no recorded
-results yet. The egui widget now commits the visible preedit on click, drag, or
-focus loss, where the Fcitx sessions above observed cancellation. No windowed
-host in this repository uses the winit adapter, so its row needs a host-supplied
-winit harness. The `NATIVE_QA.md` protocol gives steps for the feature rows.
+The later improvement and feature passes added the checks below. Their Linux
+results come from the isolated sessions of 2026-10-21 described at the top;
+macOS, Windows, and physical-keyboard results are still pending. No windowed
+host in this repository uses the winit adapter, so its row needs a
+host-supplied winit harness. The `NATIVE_QA.md` protocol gives steps for the
+feature rows.
 
 | Check | Result |
 | --- | --- |
-| Winit adapter: macOS typing at launch without switching apps; IME candidate window at the caret on the first composition; Russian layout Ctrl+C/Ctrl+V; Linux Ctrl+Alt+T reaching the host; Windows Shift+Delete, Ctrl+Insert, Shift+Insert, and AltGr through Ctrl+Alt | Pending |
-| Egui click, drag, and focus loss during composition commit the preedit exactly once, without a double commit, on macOS, Windows, and IBus/Fcitx 5 under Wayland and X11 | Pending |
-| Egui IME candidate placement in long scrolled documents | Pending |
-| Egui touch scrolling: swipes scroll until the editor has focus | Pending |
-| AZERTY digit-row shortcuts (Ctrl/Command+0–6, Shift+7/8) | Pending |
-| Egui touchpad tap-to-click places the caret, commits a preedit, and activates links | Pending |
-| Fill Color and Font Color: apply, No Fill/Automatic, undo/redo; selections and found matches stay visible over fills; fill survives external rich copy | Pending |
-| Soft line breaks: Shift+Enter in a list item and a heading; caret, selection, Home/End, and Up/Down across the break; screen-reader line reading; external plain copy shows a line break; HTML paste into Word/TextEdit shows the break | Pending |
-| Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Pending |
-| Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Pending |
-| Numbering controls: Numbered list and Ctrl/Command+Shift+7 extend or start lists; markers and the "Item N." label continue past body text and restart after headings; Restart at 1 and Continue numbering change only the focused item in one undo step; copied items keep their numbers in Word/TextEdit | Pending |
+| Winit adapter: macOS typing at launch without switching apps; IME candidate window at the caret on the first composition; Russian layout Ctrl+C/Ctrl+V; Linux Ctrl+Alt+T reaching the host; Windows Shift+Delete, Ctrl+Insert, Shift+Insert, and AltGr through Ctrl+Alt | Pending; needs a winit harness |
+| Egui click, drag, and focus loss during composition commit the preedit exactly once, without a double commit, on macOS, Windows, and IBus/Fcitx 5 under Wayland and X11 | Fcitx 5 under Wayland passed: click, drag, a touchpad tap, and moving focus to Find each committed the visible preedit once where it was composed. Switching to another application either committed it once or canceled it, depending on whether Fcitx's preedit clear reached egui in the same frame as the focus loss (both outcomes seen with egui 0.36 and 0.37); it was never duplicated, and typing resumed at the caret. X11 untested: the host's XIM connection did not open under Xvfb with egui 0.36 or 0.37. macOS, Windows, and IBus pending |
+| Egui IME candidate placement in long scrolled documents | Fcitx 5 Mozc under Wayland passed: composing on the last line of a 300-line document kept the cursor rectangle inside the visible area, and the candidate list opened beside it, above the caret at the bottom edge. Also passed at 200% scale. macOS and Windows pending |
+| Egui touch scrolling: swipes scroll until the editor has focus | Pending; virtual touch input was unavailable |
+| AZERTY digit-row shortcuts (Ctrl/Command+0–6, Shift+7/8) | Linux French XKB layout through a virtual keyboard with evdev keycodes passed: Ctrl+physical 1/3/0 set Heading 1, Heading 3, and Body; Ctrl+Shift+physical 7/8 made numbered and bulleted lists; unmodified keys typed `&é`. Physical keyboards and macOS/Windows pending |
+| Egui touchpad tap-to-click places the caret, commits a preedit, and activates links | Linux press-and-release in one frame passed: it placed the caret, committed a Mozc preedit once, and opened a link in read-only mode. Physical touchpads pending |
+| Fill Color and Font Color: apply, No Fill/Automatic, undo/redo; selections and found matches stay visible over fills; fill survives external rich copy | Linux passed: AT-SPI attributes confirmed yellow, a menu color, the button repeating it, No Fill removing only that fill, Red, a menu color, and Automatic; each command undid and redid in one step. A selection and a found match painted visibly over the fill. LibreOffice kept the fill and font color. macOS and Windows pending |
+| Soft line breaks: Shift+Enter in a list item and a heading; caret, selection, Home/End, and Up/Down across the break; screen-reader line reading; external plain copy shows a line break; HTML paste into Word/TextEdit shows the break | Linux passed: the numbered item kept its number and marker, the heading stayed one heading, Home/End/Up/Down and Shift+Left followed the visual lines, AT-SPI and Orca read the two lines separately, plain copy had a line break, and LibreOffice showed one numbered paragraph with a line break. macOS and Windows pending |
+| Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Linux passed: add, edit, and remove were one undo step each and kept the selection; Ctrl+click, a read-only click, and AT-SPI activation opened the URL once without moving the caret; the `javascript:` target was refused with a status message; hovering showed the target, and the cursor became a pointing hand only with Ctrl held or in read-only mode; LibreOffice kept the hyperlink. Orca read link text but did not announce links at the caret, because AccessKit's Unix adapter has no Hypertext interface. macOS and Windows pending |
+| Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Linux dark theme passed: one bar spanned three consecutive quote paragraphs; Enter continued the quote, and Enter on an empty quote paragraph or Backspace at a quote's start made body text in one undo step; AT-SPI exposed one block quote; LibreOffice used its Quotations style. Orca read through the quote without announcing it. Light theme (the Linux host follows egui's dark default), macOS, and Windows pending |
+| Numbering controls: Numbered list and Ctrl/Command+Shift+7 extend or start lists; markers and the "Item N." label continue past body text and restart after headings; Restart at 1 and Continue numbering change only the focused item in one undo step; copied items keep their numbers in Word/TextEdit | Linux passed: markers and the "Item N." label read 1, 2, 3; body text in the middle gave 1, 2, and changing it back restored 1, 2, 3; Restart at 1 and Continue numbering changed only the focused item, one undo step each; Ctrl+Shift+7 extended the list; an item after a heading restarted at 1; LibreOffice showed 2 and 3. macOS and Windows pending |
 
 ## Compatibility contract
 
 Textloom 1.x follows semantic versioning for the documented public API and feature
 names. Existing default builds remain independent of GUI libraries. Optional
-adapters expose types from egui 0.36, winit 0.30, and AccessKit 0.24; an upstream
+adapters expose types from egui 0.37, winit 0.30, and AccessKit 0.25; an upstream
 upgrade that breaks those exposed types requires a Textloom major release.
 Error enums (`Error`, `FragmentError`, `AccessKitError`, egui
 `AccessibilityError`), `ParagraphKind`, `Movement`, `InlineAttribute`,
@@ -283,8 +306,7 @@ timings are not API guarantees.
 
 Rust 1.95 is the minimum supported compiler for 1.0. The locked dependency graph
 is tested on that compiler, and a CI job also compiles the lowest direct
-dependency versions that `Cargo.toml` permits (AccessKit 0.24.1, as egui 0.36
-requires). Any future minimum-version increase must be announced
+dependency versions that `Cargo.toml` permits (AccessKit 0.25.1 with egui 0.37). Any future minimum-version increase must be announced
 in a minor or major release, never a patch release. Review dependency updates
 against the minimum compiler, all eight feature combinations, and the cargo-deny
 policy in `deny.toml`. Development-only dependencies, such as

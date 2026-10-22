@@ -797,7 +797,7 @@ fn scrolling_frame(
                     .max_height(100.0)
                     .show(ui, |ui| {
                         ui.add_space(preceding_space);
-                        let id = Id::new("scroll editor");
+                        let id = Id::unique("scroll editor");
                         if focus {
                             ui.memory_mut(|memory| {
                                 if !memory.has_focus(id) {
@@ -810,7 +810,7 @@ fn scrolling_frame(
                         assert!(output.accessibility_errors.is_empty());
                         visible = ui.is_rect_visible(output.response.rect);
                     });
-                offset = scroll.state.offset;
+                offset = scroll.state.clamped_offset();
                 viewport = scroll.inner_rect;
             });
         },
@@ -2742,7 +2742,7 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
 fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
     for read_only in [false, true] {
         let context = egui::Context::default();
-        let id = Id::new("wrap seam");
+        let id = Id::unique("wrap seam");
         let mut editor = Editor::from_text("first second third fourth fifth sixth seventh");
         let mut run_frame = |events| {
             let mut rect = Rect::NOTHING;
@@ -2925,13 +2925,13 @@ fn growing_preedit_scrolls_after_its_new_height_is_allocated() {
         "the first allocation precedes the new preedit"
     );
     let cache = context
-        .data(|data| data.get_temp::<Cache>(Id::new("scroll editor")))
+        .data(|data| data.get_temp::<Cache>(Id::unique("scroll editor")))
         .unwrap();
     assert!(cache.interaction.scroll_to_caret);
     let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     assert!(offset.y > 100.0);
     let cache = context
-        .data(|data| data.get_temp::<Cache>(Id::new("scroll editor")))
+        .data(|data| data.get_temp::<Cache>(Id::unique("scroll editor")))
         .unwrap();
     assert!(!cache.interaction.scroll_to_caret);
     let (output, _, viewport, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
@@ -3474,6 +3474,49 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
 }
 
 #[test]
+fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
+    let context = egui::Context::default();
+    let text = "office fl a\u{200b}b";
+    let editor = Editor::from_text(text);
+    let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
+    let layout = layouts.get(0).unwrap();
+    let shaped = context.fonts_mut(|fonts| fonts.layout_job((*layout.galley.job).clone()));
+    assert!(
+        shaped.rows[0]
+            .glyphs
+            .iter()
+            .any(|glyph| glyph.chr == 'i' && glyph.advance_width == 0.0),
+        "the default font joins ffi"
+    );
+    let y = layout.rect.center().y;
+    let x = |byte| {
+        document_caret_rect(
+            editor.document(),
+            &layouts,
+            Pos2::ZERO,
+            Position::new(0, byte),
+            true,
+        )
+        .center()
+        .x
+    };
+    let space = text.find('\u{200b}').unwrap();
+    let boundaries: Vec<_> = text.char_indices().map(|(byte, _)| byte).collect();
+    for pair in boundaries.windows(2) {
+        let (left, right) = (x(pair[0]), x(pair[1]));
+        if pair[0] == space {
+            assert_eq!(left, right, "the zero-width space stays empty");
+        } else {
+            assert!(left < right, "{:?}", &text[pair[0]..pair[1]]);
+            assert_eq!(
+                hit_test(&editor, &layouts, Vec2::new(left, y)).0,
+                Position::new(0, pair[0])
+            );
+        }
+    }
+}
+
+#[test]
 fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_edge() {
     let context = egui::Context::default();
     let narrow = "i".repeat(16);
@@ -3531,7 +3574,7 @@ fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_
 #[test]
 fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
     let context = egui::Context::default();
-    let mut editor = Editor::from_text(&format!("a {} end", "👨\u{200d}".repeat(8)));
+    let mut editor = Editor::from_text(&format!("a {}👨 end", "\u{600}".repeat(8)));
     let source = editor.document().paragraphs()[0].clone();
     let mut cache = Cache::default();
     let mut appearance = appearance();
@@ -3539,15 +3582,15 @@ fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
     appearance.width = 32.0;
     let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     let galley = &layouts.get(0).unwrap().galley;
-    assert_eq!(galley.rows.len(), 6);
+    assert_eq!(galley.rows.len(), 5);
     let mut navigation = None;
     let mut errors = Vec::new();
     let mut previous_row = 0;
     for (key, expected_row, scalar) in [
         (Key::ArrowDown, 1, 2),
-        (Key::ArrowDown, 4, 18),
-        (Key::ArrowDown, 5, 19),
-        (Key::ArrowUp, 4, 18),
+        (Key::ArrowDown, 3, 11),
+        (Key::ArrowDown, 4, 12),
+        (Key::ArrowUp, 3, 11),
         (Key::ArrowUp, 1, 2),
         (Key::ArrowUp, 0, 0),
     ] {
@@ -3967,7 +4010,7 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
         let select = |position| {
             Event::AccessKitActionRequest(ActionRequest {
                 action: Action::SetTextSelection,
-                target_node: Id::new(WIDGET_ID).accesskit_id(),
+                target_node: Id::unique(WIDGET_ID).accesskit_id(),
                 target_tree: TreeId::ROOT,
                 data: Some(ActionData::SetTextSelection(TextSelection {
                     anchor: position,
@@ -4008,7 +4051,7 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
             let node = &update
                 .nodes
                 .iter()
-                .find(|(id, _)| *id == Id::new(WIDGET_ID).accesskit_id())
+                .find(|(id, _)| *id == Id::unique(WIDGET_ID).accesskit_id())
                 .unwrap()
                 .1;
             assert_eq!(node.text_selection().unwrap().focus, position);
@@ -4435,7 +4478,7 @@ fn widget_frame(
     focus: bool,
     configure: fn(RichTextEditor<'_>) -> RichTextEditor<'_>,
 ) -> (egui::FullOutput, RichTextEditorOutput) {
-    let id = Id::new(WIDGET_ID);
+    let id = Id::unique(WIDGET_ID);
     let mut widget = None;
     let mut output = context.run_ui(
         egui::RawInput {
@@ -4471,7 +4514,7 @@ fn unchanged(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
 
 fn widget_cache(context: &egui::Context) -> Cache {
     context
-        .data(|data| data.get_temp::<Cache>(Id::new(WIDGET_ID)))
+        .data(|data| data.get_temp::<Cache>(Id::unique(WIDGET_ID)))
         .expect("cached widget")
 }
 
@@ -4525,7 +4568,7 @@ fn ime_area_stays_next_to_the_caret_and_its_preedit_in_long_documents() {
     editor
         .set_selection(Selection::caret(Position::new(150, 3)))
         .unwrap();
-    let id = Id::new("ime area");
+    let id = Id::unique("ime area");
     let run = |editor: &mut Editor, events| {
         let mut output = context.run_ui(
             egui::RawInput {
@@ -4558,6 +4601,7 @@ fn ime_area_stays_next_to_the_caret_and_its_preedit_in_long_documents() {
         ime.rect.top() >= 0.0 && ime.rect.bottom() <= 400.0,
         "{ime:?}"
     );
+    let caret = ime.cursor_rect;
 
     let ime = run(
         &mut editor,
@@ -4573,8 +4617,13 @@ fn ime_area_stays_next_to_the_caret_and_its_preedit_in_long_documents() {
     };
     assert!(ime.rect.contains_rect(ime.cursor_rect), "{ime:?}");
     assert_eq!(ime.rect.right(), ime.cursor_rect.right());
+    assert_eq!(
+        ime.rect.left(),
+        caret.left(),
+        "the area starts at the preedit: {ime:?}"
+    );
     assert!(
-        ime.rect.width() > 20.0,
+        ime.rect.width() > 0.0,
         "the area covers the preedit: {ime:?}"
     );
     assert_eq!(ime.rect.height(), ime.cursor_rect.height());
@@ -4625,7 +4674,7 @@ fn pointer_press_places_the_caret_and_a_drag_extends_from_the_press_point() {
         unchanged,
     );
     assert_eq!(editor.selection(), Selection::caret(Position::new(0, 6)));
-    assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+    assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
     let release = press + Vec2::new(2.0, 0.0);
     widget_frame(
         &context,
@@ -4871,9 +4920,11 @@ fn two_editors_pointer_gestures(drag: bool) {
             },
             |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    let a = RichTextEditor::new(first).id(Id::new(WIDGET_ID)).show(ui);
+                    let a = RichTextEditor::new(first)
+                        .id(Id::unique(WIDGET_ID))
+                        .show(ui);
                     let b = RichTextEditor::new(second)
-                        .id(Id::new("second editor"))
+                        .id(Id::unique("second editor"))
                         .show(ui);
                     assert!(a.errors.is_empty(), "{:?}", a.errors);
                     assert!(b.errors.is_empty(), "{:?}", b.errors);
@@ -5326,7 +5377,7 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
         .set_selection(Selection::caret(Position::new(2, 0)))
         .unwrap();
     editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
-    let id = Id::new("retained-paint");
+    let id = Id::unique("retained-paint");
     let mut width = 220.0;
     for step in 0..12 {
         match step {
@@ -5466,7 +5517,7 @@ fn output_reports_caret_and_selection_geometry_even_when_unfocused() {
                             .max_height(100.0)
                             .show(ui, |ui| {
                                 let output = RichTextEditor::new(editor)
-                                    .id(Id::new("unfocused"))
+                                    .id(Id::unique("unfocused"))
                                     .show(ui);
                                 if scroll {
                                     ui.scroll_to_rect(output.caret_rect, None);
@@ -5477,7 +5528,7 @@ fn output_reports_caret_and_selection_geometry_even_when_unfocused() {
                                     output.response.rect,
                                 )
                             });
-                        offset = area.state.offset;
+                        offset = area.state.clamped_offset();
                         geometry = area.inner;
                     });
                 },
@@ -5582,7 +5633,7 @@ fn pointer_and_blur_commit_preedit_text_while_escape_cancels_it() {
 
     editor.update_composition("候補", None).unwrap();
     widget_frame(&context, &mut editor, vec![], Some(3.0), true, unchanged);
-    context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+    context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
     widget_frame(&context, &mut editor, vec![], Some(3.1), false, unchanged);
     assert!(editor.composition().is_none());
     assert!(editor.document().plain_text().contains("候補"));
@@ -5685,7 +5736,7 @@ fn a_first_queued_preedit_keeps_its_selection_before_a_click_or_blur() {
         .set_selection(Selection::new(Position::default(), Position::new(0, 3)))
         .unwrap();
     widget_frame(&context, &mut editor, vec![], Some(0.0), true, unchanged);
-    context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+    context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
     widget_frame(
         &context,
         &mut editor,
@@ -5778,7 +5829,7 @@ fn ime_events_queued_with_a_focus_change_apply_before_blur_commits() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("abc");
     composing_frame(&context, &mut editor, "ni");
-    context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+    context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
     widget_frame(
         &context,
         &mut editor,
@@ -5812,7 +5863,7 @@ fn focus_requests_that_leave_focus_in_place_keep_queued_ime_before_a_host_focus_
         composing_frame(&context, &mut editor, "ni");
         let request = Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
             action: egui::accesskit::Action::Focus,
-            target_node: Id::new(target).accesskit_id(),
+            target_node: Id::unique(target).accesskit_id(),
             target_tree: egui::accesskit::TreeId::ROOT,
             data: None,
         });
@@ -5824,8 +5875,8 @@ fn focus_requests_that_leave_focus_in_place_keep_queued_ime_before_a_host_focus_
             true,
             unchanged,
         );
-        assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
-        context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+        assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
+        context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
         widget_frame(
             &context,
             &mut editor,
@@ -5864,7 +5915,7 @@ fn edits_batched_in_one_frame_relayout_without_comparing_every_paragraph() {
             .unwrap();
         if blurred {
             composing_frame(&context, &mut editor, "ni");
-            context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+            context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
         } else {
             widget_frame(&context, &mut editor, vec![], Some(0.0), true, unchanged);
         }
@@ -5988,7 +6039,7 @@ fn blur_commit_echoes_are_ignored_after_focus_returns() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("abc");
         composing_frame(&context, &mut editor, "한");
-        context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+        context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
         widget_frame(&context, &mut editor, vec![], Some(0.2), false, unchanged);
         assert_eq!(editor.document().plain_text(), "한abc");
         widget_frame(&context, &mut editor, events, Some(time), true, unchanged);
@@ -6024,7 +6075,7 @@ fn ignored_input_preserves_canceled_and_blur_commit_echoes() {
             let cancellation = if canceled {
                 vec![key(Key::Escape, Modifiers::NONE)]
             } else {
-                context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+                context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
                 vec![]
             };
             widget_frame(
@@ -6286,7 +6337,7 @@ fn rejected_preedit_ranges_preserve_canceled_commit_echoes() {
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let id = Id::new(WIDGET_ID);
+                        let id = Id::unique(WIDGET_ID);
                         ui.memory_mut(|memory| memory.request_focus(id));
                         errors = RichTextEditor::new(&mut editor).id(id).show(ui).errors;
                     });
@@ -6320,7 +6371,7 @@ fn ignored_ime_events_preserve_cancellation_echoes_queued_before_blur() {
         let context = egui::Context::default();
         let mut editor = Editor::from_text("abc");
         composing_frame(&context, &mut editor, "한");
-        context.memory_mut(|memory| memory.surrender_focus(Id::new(WIDGET_ID)));
+        context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
         let rejected = matches!(
             ignored,
             Event::Ime(ImeEvent::Preedit {
@@ -6343,7 +6394,7 @@ fn ignored_ime_events_preserve_cancellation_echoes_queued_before_blur() {
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
                         errors = RichTextEditor::new(&mut editor)
-                            .id(Id::new(WIDGET_ID))
+                            .id(Id::unique(WIDGET_ID))
                             .show(ui)
                             .errors;
                     });
@@ -6810,7 +6861,7 @@ fn nonempty_preedit_consumes_cut_paste_and_text() {
 fn touch_swipes_scroll_until_the_editor_is_focused() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text(&"line of text\n".repeat(80));
-    let id = Id::new("touch");
+    let id = Id::unique("touch");
     let mut time = 0.0;
     let mut run = |editor: &mut Editor, events: Vec<Event>| {
         time += 0.05;
@@ -6828,7 +6879,7 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
                         let area = egui::ScrollArea::vertical().animated(false).show(ui, |ui| {
                             RichTextEditor::new(editor).id(id).show(ui);
                         });
-                        offset = area.state.offset;
+                        offset = area.state.clamped_offset();
                     });
                 },
             )
@@ -6944,7 +6995,7 @@ fn tab_after_a_list_shortcut_in_the_previous_frame_indents_the_new_item() {
         editor.document().paragraphs()[0].kind(),
         ParagraphKind::Bullet { indent: 1 }
     );
-    assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+    assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
 }
 
 #[test]
@@ -6970,7 +7021,7 @@ fn forget_state_releases_the_cached_layout() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("cached");
     let (_, widget) = widget_frame(&context, &mut editor, vec![], None, false, unchanged);
-    assert_eq!(widget.response.id, Id::new(WIDGET_ID));
+    assert_eq!(widget.response.id, Id::unique(WIDGET_ID));
     assert!(
         context
             .data(|data| data.get_temp::<Cache>(widget.response.id))
@@ -7734,7 +7785,7 @@ fn link_frame(
     modifiers: Modifiers,
     read_only: bool,
 ) -> (egui::FullOutput, RichTextEditorOutput) {
-    let id = Id::new(WIDGET_ID);
+    let id = Id::unique(WIDGET_ID);
     let mut widget = None;
     let mut events = events;
     if context.input(|input| input.modifiers) != modifiers {
@@ -7880,7 +7931,7 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
     );
     assert_eq!(released.clicked_link, Some(link.clone()));
     assert_eq!(editor.selection(), selection);
-    assert!(context.memory(|memory| memory.has_focus(Id::new(WIDGET_ID))));
+    assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
 
     for (time, point, modifiers, caret) in [
         (7.0, on_link, Modifiers::NONE, 8),
@@ -8163,7 +8214,7 @@ fn stale_accessibility_link_clicks_are_rejected() {
             .unwrap();
         let mut events = Vec::new();
         if edit_in_batch {
-            context.memory_mut(|memory| memory.request_focus(Id::new(WIDGET_ID)));
+            context.memory_mut(|memory| memory.request_focus(Id::unique(WIDGET_ID)));
             events.push(Event::Text("prefix ".into()));
         } else {
             editor.select_all();

@@ -55,7 +55,7 @@ nesting level, and choosing the current paragraph type keeps list numbering.
 for native accessibility.
 
 The host provides the system's plain-text clipboard and native IME caret area.
-It adapts egui-winit 0.36.2's cursor-area output to the composing caret rectangle,
+egui-winit 0.37 places the native cursor area at the composing caret rectangle,
 so native candidate windows follow the caret within a multiline document.
 After its text fields process IME input, the host retires those events to avoid
 repeated unchanged cursor-area requests and Fcitx preedit/redraw feedback.
@@ -65,10 +65,8 @@ focus traversal; fresh input or a new composition in the field ends the guard.
 AccessKit focus changes run in separate egui passes, preserving text before and
 after a handoff between the document and native fields. Longer sequences continue
 on the next repaint if they reach egui's pass limit.
-On Linux, the example workspace includes two upstream AccessKit compatibility
-backports for current AT-SPI activation and the application's desktop parent.
-See [the source and removal notes](vendor/accesskit_unix/BACKPORT.md). These
-host dependencies do not change the library's optional AccessKit 0.24 API.
+On Linux, AccessKit's Unix adapter 0.24 activates with current AT-SPI services,
+gives the application its desktop parent, and exposes `EditableText`.
 Plain clipboard behavior remains the default. Add `--rich-clipboard` to enable
 the example's native rich backend on Linux (Wayland/X11), macOS, or Windows;
 other platforms build the host but reject the flag:
@@ -106,9 +104,11 @@ dies, including when it is killed or aborts. macOS and Windows publish eager nat
 All platform wrappers and their dependencies stay in this example's separate
 workspace, and its Rust code continues to forbid unsafe code.
 
-Egui's default fonts have limited script coverage. Supply a TTF/OTF/TTC font
-with the scripts being tested through `--font PATH`; `--bold-font PATH` registers
-the widget's `Bold` family. These flags do not install or change system fonts.
+Egui's default fonts have limited script coverage, so the host also loads
+installed system fonts for scripts and emoji they lack, as eframe does by
+default. To test a specific font, supply a TTF/OTF/TTC file through
+`--font PATH`; `--bold-font PATH` registers the widget's `Bold` family. These
+flags do not install or change system fonts.
 For example, on Linux with Noto CJK and Liberation installed:
 
 ```sh

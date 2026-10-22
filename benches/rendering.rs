@@ -51,7 +51,7 @@ fn frame_config(
     let output = context.run_ui(input, |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut widget = RichTextEditor::new(editor).id(egui::Id::new("bench"));
+                let mut widget = RichTextEditor::new(editor).id(egui::Id::unique("bench"));
                 if let Some(width) = config.width {
                     widget = widget.desired_width(width);
                 }
@@ -103,7 +103,7 @@ fn main() {
             frame(&context, &mut editor);
         }
         let split = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64 / 2.0;
-        context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("bench")));
         editor.begin_composition();
         editor.update_composition("preedit", Some(0..7)).unwrap();
         for _ in 0..3 {
@@ -247,7 +247,7 @@ fn batched_typing_frames() {
             .set_selection(Selection::caret(Position::new(paragraphs / 2, 5)))
             .unwrap();
         frame(&context, &mut editor);
-        context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("bench")));
         for _ in 0..3 {
             frame(&context, &mut editor);
         }
@@ -391,7 +391,7 @@ fn native_preedit_frames() {
         let context = egui::Context::default();
         let mut editor = Editor::default();
         frame(&context, &mut editor);
-        context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("bench")));
         let event = egui::Event::Ime(egui::ImeEvent::Preedit {
             text: text.clone(),
             active_range_chars: Some(scalar..scalar),
@@ -419,7 +419,7 @@ fn long_preedit_frames() {
     let context = egui::Context::default();
     let mut editor = Editor::default();
     frame(&context, &mut editor);
-    context.memory_mut(|memory| memory.request_focus(egui::Id::new("bench")));
+    context.memory_mut(|memory| memory.request_focus(egui::Id::unique("bench")));
     editor.update_composition(&text, Some(0..0)).unwrap();
     for _ in 0..3 {
         frame(&context, &mut editor);
