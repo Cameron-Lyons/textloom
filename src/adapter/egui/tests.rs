@@ -1,4 +1,25 @@
-use super::*;
+use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::sync::Arc;
+use std::{array, mem};
+
+use egui::text::{CCursor, CharIndex};
+use egui::{
+    Color32, Event, FontFamily, FontId, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Stroke, Vec2,
+};
+
+use super::accessibility::AccessibilityError;
+use super::input::InputOptions;
+use super::layout::{Appearance, ParagraphLayouts};
+use super::paint::PaintCache;
+use super::{
+    Cache, PADDING, PARAGRAPH_GAP, RichClipboard, RichTextEditor, RichTextEditorOutput, input,
+    input_routing, layout, navigation, paint,
+};
+use crate::{
+    Color, Document, Editor, Error, Fragment, InlineAttribute, Link, ParagraphKind, Position,
+    SearchOptions, Selection, StylePatch,
+};
 
 fn frame(
     context: &egui::Context,
@@ -94,7 +115,7 @@ fn styled_clipboard_editor() -> Editor {
         .apply_style(StylePatch {
             bold: Some(true),
             italic: Some(true),
-            foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
+            foreground: Some(Some(Color([42, 100, 200, 255]))),
             ..Default::default()
         })
         .unwrap();
@@ -544,12 +565,12 @@ fn routed_paste_keeps_its_modifiers_across_focus_passes_and_queued_input() {
             for rich in [false, true] {
                 let context = egui::Context::default();
                 context.enable_accesskit();
-                install_input_routing(&context);
+                input_routing::install_input_routing(&context);
                 context.options_mut(|options| {
-                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                    options.max_passes = NonZeroUsize::new(max_passes).unwrap();
                 });
                 let mut editors = [Editor::default(), Editor::default()];
-                let mut clipboards = std::array::from_fn(|_| TestClipboard {
+                let mut clipboards = array::from_fn(|_| TestClipboard {
                     fragment: Some(fragment.clone()),
                     ..Default::default()
                 });
@@ -802,7 +823,7 @@ fn caret_cut_preserves_an_empty_preedit_for_its_normal_commit() {
             let output = clipboard_frame(
                 &context,
                 &mut editor,
-                std::mem::take(&mut events),
+                mem::take(&mut events),
                 true,
                 false,
                 true,
@@ -1251,7 +1272,7 @@ fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
     styled
         .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
         .unwrap();
-    styled.toggle_style(crate::InlineAttribute::Bold).unwrap();
+    styled.toggle_style(InlineAttribute::Bold).unwrap();
     styled
         .set_selection(Selection::caret(Position::new(1, 0)))
         .unwrap();
@@ -1703,8 +1724,8 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                     actual_layout.rect.right() + 1.0,
                 ] {
                     assert_eq!(
-                        hit_test(editor, actual, Vec2::new(x, y)),
-                        hit_test(editor, expected, Vec2::new(x, y)),
+                        navigation::hit_test(editor, actual, Vec2::new(x, y)),
+                        navigation::hit_test(editor, expected, Vec2::new(x, y)),
                         "step={step}, paragraph={index}, point={x},{y}"
                     );
                 }
@@ -1713,18 +1734,20 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             for grapheme in [0, source.grapheme_count() / 2, source.grapheme_count()] {
                 let position = Position::new(index, source.byte_from_grapheme(grapheme).unwrap());
                 for affinity in [false, true] {
-                    let actual_caret =
-                        document_caret_rect(document, actual, origin, position, affinity);
-                    let expected_caret =
-                        document_caret_rect(document, expected, origin, position, affinity);
+                    let actual_caret = navigation::document_caret_rect(
+                        document, actual, origin, position, affinity,
+                    );
+                    let expected_caret = navigation::document_caret_rect(
+                        document, expected, origin, position, affinity,
+                    );
                     assert_eq!(
                         actual_caret, expected_caret,
                         "step={step}, position={position:?}, affinity={affinity}"
                     );
                     let point = actual_caret.center() - origin;
                     assert_eq!(
-                        hit_test(editor, actual, point),
-                        hit_test(editor, expected, point)
+                        navigation::hit_test(editor, actual, point),
+                        navigation::hit_test(editor, expected, point)
                     );
                 }
             }
@@ -1984,7 +2007,7 @@ fn malformed_shaping_retries_preserve_rendered_text_styles_and_widget_navigation
         .apply_style(StylePatch {
             italic: Some(true),
             underline: Some(true),
-            foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
+            foreground: Some(Some(Color([42, 100, 200, 255]))),
             ..Default::default()
         })
         .unwrap();
@@ -2976,7 +2999,7 @@ fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges(
         for start in 0..boundaries.len() {
             for end in start..boundaries.len() {
                 assert_eq!(
-                    preedit_byte_range(text, &(start..end)),
+                    navigation::preedit_byte_range(text, &(start..end)),
                     Ok(boundaries[start]..boundaries[end]),
                     "text={text:?}, scalars={start}..{end}"
                 );
@@ -2995,7 +3018,7 @@ fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges(
             usize::MAX..usize::MAX,
         ] {
             assert_eq!(
-                preedit_byte_range(text, &range),
+                navigation::preedit_byte_range(text, &range),
                 Err(Error::InvalidCompositionSelection)
             );
         }
@@ -3133,7 +3156,7 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
                     link_color: Color32::LIGHT_BLUE,
                     width: 400.0,
                 };
-                let job = paragraph_job(
+                let job = layout::paragraph_job(
                     editor.document().paragraph(0).expect("paragraph"),
                     &appearance,
                     400.0,
@@ -3150,6 +3173,8 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
 
 #[test]
 fn character_hit_positions_snap_to_whole_graphemes() {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let context = egui::Context::default();
     for text in [
         "",
@@ -3168,7 +3193,8 @@ fn character_hit_positions_snap_to_whole_graphemes() {
         let mut previous = 0;
         let mut x = layout.rect.left() - 4.0;
         while x < layout.rect.left() + layout.galley.rect.right() + 4.0 {
-            let (position, _) = hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y));
+            let (position, _) =
+                navigation::hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y));
             assert!(
                 boundaries.contains(&position.byte) && position.byte >= previous,
                 "text={text:?}, x={x}, byte={}",
@@ -3189,7 +3215,7 @@ fn clicks_inside_multi_scalar_graphemes_snap_to_the_visually_nearer_edge() {
         let editor = Editor::from_text(&text);
         let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
         let caret = |byte| {
-            document_caret_rect(
+            navigation::document_caret_rect(
                 editor.document(),
                 &layouts,
                 Pos2::ZERO,
@@ -3202,7 +3228,7 @@ fn clicks_inside_multi_scalar_graphemes_snap_to_the_visually_nearer_edge() {
         for (fraction, expected) in [(0.25, 1), (0.75, end)] {
             let point = left.to_vec2() + (right - left) * fraction;
             assert_eq!(
-                hit_test(&editor, &layouts, point).0,
+                navigation::hit_test(&editor, &layouts, point).0,
                 Position::new(0, expected),
                 "text={text:?}, fraction={fraction}"
             );
@@ -3234,7 +3260,7 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
     let color = Color32::from_rgb(4, 5, 6);
     let rectangles = |selection| {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            paint_document(
+            paint::paint_document(
                 ui.painter(),
                 &mut PaintCache::default(),
                 editor.document(),
@@ -3950,7 +3976,7 @@ fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() 
         (Key::ArrowUp, 1, 12),
         (Key::ArrowUp, 0, 8),
     ] {
-        assert!(handle_key(
+        assert!(input::handle_key(
             &mut editor,
             context.os(),
             key,
@@ -4011,7 +4037,7 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
         (Key::ArrowUp, 1, 0, Some(0)),
         (Key::ArrowUp, 0, 0, Some(0)),
     ] {
-        assert!(handle_key(
+        assert!(input::handle_key(
             &mut editor,
             context.os(),
             key,
@@ -4069,7 +4095,7 @@ fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
     );
     let y = layout.rect.center().y;
     let x = |byte| {
-        document_caret_rect(
+        navigation::document_caret_rect(
             editor.document(),
             &layouts,
             Pos2::ZERO,
@@ -4088,7 +4114,7 @@ fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
         } else {
             assert!(left < right, "{:?}", &text[pair[0]..pair[1]]);
             assert_eq!(
-                hit_test(&editor, &layouts, Vec2::new(left, y)).0,
+                navigation::hit_test(&editor, &layouts, Vec2::new(left, y)).0,
                 Position::new(0, pair[0])
             );
         }
@@ -4102,7 +4128,7 @@ fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_
     let mut editor = Editor::from_text(&format!("{narrow}\na🇺🇸b\n{narrow}"));
     let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
     let x = |paragraph, byte| {
-        document_caret_rect(
+        navigation::document_caret_rect(
             editor.document(),
             &layouts,
             Pos2::ZERO,
@@ -4131,7 +4157,7 @@ fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_
             .unwrap();
         let mut navigation = None;
         let mut errors = Vec::new();
-        assert!(handle_key(
+        assert!(input::handle_key(
             &mut editor,
             context.os(),
             key,
@@ -4174,7 +4200,7 @@ fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
         (Key::ArrowUp, 1, 2),
         (Key::ArrowUp, 0, 0),
     ] {
-        assert!(handle_key(
+        assert!(input::handle_key(
             &mut editor,
             context.os(),
             key,
@@ -4501,7 +4527,7 @@ fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
         (usize::MAX, Position::default()),
     ] {
         assert_eq!(
-            surrounding_position(document, focus, count, false),
+            input::surrounding_position(document, focus, count, false),
             expected
         );
     }
@@ -4516,7 +4542,10 @@ fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
         (6, Position::new(2, "e\u{301}👩🏽\u{200d}💻".len())),
         (usize::MAX, document.end()),
     ] {
-        assert_eq!(surrounding_position(document, focus, count, true), expected);
+        assert_eq!(
+            input::surrounding_position(document, focus, count, true),
+            expected
+        );
     }
 }
 
@@ -4620,7 +4649,7 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
             );
             assert_eq!(editor.selection(), Selection::caret(seam));
             assert_eq!(caret_segments(&output), 1, "moved caret must be visible");
-            let expected = document_caret_rect(
+            let expected = navigation::document_caret_rect(
                 editor.document(),
                 &cache.layout.layouts,
                 widget.response.rect.min + Vec2::splat(PADDING),
@@ -5127,7 +5156,7 @@ fn caret_point(context: &egui::Context, rect: Rect, editor: &Editor, position: P
         .map_or((editor.document(), &cache.layout.layouts), |preview| {
             (&preview.document, &preview.render_cache.layouts)
         });
-    document_caret_rect(
+    navigation::document_caret_rect(
         document,
         layouts,
         rect.min + Vec2::splat(PADDING),
@@ -5809,12 +5838,12 @@ fn selection_is_spliced_between_code_backgrounds_and_glyphs() {
 fn fills_paint_behind_glyphs_replace_code_backgrounds_and_keep_selection_visible() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("plain fill code");
-    let blue = crate::Color([0, 112, 192, 128]);
+    let blue = Color([0, 112, 192, 128]);
     for (range, patch) in [
         (
             6..10,
             StylePatch {
-                background: Some(Some(crate::Color::YELLOW)),
+                background: Some(Some(Color::YELLOW)),
                 ..Default::default()
             },
         ),
@@ -5940,7 +5969,7 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
         .unwrap();
     editor
         .apply_style(StylePatch {
-            background: Some(Some(crate::Color::YELLOW)),
+            background: Some(Some(Color::YELLOW)),
             code: Some(true),
             ..Default::default()
         })
@@ -6001,7 +6030,7 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
                 editor.select_all();
                 editor
                     .apply_style(StylePatch {
-                        foreground: Some(Some(crate::Color([40, 100, 200, 255]))),
+                        foreground: Some(Some(Color([40, 100, 200, 255]))),
                         ..Default::default()
                     })
                     .unwrap();
@@ -6048,9 +6077,7 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
 fn host_highlight_ranges_paint_visible_matches_and_skip_stale_ranges() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("find me\nand find you");
-    let found = editor
-        .document()
-        .find("find", crate::SearchOptions::default());
+    let found = editor.document().find("find", SearchOptions::default());
     assert_eq!(found.len(), 2);
     let ranges = [
         found[0].clone(),
@@ -6876,7 +6903,7 @@ fn ordinary_input_cancels_a_cleared_preedit_and_rejects_its_late_commit() {
                 widget_frame(
                     &context,
                     &mut editor,
-                    std::mem::take(&mut events),
+                    mem::take(&mut events),
                     Some(0.2),
                     true,
                     unchanged,
@@ -6920,7 +6947,7 @@ fn text_keys_preserve_a_cleared_preedit_until_their_text_event() {
                 widget_frame(
                     &context,
                     &mut editor,
-                    std::mem::take(&mut events),
+                    mem::take(&mut events),
                     Some(0.2),
                     true,
                     unchanged,
@@ -7302,7 +7329,7 @@ fn cleared_preedit_still_accepts_a_normal_commit() {
                 active_range_chars: None,
             })];
             if separate_frame {
-                frame(&context, &mut editor, std::mem::take(&mut events), true);
+                frame(&context, &mut editor, mem::take(&mut events), true);
             }
             events.push(Event::Ime(ImeEvent::Commit(committed.into())));
             frame(&context, &mut editor, events, true);
@@ -7951,7 +7978,7 @@ fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
 
                 let key = name.as_deref().and_then(Key::from_name).unwrap_or(position);
                 let mut egui_editor = start();
-                let handled = handle_key(
+                let handled = input::handle_key(
                     &mut egui_editor,
                     egui::os::OperatingSystem::Nix,
                     key,
@@ -8184,7 +8211,7 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
     assert_eq!(galley.rows.len(), 4);
     assert!(galley.rows[..3].iter().all(|row| row.ends_with_newline));
     let caret = |byte, prefer_next_row| {
-        document_caret_rect(
+        navigation::document_caret_rect(
             editor.document(),
             &layouts,
             Pos2::ZERO,
@@ -8210,15 +8237,15 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
     };
     let past = galley.rows[0].rect().right() + 20.0;
     assert_eq!(
-        hit_test(&editor, &layouts, point(0, past)),
+        navigation::hit_test(&editor, &layouts, point(0, past)),
         (Position::new(0, 2), false)
     );
     assert_eq!(
-        hit_test(&editor, &layouts, point(2, past)).0,
+        navigation::hit_test(&editor, &layouts, point(2, past)).0,
         Position::new(0, 10)
     );
     assert_eq!(
-        hit_test(&editor, &layouts, point(1, 0.0)).0,
+        navigation::hit_test(&editor, &layouts, point(1, 0.0)).0,
         Position::new(0, 5)
     );
 }
@@ -8235,7 +8262,7 @@ fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
     let range = |start, end| Position::new(0, start)..Position::new(0, end);
     let rectangles = |selection: Option<Selection>, highlights: &[Range<Position>]| {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            paint_document(
+            paint::paint_document(
                 ui.painter(),
                 &mut PaintCache::default(),
                 editor.document(),
@@ -8312,7 +8339,7 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
         let document = editor.document();
         let rows = layouts.get(0).unwrap().galley.rows.len();
         assert!(rows > 30, "rows={rows}");
-        let found = document.find("match", crate::SearchOptions::default());
+        let found = document.find("match", SearchOptions::default());
         let tail = document.paragraph(1).unwrap().text().len();
         let spans = [
             found[found.len() / 2].start..Position::new(1, 2),
@@ -8330,7 +8357,7 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
             .collect();
         let paint = |paint_cache: &mut PaintCache, clip: Rect, selection: Selection| {
             let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                paint_document(
+                paint::paint_document(
                     &ui.painter().with_clip_rect(clip),
                     paint_cache,
                     document,
@@ -8405,7 +8432,13 @@ fn ime_preview_lays_out_soft_line_breaks_in_its_preedit() {
     let preview = cache.preview.as_ref().unwrap();
     assert_eq!(preview.document.paragraphs().len(), 1);
     assert_eq!(preview.caret, Position::new(0, 8));
-    let caret = document_caret_rect(&preview.document, &layouts, Pos2::ZERO, preview.caret, true);
+    let caret = navigation::document_caret_rect(
+        &preview.document,
+        &layouts,
+        Pos2::ZERO,
+        preview.caret,
+        true,
+    );
     assert_eq!(
         caret.top(),
         layout.rect.top() + layout.galley.rows[2].min_y()

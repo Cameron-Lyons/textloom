@@ -1,11 +1,21 @@
-use super::*;
+use std::borrow::Cow;
+use std::ops::Range;
+use std::sync::Arc;
+use std::{iter, mem};
+
 use unicode_segmentation::UnicodeSegmentation;
+
+use super::change::Delta;
+use crate::{
+    Color, Document, Editor, Error, Fragment, InlineStyle, Movement, Paragraph, ParagraphKind,
+    Position, SearchOptions, Selection, Span, StylePatch,
+};
 
 #[test]
 fn saved_state_cache_tracks_edits_and_rollback_after_revision_saturation() {
     let mut document = Document::from_text("abc");
     document.revision = u64::MAX;
-    let mut editor = crate::Editor::new(document);
+    let mut editor = Editor::new(document);
     assert!(!editor.is_modified());
     editor.insert_text("x").unwrap();
     assert_eq!(editor.document().revision(), u64::MAX);
@@ -38,7 +48,7 @@ fn newline_normalization_handles_all_adjacent_breaks_and_keeps_lf_borrowed() {
                 case /= tokens.len();
             }
             let expected = text.replace("\r\n", "\n").replace(['\r', '\u{2029}'], "\n");
-            let normalized = normalize_newlines(&text);
+            let normalized = super::normalize_newlines(&text);
             assert_eq!(normalized, expected, "input {text:?}");
             assert_eq!(
                 matches!(normalized, Cow::Borrowed(_)),
@@ -317,7 +327,7 @@ fn trailing_grapheme_tracking_matches_complete_segmentation_while_text_grows() {
             if next(3) == 0 {
                 continue;
             }
-            tail = last_grapheme_start(&text, tail, scanned);
+            tail = super::last_grapheme_start(&text, tail, scanned);
             scanned = text.len();
             assert_eq!(
                 tail,
@@ -332,21 +342,19 @@ fn trailing_grapheme_tracking_matches_complete_segmentation_while_text_grows() {
     for (prefix, appended, expected) in [("🇦🇧", "🇨", 8), ("🇦", "🇨", 0), ("🇦", "🇨🇩", 8)]
     {
         assert_eq!(
-            last_grapheme_start(&format!("{prefix}{appended}"), 0, prefix.len()),
+            super::last_grapheme_start(&format!("{prefix}{appended}"), 0, prefix.len()),
             expected,
             "{prefix:?} + {appended:?}"
         );
     }
     // The cached start is trusted rather than recomputed, so a growing cluster is never rescanned.
-    assert_eq!(last_grapheme_start("ab\u{301}", 0, 2), 0);
-    assert_eq!(last_grapheme_start("ab\u{301}c", 0, 2), 4);
-    assert_eq!(last_grapheme_start("abcd", 0, 2), 3);
+    assert_eq!(super::last_grapheme_start("ab\u{301}", 0, 2), 0);
+    assert_eq!(super::last_grapheme_start("ab\u{301}c", 0, 2), 4);
+    assert_eq!(super::last_grapheme_start("abcd", 0, 2), 3);
 }
 
 #[test]
 fn nearby_grapheme_navigation_and_deletion_keep_indexes_lazy() {
-    use crate::{Editor, Movement, Selection};
-
     let phrase = "café e\u{301} 👩🏽\u{200d}💻 🇺🇸 नमस्ते ";
     let text = phrase.repeat(256);
     let original = Selection::caret(Position::new(0, phrase.len() * 128));
@@ -464,16 +472,10 @@ fn all_match_search_in_a_long_regional_run_reuses_grapheme_index() {
     let expected: Vec<_> = (0..128)
         .map(|index| Position::new(0, 1 + index * 8)..Position::new(0, 1 + (index + 1) * 8))
         .collect();
-    assert_eq!(
-        document.find("🇦🇦", crate::SearchOptions::default()),
-        expected
-    );
+    assert_eq!(document.find("🇦🇦", SearchOptions::default()), expected);
     let paragraph = document.paragraph(0).unwrap();
     let cached = paragraph.cached_grapheme_boundaries().unwrap().as_ptr();
-    assert_eq!(
-        document.find("🇦🇦", crate::SearchOptions::default()),
-        expected
-    );
+    assert_eq!(document.find("🇦🇦", SearchOptions::default()), expected);
     assert_eq!(
         paragraph.cached_grapheme_boundaries().unwrap().as_ptr(),
         cached
@@ -499,9 +501,9 @@ fn unicode_editing_snaps_carets_and_indexes_only_long_contexts() {
             true,
         ),
     ] {
-        let mut editor = crate::Editor::from_text(&text);
+        let mut editor = Editor::from_text(&text);
         editor
-            .set_selection(crate::Selection::caret(Position::new(0, byte)))
+            .set_selection(Selection::caret(Position::new(0, byte)))
             .unwrap();
         editor.insert_text(insertion).unwrap();
         let paragraph = editor.document().paragraph(0).unwrap();
@@ -697,18 +699,11 @@ fn zero_index_conversion_and_vertical_navigation_keep_unicode_indexes_lazy() {
 
     let paragraph = "é👩\u{200d}💻e\u{301}".repeat(256);
     let source = format!("start\n{paragraph}\n{paragraph}");
-    let mut editor = crate::Editor::from_text(&source);
-    editor
-        .move_cursor(crate::Movement::ParagraphDown, false)
-        .unwrap();
-    assert_eq!(
-        editor.selection(),
-        crate::Selection::caret(Position::new(1, 0))
-    );
-    editor
-        .move_cursor(crate::Movement::ParagraphDown, true)
-        .unwrap();
-    let selection = crate::Selection::new(Position::new(1, 0), Position::new(2, 0));
+    let mut editor = Editor::from_text(&source);
+    editor.move_cursor(Movement::ParagraphDown, false).unwrap();
+    assert_eq!(editor.selection(), Selection::caret(Position::new(1, 0)));
+    editor.move_cursor(Movement::ParagraphDown, true).unwrap();
+    let selection = Selection::new(Position::new(1, 0), Position::new(2, 0));
     assert_eq!(editor.selection(), selection);
     assert!(
         editor
@@ -1355,8 +1350,8 @@ fn span_lookup_skips_empty_ranges_and_runs_that_only_touch() {
 
 #[test]
 fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
-    let red = crate::Color([255, 0, 0, 255]);
-    let blue = crate::Color([0, 0, 255, 255]);
+    let red = Color([255, 0, 0, 255]);
+    let blue = Color([0, 0, 255, 255]);
     let styles = [
         InlineStyle::default(),
         bold(),
@@ -1373,7 +1368,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
             ..bold()
         },
         InlineStyle {
-            background: Some(crate::Color::YELLOW),
+            background: Some(Color::YELLOW),
             ..InlineStyle::default()
         },
     ];
@@ -1437,7 +1432,7 @@ fn formatting_ranges_match_per_grapheme_styles_and_share_unchanged_data() {
             ..StylePatch::default()
         },
         StylePatch {
-            background: Some(Some(crate::Color::YELLOW)),
+            background: Some(Some(Color::YELLOW)),
             ..StylePatch::default()
         },
     ];
@@ -1648,7 +1643,7 @@ fn sparse_changes_retain_only_their_changed_runs() {
         .map(|&paragraph| Position::new(paragraph, 0)..Position::new(paragraph, 5))
         .collect();
     let (delta, _) = document.replace_matches(&matches, "swap");
-    let splices: Vec<_> = std::iter::once(&delta)
+    let splices: Vec<_> = iter::once(&delta)
         .chain(&delta.rest)
         .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
         .collect();
@@ -1661,8 +1656,8 @@ fn sparse_changes_retain_only_their_changed_runs() {
     };
     assert_eq!(
         contiguous.retained_bytes() - delta.retained_bytes(),
-        24 * (std::mem::size_of::<Paragraph>() + 2 * std::mem::size_of::<Arc<Paragraph>>())
-            - 2 * std::mem::size_of::<Delta>()
+        24 * (mem::size_of::<Paragraph>() + 2 * mem::size_of::<Arc<Paragraph>>())
+            - 2 * mem::size_of::<Delta>()
     );
     let shared = |expected: &[Arc<Paragraph>], document: &Document| {
         expected
@@ -1713,7 +1708,7 @@ fn sparse_changes_that_shift_paragraphs_retain_only_their_changed_runs() {
             Position::new(last, 0)..Position::new(last, 5),
         ];
         let (delta, _) = document.replace_matches(&matches, "x\ny");
-        let splices: Vec<_> = std::iter::once(&delta)
+        let splices: Vec<_> = iter::once(&delta)
             .chain(&delta.rest)
             .map(|splice| (splice.start, splice.before.len(), splice.after.len()))
             .collect();
@@ -1848,9 +1843,9 @@ fn sparse_kind_changes_renumber_lists_through_history() {
 
 #[test]
 fn history_charges_the_larger_side_without_shared_text_or_runs() {
-    let record = std::mem::size_of::<Paragraph>();
-    let run = std::mem::size_of::<Span>();
-    let pointer = std::mem::size_of::<Arc<Paragraph>>();
+    let record = mem::size_of::<Paragraph>();
+    let run = mem::size_of::<Span>();
+    let pointer = mem::size_of::<Arc<Paragraph>>();
     let text = "word ".repeat(1000);
     let mut document = Document::from_text(&format!("{text}\n{text}"));
     let (typed, _) = document
@@ -1890,8 +1885,8 @@ fn history_charges_the_larger_side_without_shared_text_or_runs() {
 
 #[test]
 fn sparse_history_charges_the_pointers_and_record_of_each_run() {
-    let record = std::mem::size_of::<Paragraph>();
-    let pointer = std::mem::size_of::<Arc<Paragraph>>();
+    let record = mem::size_of::<Paragraph>();
+    let pointer = mem::size_of::<Arc<Paragraph>>();
     let mut document = Document::from_text(&vec!["text"; 100].join("\n"));
     document.set_kind(0..100, ParagraphKind::Quote).unwrap();
     for index in (0..100).step_by(10) {
@@ -1903,7 +1898,7 @@ fn sparse_history_charges_the_pointers_and_record_of_each_run() {
     assert_eq!(delta.rest.len(), 9);
     assert_eq!(
         delta.retained_bytes(),
-        10 * (record + 2 * pointer) + 9 * std::mem::size_of::<Delta>()
+        10 * (record + 2 * pointer) + 9 * mem::size_of::<Delta>()
     );
 }
 
@@ -2240,7 +2235,7 @@ fn unicode_replacements_preserve_text_invariants_and_replay_exactly() {
                     let mut expected = plain.clone();
                     expected.replace_range(
                         global_offset(*start)..global_offset(*end),
-                        &normalize_newlines(insertion),
+                        &super::normalize_newlines(insertion),
                     );
                     let mut edited = original.clone();
                     let (delta, caret) = edited
