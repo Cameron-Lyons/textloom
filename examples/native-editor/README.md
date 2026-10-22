@@ -38,6 +38,11 @@ and whole-word options; replace-all is one undo step.
   is one undo step.
 - Enter starts a new paragraph, continuing a list or quote; Shift+Enter starts a
   new line within the paragraph.
+- Ctrl/Command+Q closes the window. Unlike egui's default quit shortcut, it
+  ignores chords with Alt, so Ctrl+Alt+Q, which Windows treats as AltGr+Q (`@`
+  on a German layout), leaves the window open. egui-winit drops text typed
+  while Ctrl is held, so such chords type nothing in egui hosts; AltGr types
+  them.
 
 Capture/restore keeps a native rich snapshot in memory. Restoring clears
 editing history. Use `--read-only` to start with editing disabled while

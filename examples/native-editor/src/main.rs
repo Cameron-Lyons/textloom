@@ -870,6 +870,38 @@ fn kind_name(kind: ParagraphKind) -> String {
     }
 }
 
+/// Prepares an egui context for the host. egui's default quit shortcut matches
+/// Ctrl/Command+Q while ignoring Alt, so it would also close the window for
+/// Ctrl+Alt+Q, which Windows treats as AltGr+Q (`@` on a German layout); the
+/// host handles Q itself instead.
+fn configure_context(context: &egui::Context) {
+    textloom::adapter::egui::install_input_routing(context);
+    context.options_mut(|options| options.quit_shortcuts.clear());
+}
+
+/// Removes presses of `key` with Ctrl or Command and reports whether there were
+/// any. Chords with Alt are left alone: they type AltGr or Option characters.
+fn take_command_shortcut(input: &mut egui::InputState, key: egui::Key) -> bool {
+    let mut requested = false;
+    input.events.retain(|event| {
+        let matches = matches!(
+            event,
+            egui::Event::Key {
+                key: pressed_key,
+                pressed: true,
+                modifiers,
+                ..
+            } if *pressed_key == key
+                && modifiers.command
+                && !modifiers.alt
+                && !(modifiers.mac_cmd && modifiers.ctrl)
+        );
+        requested |= matches;
+        !matches
+    });
+    requested
+}
+
 impl eframe::App for NativeEditor {
     fn raw_input_hook(&mut self, _context: &egui::Context, input: &mut egui::RawInput) {
         if let Some(clipboard) = &mut self.clipboard {
@@ -956,27 +988,12 @@ impl eframe::App for NativeEditor {
         }
         if self.enabled
             && !self.read_only
-            && ui.input_mut(|input| {
-                let mut requested = false;
-                input.events.retain(|event| {
-                    let matches = matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::K,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } if modifiers.command
-                            && !modifiers.alt
-                            && !(modifiers.mac_cmd && modifiers.ctrl)
-                    );
-                    requested |= matches;
-                    !matches
-                });
-                requested
-            })
+            && ui.input_mut(|input| take_command_shortcut(input, egui::Key::K))
         {
             self.open_link_field();
+        }
+        if ui.input_mut(|input| take_command_shortcut(input, egui::Key::Q)) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("TextLoom native editor");
@@ -1200,7 +1217,7 @@ fn main() -> eframe::Result {
         "TextLoom native example",
         options,
         Box::new(move |context| {
-            textloom::adapter::egui::install_input_routing(&context.egui_ctx);
+            configure_context(&context.egui_ctx);
             if let Some(theme) = arguments.theme {
                 context.egui_ctx.set_theme(theme);
             }
@@ -1262,6 +1279,7 @@ mod tests {
         time: f64,
         nodes: HashMap<NodeId, Node>,
         commands: Vec<egui::OutputCommand>,
+        viewport_commands: Vec<egui::ViewportCommand>,
         report: PathBuf,
     }
 
@@ -1287,7 +1305,7 @@ mod tests {
                 None,
             );
             let context = egui::Context::default();
-            textloom::adapter::egui::install_input_routing(&context);
+            configure_context(&context);
             context.enable_accesskit();
             let mut harness = Self {
                 app,
@@ -1296,6 +1314,7 @@ mod tests {
                 time: 0.0,
                 nodes: HashMap::new(),
                 commands: Vec::new(),
+                viewport_commands: Vec::new(),
                 report,
             };
             harness.step(Vec::new());
@@ -1319,6 +1338,10 @@ mod tests {
             let (app, frame) = (&mut self.app, &mut self.frame);
             let mut output = self.context.run_ui(input, |ui| app.ui(ui, frame));
             self.commands.append(&mut output.platform_output.commands);
+            for viewport in output.viewport_output.values() {
+                self.viewport_commands
+                    .extend(viewport.commands.iter().cloned());
+            }
             let update = output.platform_output.accesskit_update.take();
             output.drop_without_applying_deltas();
             if let Some(update) = update {
@@ -2735,6 +2758,39 @@ mod tests {
             assert!(harness.editor_focused());
             harness.assert_no_command_errors();
         }
+    }
+
+    #[test]
+    fn quit_shortcut_ignores_altgr_chords() {
+        let quit = |modifiers| egui::Event::Key {
+            key: egui::Key::Q,
+            physical_key: Some(egui::Key::Q),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        // Windows reports AltGr as Ctrl+Alt; macOS types Option characters.
+        for modifiers in [
+            egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::COMMAND,
+            egui::Modifiers::MAC_CMD | egui::Modifiers::ALT | egui::Modifiers::COMMAND,
+        ] {
+            let mut harness = Harness::new("quit-altgr");
+            harness.step(vec![quit(modifiers)]);
+            assert!(
+                !harness
+                    .viewport_commands
+                    .contains(&egui::ViewportCommand::Close),
+                "{modifiers:?} closed the window"
+            );
+            assert!(harness.editor_focused());
+        }
+        let mut harness = Harness::new("quit");
+        harness.step(vec![quit(egui::Modifiers::CTRL | egui::Modifiers::COMMAND)]);
+        assert!(
+            harness
+                .viewport_commands
+                .contains(&egui::ViewportCommand::Close)
+        );
     }
 
     #[test]
