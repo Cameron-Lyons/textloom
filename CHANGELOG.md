@@ -564,7 +564,7 @@ Library behavior changes relative to 0.1 come first, then host and CI changes.
   them. Egui read-only mode consumes only the chords editable mode handles.
 - Winit: Ctrl+Alt chords type text only on Windows (AltGr). Modifiers survive
   widget blur. `sync_ime` sends only changes, allows IME after focus gain or
-  `Ime::Disabled`, releases it once after blur or read-only mode, and
+  `Ime::Disabled`, releases it once after editor blur or read-only mode, and
   interrupts preedits the editor dropped.
 - The `egui` feature uses egui 0.37 and the `accesskit` feature uses AccessKit
   0.25; 0.1 used egui 0.36 and AccessKit 0.24. The `egui` feature no longer
@@ -611,8 +611,12 @@ Library behavior changes relative to 0.1 come first, then host and CI changes.
   published caret follows the painted caret's affinity.
 - Winit: typing works at macOS startup despite winit 0.30's spurious
   `Focused(false)` (winit #4371). `sync_ime` sends the caret area without
-  waiting for `Ime::Enabled`, so candidate windows follow the caret from the
-  first composition. Shortcuts work on non-Latin, AZERTY, and German layouts.
+  waiting for `Ime::Enabled` and again after it, because Wayland's enable
+  resets the area, so candidate windows follow the caret from the first
+  composition. IME stays allowed while only the window is in the background:
+  winit 0.30 on X11 recreated the input context after each app switch, which
+  reset the input method to direct input. Shortcuts work on non-Latin, AZERTY,
+  and German layouts.
 
 ### Performance
 
