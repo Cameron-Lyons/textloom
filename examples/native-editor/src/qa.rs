@@ -1,30 +1,65 @@
+//! Command-line options and the content-free QA report of the native host.
+//!
+//! [`Options::parse`] reads the host's flags. With `--qa-report PATH`, a
+//! [`Session`] counts raw host input events and observed editor state
+//! transitions while the window is open, and [`Session::write_report`] writes
+//! them as JSON on graceful exit. The report records sizes, counts, and flags
+//! only: document, clipboard, search, and IME preedit text never appear in it.
+//! `scripts/qa-tools` validates the report, so its field names and layout are
+//! a format other tools parse.
+
+use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use textloom::{Composition, Editor, InlineStyle, Selection};
+use textloom::{Composition, DecodeLimits, Document, Editor, InlineStyle, Selection};
 
+/// The `--help` text, printed verbatim to stdout.
 pub const HELP: &str = "TextLoom native example\n\nUsage: textloom-native-example [--smoke-test] [--read-only] [--disabled] [--rich-clipboard] [--clipboard-self-test] [--font PATH] [--bold-font PATH] [--theme light|dark] [--qa-report PATH]\n\n--smoke-test requests a graceful close after 20 native frames.\n--read-only permits selection and copy while preventing edits.\n--disabled disables document focus and interaction.\n--rich-clipboard enables the example's native rich clipboard transport.\n--clipboard-self-test runs a deterministic rich clipboard fixture check.\n                      Requires --rich-clipboard and writes the system clipboard;\n                      use only in an isolated test session.\n--font adds a proportional font, such as a CJK fallback.\n--bold-font supplies the widget's Bold font family.\n--theme overrides the system theme; Linux reports none, so egui uses dark.\n--qa-report writes content-free JSON observations on graceful exit.\n            PATH is created at startup and must not already exist;\n            reports do not certify manual checks.\n\nSet TEXTLOOM_QA_REVISION when compiling to identify the source revision.";
 
+/// The host's command-line flags; see [`HELP`] for what each one does.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
+    /// `--smoke-test`: close gracefully after 20 rendered frames.
     pub smoke_test: bool,
+    /// `--read-only`: start with editing disabled but selection and copy
+    /// allowed.
     pub read_only: bool,
+    /// `--disabled`: start with the document widget disabled entirely.
     pub disabled: bool,
+    /// `--rich-clipboard`: use the native rich clipboard transport.
     pub rich_clipboard: bool,
+    /// `--clipboard-self-test`: run the rich clipboard fixture check, which
+    /// writes the system clipboard. Only valid with `--rich-clipboard`.
     pub clipboard_self_test: bool,
+    /// `--font PATH`: a font file added first to the proportional family.
     pub regular_font: Option<PathBuf>,
+    /// `--bold-font PATH`: a font file registered as the widget's `Bold`
+    /// family.
     pub bold_font: Option<PathBuf>,
+    /// `--qa-report PATH`: where to write the QA report. The file must not
+    /// exist yet.
     pub qa_report: Option<PathBuf>,
+    /// `--theme light|dark`: overrides the system theme.
     pub theme: Option<egui::Theme>,
+    /// `--help` or `-h`: print [`HELP`] and exit.
     pub help: bool,
 }
 
 impl Options {
+    /// Parses the host's arguments, excluding the program name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for stderr when an argument is unknown, given twice,
+    /// or missing its value (a path value may not be empty or start with
+    /// `--`), when `--clipboard-self-test` lacks `--rich-clipboard`, or when
+    /// `--rich-clipboard` is requested on a platform without a backend.
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut options = Self::default();
         let mut arguments = arguments.into_iter();
@@ -84,6 +119,10 @@ impl Options {
     }
 }
 
+/// Counts of raw host input events by kind, reported as `host_input_events`.
+///
+/// These count events as they arrive, including those for the toolbar
+/// fields; they do not show which inputs the document accepted.
 #[derive(Default)]
 struct InputCounts {
     text: u64,
@@ -100,6 +139,7 @@ struct InputCounts {
 }
 
 impl InputCounts {
+    /// Counts `events`, the raw events of one input pass.
     fn observe(&mut self, events: &[egui::Event]) {
         for event in events {
             match event {
@@ -122,18 +162,33 @@ impl InputCounts {
     }
 }
 
+/// Native window focus and document widget focus, observed separately.
+///
+/// The report counts the document as focused only when both hold.
 #[derive(Clone, Copy, Default)]
 pub struct FocusState {
+    /// Whether the native window has keyboard focus.
     pub window_focused: bool,
+    /// Whether egui's keyboard focus is still on the document widget.
     pub widget_focus_retained: bool,
 }
 
+/// The QA report's destination, claimed when the host starts.
 pub struct ReportFile {
     path: PathBuf,
+    /// The open, still empty report file; `None` once the report is written.
     file: Option<File>,
 }
 
 impl ReportFile {
+    /// Creates the empty report file at `path`, before the window opens, so an
+    /// unusable path fails at startup instead of discarding a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from creating the file, including
+    /// [`io::ErrorKind::AlreadyExists`] when `path` already exists: the report
+    /// never overwrites earlier evidence.
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         Ok(Self {
@@ -143,6 +198,10 @@ impl ReportFile {
     }
 }
 
+/// QA observations of one host session, written as the report on exit.
+///
+/// Each `*_changes` counter counts observed transitions between UI passes, so
+/// several changes within one pass count once.
 pub struct Session {
     report_file: ReportFile,
     started_unix_seconds: u64,
@@ -154,10 +213,13 @@ pub struct Session {
     bold_font_supplied: bool,
     frames: u64,
     input: InputCounts,
+    // The editor state last observed by `observe_editor`, compared with the
+    // next observation to count changes.
     revision: u64,
     selection: Selection,
     typing_style: InlineStyle,
     composition: Option<Composition>,
+    /// Whether the window was focused and the document kept widget focus.
     focused: bool,
     focus_state: FocusState,
     enabled: bool,
@@ -175,6 +237,8 @@ pub struct Session {
     host_command_errors: u64,
     clipboard_self_test_errors: u64,
     snapshot_restores: u64,
+    /// egui's pixels per point in the latest frame; `None` before the first
+    /// frame.
     pixels_per_point: Option<f32>,
     minimum_pixels_per_point: Option<f32>,
     maximum_pixels_per_point: Option<f32>,
@@ -182,6 +246,8 @@ pub struct Session {
 }
 
 impl Session {
+    /// Starts observing a session whose report goes to `report_file`, taking
+    /// `editor`'s current state as the baseline for change counts.
     pub fn new(options: &Options, report_file: ReportFile, editor: &Editor) -> Self {
         Self {
             report_file,
@@ -222,6 +288,8 @@ impl Session {
         }
     }
 
+    /// Counts a rendered frame and records its display scale. Call it once per
+    /// frame, not once per input pass.
     pub fn begin_frame(&mut self, context: &egui::Context) {
         self.frames += 1;
         let scale = context.pixels_per_point();
@@ -237,10 +305,14 @@ impl Session {
         self.native_pixels_per_point = context.native_pixels_per_point();
     }
 
+    /// Counts the raw input events of the current pass. With input routing,
+    /// egui may run several passes per frame, each with its own events.
     pub fn observe_input_pass(&mut self, context: &egui::Context) {
         context.input(|input| self.input.observe(&input.raw.events));
     }
 
+    /// Compares the editor and widget state after a UI pass with the previous
+    /// observation and counts each change.
     pub fn observe_editor(
         &mut self,
         editor: &Editor,
@@ -248,25 +320,29 @@ impl Session {
         enabled: bool,
         read_only: bool,
     ) {
-        macro_rules! observe {
-            ($previous:ident, $counter:ident, $current:expr) => {
-                let current = $current;
-                if self.$previous != current {
-                    self.$counter += 1;
-                    self.$previous = current;
-                }
-            };
-        }
-        observe!(revision, revision_changes, editor.document().revision());
-        observe!(selection, selection_changes, editor.selection());
-        observe!(typing_style, typing_style_changes, editor.typing_style());
+        observe_change(
+            &mut self.revision,
+            &mut self.revision_changes,
+            editor.document().revision(),
+        );
+        observe_change(
+            &mut self.selection,
+            &mut self.selection_changes,
+            editor.selection(),
+        );
+        observe_change(
+            &mut self.typing_style,
+            &mut self.typing_style_changes,
+            editor.typing_style(),
+        );
+        // Compare by reference to avoid cloning the composition every pass.
         let composition = editor.composition();
         if self.composition.as_ref() != composition {
             self.composition_changes += 1;
             self.composition = composition.cloned();
         }
-        observe!(enabled, enabled_changes, enabled);
-        observe!(read_only, read_only_changes, read_only);
+        observe_change(&mut self.enabled, &mut self.enabled_changes, enabled);
+        observe_change(&mut self.read_only, &mut self.read_only_changes, read_only);
         let focused = focus_state.window_focused && focus_state.widget_focus_retained;
         self.focus_state = focus_state;
         if self.focused != focused {
@@ -279,15 +355,21 @@ impl Session {
         }
     }
 
+    /// Adds the editing and accessibility errors the widget reported in one
+    /// pass.
     pub fn widget_errors(&mut self, editing: usize, accessibility: usize) {
         self.editing_errors += editing as u64;
         self.accessibility_errors += accessibility as u64;
     }
 
+    /// Counts a toolbar, link, or search command that failed.
     pub fn host_command_error(&mut self) {
         self.host_command_errors += 1;
     }
 
+    /// Records the clipboard fixture check's outcome. A failure is sticky: a
+    /// later passing result cannot clear it. Ignored unless the check was
+    /// requested.
     pub fn clipboard_self_test_result(&mut self, passed: bool) {
         if !self.clipboard_self_test_requested {
             return;
@@ -298,19 +380,23 @@ impl Session {
         self.clipboard_self_test_passed = passed && self.clipboard_self_test_errors == 0;
     }
 
+    /// Counts a restored in-memory snapshot.
     pub fn snapshot_restored(&mut self) {
         self.snapshot_restores += 1;
     }
 
+    /// Renders the JSON report for the session so far, ending with `editor`'s
+    /// final state. `source_revision` is `TEXTLOOM_QA_REVISION` at build time.
     fn report(&self, editor: &Editor, source_revision: Option<&str>) -> String {
         let document = editor.document();
         let snapshot = document.to_bytes();
-        let round_trip = textloom::Document::from_bytes_with_limits(
-            &snapshot,
-            textloom::DecodeLimits::UNLIMITED,
-        )
-        .is_ok_and(|restored| restored.to_bytes() == snapshot);
-        let text_bytes: usize = document.paragraphs().iter().map(|p| p.text().len()).sum();
+        let round_trip = Document::from_bytes_with_limits(&snapshot, DecodeLimits::UNLIMITED)
+            .is_ok_and(|restored| restored.to_bytes() == snapshot);
+        let text_bytes: usize = document
+            .paragraphs()
+            .iter()
+            .map(|paragraph| paragraph.text().len())
+            .sum();
         let selection = editor.selection();
         let style = editor.typing_style();
         format!(
@@ -331,8 +417,8 @@ impl Session {
                 "  \"final_typing_style\": {{\"bold\": {bold}, \"italic\": {italic}, \"underline\": {underline}, \"strikethrough\": {strike}, \"code\": {code}, \"explicit_foreground\": {foreground}}}\n",
                 "}}\n",
             ),
-            os = json_string(std::env::consts::OS),
-            arch = json_string(std::env::consts::ARCH),
+            os = json_string(env::consts::OS),
+            arch = json_string(env::consts::ARCH),
             source_revision = source_revision.map_or_else(|| "null".into(), json_string),
             started = self.started_unix_seconds,
             ended = unix_seconds(),
@@ -398,6 +484,13 @@ impl Session {
         )
     }
 
+    /// Writes the report into the file claimed at startup, syncs it, and
+    /// returns its path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] if the report was already
+    /// written, or the I/O error from writing or syncing the file.
     pub fn write_report(&mut self, editor: &Editor) -> io::Result<&Path> {
         let mut file = self.report_file.file.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::AlreadyExists, "QA report already written")
@@ -414,6 +507,17 @@ impl Session {
     }
 }
 
+/// Stores `current` in `previous` and counts a change in `changes` when the
+/// two differ.
+fn observe_change<T: PartialEq>(previous: &mut T, changes: &mut u64, current: T) {
+    if *previous != current {
+        *changes += 1;
+        *previous = current;
+    }
+}
+
+/// The current time in whole seconds since the Unix epoch, or 0 if the clock
+/// is set before it.
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -421,12 +525,16 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+/// Formats `value` as a JSON number, or `null` when it is absent or not
+/// finite.
 fn json_number(value: Option<f32>) -> String {
     value
         .filter(|value| value.is_finite())
         .map_or_else(|| "null".into(), |value| value.to_string())
 }
 
+/// Formats `value` as a quoted JSON string, escaping quotes, backslashes, and
+/// the control characters U+0000 to U+001F.
 fn json_string(value: &str) -> String {
     let mut output = String::from("\"");
     for character in value.chars() {
@@ -437,7 +545,8 @@ fn json_string(value: &str) -> String {
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
             character if character <= '\u{1f}' => {
-                write!(output, "\\u{:04x}", character as u32).unwrap();
+                write!(output, "\\u{:04x}", character as u32)
+                    .expect("formatting into a String cannot fail");
             }
             character => output.push(character),
         }
@@ -446,18 +555,28 @@ fn json_string(value: &str) -> String {
     output
 }
 
-pub fn read_font(path: Option<&PathBuf>) -> Result<Option<Vec<u8>>, eframe::Error> {
-    path.map(std::fs::read)
+/// Reads the font file at `path`, if one was supplied.
+///
+/// # Errors
+///
+/// Returns the read failure as an [`eframe::Error::AppCreation`], so `main`
+/// can return it before opening a window.
+pub fn read_font(path: Option<&Path>) -> Result<Option<Vec<u8>>, eframe::Error> {
+    path.map(fs::read)
         .transpose()
         .map_err(|error| eframe::Error::AppCreation(error.into()))
 }
 
+/// The host's arguments, without the program name.
 pub fn arguments() -> impl Iterator<Item = OsString> {
-    std::env::args_os().skip(1)
+    env::args_os().skip(1)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+    use std::{mem, process};
+
     use super::*;
 
     fn options(arguments: &[&str]) -> Result<Options, String> {
@@ -477,7 +596,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("textloom-{name}-{}-{unique}", std::process::id()))
+        env::temp_dir().join(format!("textloom-{name}-{}-{unique}", process::id()))
     }
 
     #[test]
@@ -531,7 +650,10 @@ mod tests {
             ["--clipboard-self-test", "--rich-clipboard"],
         ] {
             let parsed = options(&arguments).unwrap();
-            assert!(parsed.rich_clipboard && parsed.clipboard_self_test);
+            assert!(
+                parsed.rich_clipboard && parsed.clipboard_self_test,
+                "{arguments:?}"
+            );
         }
         let parsed = options(&["--rich-clipboard"]).unwrap();
         assert!(parsed.rich_clipboard && !parsed.clipboard_self_test);
@@ -653,7 +775,7 @@ mod tests {
             textloom::adapter::egui::install_input_routing(&context);
             context.enable_accesskit();
             context.options_mut(|options| {
-                options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                options.max_passes = NonZeroUsize::new(max_passes).unwrap();
             });
             let first_id = egui::Id::unique("qa-first-field");
             let second_id = egui::Id::unique("qa-second-field");
@@ -680,7 +802,7 @@ mod tests {
                 let output = context.run_ui(
                     egui::RawInput {
                         focused: true,
-                        events: std::mem::take(&mut events),
+                        events: mem::take(&mut events),
                         ..Default::default()
                     },
                     |ui| {
@@ -696,13 +818,19 @@ mod tests {
                 );
                 output.drop_without_applying_deltas();
             }
-            assert_eq!(session.frames, 6);
-            assert_eq!(session.input.text, 2);
-            assert_eq!(session.input.paste, 1);
-            assert_eq!(session.input.accessibility_action, 2);
-            assert_eq!(session.input.window_focus_gained, 1);
-            assert_eq!(first, "before!");
-            assert_eq!(second, "after");
+            assert_eq!(session.frames, 6, "max_passes={max_passes}");
+            assert_eq!(session.input.text, 2, "max_passes={max_passes}");
+            assert_eq!(session.input.paste, 1, "max_passes={max_passes}");
+            assert_eq!(
+                session.input.accessibility_action, 2,
+                "max_passes={max_passes}"
+            );
+            assert_eq!(
+                session.input.window_focus_gained, 1,
+                "max_passes={max_passes}"
+            );
+            assert_eq!(first, "before!", "max_passes={max_passes}");
+            assert_eq!(second, "after", "max_passes={max_passes}");
         }
     }
 
@@ -759,28 +887,28 @@ mod tests {
             ReportFile::create(&path).err().unwrap().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_eq!(fs::read(&path).unwrap(), b"");
         assert_eq!(session.write_report(&editor).unwrap(), path);
-        let initial = std::fs::read(&path).unwrap();
+        let initial = fs::read(&path).unwrap();
         assert!(initial.starts_with(b"{"));
         assert_eq!(
             session.write_report(&editor).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(std::fs::read(&path).unwrap(), initial);
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), initial);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn unusable_report_paths_fail_at_startup() {
         let existing = temporary_path("existing.json");
-        std::fs::write(&existing, b"{}").unwrap();
+        fs::write(&existing, b"{}").unwrap();
         assert_eq!(
             ReportFile::create(&existing).err().unwrap().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(std::fs::read(&existing).unwrap(), b"{}");
-        std::fs::remove_file(existing).unwrap();
+        assert_eq!(fs::read(&existing).unwrap(), b"{}");
+        fs::remove_file(existing).unwrap();
         let missing_parent = temporary_path("missing").join("report.json");
         assert_eq!(
             ReportFile::create(&missing_parent).err().unwrap().kind(),

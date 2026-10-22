@@ -1188,8 +1188,8 @@ fn main() -> eframe::Result {
         println!("{}", qa::HELP);
         return Ok(());
     }
-    let regular_font = qa::read_font(arguments.regular_font.as_ref())?;
-    let bold_font = qa::read_font(arguments.bold_font.as_ref())?;
+    let regular_font = qa::read_font(arguments.regular_font.as_deref())?;
+    let bold_font = qa::read_font(arguments.bold_font.as_deref())?;
     let report = match &arguments.qa_report {
         Some(path) => match qa::ReportFile::create(path) {
             Ok(report) => Some(report),
