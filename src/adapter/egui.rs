@@ -13,21 +13,15 @@
 //! eframe, which enables them, must enable `egui/default_fonts` themselves.
 
 use crate::{Composition, Document, Editor, Error, Fragment, Link, Position, Selection};
-#[cfg(test)]
-use crate::{ParagraphKind, StylePatch};
 use egui::text::{CharIndex, LayoutJob};
 use egui::{
     Color32, Event, FontFamily, FontId, Galley, Id, ImeEvent, Pos2, Rect, Response, Sense,
     TextFormat, TextStyle, Ui, Vec2, Widget,
 };
-#[cfg(test)]
-use egui::{Key, Modifiers, Stroke, text::CCursor};
 use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
-#[cfg(test)]
-use unicode_segmentation::UnicodeSegmentation;
 
 mod accessibility;
 mod composition;
@@ -39,17 +33,9 @@ mod paint;
 pub use accessibility::AccessibilityError;
 use composition::CompositionPreview;
 use input::InputOptions;
-#[cfg(test)]
-use input::{handle_key, surrounding_position};
 pub use input_routing::install_input_routing;
-#[cfg(test)]
-use layout::paragraph_job;
 use layout::{Appearance, LayoutCache, ParagraphLayouts};
 use navigation::VerticalNavigation;
-#[cfg(test)]
-use navigation::{document_caret_rect, hit_test, preedit_byte_range};
-#[cfg(test)]
-use paint::paint_document;
 use paint::{BackgroundRanges, PaintCache};
 
 /// Exchanges rich [`Fragment`]s with the host's clipboard.
