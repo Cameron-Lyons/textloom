@@ -7,10 +7,19 @@ use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 use crate::types::Direction;
 use crate::{Error, InlineStyle, Link, ParagraphKind, StylePatch};
 
+/// A run of a [`Paragraph`]'s text with one style and link.
+///
+/// A paragraph's spans cover its text in order, without gaps or overlaps.
+/// Their ranges are nonempty and end on extended grapheme cluster boundaries,
+/// and neighboring spans differ in style or link, because paragraphs merge
+/// runs that agree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
+    /// The run's byte range in the paragraph's text.
     pub range: Range<usize>,
+    /// The run's character formatting.
     pub style: InlineStyle,
+    /// The run's hyperlink target, or `None` if it is not linked.
     pub link: Option<Link>,
 }
 
@@ -51,6 +60,22 @@ impl<'spans> SpanCursor<'spans> {
     }
 }
 
+/// One paragraph of a [`Document`](crate::Document): immutable text with
+/// formatting runs and a block kind.
+///
+/// The text never contains CR, LF, or U+2029 PARAGRAPH SEPARATOR, because
+/// paragraph breaks separate paragraphs instead; it may contain U+2028 LINE
+/// SEPARATOR as a soft line break. The [`spans`](Paragraph::spans) cover the
+/// text. Documents, fragments, and undo history share paragraphs through
+/// [`Arc`]. A paragraph builds its grapheme, scalar, and word indexes when
+/// they are first needed and shares them with copies of it that differ only
+/// in kind or formatting.
+///
+/// Byte offsets are UTF-8 offsets into [`text`](Paragraph::text). The
+/// conversion methods map them to and from grapheme indexes (extended
+/// grapheme clusters, what a reader sees as one character) and scalar indexes
+/// (Unicode scalar values, Rust `char`s) for GUI and accessibility
+/// integrations. ASCII text needs no indexes.
 #[derive(Clone)]
 pub struct Paragraph {
     pub(super) text: Arc<str>,
@@ -87,6 +112,20 @@ impl Debug for Paragraph {
 }
 
 impl Paragraph {
+    /// Creates a validated paragraph from text, formatting runs, and a block
+    /// kind, for importers that assemble documents with
+    /// [`Document::from_paragraphs`](crate::Document::from_paragraphs).
+    ///
+    /// `spans` must cover `text` contiguously from byte 0 to its end with
+    /// nonempty ranges whose ends fall on extended grapheme cluster
+    /// boundaries, so empty text takes no spans. Neighboring spans with an
+    /// equal style and link are merged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeadingLevel`] for a heading level outside
+    /// `1..=6`, and [`Error::InvalidFragment`] if the spans do not cover the
+    /// text as described or the text contains CR, LF, or U+2029.
     pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
         let paragraph = Self::from_parts(text, spans, kind)?;
         if text.contains(['\r', '\n', '\u{2029}']) {
@@ -95,16 +134,20 @@ impl Paragraph {
         Ok(paragraph)
     }
 
+    /// Returns the paragraph's text.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// Returns the formatting runs, which cover the text in order; empty text
+    /// has none.
     #[must_use]
     pub fn spans(&self) -> &[Span] {
         &self.spans
     }
 
+    /// Returns the paragraph's block kind.
     #[must_use]
     pub fn kind(&self) -> ParagraphKind {
         self.kind
@@ -114,6 +157,10 @@ impl Paragraph {
         self.ascii
     }
 
+    /// Returns the number of extended grapheme clusters in the text.
+    ///
+    /// For non-ASCII text, this builds the grapheme index if it is not built
+    /// yet.
     #[must_use]
     pub fn grapheme_count(&self) -> usize {
         if self.ascii {
@@ -123,6 +170,10 @@ impl Paragraph {
         }
     }
 
+    /// Returns the byte offset where grapheme `index` starts, or the text's
+    /// length when `index` equals the [grapheme count](Paragraph::grapheme_count).
+    ///
+    /// Returns `None` for larger indexes.
     #[must_use]
     pub fn byte_from_grapheme(&self, index: usize) -> Option<usize> {
         if index == 0 || self.ascii {
@@ -132,6 +183,10 @@ impl Paragraph {
         }
     }
 
+    /// Returns the index of the grapheme that starts at `byte`, or the
+    /// [grapheme count](Paragraph::grapheme_count) at the end of the text.
+    ///
+    /// Returns `None` if `byte` is past the end or not a grapheme boundary.
     #[must_use]
     pub fn grapheme_index(&self, byte: usize) -> Option<usize> {
         if byte == 0 {
@@ -145,16 +200,29 @@ impl Paragraph {
         }
     }
 
+    /// Returns the nearest grapheme boundary before `byte`, or 0 if `byte` is
+    /// 0.
+    ///
+    /// `byte` need not be a boundary itself, and offsets past the end give
+    /// the text's length.
     #[must_use]
     pub fn previous_grapheme(&self, byte: usize) -> usize {
         self.boundary_at_or_before(byte.saturating_sub(1))
     }
 
+    /// Returns the nearest grapheme boundary after `byte`, or the text's
+    /// length if there is none.
+    ///
+    /// `byte` need not be a boundary itself.
     #[must_use]
     pub fn next_grapheme(&self, byte: usize) -> usize {
         self.boundary_at_or_after(byte.saturating_add(1))
     }
 
+    /// Returns `byte` if it is a grapheme boundary, and otherwise the nearest
+    /// boundary before it.
+    ///
+    /// Offsets past the end give the text's length.
     #[must_use]
     pub fn boundary_at_or_before(&self, byte: usize) -> usize {
         if byte == 0 || byte >= self.text.len() || self.ascii {
@@ -178,6 +246,10 @@ impl Paragraph {
         }
     }
 
+    /// Returns `byte` if it is a grapheme boundary, and otherwise the nearest
+    /// boundary after it.
+    ///
+    /// Offsets past the end give the text's length.
     #[must_use]
     pub fn boundary_at_or_after(&self, byte: usize) -> usize {
         if byte == 0 || byte >= self.text.len() || self.ascii {
@@ -238,6 +310,7 @@ impl Paragraph {
         grapheme_context(&self.text, byte)
     }
 
+    /// Returns the number of Unicode scalar values (`char`s) in the text.
     #[must_use]
     pub fn scalar_count(&self) -> usize {
         if self.ascii {
@@ -249,6 +322,10 @@ impl Paragraph {
         }
     }
 
+    /// Returns the byte offset of scalar `index`, or the text's length when
+    /// `index` equals the [scalar count](Paragraph::scalar_count).
+    ///
+    /// Returns `None` for larger indexes.
     #[must_use]
     pub fn byte_from_scalar(&self, index: usize) -> Option<usize> {
         if index == 0 || self.ascii {
@@ -258,6 +335,10 @@ impl Paragraph {
         }
     }
 
+    /// Returns the index of the scalar that starts at `byte`, or the
+    /// [scalar count](Paragraph::scalar_count) at the end of the text.
+    ///
+    /// Returns `None` if `byte` is past the end or inside a character.
     #[must_use]
     pub fn scalar_index(&self, byte: usize) -> Option<usize> {
         if byte == 0 {
@@ -271,6 +352,12 @@ impl Paragraph {
         }
     }
 
+    /// Returns the nearest start of a word before `byte`, or 0 if there is
+    /// none.
+    ///
+    /// Words follow Unicode word segmentation (UAX #29), a run of
+    /// punctuation, symbols, or emoji also counts as a word, and whitespace is
+    /// skipped. The result is a grapheme boundary.
     #[must_use]
     pub fn previous_word(&self, byte: usize) -> usize {
         if byte == 0 {
@@ -287,6 +374,11 @@ impl Paragraph {
         self.boundary_at_or_before(byte)
     }
 
+    /// Returns the nearest end of a word after `byte`, or the text's length if
+    /// there is none.
+    ///
+    /// Words are as for [`previous_word`](Paragraph::previous_word). The
+    /// result is a grapheme boundary.
     #[must_use]
     pub fn next_word(&self, byte: usize) -> usize {
         if byte >= self.text.len() {

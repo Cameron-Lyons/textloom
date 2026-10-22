@@ -26,6 +26,18 @@ pub use paragraph::{Paragraph, Span};
 #[cfg(any(feature = "egui", feature = "accesskit"))]
 use change::LastChange;
 
+/// A rich-text document: a nonempty sequence of [`Paragraph`]s.
+///
+/// A document always has at least one paragraph; an empty document is one
+/// empty paragraph. Locations in it are [`Position`]s. Paragraphs are
+/// immutable and shared through [`Arc`], so cloning a document, capturing a
+/// [`Fragment`], or recording undo history copies pointers, not text, and an
+/// edit rebuilds only the paragraphs it changes.
+///
+/// A document is usually edited through an [`Editor`](crate::Editor), which
+/// owns one and adds a selection, typing style, undo history, and IME
+/// composition. Two documents are equal when their paragraphs and their
+/// [revisions](Document::revision) are equal.
 #[derive(Clone)]
 pub struct Document {
     paragraphs: Vec<Arc<Paragraph>>,
@@ -60,11 +72,18 @@ impl Default for Document {
 }
 
 impl Document {
+    /// Creates a document with one empty body paragraph.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates a document of unformatted body paragraphs from plain text.
+    ///
+    /// LF, CRLF, a lone CR, and U+2029 PARAGRAPH SEPARATOR each end a
+    /// paragraph; U+2028 LINE SEPARATOR stays in the text as a soft line break
+    /// within its paragraph. Empty text gives one empty paragraph, and a
+    /// trailing line break gives a final empty paragraph.
     #[must_use]
     pub fn from_text(text: &str) -> Self {
         let text = normalize_newlines(text);
@@ -75,11 +94,21 @@ impl Document {
         )
     }
 
+    /// Creates a document containing a fragment's paragraphs, sharing their
+    /// storage with the fragment.
+    ///
+    /// `Document::from(fragment)` does the same without cloning the
+    /// fragment's paragraph list.
     #[must_use]
     pub fn from_fragment(fragment: &Fragment) -> Self {
         Self::from_shared(fragment.paragraphs().to_vec())
     }
 
+    /// Creates a document from paragraphs, such as ones an importer built
+    /// with [`Paragraph::new`].
+    ///
+    /// Accepts owned or shared (`Arc`) paragraphs. No paragraphs give one
+    /// empty paragraph.
     pub fn from_paragraphs<I>(paragraphs: I) -> Self
     where
         I: IntoIterator,
@@ -104,20 +133,61 @@ impl Document {
         }
     }
 
+    /// Encodes the document losslessly in Textloom's native format (TLFR,
+    /// version 2), which [`Document::from_bytes`] decodes.
+    ///
+    /// The encoding is the same on every architecture.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Fragment::encode_paragraphs(self.paragraphs())
     }
 
+    /// Decodes a document from TLFR bytes (version 1 or 2) within
+    /// [`DecodeLimits::DEFAULT`](crate::DecodeLimits::DEFAULT).
+    ///
+    /// The decoded document starts at revision 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`FragmentError`] that [`Fragment::from_bytes`] reports for
+    /// malformed input or input beyond the default limits. Use
+    /// [`Document::from_bytes_with_limits`] to decode larger trusted input.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FragmentError> {
         Fragment::from_bytes(bytes).map(|fragment| Self::from_shared(fragment.into_paragraphs()))
     }
 
+    /// Exports the document as an HTML fragment.
+    ///
+    /// The output is one `<div style="white-space:pre-wrap">` containing
+    /// escaped text in `<p>`, `<h1>` to `<h6>`, `<blockquote>`, and nested
+    /// `<ul>` and `<ol>` elements. Ordered lists carry their displayed numbers
+    /// in `<ol start>`, and in `<li value>` where an item does not continue
+    /// the previous number. Inline formatting uses `<strong>`,
+    /// `<em>`, `<u>`, `<s>`, `<code>`, and a `<span>` with `color` and
+    /// `background-color`; consecutive runs with one link share an `<a href>`,
+    /// except that `javascript:`, `vbscript:`, and `data:` targets are written
+    /// as plain text. Soft line breaks and empty paragraphs become `<br>`, and
+    /// NUL becomes U+FFFD.
     #[must_use]
     pub fn to_html(&self) -> String {
         export::html(self.paragraphs(), Levels::default())
     }
 
+    /// Copies the text, formatting, links, and paragraph kinds in `range` into
+    /// a [`Fragment`], as a rich copy does.
+    ///
+    /// Partly covered paragraphs contribute only their covered text, and an
+    /// empty range gives one empty paragraph. An ordered item that begins a
+    /// list and is the fragment's first item at its indent is captured with an
+    /// explicit start of 1, so a copied list stays a new list; items that
+    /// continue an earlier list keep continuing. The fragment's
+    /// [HTML](Fragment::to_html) keeps the numbers the items displayed here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRange`] if `range.start` comes after
+    /// `range.end`, and [`Error::InvalidPosition`] if either end is not a
+    /// valid position in this document.
     pub fn fragment(&self, range: Range<Position>) -> Result<Fragment, Error> {
         self.validate_range(&range)?;
         let numbering = if range.start.paragraph != 0
@@ -161,6 +231,7 @@ impl Document {
         Ok(Fragment::captured(paragraphs, numbering))
     }
 
+    /// Returns the paragraphs in document order; there is always at least one.
     #[must_use]
     pub fn paragraphs(&self) -> &[Arc<Paragraph>] {
         &self.paragraphs
@@ -170,12 +241,31 @@ impl Document {
         self.paragraphs
     }
 
+    /// Returns the paragraph at `index`, or `None` if there is no such
+    /// paragraph.
     #[must_use]
     pub fn paragraph(&self, index: usize) -> Option<&Paragraph> {
         self.paragraphs.get(index).map(Arc::as_ref)
     }
 
+    /// Returns the number that the paragraph at `index` displays as an
+    /// ordered list item, or `None` if it is not an
+    /// [`Ordered`](ParagraphKind::Ordered) item or does not exist.
+    ///
+    /// An item with an explicit `start` displays that number. An item without
+    /// one continues the nearest earlier ordered item at the same indent,
+    /// displaying the next number, unless a heading or a shallower list item
+    /// lies between them; otherwise it displays 1. Body text, quotes, and
+    /// bullets at the same indent therefore interrupt a list without ending
+    /// it, and deeper items are skipped. Numbers saturate at `u32::MAX`.
+    ///
+    /// The numbers of the whole document are computed in one pass on the
+    /// first call and cached until a change affects numbering.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expect checks an internal invariant: the cache numbers every ordered item"
+    )]
     pub fn list_number(&self, index: usize) -> Option<u32> {
         match self.paragraphs.get(index)?.kind {
             ParagraphKind::Ordered {
@@ -202,12 +292,18 @@ impl Document {
         &numbers[numbers.partition_point(|&(index, _)| index < from)..]
     }
 
+    /// Returns the position at the end of the last paragraph.
     #[must_use]
     pub fn end(&self) -> Position {
         let paragraph = self.paragraphs.len() - 1;
         Position::new(paragraph, self.paragraphs[paragraph].text.len())
     }
 
+    /// Returns a counter of content changes, for cheap change detection.
+    ///
+    /// It starts at 0 for a new or decoded document, increases by one with
+    /// every change, including undo and redo, and saturates at `u64::MAX`.
+    /// Commands that change nothing leave it as it is, and a clone keeps it.
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
@@ -217,11 +313,24 @@ impl Document {
         Arc::clone(&self.identity)
     }
 
+    /// Returns the document's plain text, with LF between paragraphs.
+    ///
+    /// Soft line breaks (U+2028) are also written as LF, and list markers are
+    /// omitted.
     #[must_use]
     pub fn plain_text(&self) -> String {
         export::plain_text(self.paragraphs())
     }
 
+    /// Returns the plain text in `range`, written as by
+    /// [`plain_text`](Document::plain_text): paragraph breaks and soft line
+    /// breaks become LF.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRange`] if `range.start` comes after
+    /// `range.end`, and [`Error::InvalidPosition`] if either end is not a
+    /// valid position in this document.
     pub fn text(&self, range: Range<Position>) -> Result<String, Error> {
         self.validate_range(&range)?;
         let mut result = String::new();
@@ -263,6 +372,14 @@ impl Document {
         })
     }
 
+    /// Checks that `position` names an existing paragraph and an extended
+    /// grapheme cluster boundary of its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPosition`] holding `position` if the paragraph
+    /// does not exist, the byte offset is past the paragraph's end, or it falls
+    /// inside a character or grapheme.
     pub fn validate_position(&self, position: Position) -> Result<(), Error> {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
             return Err(Error::InvalidPosition(position));
@@ -274,6 +391,11 @@ impl Document {
         }
     }
 
+    /// Returns the style that typing at `position` continues: that of the
+    /// grapheme before it, or at a paragraph start, of the grapheme after it.
+    ///
+    /// Returns the default style for an empty paragraph or an invalid
+    /// position.
     #[must_use]
     pub fn style_at(&self, position: Position) -> InlineStyle {
         let Some(paragraph) = self.paragraph(position.paragraph) else {
@@ -293,6 +415,10 @@ impl Document {
         self.validate_position(range.end)
     }
 
+    /// Returns the link of the grapheme after `position`, for click handling.
+    ///
+    /// Returns `None` if that grapheme is not linked, `position` is at the end
+    /// of its paragraph, or `position` is invalid.
     #[must_use]
     pub fn link_at(&self, position: Position) -> Option<&Link> {
         let paragraph = self.paragraph(position.paragraph)?;
@@ -302,6 +428,11 @@ impl Document {
         paragraph.link_for_byte(position.byte)
     }
 
+    /// Returns the range of the whole link that [`link_at`](Document::link_at)
+    /// finds at `position`: the consecutive runs of its paragraph that carry
+    /// an equal link.
+    ///
+    /// Returns `None` whenever `link_at` does.
     #[must_use]
     pub fn link_range_at(&self, position: Position) -> Option<Range<Position>> {
         let paragraph = self.paragraph(position.paragraph)?;
