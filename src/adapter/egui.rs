@@ -735,35 +735,41 @@ impl<'a> RichTextEditor<'a> {
                 }
             }
             cache.interaction.caret_rect = Some(local_caret);
+        } else {
+            cache.interaction.scroll_to_caret = false;
+        }
+        // Like egui's TextEdit, keep requesting IME while the window is in the
+        // background. Winit 0.30 on X11 leaves an input context created after the
+        // window regains focus unfocused, so IME would stop after an app switch.
+        if !self.read_only
+            && ui.is_enabled()
+            && ui.memory(|memory| memory.owns_ime_events(response.id))
+        {
             let transform = ui
                 .ctx()
                 .layer_transform_to_global(ui.layer_id())
                 .unwrap_or_default();
-            if !self.read_only && ui.is_enabled() {
-                let mut ime_area = caret;
-                if let Some(preview) = preview {
-                    let start = document_caret_rect(
-                        display_document,
-                        display_layouts,
-                        origin,
-                        preview.composition.replacement.range().start,
-                        true,
-                    );
-                    if start.top() == caret.top() {
-                        ime_area = ime_area.union(start);
-                    }
+            let mut ime_area = caret;
+            if let Some(preview) = preview {
+                let start = document_caret_rect(
+                    display_document,
+                    display_layouts,
+                    origin,
+                    preview.composition.replacement.range().start,
+                    true,
+                );
+                if start.top() == caret.top() {
+                    ime_area = ime_area.union(start);
                 }
-                ui.output_mut(|output| {
-                    output.ime = Some(egui::output::IMEOutput {
-                        purpose: egui::IMEPurpose::Normal,
-                        rect: transform * ime_area.intersect(rect),
-                        cursor_rect: transform * caret,
-                        should_interrupt_composition: interrupted,
-                    })
-                });
             }
-        } else {
-            cache.interaction.scroll_to_caret = false;
+            ui.output_mut(|output| {
+                output.ime = Some(egui::output::IMEOutput {
+                    purpose: egui::IMEPurpose::Normal,
+                    rect: transform * ime_area.intersect(rect),
+                    cursor_rect: transform * caret,
+                    should_interrupt_composition: interrupted,
+                })
+            });
         }
 
         let hovered_link = response
