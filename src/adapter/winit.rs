@@ -1306,7 +1306,7 @@ mod tests {
             } else {
                 adapter.set_focused(false, &mut editor);
             }
-            assert!(!adapter.is_focused());
+            assert!(!adapter.is_focused(), "window blur: {window_blur}");
             assert!(
                 !key(
                     &mut adapter,
@@ -1314,7 +1314,8 @@ mod tests {
                     Key::Character("ignored".into()),
                     Some("ignored"),
                 )
-                .handled
+                .handled,
+                "window blur: {window_blur}"
             );
             if window_blur {
                 adapter
@@ -1333,9 +1334,9 @@ mod tests {
             }
             assert_eq!(editor.document().plain_text(), "abcd");
             assert_eq!(editor.undo_len(), 2);
-            assert!(editor.undo());
+            assert!(editor.undo(), "window blur: {window_blur}");
             assert_eq!(editor.document().plain_text(), "ab");
-            assert!(editor.undo());
+            assert!(editor.undo(), "window blur: {window_blur}");
             assert_eq!(editor.document().plain_text(), "");
         }
     }
@@ -1359,31 +1360,40 @@ mod tests {
                     Key::Character(level.to_string().into()),
                     None,
                 );
-                assert!(outcome.handled && outcome.changed);
+                assert!(
+                    outcome.handled && outcome.changed,
+                    "{command_modifier:?}, level {level}"
+                );
                 assert!(
                     editor
                         .document()
                         .paragraphs()
                         .iter()
-                        .all(|paragraph| { paragraph.kind() == ParagraphKind::Heading { level } })
+                        .all(|paragraph| { paragraph.kind() == ParagraphKind::Heading { level } }),
+                    "{command_modifier:?}, level {level}"
                 );
                 assert_eq!(editor.selection(), selection);
             }
-            assert!(key(&mut adapter, &mut editor, Key::Character("0".into()), None).changed);
             assert!(
-                editor
-                    .document()
-                    .paragraphs()
-                    .iter()
-                    .all(|paragraph| { paragraph.kind() == ParagraphKind::Body })
+                key(&mut adapter, &mut editor, Key::Character("0".into()), None).changed,
+                "{command_modifier:?}"
             );
-            assert!(editor.undo());
             assert!(
                 editor
                     .document()
                     .paragraphs()
                     .iter()
-                    .all(|paragraph| { paragraph.kind() == ParagraphKind::Heading { level: 6 } })
+                    .all(|paragraph| { paragraph.kind() == ParagraphKind::Body }),
+                "{command_modifier:?}"
+            );
+            assert!(editor.undo(), "{command_modifier:?}");
+            assert!(
+                editor
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .all(|paragraph| { paragraph.kind() == ParagraphKind::Heading { level: 6 } }),
+                "{command_modifier:?}"
             );
             let history = editor.undo_len();
             let revision = editor.document().revision();
@@ -1395,7 +1405,10 @@ mod tests {
                     Key::Character(shortcut.into()),
                     None,
                 );
-                assert!(outcome.handled && !outcome.changed);
+                assert!(
+                    outcome.handled && !outcome.changed,
+                    "{command_modifier:?}, read-only {shortcut}"
+                );
                 assert_eq!(editor.document().revision(), revision);
                 assert_eq!(editor.undo_len(), history);
                 assert_eq!(editor.selection(), selection);
@@ -1442,7 +1455,7 @@ mod tests {
                 KeyCode::Digit3,
                 Some("3"),
             );
-            assert!(!outcome.handled && !outcome.changed);
+            assert!(!outcome.handled && !outcome.changed, "{modifiers:?}");
         }
         let revision = editor.document().revision();
         adapter.set_read_only(true, &mut editor);
@@ -1480,7 +1493,7 @@ mod tests {
                 Key::Named(NamedKey::Backspace),
                 None,
             );
-            assert!(outcome.handled && outcome.changed);
+            assert!(outcome.handled && outcome.changed, "{selection:?}");
             assert_eq!(
                 editor.document().plain_text(),
                 if selection == caret {
@@ -1498,11 +1511,11 @@ mod tests {
                     Key::Named(NamedKey::Backspace),
                     None,
                 );
-                assert!(outcome.handled && !outcome.changed);
+                assert!(outcome.handled && !outcome.changed, "{selection:?}");
                 assert_eq!(editor.document().revision(), revision);
                 assert_eq!(editor.undo_len(), 1);
             }
-            assert!(editor.undo());
+            assert!(editor.undo(), "{selection:?}");
             assert_eq!(editor.document().plain_text(), text);
             assert_eq!(editor.selection(), selection);
         }
@@ -1551,7 +1564,7 @@ mod tests {
                 None,
             );
             assert_eq!(editor.document().plain_text(), expected);
-            assert!(editor.undo());
+            assert!(editor.undo(), "{modifiers:?}");
         }
     }
 
@@ -1604,7 +1617,10 @@ mod tests {
                         Key::Character(shortcut.into()),
                         None,
                     );
-                    assert!(outcome.handled && outcome.changed);
+                    assert!(
+                        outcome.handled && outcome.changed,
+                        "{shortcut}, reverse: {reverse}, enabling: {enabled}"
+                    );
                     let style = editor.selection_style();
                     let actual = match shortcut {
                         "b" => style.bold,
@@ -1615,8 +1631,8 @@ mod tests {
                     assert_eq!(editor.selection(), selection);
                 }
                 assert_eq!(editor.undo_len(), 2);
-                assert!(editor.undo());
-                assert!(editor.undo());
+                assert!(editor.undo(), "{shortcut}, reverse: {reverse}");
+                assert!(editor.undo(), "{shortcut}, reverse: {reverse}");
                 assert_eq!(editor.document().to_bytes(), original);
                 assert_eq!(editor.selection(), selection);
             }
@@ -1649,7 +1665,7 @@ mod tests {
                 Key::Character(shortcut.into()),
                 None,
             );
-            assert!(outcome.handled && !outcome.changed);
+            assert!(outcome.handled && !outcome.changed, "{shortcut}");
             assert_eq!(
                 outcome.clipboard,
                 Some(ClipboardEvent::Copy("aoriginal".to_owned()))
@@ -1662,13 +1678,13 @@ mod tests {
                 Key::Character(shortcut.into()),
                 None,
             );
-            assert!(outcome.handled && !outcome.changed);
+            assert!(outcome.handled && !outcome.changed, "{shortcut}");
             assert_eq!(outcome.clipboard, None);
         }
         adapter.set_modifiers(ModifiersState::empty());
         for named in [NamedKey::Enter, NamedKey::Backspace, NamedKey::Delete] {
             let outcome = key(&mut adapter, &mut editor, Key::Named(named), None);
-            assert!(outcome.handled && !outcome.changed);
+            assert!(outcome.handled && !outcome.changed, "{named:?}");
         }
         let text = key(
             &mut adapter,
@@ -1734,9 +1750,9 @@ mod tests {
             Ime::Disabled,
         ] {
             let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
-            assert!(outcome.handled && !outcome.changed);
-            assert!(!adapter.ime_enabled());
-            assert!(editor.composition().is_none());
+            assert!(outcome.handled && !outcome.changed, "{event:?}");
+            assert!(!adapter.ime_enabled(), "{event:?}");
+            assert!(editor.composition().is_none(), "{event:?}");
         }
         adapter.set_modifiers(ModifiersState::CONTROL);
         let outcome = key(&mut adapter, &mut editor, Key::Character("x".into()), None);
@@ -1881,7 +1897,10 @@ mod tests {
             ModifiersState::SUPER,
         ] {
             adapter.set_modifiers(modifier);
-            assert!(!key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None).handled);
+            assert!(
+                !key(&mut adapter, &mut editor, Key::Named(NamedKey::Tab), None).handled,
+                "{modifier:?}"
+            );
             assert_eq!(
                 editor.document().paragraph(0).unwrap().kind(),
                 ParagraphKind::Bullet { indent: 0 }
@@ -1912,8 +1931,8 @@ mod tests {
         let mut adapter = focused(&mut editor);
         for clipboard in ["", "\u{0}\u{1}\u{7}"] {
             let outcome = adapter.paste(&mut editor, clipboard).unwrap();
-            assert!(outcome.handled);
-            assert!(!outcome.changed);
+            assert!(outcome.handled, "{clipboard:?}");
+            assert!(!outcome.changed, "{clipboard:?}");
             assert_eq!(editor.document().plain_text(), "typed original");
             assert_eq!(editor.document().revision(), revision);
             assert_eq!(editor.selection(), selection);
@@ -1944,11 +1963,11 @@ mod tests {
             editor.update_composition(preedit, None).unwrap();
             let composition = editor.composition().cloned();
             let outcome = adapter.paste(&mut editor, "\u{0}").unwrap();
-            assert!(outcome.handled);
-            assert!(!outcome.changed);
+            assert!(outcome.handled, "preedit {preedit:?}");
+            assert!(!outcome.changed, "preedit {preedit:?}");
             assert_eq!(editor.composition(), composition.as_ref());
             assert_eq!(editor.document().plain_text(), "original");
-            assert!(!editor.can_undo());
+            assert!(!editor.can_undo(), "preedit {preedit:?}");
         }
     }
 
@@ -2144,7 +2163,7 @@ mod tests {
                     .unwrap();
                 assert!(commit.changed, "{logical:?}");
                 assert_eq!(editor.document().plain_text(), "éc");
-                assert!(editor.undo());
+                assert!(editor.undo(), "{logical:?}");
                 assert_eq!(editor.document().plain_text(), "abc");
                 assert_eq!(editor.selection(), selection);
             }
@@ -2195,11 +2214,11 @@ mod tests {
                         .unwrap();
                     assert!(outcome.handled && outcome.changed, "{logical:?}");
                     assert_eq!(editor.document().plain_text(), "a候b");
-                    assert!(editor.composition().is_none());
-                    assert!(editor.undo());
+                    assert!(editor.composition().is_none(), "{logical:?}");
+                    assert!(editor.undo(), "{logical:?}");
                     assert_eq!(editor.document().plain_text(), "ab");
                     assert_eq!(editor.selection(), selection);
-                    assert!(!editor.can_undo());
+                    assert!(!editor.can_undo(), "{logical:?}");
                 }
             }
         }
@@ -2267,7 +2286,10 @@ mod tests {
             assert_eq!(editor.document().to_bytes(), before);
             assert_eq!(editor.selection(), selection);
             assert_eq!((editor.undo_len(), editor.redo_len()), history);
-            assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+            assert!(
+                adapter.plan_ime(&editor, false, area(1.0)).interrupt,
+                "{logical:?}"
+            );
         }
     }
 
@@ -2336,12 +2358,12 @@ mod tests {
             Ime::Commit(String::new()),
         ] {
             let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
-            assert!(outcome.handled);
-            assert!(!outcome.changed);
+            assert!(outcome.handled, "{event:?}");
+            assert!(!outcome.changed, "{event:?}");
             assert_eq!(editor.document().plain_text(), "selected");
             assert_eq!(editor.selection(), selection);
-            assert!(editor.composition().is_none());
-            assert!(!editor.can_undo());
+            assert!(editor.composition().is_none(), "{event:?}");
+            assert!(!editor.can_undo(), "{event:?}");
         }
     }
 
@@ -2485,7 +2507,10 @@ mod tests {
                         physical,
                         text,
                     );
-                    assert!(!outcome.handled && !outcome.changed);
+                    assert!(
+                        !outcome.handled && !outcome.changed,
+                        "{command_modifier:?}, read-only: {read_only}, {logical}"
+                    );
                     assert_eq!(editor.document().plain_text(), "");
                 }
             }
@@ -2508,7 +2533,7 @@ mod tests {
                 KeyCode::KeyC,
                 Some(logical),
             );
-            assert!(copy.handled);
+            assert!(copy.handled, "{logical}");
             assert_eq!(copy.clipboard, Some(ClipboardEvent::Copy("text".into())));
         }
         editor
@@ -2718,7 +2743,7 @@ mod tests {
                 KeyCode::KeyA,
                 Some("a"),
             );
-            assert!(select.handled && select.changed);
+            assert!(select.handled && select.changed, "{command_modifier:?}");
             let copy = chord(
                 &mut adapter,
                 &mut editor,
@@ -2782,7 +2807,7 @@ mod tests {
                 assert_eq!(mem::discriminant(&second), mem::discriminant(&kind));
             }
             let bold = chord(&mut adapter, &mut editor, command, "b", KeyCode::KeyB, None);
-            assert!(bold.handled && bold.changed);
+            assert!(bold.handled && bold.changed, "{command_modifier:?}");
             assert_eq!(editor.selection_style().bold, Some(true));
 
             let cut = chord(
@@ -2931,7 +2956,7 @@ mod tests {
                     Selection::new(if extend { start } else { expected }, expected)
                 );
                 assert_eq!(editor.document().plain_text(), text);
-                assert!(!editor.can_undo());
+                assert!(!editor.can_undo(), "Control-{letter}, extend: {extend}");
             }
         }
     }
@@ -2951,18 +2976,18 @@ mod tests {
             adapter.set_focused(true, &mut editor);
             adapter.set_modifiers(ModifiersState::CONTROL);
             let outcome = key(&mut adapter, &mut editor, logical.clone(), None);
-            assert!(outcome.handled && outcome.changed);
+            assert!(outcome.handled && outcome.changed, "{logical:?}");
             assert_eq!(editor.document().plain_text(), expected);
-            assert!(editor.undo());
+            assert!(editor.undo(), "{logical:?}");
             assert_eq!(editor.document().plain_text(), text);
             assert_eq!(editor.selection(), caret);
             adapter.set_read_only(true, &mut editor);
             let outcome = key(&mut adapter, &mut editor, logical.clone(), None);
-            assert!(outcome.handled && !outcome.changed);
+            assert!(outcome.handled && !outcome.changed, "{logical:?}");
             adapter.set_read_only(false, &mut editor);
             editor.update_composition("候", None).unwrap();
-            let outcome = key(&mut adapter, &mut editor, logical, None);
-            assert!(outcome.handled && !outcome.changed);
+            let outcome = key(&mut adapter, &mut editor, logical.clone(), None);
+            assert!(outcome.handled && !outcome.changed, "{logical:?}");
             assert_eq!(editor.composition().unwrap().text, "候");
             assert_eq!(editor.document().plain_text(), text);
         }
@@ -3008,13 +3033,13 @@ mod tests {
                 });
                 for target in &targets {
                     let outcome = key(&mut adapter, &mut editor, Key::Named(named), None);
-                    assert!(outcome.handled);
+                    assert!(outcome.handled, "{named:?} to {target:?}, extend: {extend}");
                     assert_eq!(
                         editor.selection(),
                         Selection::new(if extend { start } else { *target }, *target)
                     );
                 }
-                assert!(!editor.can_undo());
+                assert!(!editor.can_undo(), "{named:?}, extend: {extend}");
             }
         }
     }
@@ -3090,7 +3115,10 @@ mod tests {
             for modifiers in [ModifiersState::empty(), ModifiersState::SHIFT] {
                 adapter.set_modifiers(modifiers);
                 for page in [NamedKey::PageDown, NamedKey::PageUp] {
-                    assert!(!key(&mut adapter, &mut editor, Key::Named(page), None).handled);
+                    assert!(
+                        !key(&mut adapter, &mut editor, Key::Named(page), None).handled,
+                        "{page:?} with {modifiers:?}, host vertical: {host_vertical}"
+                    );
                     assert_eq!(editor.selection(), caret);
                 }
                 let down = key(
@@ -3114,7 +3142,7 @@ mod tests {
                 Key::Named(NamedKey::ArrowDown),
                 None,
             );
-            assert!(end.handled);
+            assert!(end.handled, "host vertical: {host_vertical}");
             assert_eq!(editor.selection().focus, editor.document().end());
         }
     }
@@ -3159,7 +3187,7 @@ mod tests {
                 .handle_ime(&Ime::Preedit("n".into(), Some((1, 1))), &mut editor)
                 .unwrap();
             let blocked = paste(&mut adapter, &mut editor).unwrap();
-            assert!(blocked.handled && !blocked.changed);
+            assert!(blocked.handled && !blocked.changed, "rich: {rich}");
             assert_eq!(editor.composition().unwrap().text, "n");
             assert_eq!(editor.document().plain_text(), "ab");
 
@@ -3167,11 +3195,11 @@ mod tests {
                 .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
                 .unwrap();
             let pasted = paste(&mut adapter, &mut editor).unwrap();
-            assert!(pasted.handled && pasted.changed);
-            assert!(editor.composition().is_none());
+            assert!(pasted.handled && pasted.changed, "rich: {rich}");
+            assert!(editor.composition().is_none(), "rich: {rich}");
             assert_eq!(editor.document().plain_text(), "xb");
             assert_eq!(editor.undo_len(), 1);
-            assert!(editor.undo());
+            assert!(editor.undo(), "rich: {rich}");
             assert_eq!(editor.document().plain_text(), "ab");
             assert_eq!(editor.selection(), replacement);
         }
@@ -3366,14 +3394,17 @@ mod tests {
                     Key::Named(NamedKey::Escape),
                     None,
                 );
-                assert!(escape.handled && escape.changed);
+                assert!(escape.handled && escape.changed, "host click: {host_click}");
             }
-            assert!(editor.composition().is_none());
+            assert!(editor.composition().is_none(), "host click: {host_click}");
             let resent = adapter
                 .handle_ime(&Ime::Preedit("nih".into(), Some((3, 3))), &mut editor)
                 .unwrap();
-            assert!(resent.handled && !resent.changed);
-            assert!(editor.composition().is_none());
+            assert!(
+                resent.handled && !resent.changed,
+                "host click: {host_click}"
+            );
+            assert!(editor.composition().is_none(), "host click: {host_click}");
             assert_eq!(
                 adapter.plan_ime(&editor, false, area(1.0)),
                 interrupt(area(1.0))
@@ -3396,6 +3427,10 @@ mod tests {
             for (clear_before_cancel, clear_after_cancel) in
                 [(false, false), (false, true), (true, false)]
             {
+                let case = format!(
+                    "host click: {host_click}, cleared before cancel: {clear_before_cancel}, \
+                     cleared after: {clear_after_cancel}"
+                );
                 let mut editor = Editor::from_text("abc");
                 let mut adapter = focused(&mut editor);
                 adapter.plan_ime(&editor, false, area(1.0));
@@ -3424,16 +3459,19 @@ mod tests {
                     let cleared = adapter
                         .handle_ime(&Ime::Preedit(String::new(), None), &mut editor)
                         .unwrap();
-                    assert!(cleared.handled && !cleared.changed);
+                    assert!(cleared.handled && !cleared.changed, "{case}");
                 }
                 let commit = adapter
                     .handle_ime(&Ime::Commit("に".into()), &mut editor)
                     .unwrap();
-                assert!(commit.handled && !commit.changed);
+                assert!(commit.handled && !commit.changed, "{case}");
                 assert_eq!(editor.document().plain_text(), "abc");
                 assert_eq!(editor.selection(), selection);
-                assert!(!editor.can_undo());
-                assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+                assert!(!editor.can_undo(), "{case}");
+                assert!(
+                    adapter.plan_ime(&editor, false, area(1.0)).interrupt,
+                    "{case}"
+                );
 
                 adapter
                     .handle_ime(&Ime::Preedit("ka".into(), None), &mut editor)
@@ -3443,7 +3481,8 @@ mod tests {
                     adapter
                         .handle_ime(&Ime::Commit("か".into()), &mut editor)
                         .unwrap()
-                        .changed
+                        .changed,
+                    "{case}"
                 );
                 assert_eq!(
                     editor.document().plain_text(),
@@ -3469,21 +3508,27 @@ mod tests {
             adapter
                 .handle_ime(&Ime::Preedit("ni".into(), Some((2, 2))), &mut editor)
                 .unwrap();
-            assert!(adapter.set_read_only(true, &mut editor).changed);
-            assert!(editor.composition().is_none());
-            if let Some(event) = event {
-                let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
-                assert!(outcome.handled && !outcome.changed);
+            assert!(
+                adapter.set_read_only(true, &mut editor).changed,
+                "{event:?}"
+            );
+            assert!(editor.composition().is_none(), "{event:?}");
+            if let Some(event) = &event {
+                let outcome = adapter.handle_ime(event, &mut editor).unwrap();
+                assert!(outcome.handled && !outcome.changed, "{event:?}");
             }
             adapter.set_read_only(false, &mut editor);
 
             let commit = adapter
                 .handle_ime(&Ime::Commit("你".into()), &mut editor)
                 .unwrap();
-            assert!(commit.handled && !commit.changed);
+            assert!(commit.handled && !commit.changed, "{event:?}");
             assert_eq!(editor.document().plain_text(), "abc");
-            assert!(!editor.can_undo());
-            assert!(adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+            assert!(!editor.can_undo(), "{event:?}");
+            assert!(
+                adapter.plan_ime(&editor, false, area(1.0)).interrupt,
+                "{event:?}"
+            );
         }
     }
 
@@ -3559,7 +3604,10 @@ mod tests {
             (none, NamedKey::Paste, ClipboardEvent::PasteRequest),
         ] {
             let outcome = press(&mut adapter, &mut editor, modifiers, named);
-            assert!(outcome.handled && !outcome.changed);
+            assert!(
+                outcome.handled && !outcome.changed,
+                "{modifiers:?} {named:?}"
+            );
             assert_eq!(outcome.clipboard, Some(expected));
         }
         let cut = press(&mut adapter, &mut editor, none, NamedKey::Cut);
@@ -3569,7 +3617,7 @@ mod tests {
         adapter.set_read_only(true, &mut editor);
         for (modifiers, named) in [(shift, NamedKey::Delete), (none, NamedKey::Cut)] {
             let copy = press(&mut adapter, &mut editor, modifiers, named);
-            assert!(copy.handled && !copy.changed);
+            assert!(copy.handled && !copy.changed, "{modifiers:?} {named:?}");
             assert_eq!(copy.clipboard, Some(ClipboardEvent::Copy("secret".into())));
         }
         for (modifiers, named) in [
@@ -3579,7 +3627,10 @@ mod tests {
             (none, NamedKey::Redo),
         ] {
             let outcome = press(&mut adapter, &mut editor, modifiers, named);
-            assert!(outcome.handled && !outcome.changed);
+            assert!(
+                outcome.handled && !outcome.changed,
+                "{modifiers:?} {named:?}"
+            );
             assert_eq!(outcome.clipboard, None);
         }
         assert_eq!(editor.document().plain_text(), "secret");
@@ -3658,7 +3709,7 @@ mod tests {
                 Key::Named(NamedKey::Enter),
                 Some("\r"),
             );
-            assert!(!submit.handled && !submit.changed);
+            assert!(!submit.handled && !submit.changed, "read-only: {read_only}");
             adapter.set_modifiers(ModifiersState::empty());
             let enter = key(
                 &mut adapter,
@@ -3666,7 +3717,7 @@ mod tests {
                 Key::Named(NamedKey::Enter),
                 Some("\r"),
             );
-            assert!(enter.handled);
+            assert!(enter.handled, "read-only: {read_only}");
             let paragraphs = if read_only { 1 } else { 2 };
             assert_eq!(editor.document().paragraphs().len(), paragraphs);
         }
@@ -3685,7 +3736,7 @@ mod tests {
                 Key::Named(NamedKey::Enter),
                 Some("\r"),
             );
-            assert!(outcome.handled);
+            assert!(outcome.handled, "read-only: {read_only}");
             assert_eq!(outcome.changed, !read_only);
             assert_eq!(editor.document().paragraphs().len(), 1);
             let expected = if read_only { "text" } else { "\u{2028}text" };
@@ -3697,7 +3748,7 @@ mod tests {
                 Key::Named(NamedKey::Enter),
                 Some("\r"),
             );
-            assert!(!submit.handled && !submit.changed);
+            assert!(!submit.handled && !submit.changed, "read-only: {read_only}");
         }
     }
 

@@ -1824,7 +1824,10 @@ mod accesskit_bridge {
                 let expected_children = expected[&ids[&id]].children();
                 assert_eq!(children.len(), expected_children.len());
                 for (child, expected_child) in children.iter().zip(expected_children) {
-                    assert!(ids.insert(*child, *expected_child).is_none());
+                    assert!(
+                        ids.insert(*child, *expected_child).is_none(),
+                        "node {child:?} has two parents"
+                    );
                     pending.push(*child);
                 }
             }
@@ -1862,7 +1865,10 @@ mod accesskit_bridge {
                 for (index, run) in paragraph.runs.iter().enumerate() {
                     assert_eq!(run.range.start, end);
                     end = run.range.end;
-                    assert!(run.node.character_lengths().len() <= MAX_RUN_CHARACTERS);
+                    assert!(
+                        run.node.character_lengths().len() <= MAX_RUN_CHARACTERS,
+                        "run {index} of {text:?}"
+                    );
                     let bytes: usize = run.text_lengths().sum();
                     assert_eq!(bytes, run.range.len());
                     let value = run.node.value().unwrap();
@@ -1876,11 +1882,15 @@ mod accesskit_bridge {
                         text[run.range.clone()].ends_with(LINE_SEPARATOR)
                     );
                     let starts = run.node.word_starts();
-                    assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+                    assert!(
+                        starts.windows(2).all(|pair| pair[0] < pair[1]),
+                        "run {index} of {text:?}"
+                    );
                     assert!(
                         starts
                             .iter()
-                            .all(|start| usize::from(*start) < run.lengths().len())
+                            .all(|start| usize::from(*start) < run.lengths().len()),
+                        "run {index} of {text:?}"
                     );
                     let previous = index
                         .checked_sub(1)
@@ -1899,7 +1909,7 @@ mod accesskit_bridge {
                     );
                 }
                 assert_eq!(end, text.len());
-                assert!(!paragraph.runs.last().unwrap().soft_break);
+                assert!(!paragraph.runs.last().unwrap().soft_break, "{text:?}");
             }
         }
 
@@ -2119,7 +2129,7 @@ mod accesskit_bridge {
             for action in [Action::SetValue, Action::ReplaceSelectedText] {
                 let replace = request(&adapter, action, Some(ActionData::Value("new".into())));
                 let outcome = adapter.handle_action(&replace, &mut editor).unwrap();
-                assert!(outcome.handled && !outcome.changed);
+                assert!(outcome.handled && !outcome.changed, "{action:?}");
             }
             assert_eq!(editor.document().plain_text(), "original");
             assert_eq!(editor.selection(), selection);
@@ -2304,7 +2314,10 @@ mod accesskit_bridge {
             assert_eq!(update.nodes.len(), 3);
             assert_eq!(adapter.paragraphs.as_ptr(), storage);
             for index in [0, 2] {
-                assert!(Arc::ptr_eq(&before[index], &adapter.paragraphs[index]));
+                assert!(
+                    Arc::ptr_eq(&before[index], &adapter.paragraphs[index]),
+                    "paragraph {index}"
+                );
             }
             assert_ne!(adapter.paragraph_node(0), adapter.paragraph_node(1));
             assert_eq!(
@@ -2371,7 +2384,7 @@ mod accesskit_bridge {
                 assert_eq!(adapter.next_id, Some(u64::MAX));
                 assert_eq!(adapter.paragraphs.as_ptr(), storage);
                 for (previous, current) in before.iter().zip(&adapter.paragraphs) {
-                    assert!(Arc::ptr_eq(previous, current));
+                    assert!(Arc::ptr_eq(previous, current), "structural: {structural}");
                 }
                 assert_eq!(adapter.run_locations.get(), locations.as_ref());
                 assert_eq!(
@@ -2388,7 +2401,7 @@ mod accesskit_bridge {
                     adapter.from_text_position(&editor, published),
                     Err(AccessKitError::StaleDocument)
                 );
-                assert!(editor.undo());
+                assert!(editor.undo(), "structural: {structural}");
             }
             adapter.next_id = next_id;
             assert!(
