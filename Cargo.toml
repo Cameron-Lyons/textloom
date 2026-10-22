@@ -69,6 +69,8 @@ missing_debug_implementations = "warn"
 [lints.clippy]
 all = "warn"
 # Google Rust Style Guide rules that Clippy checks outside its default lints.
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
 missing_panics_doc = "warn"
 must_use_candidate = "warn"
 needless_for_each = "warn"

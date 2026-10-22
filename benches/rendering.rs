@@ -390,13 +390,15 @@ fn formatted_editor(count: usize) -> Editor {
     let paragraph = Paragraph::try_new(
         &"x".repeat(count),
         (0..count)
-            .map(|index| Span {
-                range: index..index + 1,
-                style: InlineStyle {
-                    foreground: Some(colors[index % 2]),
-                    ..Default::default()
-                },
-                link: None,
+            .map(|index| {
+                Span::new(
+                    index..index + 1,
+                    InlineStyle {
+                        foreground: Some(colors[index % 2]),
+                        ..Default::default()
+                    },
+                    None,
+                )
             })
             .collect(),
         ParagraphKind::Body,

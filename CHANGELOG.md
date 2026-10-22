@@ -26,6 +26,9 @@ item is documented.
 - `AccessKitAdapter::to_text_position` and `from_text_position` are
   `text_position` and `editor_position`, since they convert their argument
   rather than the adapter.
+- `Span` is `#[non_exhaustive]`, so it can gain fields in a minor release.
+  Build spans with `Span::new(range, style, link)` instead of a struct
+  expression.
 
 ## 1.0.0-rc.1
 

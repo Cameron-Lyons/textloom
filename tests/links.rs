@@ -117,11 +117,7 @@ fn runs_merge_only_when_their_style_and_link_agree() {
         bold: true,
         ..InlineStyle::default()
     };
-    let span = |range, style, target: Option<&str>| Span {
-        range,
-        style,
-        link: target.map(link),
-    };
+    let span = |range, style, target: Option<&str>| Span::new(range, style, target.map(link));
     let paragraph = Paragraph::try_new(
         "abcdefgh",
         vec![
@@ -407,23 +403,21 @@ fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
         (17..18, false, Some(first.clone())),
         (18..19, true, Some(first.clone())),
     ]
-    .map(|(range, bold, link)| Span {
-        range,
-        style: InlineStyle {
-            bold,
-            ..InlineStyle::default()
-        },
-        link,
+    .map(|(range, bold, link)| {
+        Span::new(
+            range,
+            InlineStyle {
+                bold,
+                ..InlineStyle::default()
+            },
+            link,
+        )
     });
     let document = Document::from_paragraphs([
         Paragraph::try_new("é👩\u{200d}💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
         Paragraph::try_new(
             "next",
-            vec![Span {
-                range: 0..4,
-                style: InlineStyle::default(),
-                link: None,
-            }],
+            vec![Span::new(0..4, InlineStyle::default(), None)],
             ParagraphKind::Body,
         )
         .unwrap(),

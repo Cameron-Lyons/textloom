@@ -45,6 +45,10 @@ use crate::{Composition, Document, Editor, Error, Link, ParagraphKind, Position,
 /// A caret position counted in extended grapheme clusters within its paragraph,
 /// instead of in the UTF-8 bytes of a [`Position`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "an accessible position is exactly a paragraph index and a grapheme offset, like `Position`"
+)]
 pub struct AccessiblePosition {
     /// The zero-based index of the paragraph in the document.
     pub paragraph: usize,
@@ -56,6 +60,10 @@ pub struct AccessiblePosition {
 /// A directional selection whose endpoints are [`AccessiblePosition`]s, the
 /// grapheme-based counterpart of a [`Selection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "an accessible selection is exactly an anchor and a focus, like `Selection`"
+)]
 pub struct AccessibleSelection {
     /// The endpoint that stays in place when the selection is extended.
     pub anchor: AccessiblePosition,

@@ -13,7 +13,11 @@ use crate::{Error, InlineStyle, Link, ParagraphKind, StylePatch};
 /// Their ranges are nonempty and end on extended grapheme cluster boundaries,
 /// and neighboring spans differ in style or link, because paragraphs merge
 /// runs that agree.
+///
+/// Fields may be added in minor releases, so build a span with
+/// [`Span::new`] rather than a struct expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Span {
     /// The run's byte range in the paragraph's text.
     pub range: Range<usize>,
@@ -24,6 +28,15 @@ pub struct Span {
 }
 
 impl Span {
+    /// Creates a span that gives the UTF-8 byte `range` of a paragraph's text
+    /// `style` and, if `link` is `Some`, a hyperlink.
+    ///
+    /// [`Paragraph::try_new`] checks that its spans fit the text.
+    #[must_use]
+    pub fn new(range: Range<usize>, style: InlineStyle, link: Option<Link>) -> Self {
+        Self { range, style, link }
+    }
+
     fn continues(&self, style: InlineStyle, link: Option<&Link>) -> bool {
         self.style == style && self.link.as_ref() == link
     }

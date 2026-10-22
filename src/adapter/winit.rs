@@ -131,6 +131,10 @@ pub struct InputOutcome {
 /// [`Control`](Self::Control) elsewhere. In both modes, Alt (Option) moves and
 /// deletes by words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "command shortcuts use either Control or Super; there is no third convention"
+)]
 pub enum CommandModifier {
     /// Control, as on Windows and Linux. Control also moves and deletes by words,
     /// and Control+Insert, Shift+Insert, and Shift+Delete copy, paste, and cut.

@@ -12,6 +12,10 @@ use crate::{Document, InlineStyle, Selection};
 /// then the redo steps farthest from the current state, so a single step
 /// larger than `max_bytes` is not kept. A zero bound disables history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "built with struct update syntax from `HistoryLimits::default()`; a new field is a major release"
+)]
 pub struct HistoryLimits {
     /// The maximum number of undo and redo steps together; 256 by default.
     pub max_entries: usize,

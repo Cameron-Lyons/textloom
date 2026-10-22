@@ -621,11 +621,7 @@ fn version_two_rich_fixture_remains_readable_and_byte_identical() {
     let version_one = Fragment::from_bytes(include_bytes!("fixtures/native-v1.tlfr")).unwrap();
     let plain = |text: &str| {
         (!text.is_empty())
-            .then(|| Span {
-                range: 0..text.len(),
-                style: InlineStyle::default(),
-                link: None,
-            })
+            .then(|| Span::new(0..text.len(), InlineStyle::default(), None))
             .into_iter()
             .collect()
     };
@@ -1339,11 +1335,7 @@ fn quotes_encode_as_version_two_tag_six_and_export_one_blockquote_per_run() {
 
     let quote = |text: &str| {
         let spans = (!text.is_empty())
-            .then(|| Span {
-                range: 0..text.len(),
-                style: InlineStyle::default(),
-                link: None,
-            })
+            .then(|| Span::new(0..text.len(), InlineStyle::default(), None))
             .into_iter()
             .collect();
         Paragraph::try_new(text, spans, ParagraphKind::Quote).unwrap()
@@ -1528,13 +1520,7 @@ fn copied_list_items_export_the_numbers_they_showed_without_changing_native_byte
 #[test]
 fn paragraph_separators_cannot_appear_inside_paragraph_text() {
     let text = "a\u{2029}b";
-    let spans = || {
-        vec![Span {
-            range: 0..text.len(),
-            style: InlineStyle::default(),
-            link: None,
-        }]
-    };
+    let spans = || vec![Span::new(0..text.len(), InlineStyle::default(), None)];
     assert_eq!(
         Paragraph::try_new(text, spans(), ParagraphKind::Body),
         Err(Error::InvalidFragment)

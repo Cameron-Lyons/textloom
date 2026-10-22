@@ -1435,11 +1435,11 @@ fn seeded_documents_replace_selections_like_deleting_them_first() {
             for _ in 0..next(3) {
                 let start = text.len();
                 text.push_str(["a", "bc", "e\u{301}"][next(3)]);
-                spans.push(Span {
-                    range: start..text.len(),
-                    style: styles[next(styles.len())],
-                    link: None,
-                });
+                spans.push(Span::new(
+                    start..text.len(),
+                    styles[next(styles.len())],
+                    None,
+                ));
             }
             Paragraph::try_new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
         }));
@@ -2418,11 +2418,7 @@ fn document_with(lines: &[Line]) -> Document {
         let spans = if line.text.is_empty() {
             Vec::new()
         } else {
-            vec![Span {
-                range: 0..line.text.len(),
-                style: InlineStyle::default(),
-                link: None,
-            }]
+            vec![Span::new(0..line.text.len(), InlineStyle::default(), None)]
         };
         Paragraph::try_new(&line.text, spans, line.kind)
             .expect("one span covering the whole text, or none for empty text, is valid")

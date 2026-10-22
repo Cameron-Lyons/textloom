@@ -17,6 +17,10 @@ use std::sync::Arc;
 /// paragraph and the start of the next are different positions, one step
 /// apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "a position is exactly a paragraph index and a byte offset"
+)]
 pub struct Position {
     /// Zero-based index of the paragraph in the document.
     pub paragraph: usize,
@@ -45,6 +49,10 @@ impl Position {
 /// selection is a caret. [`Selection::range`] returns the selected positions in
 /// document order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "a selection is exactly an anchor and a focus"
+)]
 pub struct Selection {
     /// The fixed end, where the selection started.
     pub anchor: Position,
@@ -89,6 +97,10 @@ impl Selection {
 /// Alpha is straight (not premultiplied): 255 is opaque and 0 is fully
 /// transparent. The associated constants are Excel's ten standard colors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "an RGBA color has exactly four channels"
+)]
 pub struct Color(
     /// The `[red, green, blue, alpha]` channels.
     pub [u8; 4],
@@ -196,6 +208,10 @@ impl Display for Link {
 /// to `<strong>`, `<em>`, `<u>`, `<s>`, `<code>`, and a `<span>` carrying
 /// `color` and `background-color`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "built with struct update syntax from `InlineStyle::default()`; a new field is a major release"
+)]
 pub struct InlineStyle {
     /// Whether the text has a bold (heavy) weight.
     pub bold: bool,
@@ -225,6 +241,10 @@ pub struct InlineStyle {
 /// explicit color throughout. Converting an [`InlineStyle`] gives a uniform
 /// summary with every attribute `Some`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "mirrors `InlineStyle` field for field, so it gains a field only when `InlineStyle` does"
+)]
 pub struct SelectionStyle {
     /// `Some(true)` if all selected text is bold, `Some(false)` if none is,
     /// and `None` if it is mixed.
@@ -295,6 +315,10 @@ impl SelectionStyle {
 /// [`InlineStyle`] sets every attribute, and converting a [`SelectionStyle`]
 /// copies only its uniform attributes, as a format painter does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "built with struct update syntax from `StylePatch::default()`; a new field is a major release"
+)]
 pub struct StylePatch {
     /// The new bold state, or `None` to keep each run's own.
     pub bold: Option<bool>,

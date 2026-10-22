@@ -10,6 +10,10 @@ use crate::{Document, Position, document};
 ///
 /// The default is a case-sensitive search that matches anywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "built with struct update syntax from `SearchOptions::default()`; a new field is a major release"
+)]
 pub struct SearchOptions {
     /// Whether matching distinguishes letter case. When `false`, the query
     /// and the text are compared by their Unicode lowercase mappings, with
