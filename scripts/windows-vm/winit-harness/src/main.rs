@@ -1,5 +1,5 @@
 //! A minimal winit host for checking textloom's winit adapter on Linux (Wayland,
-//! X11) and Windows. `checks.py` drives it in the Windows VM.
+//! X11) and Windows. `cargo winvm-checks` drives it in the Windows VM.
 //!
 //! One window, one `Editor`, one `WinitAdapter`, a fake monospace layout
 //! (cells of 10x24 logical px from origin 20,20) painted with softbuffer.

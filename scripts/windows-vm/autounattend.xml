@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Unattended install of the Windows 11 Enterprise LTSC evaluation for winvm.py.
+<!-- Unattended install of the Windows 11 Enterprise LTSC evaluation for `cargo winvm`.
      It skips the TPM, Secure Boot, and RAM checks, creates the auto-logon
      administrator "qa", and starts the QA agent from the setup disc at first logon.
-     Editing this file takes effect at the next `winvm.py create`. -->
+     Editing this file takes effect at the next `cargo winvm create`. -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">

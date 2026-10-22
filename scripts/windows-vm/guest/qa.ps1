@@ -1,4 +1,4 @@
-# Guest-side helpers for checks.py: start the native host with the Mesa
+# Guest-side helpers for `cargo winvm-checks`: start the native host with the Mesa
 # renderer, read editor state through UI Automation, list top-level windows
 # (IME candidate lists among them), and switch input methods. Jobs dot-source
 # this file and print one JSON object.

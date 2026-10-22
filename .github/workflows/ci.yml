@@ -36,11 +36,15 @@ jobs:
           workspaces: |
             . -> target
             examples/native-editor -> ../../target
+            scripts/qa-tools -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Complete release checks
         run: ./scripts/check-release.sh
-      - name: Native report validator regression tests
-        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+      - name: QA tool formatting, lints, and regression tests
+        run: |
+          cargo fmt --manifest-path scripts/qa-tools/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path scripts/qa-tools/Cargo.toml --all-targets --target-dir target -- -D warnings
+          cargo test --locked --manifest-path scripts/qa-tools/Cargo.toml --target-dir target
 
   msrv:
     name: MSRV and feature combinations
@@ -58,6 +62,7 @@ jobs:
           workspaces: |
             . -> target
             examples/native-editor -> ../../target
+            scripts/qa-tools -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests and doctests for every feature combination
         run: |
@@ -112,6 +117,12 @@ jobs:
           manifest-path: examples/native-editor/Cargo.toml
           command: check ${{ matrix.checks }}
           rust-version: '1.95.0'
+      - name: QA tools
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          manifest-path: scripts/qa-tools/Cargo.toml
+          command: check ${{ matrix.checks }}
+          rust-version: '1.95.0'
 
   native:
     name: Native (${{ matrix.os }})
@@ -134,6 +145,7 @@ jobs:
           workspaces: |
             . -> target
             examples/native-editor -> ../../target
+            scripts/qa-tools -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: All targets compile without Clippy warnings
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -143,9 +155,11 @@ jobs:
         run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
       - name: Tests and doctests
         run: cargo test --locked --all-features
-      - name: Build native renderer
+      - name: Build native renderer and report validator
         if: runner.os == 'macOS'
-        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+        run: |
+          cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+          cargo build --locked --manifest-path scripts/qa-tools/Cargo.toml --target-dir target --bin check-native-report
       - name: Native rendering smoke with default clipboard (macOS)
         if: runner.os == 'macOS'
         timeout-minutes: 2
@@ -163,7 +177,7 @@ jobs:
             cat "native-smoke-default-$mode.stdout" >> "native-smoke-default-$mode.log"
             if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
             grep -E '^Rendered 20 native frames at [0-9.]+ pixels per point$' "native-smoke-default-$mode.stdout"
-            python3 scripts/check_native_report.py "native-observations/default-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode" --clipboard default
+            ./target/debug/check-native-report "native-observations/default-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode" --clipboard default
           done
       - name: Native rendering smoke (macOS)
         if: runner.os == 'macOS'
@@ -186,7 +200,7 @@ jobs:
             if [ "$mode" = editable ]; then
               grep -Fx 'Native rich clipboard roundtrip and undo/redo passed' "native-smoke-$mode.stdout"
             fi
-            python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode"
+            ./target/debug/check-native-report "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os macos --mode "$mode"
             cp "native-smoke-$mode.json" "native-observations/$mode.json"
           done
       - name: Native rendering observations (macOS)
@@ -217,13 +231,16 @@ jobs:
           workspaces: |
             . -> target
             examples/native-editor -> ../../target
+            scripts/qa-tools -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install virtual display and software renderer
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
-      - name: Build native renderer
-        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Build native renderer and report validator
+        run: |
+          cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+          cargo build --locked --manifest-path scripts/qa-tools/Cargo.toml --target-dir target --bin check-native-report
       - name: Native rendering smoke
         timeout-minutes: 2
         shell: bash
@@ -246,7 +263,7 @@ jobs:
             if [ "$mode" = editable ]; then
               grep -Fx 'Native rich clipboard roundtrip and undo/redo passed' "native-smoke-$mode.stdout"
             fi
-            python3 scripts/check_native_report.py "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os linux --mode "$mode"
+            ./target/debug/check-native-report "native-smoke-$mode.json" --revision "$TEXTLOOM_QA_REVISION" --os linux --mode "$mode"
             cp "native-smoke-$mode.json" "native-observations/$mode.json"
           done
       - name: Native rendering observations (Linux X11)
@@ -276,9 +293,12 @@ jobs:
           workspaces: |
             . -> target
             examples/native-editor -> ../../target
+            scripts/qa-tools -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build native renderer
-        run: cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Build native renderer and report validator
+        run: |
+          cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+          cargo build --locked --manifest-path scripts/qa-tools/Cargo.toml --target-dir target --bin check-native-report
       - name: Install signed Mesa software renderer
         id: mesa
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
@@ -331,7 +351,7 @@ jobs:
             if ($mode -eq 'editable' -and -not (@($smokeStdout) -ccontains 'Native rich clipboard roundtrip and undo/redo passed')) {
               throw 'The native rich clipboard roundtrip and undo/redo did not pass'
             }
-            python scripts/check_native_report.py "native-smoke-$mode.json" --revision "$env:TEXTLOOM_QA_REVISION" --os windows --mode "$mode"
+            ./target/debug/check-native-report.exe "native-smoke-$mode.json" --revision "$env:TEXTLOOM_QA_REVISION" --os windows --mode "$mode"
             if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
             }

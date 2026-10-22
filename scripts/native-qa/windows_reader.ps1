@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$NativeExecutable,
+    [Parameter(Mandatory = $true)][string]$ReportValidator,
     [string]$OutputDirectory = "native-qa-observations",
     [int]$TimeoutSeconds = 270
 )
@@ -16,6 +17,7 @@ if ($TimeoutSeconds -lt 60 -or $TimeoutSeconds -gt 300) {
 }
 
 $NativeExecutable = (Resolve-Path -LiteralPath $NativeExecutable).Path
+$ReportValidator = (Resolve-Path -LiteralPath $ReportValidator).Path
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $TaskRoot = Join-Path ([IO.Path]::GetTempPath()) ("textloom-nvda-" + [guid]::NewGuid().ToString("N"))
@@ -522,7 +524,7 @@ automaticUpdates = disabled
     Wait-Condition { $NativeProcess.HasExited } "Native editor did not exit gracefully." 15 | Out-Null
     if ($NativeProcess.ExitCode -ne 0) { throw "Native editor reported failure." }
     if ($VerifiedReader.HasExited) { throw "NVDA exited during the native close test." }
-    & python scripts/check_native_report.py $ReportPath --revision $Revision --os windows --mode editable --interaction
+    & $ReportValidator $ReportPath --revision $Revision --os windows --mode editable --interaction
     if ($LASTEXITCODE -ne 0) { throw "Native report validation failed." }
     $report = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
     if ($report.host_input_events.text -lt 1 -or $report.host_input_events.key_press -lt 8 `
