@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
-use crate::winvm::{Qmp, Vm};
+use crate::winvm::{Elevation, Qmp, ScreenSize, Vm};
 use crate::{Result, ResultExt, repo_root};
 
 pub const USAGE: &str = "\
@@ -215,9 +215,11 @@ impl Checks {
 
     /// Runs PowerShell with qa.ps1 loaded; returns the JSON from its last JSON line.
     fn guest(&self, script: &str) -> Result<Value> {
-        let result = self
-            .vm
-            .run(&format!(". C:\\textloom-qa\\qa.ps1\n{script}"), false, 180)?;
+        let result = self.vm.run(
+            &format!(". C:\\textloom-qa\\qa.ps1\n{script}"),
+            Elevation::Standard,
+            180,
+        )?;
         if result.exit != 0 || result.timed_out {
             return Err(format!(
                 "guest job failed ({}): {}",
@@ -276,7 +278,7 @@ struct Session<'c> {
     c: &'c Checks,
     out: PathBuf,
     monitor: Qmp,
-    size: (u32, u32),
+    size: ScreenSize,
 }
 
 impl<'c> Session<'c> {
@@ -635,7 +637,7 @@ fn deploy(c: &Checks) -> Result<()> {
          Get-HostFile tlqa-winit-harness.exe C:\\textloom-qa\\winit\\tlqa-winit-harness.exe\n\
          Get-HostFile check-native-report.exe C:\\textloom-qa\\check-native-report.exe\n\
          Copy-Item C:\\textloom-qa\\mesa\\*.dll C:\\textloom-qa\\host -Force\n",
-        false,
+        Elevation::Standard,
         300,
     )?;
     if result.exit != 0 || result.timed_out {
@@ -1212,7 +1214,7 @@ fn ime_long_document(c: &Checks) -> Result<Value> {
 /// Windows lets only the foreground process grant that, so a visible helper is
 /// clicked through QMP (real input brings it forward) and then calls
 /// AllowSetForegroundWindow(ASFW_ANY) until it is stopped.
-fn grant_foreground(c: &Checks, monitor: &mut Qmp, size: (u32, u32)) -> Result<()> {
+fn grant_foreground(c: &Checks, monitor: &mut Qmp, size: ScreenSize) -> Result<()> {
     let helper = c.guest(
         r#"$code = @'
 Add-Type -Namespace TextloomFocus -Name Native -MemberDefinition '[DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int process);'
@@ -1285,7 +1287,7 @@ foreach ($name in 'windows-reader-evidence.json', 'windows-reader-native.json') 
     if (Test-Path "C:\textloom-qa\reader\$name") {{ Send-HostFile "C:\textloom-qa\reader\$name" $name }} }}
 exit $code"#
         ),
-        false,
+        Elevation::Standard,
         420,
     );
     let stopped = stop_foreground_grant(c);

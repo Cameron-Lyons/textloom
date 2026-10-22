@@ -7,15 +7,14 @@
 //! `scripts/windows-vm/README.md`.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::{self, Debug, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, thread};
 
@@ -23,8 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::Arguments;
-use crate::{Result, ResultExt, TempDir, repo_root};
+use crate::{Result, ResultExt, TempDir};
 
+/// The `winvm` help text.
 pub const USAGE: &str = "\
 usage: winvm create [--force|--resume]   install Windows unattended (about 30 minutes)
        winvm provision              install Mesa, PowerShell 7, NVDA, IMEs, and layouts
@@ -139,17 +139,52 @@ pub struct Config {
     pub token: String,
 }
 
+// Not derived, so that the token cannot end up in a log.
+impl Debug for Config {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What a guest job printed and how it ended.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct JobResult {
+    /// The job's exit code, or -1 if it timed out.
     pub exit: i64,
     pub timed_out: bool,
+    /// Everything the job printed, on any of its output streams.
     pub output: String,
 }
 
+/// Whether a guest job runs elevated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elevation {
+    /// As the desktop session's user, without elevation.
+    Standard,
+    /// Elevated with `RunAs`, which UAC grants in the VM without prompting.
+    Administrator,
+}
+
+/// What a request to the job server got back.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reply {
+    /// The HTTP status code.
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// The guest display's size in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenSize {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// The VM's state directory and everything kept in it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Vm {
     pub state: PathBuf,
 }
@@ -195,6 +230,7 @@ impl Vm {
     }
 
     /// Files guest jobs send with `Send-HostFile`.
+    #[must_use]
     pub fn inbox(&self) -> PathBuf {
         self.state.join("inbox")
     }
@@ -208,12 +244,14 @@ impl Vm {
     }
 
     /// Recorded guest audio, when the VM is up with `--audio wav`.
+    #[must_use]
     pub fn audio(&self) -> PathBuf {
         self.state.join("audio.wav")
     }
 
     /// The job server's settings, created with a fresh token on first use.
     pub fn config(&self) -> Result<Config> {
+        use std::os::unix::fs::OpenOptionsExt;
         let path = self.config_path();
         if !path.exists() {
             fs::create_dir_all(&self.state).context(self.state.display())?;
@@ -232,14 +270,14 @@ impl Vm {
         Ok(serde_json::from_str(&text)?)
     }
 
-    /// Sends a request to the job server; returns its status and body.
+    /// Sends a request with `payload` as its JSON body to the job server.
     pub fn request(
         &self,
         method: &str,
         path: &str,
         payload: Option<&Value>,
         timeout: f64,
-    ) -> Result<(u16, Vec<u8>)> {
+    ) -> Result<Reply> {
         let config = self.config()?;
         let body = payload
             .map(serde_json::to_vec)
@@ -256,7 +294,7 @@ impl Vm {
     }
 
     fn request_json(&self, method: &str, path: &str, timeout: f64) -> Result<Value> {
-        let (status, body) = self.request(method, path, None, timeout)?;
+        let Reply { status, body } = self.request(method, path, None, timeout)?;
         if status >= 400 {
             return Err(format!("HTTP {status}").into());
         }
@@ -268,6 +306,7 @@ impl Vm {
     }
 
     fn ensure_server(&self) -> Result<()> {
+        use std::os::unix::process::CommandExt;
         if alive(&self.server_pid()).is_some() {
             return Ok(());
         }
@@ -313,10 +352,12 @@ impl Vm {
         false
     }
 
-    /// Runs PowerShell in the guest's desktop session.
-    pub fn run(&self, script: &str, admin: bool, timeout: u64) -> Result<JobResult> {
+    /// Runs PowerShell in the guest's desktop session, stopping it after
+    /// `timeout` seconds.
+    pub fn run(&self, script: &str, elevation: Elevation, timeout: u64) -> Result<JobResult> {
+        let admin = elevation == Elevation::Administrator;
         let payload = json!({"script": script, "admin": admin, "timeout": timeout});
-        let (status, body) =
+        let Reply { status, body } =
             self.request("POST", "/run", Some(&payload), timeout as f64 + 180.0)?;
         if status >= 400 {
             return Err(format!("guest job failed with HTTP {status}").into());
@@ -362,15 +403,17 @@ impl Vm {
 
 /// The running process recorded in a PID file.
 fn alive(pid_file: &Path) -> Option<i32> {
-    use rustix::process::{Pid, test_kill_process};
+    use rustix::process::{self, Pid};
     let pid: i32 = fs::read_to_string(pid_file).ok()?.trim().parse().ok()?;
-    test_kill_process(Pid::from_raw(pid)?).ok().map(|()| pid)
+    process::test_kill_process(Pid::from_raw(pid)?)
+        .ok()
+        .map(|()| pid)
 }
 
 fn terminate(pid: i32) {
-    use rustix::process::{Pid, Signal, kill_process};
+    use rustix::process::{self, Pid, Signal};
     if let Some(pid) = Pid::from_raw(pid) {
-        let _ = kill_process(pid, Signal::TERM);
+        let _ = process::kill_process(pid, Signal::TERM);
     }
 }
 
@@ -391,7 +434,9 @@ struct JobState {
 
 impl Jobs {
     fn lock(&self) -> MutexGuard<'_, JobState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.state
+            .lock()
+            .expect("no connection panics while it holds the job state")
     }
 
     fn wait_until(
@@ -406,11 +451,11 @@ impl Jobs {
             if now >= deadline {
                 break;
             }
-            state = self
+            let (guard, _timed_out) = self
                 .changed
                 .wait_timeout(state, deadline - now)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+                .expect("no connection panics while it holds the job state");
+            state = guard;
         }
         state
     }
@@ -540,7 +585,9 @@ fn same_token(given: &[u8], token: &[u8]) -> bool {
         && given
             .iter()
             .zip(token)
-            .fold(0, |difference, (a, b)| difference | (a ^ b))
+            .fold(0, |difference, (given, expected)| {
+                difference | (given ^ expected)
+            })
             == 0
 }
 
@@ -644,17 +691,18 @@ impl Server {
                 }
             }
             "POST" if path == "/run" => {
-                let Ok(request) = serde_json::from_slice::<Value>(&request.body) else {
+                let Ok(job): serde_json::Result<Value> = serde_json::from_slice(&request.body)
+                else {
                     return Response::status(400);
                 };
-                let Some(script) = request["script"].as_str() else {
+                let Some(script) = job["script"].as_str() else {
                     return Response::status(400);
                 };
-                let timeout = request["timeout"].as_u64().unwrap_or(600);
+                let timeout = job["timeout"].as_u64().unwrap_or(600);
                 let Ok(id) = random_hex(16) else {
                     return Response::status(500);
                 };
-                let admin = request["admin"].as_bool().unwrap_or(false);
+                let admin = job["admin"].as_bool().unwrap_or(false);
                 self.jobs.submit(
                     json!({"id": id, "script": script, "admin": admin, "timeout": timeout}),
                 );
@@ -703,7 +751,7 @@ pub fn http(
     path: &str,
     body: &[u8],
     timeout: f64,
-) -> io::Result<(u16, Vec<u8>)> {
+) -> io::Result<Reply> {
     let timeout = Duration::from_secs_f64(timeout);
     let mut stream =
         TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), timeout)?;
@@ -734,12 +782,16 @@ pub fn http(
             reader.read_to_end(&mut response)?;
         }
     }
-    Ok((status, response))
+    Ok(Reply {
+        status,
+        body: response,
+    })
 }
 
 // ---------------------------------------------------------------------------- QEMU
 
 /// A connection to QEMU's monitor, which serves one client at a time.
+#[derive(Debug)]
 pub struct Qmp {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -773,6 +825,7 @@ impl Qmp {
         }
     }
 
+    /// Runs a QMP command and returns the value it returned, or null.
     pub fn command(&mut self, name: &str, arguments: Option<Value>) -> Result<Value> {
         let message = match arguments {
             Some(arguments) => json!({"execute": name, "arguments": arguments}),
@@ -793,6 +846,8 @@ impl Qmp {
             .map(drop)
     }
 
+    /// Presses (`down`) or releases a key, named by its QEMU qcode or by an
+    /// alias such as `win`, `altgr`, or `enter`.
     pub fn key(&mut self, qcode: &str, down: bool) -> Result<()> {
         let qcode = lookup(ALIASES, &qcode).unwrap_or(qcode);
         self.input(json!([{"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": qcode}}}]))
@@ -840,6 +895,7 @@ impl Qmp {
         Ok(())
     }
 
+    /// Saves the guest's screen as a PNG file and returns its absolute path.
     pub fn screenshot(&mut self, path: &Path) -> Result<PathBuf> {
         let path = std::path::absolute(path)?;
         self.command(
@@ -855,20 +911,20 @@ impl Qmp {
         Err("screendump produced no file".into())
     }
 
-    /// The guest display's size in pixels.
-    pub fn size(&mut self) -> Result<(u32, u32)> {
+    /// The guest display's size, measured from a screenshot.
+    pub fn size(&mut self) -> Result<ScreenSize> {
         let directory = TempDir::try_new("textloom-winvm-")?;
         let data = fs::read(self.screenshot(&directory.path().join("size.png"))?)?;
         png_size(&data).ok_or_else(|| "the screenshot is not a PNG".into())
     }
 
-    fn move_to(&mut self, x: i64, y: i64, (width, height): (u32, u32)) -> Result<()> {
+    fn move_to(&mut self, x: i64, y: i64, size: ScreenSize) -> Result<()> {
         let scale = |value: i64, extent: u32| {
             (value as f64 * 32767.0 / f64::from(extent.max(2) - 1)).round_ties_even()
         };
         self.input(json!([
-            {"type": "abs", "data": {"axis": "x", "value": scale(x, width) as i64}},
-            {"type": "abs", "data": {"axis": "y", "value": scale(y, height) as i64}},
+            {"type": "abs", "data": {"axis": "x", "value": scale(x, size.width) as i64}},
+            {"type": "abs", "data": {"axis": "y", "value": scale(y, size.height) as i64}},
         ]))
     }
 
@@ -877,7 +933,7 @@ impl Qmp {
     }
 
     /// Clicks at a screen position; `size` saves a screenshot to measure it.
-    pub fn click(&mut self, x: i64, y: i64, button: &str, size: Option<(u32, u32)>) -> Result<()> {
+    pub fn click(&mut self, x: i64, y: i64, button: &str, size: Option<ScreenSize>) -> Result<()> {
         let size = match size {
             Some(size) => size,
             None => self.size()?,
@@ -890,10 +946,10 @@ impl Qmp {
     }
 }
 
-fn png_size(data: &[u8]) -> Option<(u32, u32)> {
+fn png_size(data: &[u8]) -> Option<ScreenSize> {
     let width = data.get(16..20)?.try_into().ok().map(u32::from_be_bytes)?;
     let height = data.get(20..24)?.try_into().ok().map(u32::from_be_bytes)?;
-    Some((width, height))
+    Some(ScreenSize { width, height })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -915,7 +971,26 @@ impl Audio {
     }
 }
 
-fn qemu_command(vm: &Vm, install: bool, view: bool, audio: Audio) -> Vec<String> {
+/// What the VM boots from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Boot {
+    /// The Windows installation disc, with the unattended setup disc beside it.
+    Installer,
+    /// The installed disk.
+    Disk,
+}
+
+/// Whether QEMU shows the guest's screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    /// In a GTK window.
+    Window,
+    /// Not at all; screenshots still work.
+    Hidden,
+}
+
+fn qemu_command(vm: &Vm, boot: Boot, screen: Screen, audio: Audio) -> Vec<String> {
+    let install = boot == Boot::Installer;
     let memory = env::var("TEXTLOOM_WINVM_MEMORY").unwrap_or_else(|_| "4096".to_owned());
     let cpus = env::var("TEXTLOOM_WINVM_CPUS").unwrap_or_else(|_| "4".to_owned());
     let mut command: Vec<String> = [
@@ -960,7 +1035,10 @@ fn qemu_command(vm: &Vm, install: bool, view: bool, audio: Audio) -> Vec<String>
         "-pidfile",
         &vm.qemu_pid().display().to_string(),
         "-display",
-        if view { "gtk" } else { "none" },
+        match screen {
+            Screen::Window => "gtk",
+            Screen::Hidden => "none",
+        },
         "-audiodev",
         &match audio {
             Audio::Wav => format!("wav,id=snd0,path={}", vm.audio().display()),
@@ -996,7 +1074,8 @@ fn qemu_command(vm: &Vm, install: bool, view: bool, audio: Audio) -> Vec<String>
     command
 }
 
-fn start_qemu(vm: &Vm, install: bool, view: bool, audio: Audio) -> Result<()> {
+fn start_qemu(vm: &Vm, boot: Boot, screen: Screen, audio: Audio) -> Result<()> {
+    use std::os::unix::process::CommandExt;
     if alive(&vm.qemu_pid()).is_some() {
         return Err("the VM is already running".into());
     }
@@ -1005,7 +1084,7 @@ fn start_qemu(vm: &Vm, install: bool, view: bool, audio: Audio) -> Result<()> {
         .create(true)
         .append(true)
         .open(vm.state.join("qemu.log"))?;
-    let command = qemu_command(vm, install, view, audio);
+    let command = qemu_command(vm, boot, screen, audio);
     Command::new(&command[0])
         .args(&command[1..])
         .stdin(Stdio::null())
@@ -1051,7 +1130,7 @@ fn require_tools() -> Result<()> {
 // ---------------------------------------------------------------------------- commands
 
 fn here() -> PathBuf {
-    repo_root().join("scripts/windows-vm")
+    crate::repo_root().join("scripts/windows-vm")
 }
 
 fn build_unattend(vm: &Vm) -> Result<()> {
@@ -1125,7 +1204,7 @@ fn create(vm: &Vm, force: bool, resume: bool) -> Result<()> {
         fs::copy(OVMF_VARS, vm.vars())?;
         vm.ensure_server()?;
         let started = unix_now();
-        start_qemu(vm, true, false, Audio::None)?;
+        start_qemu(vm, Boot::Installer, Screen::Hidden, Audio::None)?;
         let mut monitor = vm.qmp(30.0)?;
         // The Windows disc waits for a key before booting.
         for _ in 0..60 {
@@ -1157,18 +1236,18 @@ fn create(vm: &Vm, force: bool, resume: bool) -> Result<()> {
     }
     let result = vm.run(
         "(Get-CimInstance Win32_OperatingSystem) | ForEach-Object { \"$($_.Caption) $($_.Version)\" }",
-        false,
+        Elevation::Standard,
         600,
     )?;
     println!("Installed: {}", result.output.trim());
-    down(vm, false)?;
+    down(vm)?;
     snapshot_create(vm, "installed")?;
     println!("Saved snapshot 'installed'. Next: cargo winvm provision");
     Ok(())
 }
 
 fn provision(vm: &Vm) -> Result<()> {
-    up_vm(vm, false, Audio::None)?;
+    up_vm(vm, Screen::Hidden, Audio::None)?;
     vm.share(&here().join("guest/provision.ps1"), None)?;
     vm.share(&here().join("guest/agent.ps1"), None)?;
     println!("Provisioning; this downloads about 1.5 GB and takes 20 to 40 minutes.");
@@ -1179,7 +1258,7 @@ fn provision(vm: &Vm) -> Result<()> {
          Get-HostFile agent.ps1 C:\\textloom-qa\\agent.ps1\n\
          Get-HostFile provision.ps1 C:\\textloom-qa\\provision.ps1\n\
          & C:\\textloom-qa\\provision.ps1",
-        true,
+        Elevation::Administrator,
         4 * 3600,
     )?;
     println!("{}", result.output);
@@ -1187,7 +1266,7 @@ fn provision(vm: &Vm) -> Result<()> {
         return Err("provisioning failed; the VM is still running for inspection".into());
     }
     let restarted = unix_now();
-    vm.run("shutdown /r /t 5", true, 60)?;
+    vm.run("shutdown /r /t 5", Elevation::Administrator, 60)?;
     sleep(60.0);
     // A long poll begun just before the restart can end up to 30 s later.
     if !vm.wait_for_agent(15.0 * 60.0, restarted + 60.0, |_| {}) {
@@ -1195,16 +1274,20 @@ fn provision(vm: &Vm) -> Result<()> {
     }
     println!(
         "{}",
-        vm.run("& C:\\textloom-qa\\provision.ps1 -Verify", false, 300)?
-            .output
+        vm.run(
+            "& C:\\textloom-qa\\provision.ps1 -Verify",
+            Elevation::Standard,
+            300
+        )?
+        .output
     );
-    down(vm, false)?;
+    down(vm)?;
     snapshot_create(vm, "provisioned")?;
     println!("Saved snapshot 'provisioned'.");
     Ok(())
 }
 
-fn up_vm(vm: &Vm, view: bool, audio: Audio) -> Result<()> {
+fn up_vm(vm: &Vm, screen: Screen, audio: Audio) -> Result<()> {
     if !vm.disk().exists() {
         return Err("no VM yet; run `cargo winvm create`".into());
     }
@@ -1216,14 +1299,14 @@ fn up_vm(vm: &Vm, view: bool, audio: Audio) -> Result<()> {
         return Err("the VM is running but its agent is not responding".into());
     }
     let started = unix_now();
-    start_qemu(vm, false, view, audio)?;
+    start_qemu(vm, Boot::Disk, screen, audio)?;
     if !vm.wait_for_agent(10.0 * 60.0, started, |_| {}) {
         return Err("the guest agent did not start within 10 minutes".into());
     }
     Ok(())
 }
 
-fn down(vm: &Vm, announce: bool) -> Result<()> {
+fn down(vm: &Vm) -> Result<()> {
     if let Some(pid) = alive(&vm.qemu_pid()) {
         if let Ok(mut monitor) = vm.qmp(10.0) {
             let _ = monitor.command("system_powerdown", None);
@@ -1246,9 +1329,6 @@ fn down(vm: &Vm, announce: bool) -> Result<()> {
     }
     for path in [vm.qemu_pid(), vm.server_pid(), vm.qmp_socket()] {
         let _ = fs::remove_file(path);
-    }
-    if announce {
-        println!("The VM is down.");
     }
     Ok(())
 }
@@ -1301,7 +1381,7 @@ fn restore(vm: &Vm, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_command(vm: &Vm, script: &str, admin: bool, timeout: u64) -> Result<ExitCode> {
+fn run_command(vm: &Vm, script: &str, elevation: Elevation, timeout: u64) -> Result<ExitCode> {
     let script = if script == "-" {
         let mut script = String::new();
         io::stdin().read_to_string(&mut script)?;
@@ -1309,7 +1389,7 @@ fn run_command(vm: &Vm, script: &str, admin: bool, timeout: u64) -> Result<ExitC
     } else {
         script.to_owned()
     };
-    let result = vm.run(&script, admin, timeout)?;
+    let result = vm.run(&script, elevation, timeout)?;
     print!("{}", result.output);
     io::stdout().flush()?;
     if result.timed_out {
@@ -1326,13 +1406,13 @@ enum Action {
     },
     Provision,
     Up {
-        view: bool,
+        screen: Screen,
         audio: Audio,
     },
     Down,
     Status,
     Run {
-        admin: bool,
+        elevation: Elevation,
         timeout: u64,
         script: String,
     },
@@ -1380,15 +1460,23 @@ fn parse(arguments: Vec<String>) -> Result<Action, String> {
             Action::Create { force, resume }
         }
         "up" => {
-            let view = rest.flag("--view");
+            let screen = if rest.flag("--view") {
+                Screen::Window
+            } else {
+                Screen::Hidden
+            };
             let audio = rest
                 .choice("--audio", &Audio::ALL, Audio::name)?
                 .unwrap_or(Audio::Wav);
             let [] = rest.finish_exact()?;
-            Action::Up { view, audio }
+            Action::Up { screen, audio }
         }
         "run" => {
-            let admin = rest.flag("--admin");
+            let elevation = if rest.flag("--admin") {
+                Elevation::Administrator
+            } else {
+                Elevation::Standard
+            };
             let timeout = match rest.option("--timeout")? {
                 Some(timeout) => timeout
                     .parse()
@@ -1397,7 +1485,7 @@ fn parse(arguments: Vec<String>) -> Result<Action, String> {
             };
             let [script] = rest.finish_exact()?;
             Action::Run {
-                admin,
+                elevation,
                 timeout,
                 script,
             }
@@ -1455,17 +1543,20 @@ fn execute(vm: &Vm, action: Action) -> Result<ExitCode> {
         Action::Serve => serve(vm)?,
         Action::Create { force, resume } => create(vm, force, resume)?,
         Action::Provision => provision(vm)?,
-        Action::Up { view, audio } => {
-            up_vm(vm, view, audio)?;
+        Action::Up { screen, audio } => {
+            up_vm(vm, screen, audio)?;
             println!("The VM is up and its agent is responding.");
         }
-        Action::Down => down(vm, true)?,
+        Action::Down => {
+            down(vm)?;
+            println!("The VM is down.");
+        }
         Action::Status => status(vm),
         Action::Run {
-            admin,
+            elevation,
             timeout,
             script,
-        } => return run_command(vm, &script, admin, timeout),
+        } => return run_command(vm, &script, elevation, timeout),
         Action::Share { file, name } => println!("{}", vm.share(&file, name.as_deref())?),
         Action::Screenshot(file) => println!("{}", vm.qmp(30.0)?.screenshot(&file)?.display()),
         Action::Keys(chords) => {
@@ -1494,6 +1585,7 @@ fn execute(vm: &Vm, action: Action) -> Result<ExitCode> {
 }
 
 /// The `winvm` command.
+#[must_use]
 pub fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments.is_empty()
@@ -1549,7 +1641,7 @@ mod tests {
     }
 
     impl Harness {
-        fn guest(&self, method: &str, path: &str, body: &[u8], token: &str) -> (u16, Vec<u8>) {
+        fn guest(&self, method: &str, path: &str, body: &[u8], token: &str) -> Reply {
             http(self.port, token, method, path, body, 40.0).unwrap()
         }
     }
@@ -1559,7 +1651,7 @@ mod tests {
         let harness = harness();
         thread::scope(|scope| {
             scope.spawn(|| {
-                let (status, body) = harness.guest("GET", "/next", b"", "secret");
+                let Reply { status, body } = harness.guest("GET", "/next", b"", "secret");
                 assert_eq!(status, 200);
                 let job: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(job["admin"], false);
@@ -1569,9 +1661,9 @@ mod tests {
                 let mut body = b"\xef\xbb\xbf".to_vec();
                 body.extend(result.to_string().as_bytes());
                 let path = format!("/result/{}", job["id"].as_str().unwrap());
-                assert_eq!(harness.guest("POST", &path, &body, "secret").0, 204);
+                assert_eq!(harness.guest("POST", &path, &body, "secret").status, 204);
             });
-            let result = harness.vm.run("Get-Date", false, 30).unwrap();
+            let result = harness.vm.run("Get-Date", Elevation::Standard, 30).unwrap();
             assert_eq!(result.output, "ran Get-Date");
             assert_eq!(result.exit, 0);
         });
@@ -1581,9 +1673,9 @@ mod tests {
     #[test]
     fn requests_need_the_token() {
         let harness = harness();
-        assert_eq!(harness.guest("GET", "/status", b"", "wrong").0, 403);
-        assert_eq!(harness.guest("GET", "/status", b"", "").0, 403);
-        assert_eq!(harness.guest("GET", "/status", b"", "secret").0, 200);
+        assert_eq!(harness.guest("GET", "/status", b"", "wrong").status, 403);
+        assert_eq!(harness.guest("GET", "/status", b"", "").status, 403);
+        assert_eq!(harness.guest("GET", "/status", b"", "secret").status, 200);
     }
 
     #[test]
@@ -1593,19 +1685,22 @@ mod tests {
             assert_eq!(
                 harness
                     .guest("GET", &format!("/share/{name}"), b"", "secret")
-                    .0,
+                    .status,
                 400,
                 "{name}"
             );
             assert_eq!(
                 harness
                     .guest("PUT", &format!("/inbox/{name}"), b"x", "secret")
-                    .0,
+                    .status,
                 400,
                 "{name}"
             );
         }
-        assert_eq!(harness.guest("GET", "/share/missing", b"", "secret").0, 404);
+        assert_eq!(
+            harness.guest("GET", "/share/missing", b"", "secret").status,
+            404
+        );
     }
 
     #[test]
@@ -1616,12 +1711,15 @@ mod tests {
         let name = harness.vm.share(&source, None).unwrap();
         assert_eq!(
             harness.guest("GET", &format!("/share/{name}"), b"", "secret"),
-            (200, b"shared".to_vec())
+            Reply {
+                status: 200,
+                body: b"shared".to_vec()
+            }
         );
         assert_eq!(
             harness
                 .guest("PUT", "/inbox/upload.png", b"PNG", "secret")
-                .0,
+                .status,
             204
         );
         assert_eq!(
@@ -1653,9 +1751,15 @@ mod tests {
     #[test]
     fn unknown_paths_and_methods() {
         let harness = harness();
-        assert_eq!(harness.guest("GET", "/elsewhere", b"", "secret").0, 404);
-        assert_eq!(harness.guest("DELETE", "/status", b"", "secret").0, 501);
-        assert_eq!(harness.guest("POST", "/run", b"{}", "secret").0, 400);
+        assert_eq!(
+            harness.guest("GET", "/elsewhere", b"", "secret").status,
+            404
+        );
+        assert_eq!(
+            harness.guest("DELETE", "/status", b"", "secret").status,
+            501
+        );
+        assert_eq!(harness.guest("POST", "/run", b"{}", "secret").status, 400);
     }
 
     #[test]
@@ -1663,7 +1767,13 @@ mod tests {
         let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
         header.extend(1280u32.to_be_bytes());
         header.extend(800u32.to_be_bytes());
-        assert_eq!(png_size(&header), Some((1280, 800)));
+        assert_eq!(
+            png_size(&header),
+            Some(ScreenSize {
+                width: 1280,
+                height: 800
+            })
+        );
         assert_eq!(png_size(b"short"), None);
         assert_eq!(lookup(ALIASES, &"altgr"), Some("alt_r"));
         assert_eq!(lookup(US_SHIFTED, &'?'), Some("slash"));
