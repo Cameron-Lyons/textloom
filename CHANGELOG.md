@@ -1,10 +1,11 @@
 # Changelog
 
-## 1.0.0
+## 1.0.0-rc.1
 
-Unreleased. Native host checks and publication steps are tracked in `RELEASING.md`.
-
-First stable release of the native Rust rich-text editing library.
+2026-10-22. Release candidate for 1.0.0, the first stable release of the native
+Rust rich-text editing library. The API may still change before 1.0.0.
+Hands-on Windows checks and several macOS and physical-device checks are still
+pending; see `RELEASING.md`.
 
 - macOS input supports Control+A/E/B/F/P/N navigation, Control+H/D deletion,
   and Option+Up/Down paragraph navigation with Shift selection. The egui
@@ -663,7 +664,8 @@ Timings were measured informally during development; see `BENCHMARKS.md`.
 
 ### Migration from 0.1
 
-Update the dependency to `textloom = "1.0"`.
+Update the dependency to `textloom = "1.0.0-rc.1"`. Cargo selects a release
+candidate only when the requirement names one, so `"1.0"` does not match it.
 
 - Move to egui and eframe 0.37 and AccessKit 0.25 at the same time. The adapter
   types take and return types from those versions.
