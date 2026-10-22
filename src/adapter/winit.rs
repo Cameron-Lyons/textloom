@@ -1,10 +1,12 @@
-use super::{Shortcut, clean_text, shortcut_key_name};
+use super::Shortcut;
+use crate::document::LINE_SEPARATOR;
 use crate::{Editor, Error, Fragment, Movement, ParagraphKind, Position, Selection};
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, WindowEvent};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::Window;
 
+// Windows reports AltGr as Control+Alt, so that chord types text there.
 const CTRL_ALT_IS_ALTGR: bool = cfg!(windows);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +57,11 @@ pub struct WinitAdapter {
     ime: ImeSync,
 }
 
-type ImeArea = (LogicalPosition<f64>, LogicalSize<f64>);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImeArea {
+    position: LogicalPosition<f64>,
+    size: LogicalSize<f64>,
+}
 
 #[derive(Debug, Default)]
 struct ImeSync {
@@ -70,6 +76,12 @@ struct ImeRequests {
     interrupt: bool,
     allowed: Option<bool>,
     area: Option<ImeArea>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEdge {
+    Start,
+    End,
 }
 
 impl WinitAdapter {
@@ -146,7 +158,7 @@ impl WinitAdapter {
         size: LogicalSize<f64>,
     ) {
         let window_focused = self.window_unfocused && window.has_focus();
-        let requests = self.plan_ime(editor, window_focused, (position, size));
+        let requests = self.plan_ime(editor, window_focused, ImeArea { position, size });
         if requests.interrupt {
             window.set_ime_allowed(false);
             window.set_ime_allowed(true);
@@ -154,7 +166,7 @@ impl WinitAdapter {
         if let Some(allowed) = requests.allowed {
             window.set_ime_allowed(allowed);
         }
-        if let Some((position, size)) = requests.area {
+        if let Some(ImeArea { position, size }) = requests.area {
             window.set_ime_cursor_area(position, size);
         }
     }
@@ -272,10 +284,12 @@ impl WinitAdapter {
             && matches!(key, Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight))
         {
             editor.cancel_composition();
-            let position = soft_line_boundary_position(
-                editor,
-                matches!(key, Key::Named(NamedKey::ArrowRight)),
-            );
+            let edge = if matches!(key, Key::Named(NamedKey::ArrowRight)) {
+                LineEdge::End
+            } else {
+                LineEdge::Start
+            };
+            let position = soft_line_boundary_position(editor, edge);
             let anchor = if shift {
                 editor.selection().anchor
             } else {
@@ -338,7 +352,8 @@ impl WinitAdapter {
                 Key::Named(NamedKey::Backspace) if super_command => {
                     editor.cancel_composition();
                     let range = if editor.selection().is_caret() {
-                        soft_line_boundary_position(editor, false)..editor.selection().focus
+                        soft_line_boundary_position(editor, LineEdge::Start)
+                            ..editor.selection().focus
                     } else {
                         editor.selection().range()
                     };
@@ -381,7 +396,7 @@ impl WinitAdapter {
                         || CTRL_ALT_IS_ALTGR && self.modifiers.alt_key()) =>
                 {
                     let produced = text.unwrap_or("");
-                    let clean = clean_text(produced, false);
+                    let clean = super::clean_text(produced, false);
                     if clean.is_empty() {
                         outcome.handled = false;
                     } else if !self.read_only {
@@ -471,7 +486,7 @@ impl WinitAdapter {
             }
             Ime::Commit(text) => {
                 self.ime.preedit = false;
-                let clean = clean_text(text, true);
+                let clean = super::clean_text(text, true);
                 if clean.is_empty() && !text.is_empty() {
                     editor.cancel_composition();
                 } else if !clean.is_empty() || editor.composition().is_some() {
@@ -499,7 +514,7 @@ impl WinitAdapter {
         if self.read_only {
             return Ok(blocked);
         }
-        let clean = clean_text(text, true);
+        let clean = super::clean_text(text, true);
         if clean.is_empty() {
             return Ok(blocked);
         }
@@ -640,7 +655,7 @@ impl WinitAdapter {
         let Key::Named(named) = key else {
             return None;
         };
-        let pc = self.command_modifier == CommandModifier::Control;
+        let pc_aliases = self.command_modifier == CommandModifier::Control;
         let modifiers = self.modifiers;
         Some(match named {
             NamedKey::Copy => Shortcut::Copy,
@@ -648,10 +663,14 @@ impl WinitAdapter {
             NamedKey::Paste => Shortcut::Paste,
             NamedKey::Undo => Shortcut::Undo,
             NamedKey::Redo => Shortcut::Redo,
-            NamedKey::Insert if pc && modifiers == ModifiersState::CONTROL => Shortcut::Copy,
-            NamedKey::Insert if pc && modifiers == ModifiersState::SHIFT => Shortcut::Paste,
+            NamedKey::Insert if pc_aliases && modifiers == ModifiersState::CONTROL => {
+                Shortcut::Copy
+            }
+            NamedKey::Insert if pc_aliases && modifiers == ModifiersState::SHIFT => Shortcut::Paste,
             NamedKey::Delete
-                if pc && modifiers == ModifiersState::SHIFT && !editor.selection().is_caret() =>
+                if pc_aliases
+                    && modifiers == ModifiersState::SHIFT
+                    && !editor.selection().is_caret() =>
             {
                 Shortcut::Cut
             }
@@ -705,7 +724,7 @@ fn shortcut_key(key: &Key, physical_key: PhysicalKey) -> Option<char> {
         Key::Named(_) => return None,
         Key::Dead(_) | Key::Unidentified(_) => None,
     };
-    shortcut_key_name(logical, physical_shortcut_key(physical_key))
+    super::shortcut_key_name(logical, physical_shortcut_key(physical_key))
 }
 
 fn physical_shortcut_key(physical_key: PhysicalKey) -> Option<char> {
@@ -771,7 +790,7 @@ fn move_paragraph_boundary(editor: &mut Editor, end: bool, extend: bool) -> Resu
     let document = editor.document();
     let length = document
         .paragraph(focus.paragraph)
-        .expect("valid selection")
+        .expect("the editor keeps its selection inside the document")
         .text()
         .len();
     let paragraph = if end && focus.byte == length {
@@ -786,7 +805,7 @@ fn move_paragraph_boundary(editor: &mut Editor, end: bool, extend: bool) -> Resu
         if end {
             document
                 .paragraph(paragraph)
-                .expect("valid paragraph")
+                .expect("the target paragraph index is clamped to the document")
                 .text()
                 .len()
         } else {
@@ -801,21 +820,20 @@ fn move_paragraph_boundary(editor: &mut Editor, end: bool, extend: bool) -> Resu
     editor.set_selection(Selection::new(anchor, position))
 }
 
-fn soft_line_boundary_position(editor: &Editor, end: bool) -> Position {
+fn soft_line_boundary_position(editor: &Editor, edge: LineEdge) -> Position {
     let focus = editor.selection().focus;
     let text = editor
         .document()
         .paragraph(focus.paragraph)
-        .expect("valid selection")
+        .expect("the editor keeps its selection inside the document")
         .text();
-    let byte = if end {
-        text[focus.byte..]
-            .find('\u{2028}')
-            .map_or(text.len(), |byte| focus.byte + byte)
-    } else {
-        text[..focus.byte]
-            .rfind('\u{2028}')
-            .map_or(0, |byte| byte + '\u{2028}'.len_utf8())
+    let byte = match edge {
+        LineEdge::End => text[focus.byte..]
+            .find(LINE_SEPARATOR)
+            .map_or(text.len(), |byte| focus.byte + byte),
+        LineEdge::Start => text[..focus.byte]
+            .rfind(LINE_SEPARATOR)
+            .map_or(0, |byte| byte + LINE_SEPARATOR.len_utf8()),
     };
     Position::new(focus.paragraph, byte)
 }
@@ -836,7 +854,7 @@ fn selection_contains_list(editor: &Editor) -> bool {
 mod tests {
     use super::*;
     use crate::{Position, Selection, StylePatch};
-    use std::mem::discriminant;
+    use std::mem;
     use winit::keyboard::NativeKeyCode;
 
     fn focused(editor: &mut Editor) -> WinitAdapter {
@@ -878,7 +896,10 @@ mod tests {
     }
 
     fn area(x: f64) -> ImeArea {
-        (LogicalPosition::new(x, 4.0), LogicalSize::new(1.0, 16.0))
+        ImeArea {
+            position: LogicalPosition::new(x, 4.0),
+            size: LogicalSize::new(1.0, 16.0),
+        }
     }
 
     #[test]
@@ -2244,8 +2265,8 @@ mod tests {
         let mut editor = Editor::from_text("text");
         editor.select_all();
         let mut adapter = focused(&mut editor);
-        let j = chord(&mut adapter, &mut editor, control, "j", KeyCode::KeyC, None);
-        assert!(!j.handled && j.clipboard.is_none());
+        let logical_j = chord(&mut adapter, &mut editor, control, "j", KeyCode::KeyC, None);
+        assert!(!logical_j.handled && logical_j.clipboard.is_none());
         let copy = chord(&mut adapter, &mut editor, control, "c", KeyCode::KeyI, None);
         assert_eq!(copy.clipboard, Some(ClipboardEvent::Copy("text".into())));
         assert_eq!(editor.selection_style().italic, Some(false));
@@ -2376,7 +2397,7 @@ mod tests {
                 assert!(outcome.handled && outcome.changed, "{logical}");
                 let second = editor.document().paragraph(1).unwrap().kind();
                 assert_eq!(editor.document().paragraph(0).unwrap().kind(), kind);
-                assert_eq!(discriminant(&second), discriminant(&kind));
+                assert_eq!(mem::discriminant(&second), mem::discriminant(&kind));
             }
             let bold = chord(&mut adapter, &mut editor, command, "b", KeyCode::KeyB, None);
             assert!(bold.handled && bold.changed);
