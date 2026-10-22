@@ -14,25 +14,25 @@ pub struct AccessibleSelection {
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
-pub struct AccessibleParagraph<'a> {
+pub struct AccessibleParagraph<'document> {
     pub index: usize,
-    pub text: &'a str,
+    pub text: &'document str,
     pub kind: ParagraphKind,
-    pub spans: &'a [Span],
+    pub spans: &'document [Span],
 }
 
 #[derive(Debug)]
-pub struct AccessibilitySnapshot<'a> {
-    label: &'a str,
+pub struct AccessibilitySnapshot<'editor> {
+    label: &'editor str,
     focused: bool,
     selection: Selection,
-    composition: Option<&'a Composition>,
+    composition: Option<&'editor Composition>,
     revision: u64,
-    document: &'a Document,
+    document: &'editor Document,
 }
 
-impl<'a> AccessibilitySnapshot<'a> {
-    pub fn new(editor: &'a Editor, label: &'a str, focused: bool) -> Self {
+impl<'editor> AccessibilitySnapshot<'editor> {
+    pub fn new(editor: &'editor Editor, label: &'editor str, focused: bool) -> Self {
         Self {
             label,
             focused,
@@ -43,7 +43,7 @@ impl<'a> AccessibilitySnapshot<'a> {
         }
     }
 
-    pub fn label(&self) -> &'a str {
+    pub fn label(&self) -> &'editor str {
         self.label
     }
 
@@ -55,7 +55,7 @@ impl<'a> AccessibilitySnapshot<'a> {
         self.selection
     }
 
-    pub fn composition(&self) -> Option<&'a Composition> {
+    pub fn composition(&self) -> Option<&'editor Composition> {
         self.composition
     }
 
@@ -65,7 +65,7 @@ impl<'a> AccessibilitySnapshot<'a> {
 
     pub fn paragraphs(
         &self,
-    ) -> impl ExactSizeIterator<Item = AccessibleParagraph<'a>> + DoubleEndedIterator {
+    ) -> impl ExactSizeIterator<Item = AccessibleParagraph<'editor>> + DoubleEndedIterator {
         self.document
             .paragraphs()
             .iter()
@@ -121,11 +121,11 @@ fn editor_position(document: &Document, position: AccessiblePosition) -> Result<
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccessibleAction<'a> {
+pub enum AccessibleAction<'text> {
     Focus,
     SetSelection(Selection),
-    ReplaceSelectedText(&'a str),
-    ReplaceAllText(&'a str),
+    ReplaceSelectedText(&'text str),
+    ReplaceAllText(&'text str),
 }
 
 #[non_exhaustive]
@@ -240,6 +240,7 @@ pub(crate) mod node_semantics {
         }
     }
 
+    // `crate::Color` stays qualified because AccessKit's `Color` is imported.
     fn to_accesskit_color(crate::Color([red, green, blue, alpha]): crate::Color) -> Color {
         Color {
             red,
@@ -252,36 +253,37 @@ pub(crate) mod node_semantics {
 
 #[cfg(feature = "accesskit")]
 mod accesskit_bridge {
-    use super::node_semantics::{apply_text_style, set_paragraph_semantics};
-    use super::{AccessibilityOutcome, AccessibleAction, apply_action};
+    use super::{AccessibilityOutcome, AccessibleAction, node_semantics};
     use crate::document::{LINE_SEPARATOR, SpanCursor};
-    use crate::{Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
+    use crate::{Editor, Error, InlineStyle, Link, Paragraph, ParagraphKind, Position, Selection};
     use accesskit::{
         Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, TreeId,
         TreeInfo, TreeUpdate,
     };
     use std::collections::HashMap;
-    use std::fmt;
-    use std::iter::Peekable;
+    use std::fmt::{self, Display, Formatter};
+    use std::iter::{self, Peekable};
     use std::ops::Range;
     use std::sync::{Arc, OnceLock};
     use unicode_segmentation::UnicodeSegmentation;
 
+    // AccessKit stores a run's character lengths and its word starts, which are
+    // character indices, as `u8`s.
     const MAX_RUN_CHARACTERS: usize = u8::MAX as usize;
     const MAX_CHARACTER_BYTES: usize = u8::MAX as usize;
 
     #[non_exhaustive]
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum AccessKitError {
-        Editor(crate::Error),
+        Editor(Error),
         NodeIdExhausted,
         InvalidTextPosition(TextPosition),
         InvalidActionData,
         StaleDocument,
     }
 
-    impl fmt::Display for AccessKitError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    impl Display for AccessKitError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Editor(error) => error.fmt(f),
                 Self::NodeIdExhausted => f.write_str("AccessKit node ID space exhausted"),
@@ -306,8 +308,8 @@ mod accesskit_bridge {
             }
         }
     }
-    impl From<crate::Error> for AccessKitError {
-        fn from(error: crate::Error) -> Self {
+    impl From<Error> for AccessKitError {
+        fn from(error: Error) -> Self {
             Self::Editor(error)
         }
     }
@@ -405,24 +407,35 @@ mod accesskit_bridge {
         node: Node,
     }
 
+    struct StagedQuote {
+        quote: CachedQuote,
+        previous: Option<usize>,
+    }
+
     #[derive(Debug)]
     struct PublishedEditor {
         node: Node,
         selection: Selection,
     }
 
-    struct Staged<'a> {
-        published: &'a [Arc<CachedParagraph>],
-        range: Range<usize>,
-        inserted: &'a [Arc<CachedParagraph>],
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct RunLocation {
+        paragraph: usize,
+        run: usize,
     }
 
-    impl<'a> Staged<'a> {
+    struct Staged<'cache> {
+        published: &'cache [Arc<CachedParagraph>],
+        range: Range<usize>,
+        inserted: &'cache [Arc<CachedParagraph>],
+    }
+
+    impl<'cache> Staged<'cache> {
         fn len(&self) -> usize {
             self.published.len() - self.range.len() + self.inserted.len()
         }
 
-        fn get(&self, index: usize) -> Option<&'a CachedParagraph> {
+        fn get(&self, index: usize) -> Option<&'cache CachedParagraph> {
             let paragraph = if index < self.range.start {
                 self.published.get(index)
             } else if let Some(paragraph) = self.inserted.get(index - self.range.start) {
@@ -434,7 +447,7 @@ mod accesskit_bridge {
             paragraph.map(Arc::as_ref)
         }
 
-        fn iter(&self) -> impl Iterator<Item = &'a Arc<CachedParagraph>> + use<'a> {
+        fn iter(&self) -> impl Iterator<Item = &'cache Arc<CachedParagraph>> + use<'cache> {
             let published = self.published;
             published[..self.range.start]
                 .iter()
@@ -451,7 +464,7 @@ mod accesskit_bridge {
         next_id: Option<u64>,
         paragraphs: Vec<Arc<CachedParagraph>>,
         quotes: Vec<CachedQuote>,
-        run_locations: OnceLock<HashMap<NodeId, (usize, usize)>>,
+        run_locations: OnceLock<HashMap<NodeId, RunLocation>>,
         published_editor: Option<PublishedEditor>,
         document_identity: Option<Arc<()>>,
         read_only: bool,
@@ -498,6 +511,7 @@ mod accesskit_bridge {
         pub fn root_node(&self) -> NodeId {
             self.root_id
         }
+
         pub fn editor_node(&self) -> NodeId {
             self.editor_id
         }
@@ -547,10 +561,12 @@ mod accesskit_bridge {
         }
 
         pub fn locate_text_run(&self, run: NodeId) -> Option<(usize, Range<usize>)> {
-            let &(paragraph, index) = self.run_locations().get(&run)?;
+            let location = *self.run_locations().get(&run)?;
             Some((
-                paragraph,
-                self.paragraphs[paragraph].runs[index].range.clone(),
+                location.paragraph,
+                self.paragraphs[location.paragraph].runs[location.run]
+                    .range
+                    .clone(),
             ))
         }
 
@@ -632,9 +648,11 @@ mod accesskit_bridge {
                 if start > 0 && (start < published) != (start < source.len()) {
                     start -= 1;
                 }
-                let inserted = (start..change.range.start + change.new_len)
-                    .map(&mut build)
-                    .collect::<Result<Vec<_>, _>>()?;
+                let rebuilt = start..change.range.start + change.new_len;
+                let mut inserted = Vec::with_capacity(rebuilt.len());
+                for index in rebuilt {
+                    inserted.push(build(index)?);
+                }
                 (start..change.range.end, inserted)
             } else {
                 let reusable = |cached: &CachedParagraph, index: usize| {
@@ -663,18 +681,19 @@ mod accesskit_bridge {
                         .or_default()
                         .push(paragraph);
                 }
-                let inserted = (prefix..source.len() - suffix)
-                    .map(|index| {
-                        let key = (
-                            Arc::as_ptr(&source[index]) as usize,
-                            index + 1 < source.len(),
-                        );
-                        match cached.get_mut(&key).and_then(Vec::pop) {
-                            Some(existing) => Ok(Arc::clone(existing)),
-                            None => build(index),
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let rebuilt = prefix..source.len() - suffix;
+                let mut inserted = Vec::with_capacity(rebuilt.len());
+                for index in rebuilt {
+                    let key = (
+                        Arc::as_ptr(&source[index]) as usize,
+                        index + 1 < source.len(),
+                    );
+                    let paragraph = match cached.get_mut(&key).and_then(Vec::pop) {
+                        Some(existing) => Arc::clone(existing),
+                        None => build(index)?,
+                    };
+                    inserted.push(paragraph);
+                }
                 (prefix..published - suffix, inserted)
             };
             let staged = Staged {
@@ -694,7 +713,7 @@ mod accesskit_bridge {
                 children.reserve(staged.len());
                 Some(self.stage_quotes(&staged, &mut next_id, &mut children)?)
             };
-            for (quote, previous) in quotes.iter().flatten() {
+            for StagedQuote { quote, previous } in quotes.iter().flatten() {
                 let previous = previous.and_then(|index| self.quotes.get(index));
                 if !initialized || previous.is_none_or(|previous| previous.node != quote.node) {
                     nodes.push((quote.id, quote.node.clone()));
@@ -731,7 +750,7 @@ mod accesskit_bridge {
             {
                 nodes.push((self.editor_id, editor_node.clone()));
             }
-            let tree = (!initialized).then(|| {
+            let tree: Option<TreeInfo> = (!initialized).then(|| {
                 let mut root = Node::new(if self.tree_id == TreeId::ROOT {
                     Role::Window
                 } else {
@@ -753,11 +772,15 @@ mod accesskit_bridge {
                         }
                     }
                     for (offset, paragraph) in inserted.iter().enumerate() {
-                        locations.extend(
-                            paragraph.runs.iter().enumerate().map(|(run_index, run)| {
-                                (run.id, (range.start + offset, run_index))
-                            }),
-                        );
+                        locations.extend(paragraph.runs.iter().enumerate().map(
+                            |(run_index, run)| {
+                                let location = RunLocation {
+                                    paragraph: range.start + offset,
+                                    run: run_index,
+                                };
+                                (run.id, location)
+                            },
+                        ));
                     }
                 }
             } else {
@@ -765,7 +788,7 @@ mod accesskit_bridge {
             }
             self.paragraphs.splice(range, inserted);
             if let Some(quotes) = quotes {
-                self.quotes = quotes.into_iter().map(|(quote, _)| quote).collect();
+                self.quotes = quotes.into_iter().map(|staged| staged.quote).collect();
             }
             self.published_editor = Some(PublishedEditor {
                 node: editor_node,
@@ -808,7 +831,7 @@ mod accesskit_bridge {
                 return Ok(AccessibilityOutcome::default());
             }
             if request.target_node != self.editor_id {
-                let link = (request.action == Action::Click)
+                let link: Option<&CachedLink> = (request.action == Action::Click)
                     .then(|| {
                         self.paragraphs
                             .iter()
@@ -826,7 +849,7 @@ mod accesskit_bridge {
                 });
             }
             if request.action == Action::Focus {
-                return Ok(apply_action(editor, AccessibleAction::Focus)?);
+                return Ok(super::apply_action(editor, AccessibleAction::Focus)?);
             }
             if self.read_only
                 && matches!(
@@ -850,7 +873,7 @@ mod accesskit_bridge {
                         from_text_position(&self.paragraphs, locations, selection.anchor)?,
                         from_text_position(&self.paragraphs, locations, selection.focus)?,
                     );
-                    Ok(apply_action(
+                    Ok(super::apply_action(
                         editor,
                         AccessibleAction::SetSelection(selection),
                     )?)
@@ -865,7 +888,7 @@ mod accesskit_bridge {
                     } else {
                         AccessibleAction::ReplaceSelectedText(value)
                     };
-                    Ok(apply_action(editor, action)?)
+                    Ok(super::apply_action(editor, action)?)
                 }
                 _ => Ok(AccessibilityOutcome::default()),
             }
@@ -876,7 +899,7 @@ mod accesskit_bridge {
             staged: &Staged<'_>,
             next_id: &mut Option<u64>,
             children: &mut Vec<NodeId>,
-        ) -> Result<Vec<(CachedQuote, Option<usize>)>, AccessKitError> {
+        ) -> Result<Vec<StagedQuote>, AccessKitError> {
             let is_quote =
                 |paragraph: &CachedParagraph| paragraph.paragraph.kind() == ParagraphKind::Quote;
             let mut published = HashMap::new();
@@ -932,12 +955,15 @@ mod accesskit_bridge {
                 children.push(id);
                 let mut node = Node::new(Role::Blockquote);
                 node.set_children(members);
-                quotes.push((CachedQuote { id, node }, reused));
+                quotes.push(StagedQuote {
+                    quote: CachedQuote { id, node },
+                    previous: reused,
+                });
             }
             Ok(quotes)
         }
 
-        fn run_locations(&self) -> &HashMap<NodeId, (usize, usize)> {
+        fn run_locations(&self) -> &HashMap<NodeId, RunLocation> {
             self.run_locations.get_or_init(|| {
                 self.paragraphs
                     .iter()
@@ -947,7 +973,13 @@ mod accesskit_bridge {
                             .runs
                             .iter()
                             .enumerate()
-                            .map(move |(run_index, run)| (run.id, (paragraph_index, run_index)))
+                            .map(move |(run_index, run)| {
+                                let location = RunLocation {
+                                    paragraph: paragraph_index,
+                                    run: run_index,
+                                };
+                                (run.id, location)
+                            })
                     })
                     .collect()
             })
@@ -994,12 +1026,12 @@ mod accesskit_bridge {
             None => allocate(next_id)?,
         };
         let mut node = Node::default();
-        set_paragraph_semantics(&mut node, paragraph.kind());
+        node_semantics::set_paragraph_semantics(&mut node, paragraph.kind());
         let pieces = split_runs(&paragraph, line_break);
-        let ids = pieces
-            .iter()
-            .map(|_| allocate(next_id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut ids = Vec::with_capacity(pieces.len());
+        for _ in &pieces {
+            ids.push(allocate(next_id)?);
+        }
         let mut links: Vec<CachedLink> = Vec::new();
         let mut children = Vec::with_capacity(ids.len());
         for (index, piece) in pieces.iter().enumerate() {
@@ -1037,50 +1069,47 @@ mod accesskit_bridge {
         let mut words = paragraph.word_starts().into_iter().peekable();
         let last = pieces.len() - 1;
         let mut continues_line = false;
-        let runs = pieces
-            .into_iter()
-            .enumerate()
-            .map(|(index, piece)| {
-                let line_break = line_break && index == last;
-                let word_starts = run_word_starts(&mut words, &piece);
-                let mut value = String::with_capacity(piece.range.len() + usize::from(line_break));
-                if piece.soft_break {
-                    value.push_str(
-                        &text[piece.range.start..piece.range.end - LINE_SEPARATOR.len_utf8()],
-                    );
-                    value.push('\n');
-                } else {
-                    value.push_str(&text[piece.range.clone()]);
-                }
-                let mut lengths = piece.lengths;
-                if line_break {
-                    value.push('\n');
-                    lengths.push(1);
-                }
-                let mut run_node = Node::new(Role::TextRun);
-                run_node.set_value(value);
-                run_node.set_character_lengths(lengths);
-                if !word_starts.is_empty() {
-                    run_node.set_word_starts(word_starts);
-                }
-                if continues_line {
-                    run_node.set_previous_on_line(ids[index - 1]);
-                }
-                continues_line = !piece.soft_break;
-                if continues_line && let Some(next) = ids.get(index + 1) {
-                    run_node.set_next_on_line(*next);
-                }
-                apply_text_style(&mut run_node, piece.style);
-                CachedRun {
-                    id: ids[index],
-                    node: run_node,
-                    range: piece.range,
-                    split: piece.split,
-                    line_break,
-                    soft_break: piece.soft_break,
-                }
-            })
-            .collect();
+        let mut runs = Vec::with_capacity(pieces.len());
+        for (index, piece) in pieces.into_iter().enumerate() {
+            let line_break = line_break && index == last;
+            let word_starts = run_word_starts(&mut words, &piece);
+            let mut value = String::with_capacity(piece.range.len() + usize::from(line_break));
+            if piece.soft_break {
+                value.push_str(
+                    &text[piece.range.start..piece.range.end - LINE_SEPARATOR.len_utf8()],
+                );
+                value.push('\n');
+            } else {
+                value.push_str(&text[piece.range.clone()]);
+            }
+            let mut lengths = piece.lengths;
+            if line_break {
+                value.push('\n');
+                lengths.push(1);
+            }
+            let mut run_node = Node::new(Role::TextRun);
+            run_node.set_value(value);
+            run_node.set_character_lengths(lengths);
+            if !word_starts.is_empty() {
+                run_node.set_word_starts(word_starts);
+            }
+            if continues_line {
+                run_node.set_previous_on_line(ids[index - 1]);
+            }
+            continues_line = !piece.soft_break;
+            if continues_line && let Some(next) = ids.get(index + 1) {
+                run_node.set_next_on_line(*next);
+            }
+            node_semantics::apply_text_style(&mut run_node, piece.style);
+            runs.push(CachedRun {
+                id: ids[index],
+                node: run_node,
+                range: piece.range,
+                split: piece.split,
+                line_break,
+                soft_break: piece.soft_break,
+            });
+        }
         node.set_children(children);
         Ok(CachedParagraph {
             paragraph,
@@ -1186,7 +1215,7 @@ mod accesskit_bridge {
 
     fn character_lengths(grapheme: &str) -> impl Iterator<Item = u8> + '_ {
         let mut rest = grapheme;
-        std::iter::from_fn(move || {
+        iter::from_fn(move || {
             let end = rest.floor_char_boundary(MAX_CHARACTER_BYTES);
             let length = u8::try_from(end).ok().filter(|length| *length > 0)?;
             rest = &rest[end..];
@@ -1243,29 +1272,27 @@ mod accesskit_bridge {
                     character_index: run.character_index(position.byte)?,
                 })
             })
-            .ok_or(AccessKitError::Editor(crate::Error::InvalidPosition(
-                position,
-            )))
+            .ok_or(AccessKitError::Editor(Error::InvalidPosition(position)))
     }
 
     fn from_text_position(
         paragraphs: &[Arc<CachedParagraph>],
-        run_locations: &HashMap<NodeId, (usize, usize)>,
+        run_locations: &HashMap<NodeId, RunLocation>,
         position: TextPosition,
     ) -> Result<Position, AccessKitError> {
-        if let Some(&(index, run_index)) = run_locations.get(&position.node) {
-            let paragraph = &paragraphs[index];
-            let run = &paragraph.runs[run_index];
+        if let Some(location) = run_locations.get(&position.node) {
+            let paragraph = &paragraphs[location.paragraph];
+            let run = &paragraph.runs[location.run];
             if let Some(byte) = run.byte(position.character_index) {
                 let byte = if run.split {
                     paragraph.paragraph.boundary_at_or_before(byte)
                 } else {
                     byte
                 };
-                return Ok(Position::new(index, byte));
+                return Ok(Position::new(location.paragraph, byte));
             }
             if run.line_break && position.character_index == run.lengths().len() + 1 {
-                return Ok(Position::new(index + 1, 0));
+                return Ok(Position::new(location.paragraph + 1, 0));
             }
         }
         Err(AccessKitError::InvalidTextPosition(position))
@@ -1275,7 +1302,9 @@ mod accesskit_bridge {
     mod tests {
         use super::*;
         use crate::accessibility::random_edits;
+        use crate::{Document, Fragment, StylePatch};
         use accesskit_consumer::{NodeRef as PublishedNode, TreeChangeHandler};
+        use std::collections::HashSet;
 
         struct Ignore;
 
@@ -1710,9 +1739,9 @@ mod accesskit_bridge {
                 .set_selection(Selection::new(Position::new(0, 1), Position::new(0, 2)))
                 .unwrap();
             editor
-                .apply_style(crate::StylePatch {
+                .apply_style(StylePatch {
                     bold: Some(true),
-                    ..crate::StylePatch::default()
+                    ..StylePatch::default()
                 })
                 .unwrap();
             let mut adapter = AccessKitAdapter::default();
@@ -1759,9 +1788,9 @@ mod accesskit_bridge {
                     ))
                     .unwrap();
                 editor
-                    .apply_style(crate::StylePatch {
+                    .apply_style(StylePatch {
                         background: Some(Some(fill)),
-                        ..crate::StylePatch::default()
+                        ..StylePatch::default()
                     })
                     .unwrap();
             }
@@ -1983,12 +2012,12 @@ mod accesskit_bridge {
                 .unwrap();
             let before = adapter.paragraphs.clone();
             let source = editor.document().paragraphs();
-            let fragment = crate::Fragment::from_paragraphs(vec![
+            let fragment = Fragment::from_paragraphs(vec![
                 Arc::clone(&source[1]),
                 Arc::clone(&source[0]),
                 Arc::clone(&source[2]),
             ]);
-            let reordered = Editor::new(crate::Document::from_fragment(&fragment));
+            let reordered = Editor::new(Document::from_fragment(&fragment));
             let update = adapter.update(&reordered, "Notes", true).unwrap();
             assert_eq!(update.nodes.len(), 1);
             assert!(Arc::ptr_eq(&before[0], &adapter.paragraphs[1]));
@@ -2129,7 +2158,7 @@ mod accesskit_bridge {
             let paragraph_ids: Vec<_> = (0..editor.document().paragraphs().len())
                 .map(|index| adapter.paragraph_node(index).unwrap())
                 .collect();
-            let unique: std::collections::HashSet<_> = paragraph_ids.iter().collect();
+            let unique: HashSet<_> = paragraph_ids.iter().collect();
             assert_eq!(unique.len(), paragraph_ids.len());
             for index in 0..2 {
                 let position = Position::new(index, 2);
@@ -2236,9 +2265,9 @@ mod accesskit_bridge {
                 .set_selection(Selection::new(Position::new(1, 1), Position::new(1, 4)))
                 .unwrap();
             editor
-                .apply_style(crate::StylePatch {
+                .apply_style(StylePatch {
                     bold: Some(true),
-                    ..crate::StylePatch::default()
+                    ..StylePatch::default()
                 })
                 .unwrap();
             let mut adapter = AccessKitAdapter::default();
@@ -2682,8 +2711,8 @@ mod accesskit_bridge {
 
         #[test]
         fn editor_errors_appear_once_in_error_chains() {
-            let error = AccessKitError::from(crate::Error::InvalidRange);
-            assert_eq!(error.to_string(), crate::Error::InvalidRange.to_string());
+            let error = AccessKitError::from(Error::InvalidRange);
+            assert_eq!(error.to_string(), Error::InvalidRange.to_string());
             assert!(std::error::Error::source(&error).is_none());
         }
 
@@ -2697,7 +2726,8 @@ mod accesskit_bridge {
 #[cfg(feature = "accesskit")]
 pub use accesskit_bridge::{AccessKitAdapter, AccessKitError};
 
-#[cfg(all(test, any(feature = "accesskit", feature = "egui")))]
+#[cfg(test)]
+#[cfg(any(feature = "accesskit", feature = "egui"))]
 pub(crate) mod random_edits {
     use std::ops::Range;
 
@@ -3013,6 +3043,7 @@ pub(crate) mod random_edits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StylePatch;
 
     #[test]
     fn snapshot_exposes_semantics_and_grapheme_selections() {
@@ -3124,9 +3155,9 @@ mod tests {
             .set_selection(Selection::new(Position::new(1, 5), Position::new(1, 9)))
             .unwrap();
         editor
-            .apply_style(crate::StylePatch {
+            .apply_style(StylePatch {
                 bold: Some(true),
-                ..crate::StylePatch::default()
+                ..StylePatch::default()
             })
             .unwrap();
         let selection = Selection::caret(Position::new(1, 9));
