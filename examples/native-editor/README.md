@@ -104,9 +104,11 @@ dies, including when it is killed or aborts. macOS and Windows publish eager nat
 All platform wrappers and their dependencies stay in this example's separate
 workspace, and its Rust code continues to forbid unsafe code.
 
-Egui's default fonts have limited script coverage. Supply a TTF/OTF/TTC font
-with the scripts being tested through `--font PATH`; `--bold-font PATH` registers
-the widget's `Bold` family. These flags do not install or change system fonts.
+Egui's default fonts have limited script coverage, so the host also loads
+installed system fonts for scripts and emoji they lack, as eframe does by
+default. To test a specific font, supply a TTF/OTF/TTC file through
+`--font PATH`; `--bold-font PATH` registers the widget's `Bold` family. These
+flags do not install or change system fonts.
 For example, on Linux with Noto CJK and Liberation installed:
 
 ```sh
