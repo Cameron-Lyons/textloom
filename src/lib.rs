@@ -61,8 +61,8 @@ pub use editor::{Composition, Editor, HistoryLimits};
 pub use fragment::{DecodeLimits, Fragment, FragmentError};
 pub use search::{SearchOptions, SearchWrap};
 pub use types::{
-    Color, Error, InlineAttribute, InlineStyle, Link, Movement, ParagraphKind, Position, Selection,
-    SelectionMode, SelectionStyle, StylePatch,
+    Color, Error, InlineAttribute, InlineStyle, Link, Movement, NamedColor, ParagraphKind,
+    Position, Selection, SelectionMode, SelectionStyle, StylePatch,
 };
 
 const _: () = {

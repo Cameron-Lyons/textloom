@@ -29,6 +29,11 @@ item is documented.
 - `Span` is `#[non_exhaustive]`, so it can gain fields in a minor release.
   Build spans with `Span::new(range, style, link)` instead of a struct
   expression.
+- `Color::STANDARD` lists `NamedColor`s, with `name` and `color` fields,
+  instead of `(name, color)` tuples.
+- `AccessKitAdapter::locate_link` and `locate_text_run` return the
+  document range (`Range<Position>`) instead of a paragraph index and byte
+  range tuple.
 
 ## 1.0.0-rc.1
 

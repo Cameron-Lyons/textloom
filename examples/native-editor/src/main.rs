@@ -19,8 +19,8 @@ use std::{io, mem, process};
 use eframe::egui;
 use textloom::adapter::egui::RichTextEditor;
 use textloom::{
-    Color, DecodeLimits, Document, Editor, Link, ParagraphKind, Position, SearchOptions,
-    SearchWrap, Selection, StylePatch,
+    Color, DecodeLimits, Document, Editor, Link, NamedColor, ParagraphKind, Position,
+    SearchOptions, SearchWrap, Selection, StylePatch,
 };
 
 use crate::clipboard::NativeClipboard;
@@ -806,7 +806,7 @@ fn color_control(
         ui.spacing_mut().item_spacing.x = 0.0;
         let name = Color::STANDARD
             .iter()
-            .find_map(|(name, color)| (color == last).then_some(*name))
+            .find_map(|standard| (standard.color == *last).then_some(standard.name))
             .unwrap_or("Custom");
         if swatch_button(ui, Some(*last), target.label(), false)
             .on_hover_text(format!("{}: {name}", target.label()))
@@ -820,7 +820,7 @@ fn color_control(
                 chosen = Some(None);
             }
             ui.label("Standard Colors");
-            for (name, color) in Color::STANDARD {
+            for NamedColor { name, color, .. } in Color::STANDARD {
                 if swatch_button(ui, Some(color), name, color == *last).clicked() {
                     *last = color;
                     chosen = Some(Some(color));
@@ -2599,7 +2599,7 @@ mod tests {
         fn choose_color(&mut self, target: ColorTarget, choice: &str) {
             self.click(target.menu_label(), Role::Button);
             let mut entries = vec![target.none_label()];
-            entries.extend(Color::STANDARD.map(|(name, _)| name));
+            entries.extend(Color::STANDARD.map(|standard| standard.name));
             for entry in entries {
                 assert!(
                     self.nodes

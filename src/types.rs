@@ -130,18 +130,60 @@ impl Color {
 
     /// Excel's ten standard colors with their English display names, in
     /// Excel's palette order, for font and fill color pickers.
-    pub const STANDARD: [(&'static str, Self); 10] = [
-        ("Dark Red", Self::DARK_RED),
-        ("Red", Self::RED),
-        ("Orange", Self::ORANGE),
-        ("Yellow", Self::YELLOW),
-        ("Light Green", Self::LIGHT_GREEN),
-        ("Green", Self::GREEN),
-        ("Light Blue", Self::LIGHT_BLUE),
-        ("Blue", Self::BLUE),
-        ("Dark Blue", Self::DARK_BLUE),
-        ("Purple", Self::PURPLE),
+    pub const STANDARD: [NamedColor; 10] = [
+        NamedColor {
+            name: "Dark Red",
+            color: Self::DARK_RED,
+        },
+        NamedColor {
+            name: "Red",
+            color: Self::RED,
+        },
+        NamedColor {
+            name: "Orange",
+            color: Self::ORANGE,
+        },
+        NamedColor {
+            name: "Yellow",
+            color: Self::YELLOW,
+        },
+        NamedColor {
+            name: "Light Green",
+            color: Self::LIGHT_GREEN,
+        },
+        NamedColor {
+            name: "Green",
+            color: Self::GREEN,
+        },
+        NamedColor {
+            name: "Light Blue",
+            color: Self::LIGHT_BLUE,
+        },
+        NamedColor {
+            name: "Blue",
+            color: Self::BLUE,
+        },
+        NamedColor {
+            name: "Dark Blue",
+            color: Self::DARK_BLUE,
+        },
+        NamedColor {
+            name: "Purple",
+            color: Self::PURPLE,
+        },
     ];
+}
+
+/// A [`Color`] with its English display name, an entry of
+/// [`Color::STANDARD`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct NamedColor {
+    /// The color's name in Excel's palette, such as `"Dark Red"`, for a
+    /// picker's label or tooltip.
+    pub name: &'static str,
+    /// The color.
+    pub color: Color,
 }
 
 /// A validated hyperlink target, carried by [`Span::link`](crate::Span::link).

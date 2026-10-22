@@ -705,9 +705,10 @@ fn fill_color_formats_independently_types_on_and_undoes_like_excel() {
 fn standard_colors_follow_excels_palette_order() {
     let palette: Vec<_> = Color::STANDARD
         .iter()
-        .map(|(name, Color([red, green, blue, alpha]))| {
-            assert_eq!(*alpha, 255, "{name} is opaque");
-            (*name, format!("#{red:02X}{green:02X}{blue:02X}"))
+        .map(|standard| {
+            let Color([red, green, blue, alpha]) = standard.color;
+            assert_eq!(alpha, 255, "{} is opaque", standard.name);
+            (standard.name, format!("#{red:02X}{green:02X}{blue:02X}"))
         })
         .collect();
     let expected = [
@@ -735,7 +736,7 @@ fn standard_colors_follow_excels_palette_order() {
         Color::DARK_BLUE,
         Color::PURPLE,
     ];
-    assert_eq!(Color::STANDARD.map(|(_, color)| color), constants);
+    assert_eq!(Color::STANDARD.map(|standard| standard.color), constants);
 }
 
 #[test]

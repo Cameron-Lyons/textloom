@@ -865,37 +865,36 @@ mod accesskit_bridge {
         }
 
         /// Finds a link node of the published tree, such as the target of a
-        /// `ScrollIntoView` request, and returns the index of its paragraph and the
-        /// UTF-8 byte range of the linked text in that paragraph.
+        /// `ScrollIntoView` request, and returns the document range of the linked
+        /// text. The range lies within one paragraph.
         ///
         /// Returns `None` if `node` is not a link node in the published tree.
         #[must_use]
-        pub fn locate_link(&self, node: NodeId) -> Option<(usize, Range<usize>)> {
+        pub fn locate_link(&self, node: NodeId) -> Option<Range<Position>> {
             self.paragraphs
                 .iter()
                 .enumerate()
                 .find_map(|(index, paragraph)| {
                     let link = paragraph.links.iter().find(|link| link.id == node)?;
                     let runs = &paragraph.runs[link.runs.clone()];
-                    Some((index, runs[0].range.start..runs[runs.len() - 1].range.end))
+                    let bytes = runs[0].range.start..runs[runs.len() - 1].range.end;
+                    Some(paragraph_range(index, bytes))
                 })
         }
 
         /// Finds a text run node of the published tree, such as the target of a
-        /// `ScrollIntoView` request, and returns the index of its paragraph and the
-        /// UTF-8 byte range of the paragraph's text that it shows, as
-        /// [`text_runs`](Self::text_runs) does.
+        /// `ScrollIntoView` request, and returns the document range of the text that
+        /// it shows, the same bytes that [`text_runs`](Self::text_runs) gives. The
+        /// range lies within one paragraph.
         ///
         /// Returns `None` if `run` is not a text run in the published tree.
         #[must_use]
-        pub fn locate_text_run(&self, run: NodeId) -> Option<(usize, Range<usize>)> {
+        pub fn locate_text_run(&self, run: NodeId) -> Option<Range<Position>> {
             let location = *self.run_locations().get(&run)?;
-            Some((
-                location.paragraph,
-                self.paragraphs[location.paragraph].runs[location.run]
-                    .range
-                    .clone(),
-            ))
+            let bytes = self.paragraphs[location.paragraph].runs[location.run]
+                .range
+                .clone();
+            Some(paragraph_range(location.paragraph, bytes))
         }
 
         /// Builds the tree update that brings the platform adapter's tree in line
@@ -1665,6 +1664,11 @@ mod accesskit_bridge {
             }
         }
         starts
+    }
+
+    /// The document range of the UTF-8 byte range `bytes` of paragraph `paragraph`.
+    fn paragraph_range(paragraph: usize, bytes: Range<usize>) -> Range<Position> {
+        Position::new(paragraph, bytes.start)..Position::new(paragraph, bytes.end)
     }
 
     /// Converts an editor position to a text position in the cached paragraphs.
@@ -3107,7 +3111,7 @@ mod accesskit_bridge {
                             for run in &paragraph.runs {
                                 assert_eq!(
                                     adapter.locate_text_run(run.id),
-                                    Some((index, run.range.clone()))
+                                    Some(paragraph_range(index, run.range.clone()))
                                 );
                             }
                         }
@@ -3122,10 +3126,16 @@ mod accesskit_bridge {
             let mut adapter = AccessKitAdapter::default();
             adapter.update(&editor, "Notes", Focus::Focused).unwrap();
             let (run, range) = adapter.text_runs(1).next().unwrap();
-            assert_eq!(adapter.locate_text_run(run), Some((1, range)));
+            assert_eq!(
+                adapter.locate_text_run(run),
+                Some(paragraph_range(1, range))
+            );
             editor.insert_paragraph().unwrap();
             adapter.update(&editor, "Notes", Focus::Focused).unwrap();
-            assert_eq!(adapter.locate_text_run(run), Some((2, 0..6)));
+            assert_eq!(
+                adapter.locate_text_run(run),
+                Some(Position::new(2, 0)..Position::new(2, 6))
+            );
             assert_eq!(adapter.locate_text_run(adapter.editor_node()), None);
         }
 

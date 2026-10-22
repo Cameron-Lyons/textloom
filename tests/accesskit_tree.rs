@@ -733,7 +733,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .find(|child| child.role() == Role::Link)
         .unwrap()
         .locate();
-    assert_eq!(adapter.locate_link(link_id), Some((0, 5..19)));
+    assert_eq!(
+        adapter.locate_link(link_id),
+        Some(Position::new(0, 5)..Position::new(0, 19))
+    );
     assert_eq!(adapter.locate_link(adapter.editor_node()), None);
     let click = ActionRequest {
         action: Action::Click,
