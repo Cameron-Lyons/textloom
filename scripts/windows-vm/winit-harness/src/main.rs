@@ -7,13 +7,14 @@
 //! action is printed as one JSON line on stdout (and, prefixed with "TLQA ",
 //! on stderr so it interleaves with WAYLAND_DEBUG output).
 //!
-//! Flags: --caret-end     start with the caret at the end of the document.
-//!        --anchor-start  report the IME area at the composition's start instead of
-//!                        the preedit cursor (a host choice some editors make).
-//!        --preallow-ime  call Window::set_ime_allowed(true) once right after creating
-//!                        the window, before any focus event (diagnostic for X11 XIM).
+//! Flags:
+//!
+//! - `--caret-end`: start with the caret at the end of the document.
+//! - `--anchor-start`: report the IME area at the composition's start instead
+//!   of the preedit cursor (a host choice some editors make).
+//! - `--preallow-ime`: call `Window::set_ime_allowed(true)` once right after
+//!   creating the window, before any focus event (diagnostic for X11 XIM).
 
-use std::io::Write as _;
 use std::num::NonZeroU32;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -26,14 +27,14 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-#[cfg(target_os = "linux")]
-use winit::platform::wayland::ActiveEventLoopExtWayland;
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::raw_window_handle::RawWindowHandle;
 use winit::window::{Window, WindowId};
 
-const CELL_W: f64 = 10.0;
-const CELL_H: f64 = 24.0;
-const ORIGIN: (f64, f64) = (20.0, 20.0);
+const CELL_WIDTH: f64 = 10.0;
+const CELL_HEIGHT: f64 = 24.0;
+// The top-left corner of the first cell.
+const ORIGIN_X: f64 = 20.0;
+const ORIGIN_Y: f64 = 20.0;
 const FIXTURE: &str = "Первая строка hello\nsecond line";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -44,46 +45,53 @@ enum Cell {
     PreeditSelected,
 }
 
-struct Display {
-    lines: Vec<Vec<Cell>>,
-    caret: (usize, usize),
-    composition_start: Option<(usize, usize)>,
+/// A cell's place in the painted grid.
+#[derive(Clone, Copy)]
+struct GridPosition {
+    line: usize,
+    column: usize,
 }
 
-fn chars(text: &str) -> usize {
+struct Display {
+    lines: Vec<Vec<Cell>>,
+    caret: GridPosition,
+    composition_start: Option<GridPosition>,
+}
+
+fn char_count(text: &str) -> usize {
     text.chars().count()
 }
 
 /// The painted model: document paragraphs, with the composition's replacement
-/// range shown as preedit cells, and the caret's (line, column).
+/// range shown as preedit cells, and the caret's cell.
 fn display(editor: &Editor) -> Display {
     let paragraphs: Vec<&str> = editor
         .document()
         .paragraphs()
         .iter()
-        .map(|p| p.text())
+        .map(|paragraph| paragraph.text())
         .collect();
     if let Some(composition) = editor.composition() {
         let range = composition.replacement.range();
         let mut lines: Vec<Vec<Cell>> = paragraphs[..range.start.paragraph]
             .iter()
-            .map(|text| vec![Cell::Text; chars(text)])
+            .map(|text| vec![Cell::Text; char_count(text)])
             .collect();
-        let prefix = chars(&paragraphs[range.start.paragraph][..range.start.byte]);
-        let suffix = chars(&paragraphs[range.end.paragraph][range.end.byte..]);
-        let length = chars(&composition.text);
+        let prefix = char_count(&paragraphs[range.start.paragraph][..range.start.byte]);
+        let suffix = char_count(&paragraphs[range.end.paragraph][range.end.byte..]);
+        let length = char_count(&composition.text);
         let (start, end) = composition
             .selection
-            .clone()
+            .as_ref()
             .map_or((length, length), |selection| {
                 (
-                    chars(&composition.text[..selection.start]),
-                    chars(&composition.text[..selection.end]),
+                    char_count(&composition.text[..selection.start]),
+                    char_count(&composition.text[..selection.end]),
                 )
             });
         let mut line = vec![Cell::Text; prefix];
-        line.extend((0..length).map(|k| {
-            if (start..end).contains(&k) {
+        line.extend((0..length).map(|index| {
+            if (start..end).contains(&index) {
                 Cell::PreeditSelected
             } else {
                 Cell::Preedit
@@ -94,12 +102,18 @@ fn display(editor: &Editor) -> Display {
         lines.extend(
             paragraphs[range.end.paragraph + 1..]
                 .iter()
-                .map(|text| vec![Cell::Text; chars(text)]),
+                .map(|text| vec![Cell::Text; char_count(text)]),
         );
         return Display {
             lines,
-            caret: (range.start.paragraph, prefix + end),
-            composition_start: Some((range.start.paragraph, prefix)),
+            caret: GridPosition {
+                line: range.start.paragraph,
+                column: prefix + end,
+            },
+            composition_start: Some(GridPosition {
+                line: range.start.paragraph,
+                column: prefix,
+            }),
         };
     }
     let selection = editor.selection();
@@ -121,10 +135,10 @@ fn display(editor: &Editor) -> Display {
         })
         .collect();
     let focus = selection.focus;
-    let caret = (
-        focus.paragraph,
-        chars(&paragraphs[focus.paragraph][..focus.byte]),
-    );
+    let caret = GridPosition {
+        line: focus.paragraph,
+        column: char_count(&paragraphs[focus.paragraph][..focus.byte]),
+    };
     Display {
         lines,
         caret,
@@ -136,22 +150,25 @@ fn caret_rect(display: &Display) -> [f64; 4] {
     cell_rect(display.caret)
 }
 
-fn cell_rect((line, column): (usize, usize)) -> [f64; 4] {
+/// A caret at the start of a cell, as `[x, y, width, height]` in logical px.
+fn cell_rect(position: GridPosition) -> [f64; 4] {
     [
-        ORIGIN.0 + column as f64 * CELL_W,
-        ORIGIN.1 + line as f64 * CELL_H,
+        ORIGIN_X + position.column as f64 * CELL_WIDTH,
+        ORIGIN_Y + position.line as f64 * CELL_HEIGHT,
         2.0,
-        CELL_H,
+        CELL_HEIGHT,
     ]
 }
 
+/// The character offset of `position` in the plain text, which separates
+/// paragraphs with one newline.
 fn char_offset(editor: &Editor, position: Position) -> usize {
     let paragraphs = editor.document().paragraphs();
-    paragraphs[..position.paragraph]
+    let before: usize = paragraphs[..position.paragraph]
         .iter()
-        .map(|p| chars(p.text()) + 1)
-        .sum::<usize>()
-        + chars(&paragraphs[position.paragraph].text()[..position.byte])
+        .map(|paragraph| char_count(paragraph.text()) + 1)
+        .sum();
+    before + char_count(&paragraphs[position.paragraph].text()[..position.byte])
 }
 
 fn state(editor: &Editor) -> Value {
@@ -159,10 +176,13 @@ fn state(editor: &Editor) -> Value {
     json!({
         "doc": editor.document().plain_text(),
         "selection": [char_offset(editor, anchor), char_offset(editor, focus)],
-        "composition": editor.composition().map(|c| json!({
-            "text": c.text,
-            "selection": c.selection.as_ref().map(|r| [r.start, r.end]),
-            "replacement": [char_offset(editor, c.replacement.anchor), char_offset(editor, c.replacement.focus)],
+        "composition": editor.composition().map(|composition| json!({
+            "text": composition.text,
+            "selection": composition.selection.as_ref().map(|range| [range.start, range.end]),
+            "replacement": [
+                char_offset(editor, composition.replacement.anchor),
+                char_offset(editor, composition.replacement.focus),
+            ],
         })),
     })
 }
@@ -195,7 +215,7 @@ fn describe(event: &WindowEvent) -> Value {
         WindowEvent::Ime(Ime::Enabled) => json!({"kind": "ime", "ime": "Enabled"}),
         WindowEvent::Ime(Ime::Disabled) => json!({"kind": "ime", "ime": "Disabled"}),
         WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
-            json!({"kind": "ime", "ime": "Preedit", "text": text, "cursor": cursor.map(|(a, b)| [a, b])})
+            json!({"kind": "ime", "ime": "Preedit", "text": text, "cursor": cursor.map(|(start, end)| [start, end])})
         }
         WindowEvent::Ime(Ime::Commit(text)) => {
             json!({"kind": "ime", "ime": "Commit", "text": text})
@@ -210,7 +230,8 @@ fn describe(event: &WindowEvent) -> Value {
 
 struct App {
     start: Instant,
-    seq: u64,
+    /// The number of the last JSON line printed.
+    sequence: u64,
     frame: u64,
     caret_end: bool,
     anchor_start: bool,
@@ -224,17 +245,19 @@ struct App {
 
 impl App {
     fn emit(&mut self, mut value: Value) {
-        self.seq += 1;
-        value["seq"] = json!(self.seq);
+        use std::io::Write as _;
+        self.sequence += 1;
+        value["seq"] = json!(self.sequence);
         value["ms"] = json!(self.start.elapsed().as_millis() as u64);
         let line = value.to_string();
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
         eprintln!("TLQA {line}");
     }
 
     fn write_clipboard(&mut self, action: &str, text: &str) {
+        use std::io::Write as _;
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
             // PowerShell reads the text from the environment, avoiding console code pages.
             (
@@ -301,8 +324,8 @@ impl App {
             .output();
         let text = output
             .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
         let Some(text) = text else {
             self.emit(
                 json!({"event": "paste", "clipboard_text": null, "error": "clipboard read failed"}),
@@ -330,11 +353,12 @@ impl App {
             _ => caret_rect(&model),
         };
         let changed = self.last_area != Some(rect);
+        let [x, y, width, height] = rect;
         self.adapter.sync_ime(
             &window,
             &self.editor,
-            LogicalPosition::new(rect[0], rect[1]),
-            LogicalSize::new(rect[2], rect[3]),
+            LogicalPosition::new(x, y),
+            LogicalSize::new(width, height),
         );
         self.last_area = Some(rect);
         let value = json!({
@@ -349,7 +373,7 @@ impl App {
 
     fn paint(&mut self, window: &Window, model: &Display) {
         let size = window.inner_size();
-        let (Some(width), Some(height)) =
+        let (Some(surface_width), Some(surface_height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
             return;
@@ -357,7 +381,7 @@ impl App {
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
-        if surface.resize(width, height).is_err() {
+        if surface.resize(surface_width, surface_height).is_err() {
             return;
         }
         let Ok(mut buffer) = surface.buffer_mut() else {
@@ -365,75 +389,84 @@ impl App {
         };
         buffer.fill(0xffffff);
         let scale = window.scale_factor();
-        let (w, h) = (size.width as i64, size.height as i64);
-        let mut fill = |x: f64, y: f64, rw: f64, rh: f64, color: u32| {
-            let (x0, y0) = ((x * scale).round() as i64, (y * scale).round() as i64);
-            let (x1, y1) = (
-                ((x + rw) * scale).round() as i64,
-                ((y + rh) * scale).round() as i64,
+        let (buffer_width, buffer_height) = (i64::from(size.width), i64::from(size.height));
+        // Fills `[x, y, width, height]`, given in logical px.
+        let mut fill = |[x, y, width, height]: [f64; 4], color: u32| {
+            let (left, top) = ((x * scale).round() as i64, (y * scale).round() as i64);
+            let (right, bottom) = (
+                ((x + width) * scale).round() as i64,
+                ((y + height) * scale).round() as i64,
             );
-            for py in y0.max(0)..y1.min(h) {
-                for px in x0.max(0)..x1.min(w) {
-                    buffer[(py * w + px) as usize] = color;
+            for pixel_y in top.max(0)..bottom.min(buffer_height) {
+                for pixel_x in left.max(0)..right.min(buffer_width) {
+                    buffer[(pixel_y * buffer_width + pixel_x) as usize] = color;
                 }
             }
         };
         for (line, cells) in model.lines.iter().enumerate() {
             for (column, cell) in cells.iter().enumerate() {
                 let (x, y) = (
-                    ORIGIN.0 + column as f64 * CELL_W,
-                    ORIGIN.1 + line as f64 * CELL_H,
+                    ORIGIN_X + column as f64 * CELL_WIDTH,
+                    ORIGIN_Y + line as f64 * CELL_HEIGHT,
                 );
                 match cell {
-                    Cell::Selected => fill(x, y, CELL_W, CELL_H, 0xadd8e6),
-                    Cell::PreeditSelected => fill(x, y, CELL_W, CELL_H, 0xffe0b0),
+                    Cell::Selected => fill([x, y, CELL_WIDTH, CELL_HEIGHT], 0xadd8e6),
+                    Cell::PreeditSelected => fill([x, y, CELL_WIDTH, CELL_HEIGHT], 0xffe0b0),
                     _ => {}
                 }
                 let preedit = matches!(cell, Cell::Preedit | Cell::PreeditSelected);
                 fill(
-                    x + 2.0,
-                    y + 6.0,
-                    6.0,
-                    12.0,
+                    [x + 2.0, y + 6.0, 6.0, 12.0],
                     if preedit { 0xd02090 } else { 0x303030 },
                 );
                 if preedit {
-                    fill(x, y + 21.0, CELL_W, 2.0, 0xd02090);
+                    fill([x, y + 21.0, CELL_WIDTH, 2.0], 0xd02090);
                 }
             }
         }
-        let rect = caret_rect(model);
-        fill(rect[0], rect[1], rect[2], rect[3], 0x000000);
+        fill(caret_rect(model), 0x000000);
         let _ = buffer.present();
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::raw_window_handle::HasWindowHandle as _;
         if self.window.is_some() {
             return;
         }
         #[cfg(target_os = "linux")]
         {
+            use winit::platform::wayland::ActiveEventLoopExtWayland as _;
             self.wayland = event_loop.is_wayland();
         }
         let attributes = Window::default_attributes()
             .with_title("tlqa-winit")
             .with_inner_size(LogicalSize::new(800.0, 400.0));
-        let window = Rc::new(event_loop.create_window(attributes).expect("create window"));
+        let window = Rc::new(
+            event_loop
+                .create_window(attributes)
+                .expect("winit can open the harness window on this desktop"),
+        );
         if std::env::args().any(|arg| arg == "--preallow-ime") {
             window.set_ime_allowed(true);
         }
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        self.surface =
-            Some(softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface"));
+        let context = softbuffer::Context::new(window.clone())
+            .expect("softbuffer supports the display winit connected to");
+        self.surface = Some(
+            softbuffer::Surface::new(&context, window.clone())
+                .expect("softbuffer can draw into a winit window"),
+        );
         if self.caret_end {
             self.editor
                 .move_cursor(Movement::DocumentEnd, false)
-                .expect("caret to end");
+                .expect("moving the caret only fails during a composition, and none has begun");
         }
         let focus = self.adapter.set_focused(true, &mut self.editor);
-        #[allow(clippy::unnecessary_cast)] // Xlib's c_ulong is 32 bits on Windows.
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "Xlib's c_ulong is 32 bits on Windows"
+        )]
         let x11_window = match window.window_handle().map(|handle| handle.as_raw()) {
             Ok(RawWindowHandle::Xlib(handle)) => Some(handle.window as u64),
             Ok(RawWindowHandle::Xcb(handle)) => Some(handle.window.get() as u64),
@@ -497,10 +530,10 @@ impl ApplicationHandler for App {
 fn main() {
     let caret_end = std::env::args().any(|arg| arg == "--caret-end");
     let anchor_start = std::env::args().any(|arg| arg == "--anchor-start");
-    let event_loop = EventLoop::new().expect("event loop");
+    let event_loop = EventLoop::new().expect("winit can connect to this desktop's display");
     let mut app = App {
         start: Instant::now(),
-        seq: 0,
+        sequence: 0,
         frame: 0,
         caret_end,
         anchor_start,
@@ -511,5 +544,7 @@ fn main() {
         surface: None,
         last_area: None,
     };
-    event_loop.run_app(&mut app).expect("run app");
+    event_loop
+        .run_app(&mut app)
+        .expect("the event loop runs until the window closes");
 }
