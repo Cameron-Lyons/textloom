@@ -1,3 +1,23 @@
+//! Integrations that connect the editing core to GUI toolkits.
+//!
+//! Each adapter is behind the Cargo feature of the same name and translates one
+//! toolkit's input into commands for an [editor](crate::Editor):
+//!
+//! - `egui` provides a rich-text editor widget for egui that lays out, paints, and
+//!   hit-tests the document and publishes it to egui's accessibility tree.
+//! - `winit` routes winit keyboard, modifier, focus, and IME events to an editor
+//!   whose host does its own layout, painting, pointer handling, and clipboard
+//!   access.
+//!
+//! Both adapters share the rules that map key chords to editing and formatting
+//! shortcuts and that filter control characters out of typed and pasted text.
+//!
+//! A host for another toolkit can build its own adapter on the public core API
+//! instead: paint [`Document::paragraphs`](crate::Document::paragraphs), map
+//! pointer positions to a [`Position`](crate::Position), route commands through
+//! the editor, and describe it to assistive technology with
+//! [`accessibility`](crate::accessibility).
+
 #[cfg(feature = "egui")]
 pub mod egui;
 #[cfg(feature = "winit")]
@@ -8,6 +28,11 @@ use crate::{Editor, Error, InlineAttribute, ParagraphKind};
 #[cfg(any(feature = "egui", feature = "winit"))]
 use std::borrow::Cow;
 
+/// Removes control characters from text that an adapter is about to insert.
+///
+/// With `multiline`, line feeds, carriage returns, and tabs are kept, as pasted and
+/// IME-committed text may contain them. Returns `text` unchanged, without
+/// allocating, when nothing is removed.
 #[cfg(any(feature = "egui", feature = "winit"))]
 fn clean_text(text: &str, multiline: bool) -> Cow<'_, str> {
     let allowed = |character: char| {
@@ -24,6 +49,23 @@ fn clean_text(text: &str, multiline: bool) -> Cow<'_, str> {
     }
 }
 
+/// Picks the character that identifies a command shortcut's key, for
+/// [`Shortcut::new`].
+///
+/// `logical` is the character the keyboard layout assigns to the key, and
+/// `physical` the character the same key types on a US layout, if known:
+///
+/// - An ASCII letter or digit from the layout wins, so remapped Latin layouts keep
+///   their shortcuts.
+/// - A bracket, or punctuation that egui names as a key, resolves to the physical
+///   key only when that is a digit, as on layouts that type these characters on
+///   the digit row. Otherwise a bracket stands for itself, and such punctuation
+///   for no shortcut.
+/// - Other punctuation and non-ASCII characters, such as Cyrillic or Greek
+///   letters, resolve to the physical key. Punctuation stands for itself when the
+///   physical key is unknown.
+///
+/// Letters are returned in lowercase.
 #[cfg(any(feature = "egui", feature = "winit"))]
 fn shortcut_key_name(logical: Option<char>, physical: Option<char>) -> Option<char> {
     let physical = physical.map(|key| key.to_ascii_lowercase());
@@ -37,6 +79,7 @@ fn shortcut_key_name(logical: Option<char>, physical: Option<char>) -> Option<ch
     }
 }
 
+/// Whether egui has a named `egui::Key` for this punctuation character.
 #[cfg(any(feature = "egui", feature = "winit"))]
 fn egui_names_key(character: char) -> bool {
     matches!(
@@ -62,6 +105,7 @@ fn egui_names_key(character: char) -> bool {
     )
 }
 
+/// A command-modifier shortcut that both adapters recognize.
 #[cfg(any(feature = "egui", feature = "winit"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shortcut {
@@ -82,6 +126,8 @@ enum Shortcut {
 
 #[cfg(any(feature = "egui", feature = "winit"))]
 impl Shortcut {
+    /// Resolves the shortcut for a key name from [`shortcut_key_name`] pressed with
+    /// the command modifier, and with Shift when `shift` is set.
     fn new(name: char, shift: bool) -> Option<Self> {
         Some(match (name, shift) {
             ('a', false) => Self::SelectAll,
@@ -105,10 +151,13 @@ impl Shortcut {
         })
     }
 
+    /// Whether the shortcut can change the document, so read-only mode blocks it.
     fn edits(self) -> bool {
         !matches!(self, Self::SelectAll | Self::Copy | Self::Cut)
     }
 
+    /// Runs the shortcut's editor command. Clipboard shortcuts do nothing here,
+    /// because the adapter exchanges their data with the host.
     fn apply(self, editor: &mut Editor) -> Result<(), Error> {
         match self {
             Self::SelectAll => editor.select_all(),
