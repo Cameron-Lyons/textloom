@@ -161,16 +161,26 @@ on run argv
                 set wantedLabel to item 4 of argv
                 set controls to {}
                 set inventory to ""
-                repeat with candidateControl in (entire contents of targetWindow)
-                    try
-                        set elementRole to (value of attribute "AXRole" of candidateControl) as text
-                        if elementRole is wantedRole then
-                            set elementLabel to name of candidateControl
-                            if wantedRole is "AXPopUpButton" then set elementLabel to (value of attribute "AXValue" of candidateControl) as text
-                            set inventory to inventory & " [" & elementLabel & "]"
-                            if elementLabel is wantedLabel then set end of controls to contents of candidateControl
-                        end if
-                    end try
+                -- The first AXChildren query can activate AccessKit's tree;
+                -- wait for its asynchronous update and for newly opened menus.
+                repeat 30 times
+                    set controls to {}
+                    set inventory to ""
+                    repeat with candidateControl in (entire contents of targetWindow)
+                        try
+                            set elementRole to (role of candidateControl) as text
+                            if (elementRole is wantedRole) or (commandName is "press-button" and elementRole is "AXCheckBox") then
+                                set elementLabel to (value of attribute "AXTitle" of candidateControl) as text
+                                if wantedRole is "AXPopUpButton" then set elementLabel to (value of attribute "AXValue" of candidateControl) as text
+                                set inventory to inventory & " [" & elementRole & ":" & elementLabel & "]"
+                                if elementLabel is wantedLabel then set end of controls to contents of candidateControl
+                            end if
+                        on error descriptionText number errorNumber
+                            set inventory to inventory & " [AX error " & errorNumber & "]"
+                        end try
+                    end repeat
+                    if (count of controls) is not 0 then exit repeat
+                    delay 0.1
                 end repeat
                 if (count of controls) is not 1 then error "Target control count " & (count of controls) & " for " & wantedRole & " named " & wantedLabel & "; available:" & inventory
                 set matchedControl to item 1 of controls

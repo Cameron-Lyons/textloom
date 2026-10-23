@@ -354,54 +354,79 @@ fn rich_paste_replaces_selection_in_one_undo_step_with_plain_fallback() {
 
 #[test]
 fn shifted_paste_requests_host_clipboard_and_keeps_released_modifiers_plain() {
-    for rich in [false, true] {
-        for command in [Modifiers::CTRL, Modifiers::MAC_CMD] {
-            let context = egui::Context::default();
-            input_routing::install_input_routing(&context);
-            let mut editor = Editor::from_text("original");
-            editor.select_all();
-            let fragment = styled_clipboard_editor().selected_fragment();
-            let text = fragment.plain_text();
-            let mut clipboard = TestClipboard {
-                fragment: Some(fragment),
-                ..Default::default()
-            };
-            let modifiers = command | Modifiers::COMMAND | Modifiers::SHIFT;
-            let output = clipboard_frame(
-                &context,
-                &mut editor,
-                vec![key(Key::V, modifiers)],
-                true,
-                false,
-                true,
-                rich.then_some(&mut clipboard as &mut dyn RichClipboard),
-            );
-            assert_eq!(paste_requests(&output), 1);
-            assert_eq!(editor.document().plain_text(), "original");
-            assert_eq!(editor.undo_len(), 0);
-            output.drop_without_applying_deltas();
-            let output = clipboard_frame(
-                &context,
-                &mut editor,
-                vec![
-                    Event::ModifiersChanged(Modifiers::NONE),
-                    Event::Paste(text.clone()),
-                ],
-                true,
-                false,
-                true,
-                rich.then_some(&mut clipboard as &mut dyn RichClipboard),
-            );
-            assert_eq!(paste_requests(&output), 0);
-            output.drop_without_applying_deltas();
-            assert_eq!(
-                Fragment::from_document(editor.document()),
-                Fragment::from_text(&text)
-            );
-            assert!(clipboard.calls.is_empty());
-            assert_eq!(editor.undo_len(), 1);
-            assert!(editor.undo());
-            assert_eq!(editor.document().plain_text(), "original");
+    for delay in [0, 1] {
+        for rich in [false, true] {
+            for command in [Modifiers::CTRL, Modifiers::MAC_CMD] {
+                let context = egui::Context::default();
+                input_routing::install_input_routing(&context);
+                let mut editor = Editor::from_text("original");
+                editor.select_all();
+                let selection = editor.selection();
+                let fragment = styled_clipboard_editor().selected_fragment();
+                let text = fragment.plain_text();
+                let mut clipboard = TestClipboard {
+                    fragment: Some(fragment),
+                    ..Default::default()
+                };
+                let modifiers = command | Modifiers::COMMAND | Modifiers::SHIFT;
+                let output = clipboard_frame(
+                    &context,
+                    &mut editor,
+                    vec![key(Key::V, modifiers)],
+                    true,
+                    false,
+                    true,
+                    rich.then_some(&mut clipboard as &mut dyn RichClipboard),
+                );
+                assert_eq!(paste_requests(&output), 1);
+                assert_eq!(editor.document().plain_text(), "original");
+                assert_eq!(editor.undo_len(), 0);
+                output.drop_without_applying_deltas();
+                // eframe 0.37 drains old clipboard actions before queuing this
+                // frame's RequestPaste. Release the shortcut in the first batch;
+                // the actual clipboard reply reaches the second batch.
+                for _ in 0..delay {
+                    clipboard_frame(
+                        &context,
+                        &mut editor,
+                        vec![Event::ModifiersChanged(Modifiers::NONE)],
+                        true,
+                        false,
+                        true,
+                        rich.then_some(&mut clipboard as &mut dyn RichClipboard),
+                    )
+                    .drop_without_applying_deltas();
+                    assert_eq!(editor.document().plain_text(), "original");
+                }
+                let output = clipboard_frame(
+                    &context,
+                    &mut editor,
+                    vec![
+                        Event::ModifiersChanged(Modifiers::NONE),
+                        Event::Paste(text.clone()),
+                    ],
+                    true,
+                    false,
+                    true,
+                    rich.then_some(&mut clipboard as &mut dyn RichClipboard),
+                );
+                assert_eq!(paste_requests(&output), 0);
+                output.drop_without_applying_deltas();
+                assert_eq!(
+                    Fragment::from_document(editor.document()),
+                    Fragment::from_text(&text)
+                );
+                assert!(clipboard.calls.is_empty());
+                assert_eq!(editor.undo_len(), 1);
+                assert!(editor.undo());
+                assert_eq!(editor.document().plain_text(), "original");
+                assert_eq!(editor.selection(), selection);
+                assert!(editor.redo());
+                assert_eq!(
+                    Fragment::from_document(editor.document()),
+                    Fragment::from_text(&text)
+                );
+            }
         }
     }
 }
@@ -462,7 +487,9 @@ fn empty_shifted_paste_reply_does_not_change_the_next_rich_paste() {
     editor.select_all();
     let modifiers = Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT;
     frame(&context, &mut editor, vec![key(Key::V, modifiers)], true).drop_without_applying_deltas();
-    frame(&context, &mut editor, Vec::new(), true).drop_without_applying_deltas();
+    for _ in 0..2 {
+        frame(&context, &mut editor, Vec::new(), true).drop_without_applying_deltas();
+    }
     let fragment = styled_clipboard_editor().selected_fragment();
     let text = fragment.plain_text();
     let mut clipboard = TestClipboard {

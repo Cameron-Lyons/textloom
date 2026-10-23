@@ -1,6 +1,28 @@
 # Releasing Textloom
 
-## 1.0 validation status
+## Current work toward 1.0
+
+The changes in [PR #16](https://github.com/Cameron-Lyons/textloom/pull/16) are
+unreleased; the package version remains 1.0.0-rc.2. They restore native
+paste-as-plain-text with egui 0.37, repair repeated Windows rich-copy ownership,
+and expand macOS TextEdit and Windows VM interaction checks. The native host
+now reports clipboard operation failures instead of allowing a plain fallback
+to leave every QA error counter at zero. The Windows example uses
+`clipboard-win` 5.4.3 or later; 5.4.1 was yanked on 2026-10-23.
+
+Stable 1.0 still requires final platform signoff. In particular, physical
+keyboards, touch screens/touchpads, audible reader usability, display-scale
+transitions, macOS IMEs/VoiceOver and native winit input, and untested reader
+or visual feature behavior remain open. Automated clipboard transport and
+external-renderer assertions do not establish these observations. Record
+unavailable checks explicitly rather than treating them as passes.
+
+The [native dependency limitations](#native-dependency-limitations) distinguish
+known failures from missing evidence and identify the configurations and
+upstream fixes involved. Current automated evidence is recorded separately
+from the historical sessions below; neither substitutes for manual signoff.
+
+## Earlier validation evidence
 
 Version 1.0.0-rc.2 was prepared on 2026-10-22, after the rc.1 and Windows VM
 work recorded below, as a second release candidate: `main` at
@@ -208,8 +230,8 @@ interaction jobs and the complete CI matrix before archiving a release package.
 See the repository's `scripts/native-qa/README.md` for probe scope and the
 `examples/native-editor/NATIVE_QA.md` protocol for physical desktop signoff.
 
-The 1.0.0 working tree is an unreleased candidate in
-[draft PR #1](https://github.com/Cameron-Lyons/textloom/pull/1). Linux Wayland rendering has
+The initial 1.0.0 working tree was an unreleased candidate in
+[PR #1](https://github.com/Cameron-Lyons/textloom/pull/1). Its Linux Wayland rendering had
 passed at 200% display scale with optional Noto CJK and Liberation Bold fonts.
 Native ASCII typing and plain-text copy passed with exact clipboard content
 verified. Native Unicode paste/copy, keyboard undo/redo, grouped adjacent caret
@@ -406,6 +428,50 @@ steps for the feature rows.
 | Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Linux passed: add, edit, and remove were one undo step each and kept the selection; Ctrl+click, a read-only click, and AT-SPI activation opened the URL once without moving the caret; the `javascript:` target was refused with a status message; hovering showed the target, and the cursor became a pointing hand only with Ctrl held or in read-only mode; LibreOffice kept the hyperlink. Orca read link text but did not announce links at the caret, because AccessKit's Unix adapter has no Hypertext interface. macOS and Windows pending |
 | Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Linux dark theme passed: one bar spanned three consecutive quote paragraphs; Enter continued the quote, and Enter on an empty quote paragraph or Backspace at a quote's start made body text in one undo step; AT-SPI exposed one block quote; LibreOffice used its Quotations style. Orca read through the quote without announcing it. With `--theme light` and `--theme dark`, one bar ran along the quote's left edge for the full height of three consecutive quote paragraphs, in egui's weak text color (contrast 2.96:1 light, 2.78:1 dark). macOS and Windows pending |
 | Numbering controls: Numbered list and Ctrl/Command+Shift+7 extend or start lists; markers and the "Item N." label continue past body text and restart after headings; Restart at 1 and Continue numbering change only the focused item in one undo step; copied items keep their numbers in Word/TextEdit | Linux passed: markers and the "Item N." label read 1, 2, 3; body text in the middle gave 1, 2, and changing it back restored 1, 2, 3; Restart at 1 and Continue numbering changed only the focused item, one undo step each; Ctrl+Shift+7 extended the list; an item after a heading restarted at 1; LibreOffice showed 2 and 3. macOS and Windows pending |
+
+## Native dependency limitations
+
+These are observed failures in the native integration stack, not untested
+checkboxes. They remain relevant to a consumer even when the defect is outside
+Textloom. A release candidate must disclose them. Before stable publication,
+resolve a failed behavior claimed by the release or explicitly narrow that
+claim and record the affected configuration; an upstream attribution is not
+passing signoff. See the [native protocol](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/NATIVE_QA.md)
+for the precise interaction checks.
+
+- **X11 with Fcitx 5 and xcb-imdkit 1.0.9:** composing in Document, clicking
+  Find, and returning to Document can stop all keyboard input. The upstream
+  [per-input-context synchronization fix](https://github.com/fcitx/xcb-imdkit/pull/18)
+  restores the tested round trip. Use a distribution build carrying that fix,
+  or a tested Wayland configuration; restarting Fcitx recovers a stuck session
+  but does not prevent recurrence. Do not describe this X11 combination as
+  fully supported solely because a basic composition test passes.
+- **Windows with winit 0.30.13:** the first dead key immediately after switching
+  layouts can be lost. Subsequent dead keys and ordinary AltGr input passing
+  do not clear this failure. The upstream
+  [layout-change initialization fix](https://github.com/rust-windowing/winit/pull/4582)
+  needs a backport or a compatible upstream release. Textloom cannot recover
+  text that winit did not deliver.
+- **Ctrl+Alt text in egui hosts:** egui-winit 0.37 suppresses text whenever
+  Control is held. Windows' Ctrl+Alt alternative to AltGr therefore does not
+  type characters in the egui host; physical AltGr is the tested alternative.
+  Textloom's separate winit adapter accepts the Windows Ctrl+Alt text events.
+  The example's earlier unintended Ctrl+Alt+Q quit has been fixed.
+- **X11 IME candidate placement with winit 0.30.13:** only the caret area's
+  top-left point is sent to XIM, so a popup may overlap the caret line.
+  Wayland needs the actual caret rectangle; moving that rectangle in the
+  widget to hide the X11 limitation would make other integrations incorrect.
+- **Linux reader semantics:** Orca reads the tested link and quote text but
+  did not announce links at the caret or announce a block quote. AccessKit's
+  Unix adapter lacks the Hypertext interface used for link navigation.
+  Successful text, selection, and replacement probes do not certify those
+  semantic announcements or audible usability.
+
+As of 2026-10-23, winit's latest stable release is 0.30.13, egui's is 0.37.0,
+and xcb-imdkit's latest tag is 1.0.9. An unreleased upstream fix or a locally
+patched experiment is evidence for a remedy, not the dependency shipped by
+the published crate. Breaking upgrades of exposed adapter types must also
+respect the compatibility contract below.
 
 ## Compatibility contract
 

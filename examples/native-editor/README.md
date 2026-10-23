@@ -106,7 +106,12 @@ The host retains one verified clipboard owner helper, reaps replaced or timed-ou
 helpers, joins pipe workers, and retires its owner on close. Linux serves clipboard
 requests from that owner process; preserving its item after closing the host
 depends on a clipboard manager. Linux helpers also exit when the host process
-dies, including when it is killed or aborts. macOS and Windows publish eager native data.
+dies, including when it is killed or aborts. macOS and Windows publish eager
+native data. The Windows helper owns its own message-only window and destroys
+it after closing the clipboard, before reporting success. Published data
+survives helper exit, and subsequent copies do not notify the blocked editor
+thread. Copy and capture failures increment `errors.host_command`; absent
+Textloom rich data remains a normal plain-text fallback.
 All platform wrappers and their dependencies stay in this example's separate
 workspace, and its Rust code continues to forbid unsafe code.
 
@@ -140,6 +145,7 @@ publication, and plain fallback without reading or changing the system clipboard
 
 `--clipboard-self-test` requires `--rich-clipboard` and **writes a deterministic
 fixture to the system clipboard**. Use it only in an isolated test session. It
+repeats publication seven times before checking the roundtrip. It
 verifies rich/HTML/plain publication and read-back, then widget rich insertion and one-step
 undo/redo. The fixture is a formatted, colored, and Yellow-filled numbered list. It can be combined with `--smoke-test` and `--qa-report`; successful
 completion prints `Native rich clipboard roundtrip and undo/redo passed`.

@@ -46,9 +46,11 @@ pub trait RichClipboard {
     /// plain-text paste (Command/Ctrl+Shift+V) or contains nothing but control
     /// characters. For that shortcut the widget sends
     /// [`egui::ViewportCommand::RequestPaste`]; the host must deliver the
-    /// clipboard's [`Event::Paste`] in its next input batch, as eframe does.
-    /// An empty clipboard must produce no paste in that batch. The reply stays
-    /// plain text even if the shortcut's modifiers have since been released.
+    /// clipboard's [`Event::Paste`] within its next two host input batches.
+    /// eframe 0.37 can deliver it in the second batch. The reply stays plain
+    /// after modifier release and is discarded if the requesting widget loses
+    /// focus. See [`super::install_input_routing`] for the bounded FIFO contract,
+    /// empty-clipboard expiry, and limits on interleaving unrelated pastes.
     ///
     /// Return the fragment this paste carries to insert it in place of the
     /// selection as one undo step, or `None`, the default, to insert
@@ -661,9 +663,18 @@ impl<'editor> RichTextEditor<'editor> {
             let mut event_modifiers = input_routing::modifiers_at_pass_start(ui.ctx());
             for (index, event) in events.iter().enumerate() {
                 let plain_paste = if matches!(event, Event::Paste(_)) {
-                    let plain =
-                        input_routing::is_plain_paste(ui.ctx(), paste_index) || inline_plain_paste;
+                    let reply = input_routing::paste_reply(ui.ctx(), paste_index);
                     paste_index += 1;
+                    // Recheck ownership after widget construction, which can
+                    // change focus after the plugin's raw-input hook.
+                    if response.has_focus()
+                        && matches!(reply, input_routing::PasteReply::Plain(owner) if owner != id)
+                    {
+                        consumed.push(index);
+                        continue;
+                    }
+                    let plain =
+                        matches!(reply, input_routing::PasteReply::Plain(_)) || inline_plain_paste;
                     inline_plain_paste = false;
                     plain
                 } else {
@@ -732,7 +743,7 @@ impl<'editor> RichTextEditor<'editor> {
                         if delivered {
                             inline_plain_paste = true;
                         } else {
-                            input_routing::request_plain_paste(ui.ctx());
+                            input_routing::request_plain_paste(ui.ctx(), id);
                         }
                     }
                     true
@@ -816,6 +827,9 @@ impl<'editor> RichTextEditor<'editor> {
         }
 
         cache.observe_focus(self.editor, ui.is_enabled() && response.has_focus());
+        // Manual hosts do not run Plugin::on_end_pass. Record focus while this
+        // viewport is active, before a nested viewport restores its parent.
+        input_routing::observe_widget_focus(ui.ctx());
         if interrupted {
             ui.memory_mut(|memory| memory.interrupt_ime());
         }

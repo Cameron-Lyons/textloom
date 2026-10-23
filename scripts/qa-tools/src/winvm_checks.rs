@@ -24,6 +24,9 @@ use crate::native_report::{self, Clipboard, Expected, Mode, Os};
 use crate::winvm::{Elevation, Qmp, ScreenSize, Vm};
 use crate::{Result, ResultExt};
 
+mod provenance;
+mod rich;
+
 /// The `winvm-checks` help text.
 pub const USAGE: &str = "\
 usage: winvm-checks build                  cross-compile the host, the winit harness, and the report validator for x86_64-pc-windows-gnu
@@ -68,17 +71,6 @@ fn validator_exe() -> PathBuf {
         .join("target/qa-tools")
         .join(TARGET)
         .join("release/check-native-report.exe")
-}
-
-fn git_revision() -> Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(crate::repo_root())
-        .output()?;
-    if !output.status.success() {
-        return Err("git rev-parse HEAD failed".into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn cargo_build(
@@ -261,7 +253,7 @@ impl Checks {
         };
         let result = body(&mut session);
         // Windows switches input methods system-wide; leave US English for the next check.
-        let closed = self.guest("Set-InputMethod 'en-US' | Out-Null; Stop-TextloomHost; Stop-WinitHarness; Out-Json @{}");
+        let closed = self.guest("Set-InputMethod 'en-US' | Out-Null; Stop-TextloomHost; Stop-WinitHarness; Stop-ClipboardPeer; Out-Json @{}");
         let value = result?;
         closed?;
         Ok(value)
@@ -600,7 +592,9 @@ impl Winit<'_> {
 
 fn build() -> Result<()> {
     let root = crate::repo_root();
-    let revision = git_revision()?;
+    let source = provenance::source(&root)?;
+    let revision = field::<String>(&source, "revision")?;
+    let _ = fs::remove_file(provenance::manifest_path());
     let target = root.join("target");
     cargo_build(
         &root.join("examples/native-editor/Cargo.toml"),
@@ -624,10 +618,12 @@ fn build() -> Result<()> {
     for path in [host_exe(), winit_exe(), validator_exe()] {
         println!("{}", path.display());
     }
+    provenance::finish_build(source)?;
     Ok(())
 }
 
 fn deploy(checks: &Checks) -> Result<()> {
+    let manifest = provenance::deployment()?;
     for path in [host_exe(), winit_exe(), validator_exe()] {
         if !path.exists() {
             return Err(format!(
@@ -642,6 +638,7 @@ fn deploy(checks: &Checks) -> Result<()> {
         winit_exe(),
         validator_exe(),
         crate::repo_root().join("scripts/windows-vm/guest/qa.ps1"),
+        manifest,
     ] {
         checks.vm.share(&path, None)?;
     }
@@ -650,6 +647,7 @@ fn deploy(checks: &Checks) -> Result<()> {
          New-Item -ItemType Directory -Force C:\\textloom-qa\\host, C:\\textloom-qa\\winit | Out-Null\n\
          Get-Process textloom-native-example, tlqa-winit-harness -ErrorAction SilentlyContinue | Stop-Process -Force\n\
          Get-HostFile qa.ps1 C:\\textloom-qa\\qa.ps1\n\
+         Get-HostFile windows-vm-deployment.json C:\\textloom-qa\\deployment.json\n\
          Get-HostFile textloom-native-example.exe C:\\textloom-qa\\host\\textloom-native-example.exe\n\
          Get-HostFile tlqa-winit-harness.exe C:\\textloom-qa\\winit\\tlqa-winit-harness.exe\n\
          Get-HostFile check-native-report.exe C:\\textloom-qa\\check-native-report.exe\n\
@@ -707,7 +705,7 @@ fn all_true(expectations: &Value) -> bool {
 }
 
 fn renderer_smoke(checks: &Checks) -> Result<Value> {
-    let revision = git_revision()?;
+    let revision = provenance::revision(checks)?;
     let mut observed = Map::new();
     for mode in Mode::ALL {
         let name = mode.name();
@@ -796,7 +794,23 @@ fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
         // consumes the key's state; see RELEASING.md), so that is recorded but not
         // required here.
         session.keys(&["equal", "e"])?;
-        let first = slice(&session.wait(|state| state.text != before.text)?.text, offset, offset + 1);
+        let first_state = session.wait(|state| state.text != before.text)?;
+        let first = slice(&first_state.text, offset, offset + 1);
+        session.screenshot("first-dead-key-no-warmup")?;
+        let first_expected = slice(&before.text, 0, offset) + "é" + &from(&before.text, offset);
+        let first_diagnostic = json!({
+            "passed": first_state.text == first_expected,
+            "source_revision": provenance::revision(checks)?,
+            "manual_signoff": "not_recorded",
+            "required_for_this_check": false,
+            "preparatory_key_sent": false,
+            "expected_insertion": "é",
+            "observed_insertion": slice(&first_state.text, offset,
+                offset + length(&first_state.text).saturating_sub(length(&before.text))),
+            "known_upstream_issue": "winit 0.30.13 prepares a newly selected layout on its first key, consuming pending dead-key state; upstream fix #4582 is not in this version",
+            "screenshot": session.output.join("first-dead-key-no-warmup.png"),
+        });
+        fs::write(session.output.join("first-dead-key-diagnostic.json"), pretty(&first_diagnostic)?)?;
         let at = utf16(&before.text, offset);
         session.guest(&format!("Select-HostRange {at} {}; Out-Json @{{}}", at + 1))?;
         session.keys(&["equal", "e"])?;
@@ -827,6 +841,7 @@ fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
         Ok(json!({
             "passed": all_true(&expectations), "expectations": expectations, "layout": layout,
             "first dead key after the switch": first, "typed": slice(&after_altgr.text, offset, offset + 3),
+            "first_dead_key_diagnostic": first_diagnostic,
             "Ctrl+Alt+Q typed": after_ctrl_alt.map(|state| slice(&state.text, offset, offset + 1)),
             "undo_steps": undo_steps,
         }))
@@ -1284,7 +1299,7 @@ fn read_json_file(path: &Path) -> Result<Value> {
 }
 
 fn nvda_reader_probe(checks: &Checks) -> Result<Value> {
-    let revision = git_revision()?;
+    let revision = provenance::revision(checks)?;
     let root = crate::repo_root();
     for path in [
         "scripts/native-qa/windows_reader.ps1",
@@ -1666,6 +1681,41 @@ struct Check {
 
 const CHECKS: &[Check] = &[
     Check {
+        name: "rich-colors",
+        description: "Native fill/font palettes, exact UIA RGB and CF_HTML, clear, undo/redo, and TLFR preservation.",
+        run: rich::colors,
+    },
+    Check {
+        name: "soft-breaks",
+        description: "Shift+Enter versus Enter, inline br in a numbered list, plain text, native rich paste and undo/redo.",
+        run: rich::soft_breaks,
+    },
+    Check {
+        name: "links",
+        description: "Ctrl+K, escaped HTML target, UIA hyperlink, removal, and lossless undo/redo.",
+        run: rich::links,
+    },
+    Check {
+        name: "block-quotes",
+        description: "Adjacent quotes in light/dark themes, UIA grouping, exported blockquote, and undo/redo.",
+        run: rich::quotes,
+    },
+    Check {
+        name: "numbering",
+        description: "Computed numbers, restart/continue, nested lists, indent/outdent, and native clipboard structure.",
+        run: rich::numbering,
+    },
+    Check {
+        name: "external-rich-clipboard",
+        description: "Native HTML paste into offline MSHTML with Unicode/styles/structure; external HTML copy back uses exact plain fallback.",
+        run: rich::external_clipboard,
+    },
+    Check {
+        name: "plain-paste-shortcut",
+        description: "Actual Ctrl+Shift+V replaces selected text once, drops rich source formatting, and undoes/redoes in one step.",
+        run: rich::plain_paste,
+    },
+    Check {
         name: "renderer-smoke",
         description: "The host renders 20 frames with Mesa in each mode, as the hosted Mesa job does.",
         run: renderer_smoke,
@@ -1738,7 +1788,18 @@ const CHECKS: &[Check] = &[
 ];
 
 fn run_checks(checks: &Checks, selected: &[&Check], runs: usize) -> Result<()> {
+    let provenance = provenance::deployed(checks)?;
+    let runner_source = provenance::source(&crate::repo_root())?;
+    let mut failed = Vec::new();
     for run in 1..=runs {
+        let run_checks = Checks {
+            vm: checks.vm.clone(),
+            output: if runs > 1 {
+                checks.output.join(format!("run-{run}"))
+            } else {
+                checks.output.clone()
+            },
+        };
         for check in selected {
             let label = if runs == 1 {
                 check.name.to_owned()
@@ -1747,10 +1808,14 @@ fn run_checks(checks: &Checks, selected: &[&Check], runs: usize) -> Result<()> {
             };
             println!("== {label}");
             let started = Instant::now();
+            let started_unix_seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("check timestamp")?
+                .as_secs();
             // Defense in depth only: the checks report every failure they can
             // foresee, including bad guest data, through their `Result`. Should
             // one panic anyway, the run records it and goes on to the next check.
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| (check.run)(checks)));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| (check.run)(&run_checks)));
             let mut result = match outcome {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => json!({"passed": false, "error": error.to_string()}),
@@ -1761,13 +1826,27 @@ fn run_checks(checks: &Checks, selected: &[&Check], runs: usize) -> Result<()> {
             let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
             if let Some(fields) = result.as_object_mut() {
                 fields.insert("seconds".to_owned(), seconds.into());
+                fields.insert(
+                    "started_unix_seconds".to_owned(),
+                    started_unix_seconds.into(),
+                );
+                fields.insert("provenance".to_owned(), provenance.clone());
+                fields.insert("runner_source".to_owned(), runner_source.clone());
+                fields.insert("manual_signoff".to_owned(), "not_recorded".into());
+            }
+            if result["passed"] != true {
+                failed.push(label.clone());
             }
             checks.record(&label, &result)?;
             let summary: String = result.to_string().chars().take(3000).collect();
             println!("{summary}");
         }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} check(s) failed: {}", failed.len(), failed.join(", ")).into())
+    }
 }
 
 fn dispatch(arguments: Vec<String>) -> Result<(), String> {
@@ -1779,6 +1858,9 @@ fn dispatch(arguments: Vec<String>) -> Result<(), String> {
         None => 1,
     };
     let positionals = arguments.finish()?;
+    if runs == 0 {
+        return Err("--runs must be greater than zero".to_owned());
+    }
     let names: Vec<&str> = positionals.iter().map(String::as_str).collect();
     let checks = Checks::from_env();
     let outcome = match names.as_slice() {

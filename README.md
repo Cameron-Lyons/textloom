@@ -17,6 +17,11 @@ textloom = "1.0.0-rc.2"
 | `winit` | `adapter::winit::WinitAdapter` | winit 0.30, always with its `x11`, `wayland`, and `wayland-dlopen` backends. |
 | `accesskit` | `accessibility::AccessKitAdapter` | AccessKit 0.25.1 or a later 0.25 release. |
 
+The native adapters rely on the host's input method, clipboard, and accessibility
+integration. Review the [native dependency limitations](RELEASING.md#native-dependency-limitations)
+before choosing a deployment configuration; passing headless tests does not
+establish support for every desktop, input method, or screen reader.
+
 ```rust
 use textloom::{Editor, ParagraphKind, Position, Selection, StylePatch};
 
@@ -155,7 +160,7 @@ Both input adapters share these Ctrl/Command shortcuts:
 | ]; [ | Indent; outdent selected list items |
 | Up or Home; Down or End | Document start; document end |
 
-Without Ctrl/Command, Enter inserts a paragraph break and Shift+Enter a soft line break in both adapters; read-only mode consumes both, and Ctrl/Command+Enter or Ctrl/Command+Shift+Enter reaches the host. Toggling makes a mixed selection uniformly emphasized and a uniformly emphasized selection plain for that attribute. Shortcuts listed without Shift ignore chords with Shift held, which reach the host (for example, Ctrl+Shift+V for paste as plain text; egui delivers that chord as a paste event, which the widget pastes as plain text without its rich clipboard). Latin logical keys select shortcuts, so Dvorak and Colemak keep their letters; non-Latin layouts use the physical US key, and the digit row uses its physical digit (AZERTY, German Shift+7). Ctrl/Alt+Left/Right/Backspace/Delete move or delete by word on Linux/Windows; macOS uses Option. Tab/Shift+Tab indent/outdent selections containing list items; other Tab presses stay available for host focus traversal. Losing widget or window focus ends the current typing undo group.
+Without Ctrl/Command, Enter inserts a paragraph break and Shift+Enter a soft line break in both adapters; read-only mode consumes both, and Ctrl/Command+Enter or Ctrl/Command+Shift+Enter reaches the host. Toggling makes a mixed selection uniformly emphasized and a uniformly emphasized selection plain for that attribute. Shortcuts listed without Shift ignore chords with Shift held, which reach the host. Egui additionally handles Ctrl/Command+Shift+V by requesting a native paste and inserting its text without consulting the rich clipboard. Latin logical keys select shortcuts, so Dvorak and Colemak keep their letters; non-Latin layouts use the physical US key, and the digit row uses its physical digit (AZERTY, German Shift+7). Ctrl/Alt+Left/Right/Backspace/Delete move or delete by word on Linux/Windows; macOS uses Option. Tab/Shift+Tab indent/outdent selections containing list items; other Tab presses stay available for host focus traversal. Losing widget or window focus ends the current typing undo group.
 
 On macOS, Control+A/E move to the paragraph's beginning/end, Control+B/F move by
 grapheme, Control+P/N move up/down, and Control+H/D delete backward/forward.
@@ -205,6 +210,17 @@ first use, taking effect on the next pass; late installation cannot recover that
 initial pass's starting modifiers. Hosts must honor the returned repaint
 requests to deliver pending input, including when using manual `begin_pass` /
 `end_pass` calls. Window lifecycle and dropped-file handling remain host-owned.
+
+For Command/Ctrl+Shift+V, the widget sends `egui::ViewportCommand::RequestPaste`.
+The host must return replies in request order within the next two host input
+batches, delivering `egui::Event::Paste` when text is available, or no paste
+for an empty clipboard. Eframe supplies this behavior. The reply stays plain
+even after modifier release and is discarded if the requesting widget loses
+focus. Unanswered requests expire after the second batch. Since egui supplies
+no request IDs or empty-clipboard acknowledgment, hosts must not interleave
+unrelated paste events or deliver late replies. Extra layout passes do not
+advance expiry; each manual `begin_pass`/`end_pass` pair does. See
+`install_input_routing` for the focus and native-capture integration contract.
 
 Run `cargo run --example egui_editor --features egui` for a display-independent integration example. A native window/renderer is supplied by your existing egui host; this crate does not select one for you. Egui integrations other than eframe that rely on egui's bundled fonts must enable `egui/default_fonts` themselves. Bold spans use egui's strong text color; register a bold font family and select it with `.bold_font_family()` for bold glyphs as well. If the selected bold family is not registered, bold text keeps the base family, and without a monospace family, code uses the base family; neither panics.
 
