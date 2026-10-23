@@ -153,6 +153,101 @@ func externalFixture() throws {
               "external_textloom_envelope_absent": true, "types": types()])
 }
 
+func nativeHTML() throws {
+    guard let data = try boundedData(.html), let html = String(data: data, encoding: .utf8),
+          let rich = try boundedData(customType) else {
+        throw ProbeError.failed("Native HTML or Textloom envelope is unavailable")
+    }
+    try require(rich.count > 32 && Array(rich.prefix(8)) == [84, 76, 67, 76, 1, 0, 0, 0],
+                "Native feature envelope is malformed")
+    try emit(["html": html, "native_envelope_present": true, "types": types()])
+}
+
+func rgba(_ color: Any?) -> [Int]? {
+    guard let color = (color as? NSColor)?.usingColorSpace(.sRGB) else { return nil }
+    return [color.redComponent, color.greenComponent, color.blueComponent, color.alphaComponent]
+        .map { Int(($0 * 255).rounded()) }
+}
+
+// Inspect TextEdit's actual copied RTF, never an attributed string constructed
+// directly from our HTML. List markers and one terminal paragraph LF may be
+// added by TextEdit. All payload bytes, soft separators, and attributes must
+// survive; typography and the particular installed font are not asserted.
+func textEditFeatures(_ arguments: [String]) throws {
+    try require(arguments.count == 1, "textedit-features requires a JSON specification")
+    guard let specification = try JSONSerialization.jsonObject(with: Data(arguments[0].utf8)) as? [String: Any],
+          let paragraphs = specification["paragraphs"] as? [[String: Any]],
+          !paragraphs.isEmpty, paragraphs.count <= 8,
+          let data = try boundedData(.rtf) else {
+        throw ProbeError.failed("Missing feature specification or TextEdit RTF")
+    }
+    try require(try boundedData(customType) == nil, "TextEdit feature copy retained a stale native envelope")
+    let attributed = try NSAttributedString(
+        data: data, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil
+    )
+    var lines = attributed.string.components(separatedBy: "\n")
+    if lines.last == "" { lines.removeLast() }
+    try require(lines.count == paragraphs.count, "TextEdit changed feature paragraph count: \(lines.count)")
+    var offset = 0
+    var observations: [[String: Any]] = []
+    for index in paragraphs.indices {
+        let expected = paragraphs[index]
+        guard let text = expected["text"] as? String, !text.isEmpty else {
+            throw ProbeError.failed("Feature paragraph requires nonempty text")
+        }
+        let line = lines[index] as NSString
+        let found = line.range(of: text)
+        try require(found.location != NSNotFound, "TextEdit changed feature payload \(index): \(lines[index])")
+        let range = NSRange(location: offset + found.location, length: found.length)
+        let attributes = attributed.attributes(at: range.location, effectiveRange: nil)
+        let paragraph = attributes[.paragraphStyle] as? NSParagraphStyle
+        var allowed = [text]
+        var observation: [String: Any] = ["payload_utf8_exact": true, "soft_breaks": text.filter { $0 == "\u{2028}" }.count]
+        if let start = expected["list_start"] as? Int, let number = expected["number"] as? Int {
+            guard let list = paragraph?.textLists.last else {
+                throw ProbeError.failed("TextEdit lost feature list \(index)")
+            }
+            try require(list.markerFormat.rawValue.contains(NSTextList.MarkerFormat.decimal.rawValue), "TextEdit changed feature list kind")
+            try require(list.startingItemNumber == start, "TextEdit changed feature list start")
+            let marker = list.marker(forItemNumber: number)
+            allowed += ["\t\(marker)\t\(text)", "\(marker)\t\(text)"]
+            observation["list_start"] = start
+            observation["item_number"] = number
+        } else {
+            try require(paragraph?.textLists.isEmpty ?? true, "TextEdit added an unexpected list")
+        }
+        try require(allowed.contains { Array($0.utf8) == Array(lines[index].utf8) },
+                    "TextEdit changed payload bytes, marker, or soft break in paragraph \(index)")
+        if expected["quote"] as? Bool == true {
+            guard let paragraph = paragraph else { throw ProbeError.failed("TextEdit lost quote paragraph style") }
+            try require(paragraph.headIndent > 0 && paragraph.firstLineHeadIndent > 0,
+                        "TextEdit lost blockquote indentation")
+            observation["head_indent"] = paragraph.headIndent
+            observation["first_line_head_indent"] = paragraph.firstLineHeadIndent
+        }
+        var cursor = range.location
+        while cursor < NSMaxRange(range) {
+            var effective = NSRange(location: 0, length: 0)
+            let run = attributed.attributes(at: cursor, effectiveRange: &effective)
+            for (name, key) in [("foreground", NSAttributedString.Key.foregroundColor), ("background", .backgroundColor)] {
+                if let expectedColor = specification[name] as? [Int] {
+                    try require(rgba(run[key]) == expectedColor, "TextEdit changed \(name) in feature paragraph \(index)")
+                }
+            }
+            if let expectedLink = specification["link"] as? String {
+                let actual = (run[.link] as? URL)?.absoluteString ?? (run[.link] as? String)
+                try require(actual == expectedLink, "TextEdit changed link in feature paragraph \(index)")
+            }
+            try require(NSMaxRange(effective) > cursor, "TextEdit returned invalid feature attributes")
+            cursor = min(NSMaxRange(effective), NSMaxRange(range))
+        }
+        observations.append(observation)
+        offset += line.length + 1
+    }
+    try emit(["textedit_rtf_features_exact": true, "paragraphs": observations,
+              "checked_specification": specification, "types": types()])
+}
+
 func expectPlain(_ arguments: [String], fallback: Bool) throws {
     try require(arguments.count == 1, "plain assertion requires one expected value")
     try require(try plain() == arguments[0], "Native clipboard differs from the expected document state")
@@ -169,7 +264,7 @@ func expectPlain(_ arguments: [String], fallback: Bool) throws {
 
 func diagnose(_ arguments: [String]) throws {
     try require(arguments.count == 2, "diagnose requires an artifact directory and fixture label")
-    let labels = ["native-offer", "textedit-before-paste", "textedit-after-paste", "textedit-after-copy", "failure"]
+    let labels = ["native-offer", "textedit-before-paste", "textedit-after-paste", "textedit-after-copy", "feature-import", "failure"]
     try require(labels.contains(arguments[1]), "Unexpected fixture diagnostic label")
     let directory = URL(fileURLWithPath: arguments[0], isDirectory: true)
     let label = arguments[1]
@@ -216,6 +311,8 @@ do {
     switch arguments[0] {
     case "prepare": try prepare(Array(arguments.dropFirst()))
     case "native-fixture": try nativeFixture()
+    case "native-html": try nativeHTML()
+    case "textedit-features": try textEditFeatures(Array(arguments.dropFirst()))
     case "textedit-import": try textEditImport()
     case "external-fixture": try externalFixture()
     case "state": try emit(["types": types()])

@@ -28,15 +28,45 @@ one native undo to restore its exact public fixture. Every copy requires a
 fresh clipboard generation; a separate raw UTF-8 `pbpaste` comparison also
 rejects Unicode normalization and changed line endings or trailing newlines.
 
-The companion test caps this extension at 160 native actions (currently 133).
-Short fixtures and reuse of the editable host are designed for the workflow's
-five-minute interaction budget, with no added app launches or sleeps.
-The driver avoids OS-reserved Control+arrow chords. Native line
-deletion coverage uses explicit soft breaks; it does not force font-dependent
-line wrapping. This probe does not run VoiceOver or an IME. Its Rust tests
-replay the fixture sequences against an editor oracle and check runner behavior
-without driving a desktop; they do not establish that the hosted System Events
-run passed.
+The companion test caps the shortcut extension at 160 native actions (currently
+133). The driver avoids OS-reserved Control+arrow chords.
+
+The editable session also uses PID-scoped accessibility buttons and native keys
+to exercise Fill Color, Font Color, No Fill, Automatic, link add/edit/remove,
+quote continuation/exit, and numbering restart/continuation. Every asserted
+formatting change compares exact copied HTML, with one-step undo/redo where
+specified in the observations. Shift+Enter must retain one numbered item or
+heading, while plain copy contains LF. TextEdit's actual copied RTF must retain
+the fill, foreground, hyperlink, soft separator within one numbered paragraph,
+quoted indentation, and a partial list's numbers 2 and 3. These checks avoid
+installed font names and pixel coordinates.
+
+A dedicated native Command+Shift+V check starts with a verified colored, linked
+Textloom clipboard offer, prepares a plain target without overwriting that
+offer, and verifies exact Unicode and unformatted HTML after paste. One native
+undo must restore the target and one redo must restore the plain pasted text.
+The Linux-run history oracle rejects missing paste, accidental rich paste,
+stale copies, and ineffective undo/redo.
+
+Forced-wrap Command+Backspace uses a long, single paragraph. A native
+Command+Shift+Left selection first witnesses a nonempty, proper suffix of that
+paragraph; deletion must remove exactly that suffix and undo must restore every
+byte. This measures the actual visual boundary instead of assuming font metrics.
+
+The feature extension reuses the native host and TextEdit documents. Allow
+roughly 5–7 minutes for the complete interaction step (an estimate until the
+hosted run); its timeout is eight minutes, including helper compilation and
+cleanup. It adds no app launches. `last_feature_html` records the last exact
+expected/observed native representation, and `macos-fixture-feature-import.*`
+captures the most recent TextEdit import for diagnosing failures. Rust tests
+check orchestration and oracles without a desktop; they do not establish that
+AppKit, System Events, or TextEdit passed on macOS.
+
+Native winit-adapter startup, IMEs, VoiceOver, link activation/hover, selection
+and search painting over fills, quote painting in both themes, and complete
+manual feature signoff remain separate. The existing winit harness needs macOS
+host/clipboard integration before it can honestly cover the adapter startup
+row; this probe continues to exercise the egui host.
 
 The Windows probe creates a fresh portable copy and private profile of pinned
 NVDA 2026.2 after checking the official installer digest and signature. Native

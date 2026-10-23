@@ -43,8 +43,12 @@ pub trait RichClipboard {
     }
 
     /// Called for each paste event with the text egui pasted, unless it is a
-    /// plain-text paste (Command/Ctrl+Shift+V, which egui also delivers as a
-    /// paste) or contains nothing but control characters.
+    /// plain-text paste (Command/Ctrl+Shift+V) or contains nothing but control
+    /// characters. For that shortcut the widget sends
+    /// [`egui::ViewportCommand::RequestPaste`]; the host must deliver the
+    /// clipboard's [`Event::Paste`] in its next input batch, as eframe does.
+    /// An empty clipboard must produce no paste in that batch. The reply stays
+    /// plain text even if the shortcut's modifiers have since been released.
     ///
     /// Return the fragment this paste carries to insert it in place of the
     /// selection as one undo step, or `None`, the default, to insert
@@ -652,8 +656,19 @@ impl<'editor> RichTextEditor<'editor> {
             let mut consumed = Vec::new();
             let mut layout_stale = false;
             let mut traversed = false;
+            let mut paste_index = 0;
+            let mut inline_plain_paste = false;
             let mut event_modifiers = input_routing::modifiers_at_pass_start(ui.ctx());
             for (index, event) in events.iter().enumerate() {
+                let plain_paste = if matches!(event, Event::Paste(_)) {
+                    let plain =
+                        input_routing::is_plain_paste(ui.ctx(), paste_index) || inline_plain_paste;
+                    paste_index += 1;
+                    inline_plain_paste = false;
+                    plain
+                } else {
+                    false
+                };
                 match event {
                     Event::ModifiersChanged(modifiers) => event_modifiers = *modifiers,
                     Event::WindowFocused(false) => event_modifiers = egui::Modifiers::NONE,
@@ -701,7 +716,28 @@ impl<'editor> RichTextEditor<'editor> {
                         &mut errors,
                         &mut accessibility_errors,
                     )
+                } else if response.has_focus() && input::is_plain_paste_shortcut(event) {
+                    if !self.read_only
+                        && self
+                            .editor
+                            .composition()
+                            .is_none_or(|composition| composition.text.is_empty())
+                    {
+                        // Some integrations already send both Key and Paste.
+                        // Do not ask them to paste a second copy.
+                        let delivered = events[index + 1..]
+                            .iter()
+                            .take_while(|event| !matches!(event, Event::Key { pressed: true, .. }))
+                            .any(|event| matches!(event, Event::Paste(_)));
+                        if delivered {
+                            inline_plain_paste = true;
+                        } else {
+                            input_routing::request_plain_paste(ui.ctx());
+                        }
+                    }
+                    true
                 } else if response.has_focus() {
+                    let mut plain_clipboard = None;
                     input::handle_event(
                         self.editor,
                         ui,
@@ -713,7 +749,11 @@ impl<'editor> RichTextEditor<'editor> {
                         &mut errors,
                         &mut interrupted,
                         &options,
-                        &mut self.rich_clipboard,
+                        if plain_paste {
+                            &mut plain_clipboard
+                        } else {
+                            &mut self.rich_clipboard
+                        },
                     )
                 } else {
                     false

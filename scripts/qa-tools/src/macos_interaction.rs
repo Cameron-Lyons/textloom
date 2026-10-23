@@ -19,6 +19,8 @@ use serde_json::{Map, Value, json};
 use crate::native_report::{self, Clipboard, Expected, Mode, Os};
 use crate::{Result, ResultExt, TempDir};
 
+mod features;
+
 /// The native example's window title, which [`APPLESCRIPT`] matches.
 pub const TITLE: &str = "TextLoom native example";
 /// The native example's initial document, as plain text.
@@ -153,6 +155,27 @@ on run argv
                 key code ((item 4 of argv) as integer) using {option down, shift down}
             else if commandName is "type" then
                 keystroke (item 4 of argv)
+            else if commandName is "press-button" or commandName is "press-popup" then
+                set wantedRole to "AXButton"
+                if commandName is "press-popup" then set wantedRole to "AXPopUpButton"
+                set wantedLabel to item 4 of argv
+                set controls to {}
+                set inventory to ""
+                repeat with candidateControl in (entire contents of targetWindow)
+                    try
+                        set elementRole to (value of attribute "AXRole" of candidateControl) as text
+                        if elementRole is wantedRole then
+                            set elementLabel to name of candidateControl
+                            if wantedRole is "AXPopUpButton" then set elementLabel to (value of attribute "AXValue" of candidateControl) as text
+                            set inventory to inventory & " [" & elementLabel & "]"
+                            if elementLabel is wantedLabel then set end of controls to contents of candidateControl
+                        end if
+                    end try
+                end repeat
+                if (count of controls) is not 1 then error "Target control count " & (count of controls) & " for " & wantedRole & " named " & wantedLabel & "; available:" & inventory
+                set matchedControl to item 1 of controls
+                if not (enabled of matchedControl) then error "Disabled control: " & wantedLabel
+                perform action "AXPress" of matchedControl
             else if commandName is "close" then
                 perform action "AXPress" of (first button of targetWindow whose subrole is "AXCloseButton")
             else
@@ -694,7 +717,11 @@ impl<S: System> Probe<S> {
                 return Ok(());
             }
             let stderr = result.stderr();
-            if !stderr.contains("Target window count 0") || self.system.monotonic() >= deadline {
+            // AX tree activation can take a frame after the first query. Only
+            // retry failures that happened before any action was delivered.
+            let target_pending = stderr.contains("Target window count 0")
+                || stderr.contains("Target control count 0");
+            if !target_pending || self.system.monotonic() >= deadline {
                 return Err(format!(
                     "Native {command} on PID {pid} / {window}: {}",
                     crate::tail(&stderr, 4000)
@@ -1329,6 +1356,8 @@ impl<S: System> Probe<S> {
             Value::Null,
         )?;
         self.shortcuts(pid)?;
+        self.features(pid)?;
+        self.forced_wrap(pid)?;
         self.finish(Mode::Editable, pid, &report)
     }
 

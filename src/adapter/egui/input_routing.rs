@@ -26,6 +26,11 @@ use egui::{Context, Event, FullOutput, Modifiers, Plugin, RawInput, ViewportId};
 /// The recorded modifiers let the widget tell a plain-text paste
 /// (Command/Ctrl+Shift+V) from a rich one even when the modifiers change later
 /// in the same batch.
+/// The plugin also preserves the plain-text intent of replies to the widget's
+/// [`egui::ViewportCommand::RequestPaste`]. Integrations must service that
+/// command before delivering the next input batch, as eframe does. If the
+/// clipboard is empty, that batch contains no reply; the request then expires
+/// without changing the next unrelated paste.
 ///
 /// # Examples
 ///
@@ -42,7 +47,8 @@ pub fn install_input_routing(ctx: &Context) {
 #[derive(Default)]
 struct InputRouting {
     pending: HashMap<ViewportId, PendingInput>,
-    passes: Vec<(ViewportId, Modifiers)>,
+    passes: Vec<InputPass>,
+    paste_requests: HashMap<ViewportId, (u64, usize)>,
 }
 
 pub(super) fn modifiers_at_pass_start(ctx: &Context) -> Modifiers {
@@ -51,7 +57,7 @@ pub(super) fn modifiers_at_pass_start(ctx: &Context) -> Modifiers {
         .lock()
         .passes
         .last()
-        .map(|&(_, modifiers)| modifiers);
+        .map(|pass| pass.modifiers);
     modifiers.unwrap_or_else(|| {
         // Automatic installation can miss this pass's input hook. The first
         // pass starts with no modifiers; a later installation can only use the
@@ -65,13 +71,48 @@ pub(super) fn modifiers_at_pass_start(ctx: &Context) -> Modifiers {
     })
 }
 
+/// Requests the stock integration's clipboard read. Its reply belongs to the
+/// next input batch, even if that batch is split into several focus passes.
+pub(super) fn request_plain_paste(ctx: &Context) {
+    let viewport = ctx.viewport_id();
+    let frame = ctx.cumulative_frame_nr();
+    let plugin = ctx.plugin::<InputRouting>();
+    let mut routing = plugin.lock();
+    let request = routing.paste_requests.entry(viewport).or_insert((frame, 0));
+    request.1 += 1;
+    drop(routing);
+    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+    ctx.request_repaint();
+}
+
+pub(super) fn is_plain_paste(ctx: &Context, paste_index: usize) -> bool {
+    ctx.plugin::<InputRouting>()
+        .lock()
+        .passes
+        .last()
+        .and_then(|pass| pass.plain_pastes.get(paste_index))
+        .copied()
+        .unwrap_or(false)
+}
+
+struct InputPass {
+    viewport: ViewportId,
+    modifiers: Modifiers,
+    plain_pastes: Vec<bool>,
+}
+
+struct RoutedEvent {
+    event: Event,
+    plain_paste: bool,
+}
+
 struct PendingInput {
     batches: VecDeque<InputBatch>,
     latest_focused: bool,
 }
 
 struct InputBatch {
-    events: VecDeque<Event>,
+    events: VecDeque<RoutedEvent>,
     focused: bool,
 }
 
@@ -100,10 +141,41 @@ impl Plugin for InputRouting {
         // Read egui's previous state before it processes this routed segment.
         // This also preserves held modifiers across frames and nested viewports.
         let modifiers = ctx.input_for(input.viewport_id, |input| input.modifiers);
-        self.passes.push((input.viewport_id, modifiers));
+        let mut pass = InputPass {
+            viewport: input.viewport_id,
+            modifiers,
+            plain_pastes: Vec::new(),
+        };
+        // Extra layout/focus passes run before the host can service output.
+        // begin_pass/end_pass hosts have no frame counter, but start at pass 0.
+        let new_batch = self
+            .paste_requests
+            .get(&input.viewport_id)
+            .is_some_and(|&(frame, _)| {
+                ctx.cumulative_frame_nr_for(input.viewport_id) > frame
+                    || (ctx.viewport_id() == input.viewport_id && ctx.current_pass_index() == 0)
+            });
+        let mut plain_replies = if new_batch {
+            self.paste_requests
+                .remove(&input.viewport_id)
+                .map_or(0, |(_, count)| count)
+        } else {
+            0
+        };
         if !self.pending.contains_key(&input.viewport_id)
             && !input.events.iter().any(requests_focus)
         {
+            pass.plain_pastes = input
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Paste(_)))
+                .map(|_| {
+                    let plain = plain_replies > 0;
+                    plain_replies = plain_replies.saturating_sub(1);
+                    plain
+                })
+                .collect();
+            self.passes.push(pass);
             return;
         }
 
@@ -119,7 +191,16 @@ impl Plugin for InputRouting {
         // Preserve window focus, but keep current timestamps and geometry.
         if !input.events.is_empty() || input.focused != pending.latest_focused {
             pending.batches.push_back(InputBatch {
-                events: mem::take(&mut input.events).into(),
+                events: mem::take(&mut input.events)
+                    .into_iter()
+                    .map(|event| {
+                        let plain_paste = matches!(event, Event::Paste(_)) && plain_replies > 0;
+                        if plain_paste {
+                            plain_replies -= 1;
+                        }
+                        RoutedEvent { event, plain_paste }
+                    })
+                    .collect(),
                 focused: input.focused,
             });
             pending.latest_focused = input.focused;
@@ -129,25 +210,32 @@ impl Plugin for InputRouting {
              focus request",
         );
         input.focused = batch.focused;
-        if batch.events.front().is_some_and(requests_focus) {
+        if batch
+            .events
+            .front()
+            .is_some_and(|event| requests_focus(&event.event))
+        {
             input.events.push(
                 batch
                     .events
                     .pop_front()
-                    .expect("the front event was just checked"),
+                    .expect("the front event was just checked")
+                    .event,
             );
         } else {
             while batch
                 .events
                 .front()
-                .is_some_and(|event| !requests_focus(event))
+                .is_some_and(|event| !requests_focus(&event.event))
             {
-                input.events.push(
-                    batch
-                        .events
-                        .pop_front()
-                        .expect("the front event was just checked"),
-                );
+                let event = batch
+                    .events
+                    .pop_front()
+                    .expect("the front event was just checked");
+                if matches!(event.event, Event::Paste(_)) {
+                    pass.plain_pastes.push(event.plain_paste);
+                }
+                input.events.push(event.event);
             }
         }
         if batch.events.is_empty() {
@@ -156,16 +244,19 @@ impl Plugin for InputRouting {
         if pending.batches.is_empty() {
             self.pending.remove(&input.viewport_id);
         }
+        self.passes.push(pass);
     }
 
     fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput) {
         // Automatic installation may happen after this pass's input hook. The
         // stack also identifies the ended viewport after a nested viewport pass.
-        let Some((viewport, _)) = self.passes.pop() else {
+        let Some(InputPass { viewport, .. }) = self.passes.pop() else {
             return;
         };
         if self.passes.is_empty() {
             self.pending
+                .retain(|id, _| output.viewport_output.contains_key(id));
+            self.paste_requests
                 .retain(|id, _| output.viewport_output.contains_key(id));
         }
         if self.pending.contains_key(&viewport) {

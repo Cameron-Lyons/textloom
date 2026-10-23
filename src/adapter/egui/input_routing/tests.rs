@@ -110,6 +110,81 @@ fn raw(events: Vec<Event>) -> RawInput {
     }
 }
 
+#[test]
+fn plain_paste_reply_keeps_its_intent_through_queued_focus_passes() {
+    for max_passes in [1, 2, 8] {
+        let ctx = Context::default();
+        super::install_input_routing(&ctx);
+        ctx.options_mut(|options| options.max_passes = NonZeroUsize::new(max_passes).unwrap());
+        ctx.run_ui(raw(Vec::new()), |ui| super::request_plain_paste(ui.ctx()))
+            .drop_without_applying_deltas();
+        let mut seen = Vec::new();
+        let mut events = vec![
+            focus("first"),
+            Event::Paste("plain".into()),
+            focus("second"),
+            Event::Paste("rich".into()),
+        ];
+        for _ in 0..8 {
+            ctx.run_ui(raw(std::mem::take(&mut events)), |ui| {
+                let input = ui.input(|input| input.events.clone());
+                for (index, text) in input
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Paste(text) => Some(text),
+                        _ => None,
+                    })
+                    .enumerate()
+                {
+                    seen.push((text.clone(), super::is_plain_paste(ui.ctx(), index)));
+                }
+            })
+            .drop_without_applying_deltas();
+            if ctx.plugin::<InputRouting>().lock().pending.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![("plain".into(), true), ("rich".into(), false)],
+            "max_passes={max_passes}"
+        );
+    }
+}
+
+#[test]
+fn plain_paste_requests_survive_extra_layout_passes_and_expire_on_an_empty_reply() {
+    let ctx = Context::default();
+    super::install_input_routing(&ctx);
+    ctx.run_ui(raw(Vec::new()), |ui| {
+        if ui.ctx().current_pass_index() == 0 {
+            super::request_plain_paste(ui.ctx());
+            ui.ctx().request_discard("test another layout pass");
+        }
+    })
+    .drop_without_applying_deltas();
+    ctx.run_ui(raw(vec![Event::Paste("reply".into())]), |ui| {
+        assert!(super::is_plain_paste(ui.ctx(), 0));
+    })
+    .drop_without_applying_deltas();
+
+    // Manual begin_pass/end_pass hosts do not advance cumulative_frame_nr.
+    ctx.begin_pass(raw(Vec::new()));
+    super::request_plain_paste(&ctx);
+    ctx.end_pass().drop_without_applying_deltas();
+    ctx.begin_pass(raw(vec![Event::Paste("manual reply".into())]));
+    assert!(super::is_plain_paste(&ctx, 0));
+    ctx.end_pass().drop_without_applying_deltas();
+    ctx.begin_pass(raw(Vec::new()));
+    super::request_plain_paste(&ctx);
+    ctx.end_pass().drop_without_applying_deltas();
+    ctx.begin_pass(raw(Vec::new()));
+    ctx.end_pass().drop_without_applying_deltas();
+    ctx.begin_pass(raw(vec![Event::Paste("later rich paste".into())]));
+    assert!(!super::is_plain_paste(&ctx, 0));
+    ctx.end_pass().drop_without_applying_deltas();
+}
+
 fn focus(name: &str) -> Event {
     Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
         action: egui::accesskit::Action::Focus,
