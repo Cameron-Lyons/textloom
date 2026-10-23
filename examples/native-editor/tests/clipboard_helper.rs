@@ -1,12 +1,13 @@
+//! Checks that a Linux clipboard copy helper exits when its host process is
+//! killed, so a crashed host never leaves a helper serving the clipboard.
+
 #![cfg(target_os = "linux")]
 
-use std::{
-    io::{BufRead, BufReader, Read},
-    process::{Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 #[test]
 fn copy_helper_exits_when_its_host_is_killed() {

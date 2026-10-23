@@ -1,20 +1,30 @@
+//! Tests editing operations on paragraph structure: batch replacement against
+//! sequential edits and string oracles, find navigation, word deletion, list
+//! indentation and numbering, heading splits, and how typed and pasted text
+//! chooses paragraph kinds, including undo and allocation sharing.
+
+use std::iter;
 use std::sync::Arc;
 
 use textloom::{
-    Document, Editor, Error, Fragment, HistoryLimits, InlineStyle, Paragraph, ParagraphKind,
-    Position, SearchOptions, Selection, Span, StylePatch,
+    Document, Editor, Error, Fragment, HistoryLimits, InlineStyle, Movement, Paragraph,
+    ParagraphKind, Position, SearchOptions, SearchWrap, Selection, SelectionMode, Span, StylePatch,
 };
 
 const H1: ParagraphKind = ParagraphKind::Heading { level: 1 };
 const BODY: ParagraphKind = ParagraphKind::Body;
 
-fn ord(indent: u8, number: u32) -> ParagraphKind {
+/// Returns an ordered item kind with an explicit start, which `shown` also
+/// uses to report each item's displayed number.
+fn ordered(indent: u8, number: u32) -> ParagraphKind {
     ParagraphKind::Ordered {
         indent,
         start: Some(number),
     }
 }
 
+/// Returns each paragraph's kind, with ordered items' `start` replaced by the
+/// number the item displays.
 fn shown(document: &Document) -> Vec<ParagraphKind> {
     document
         .paragraphs()
@@ -43,20 +53,51 @@ fn stored_kinds(editor: &Editor) -> Vec<ParagraphKind> {
         .collect()
 }
 
-fn lines(editor: &Editor) -> Vec<(String, ParagraphKind)> {
+/// A paragraph's text and its kind as `shown` reports it.
+#[derive(Debug, PartialEq)]
+struct Line {
+    text: String,
+    kind: ParagraphKind,
+}
+
+fn lines(editor: &Editor) -> Vec<Line> {
     editor
         .document()
         .paragraphs()
         .iter()
         .zip(kinds(editor))
-        .map(|(paragraph, kind)| (paragraph.text().to_owned(), kind))
+        .map(|(paragraph, kind)| Line {
+            text: paragraph.text().to_owned(),
+            kind,
+        })
         .collect()
 }
 
-fn line(text: &str, kind: ParagraphKind) -> (String, ParagraphKind) {
-    (text.to_owned(), kind)
+fn line(text: &str, kind: ParagraphKind) -> Line {
+    Line {
+        text: text.to_owned(),
+        kind,
+    }
 }
 
+/// The observable paragraph structure after a replacement: what each paragraph
+/// shows and the kinds stored for it.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    lines: Vec<Line>,
+    stored_kinds: Vec<ParagraphKind>,
+}
+
+fn outcome(editor: &Editor) -> Outcome {
+    Outcome {
+        lines: lines(editor),
+        stored_kinds: stored_kinds(editor),
+    }
+}
+
+/// Returns an editor for `text` whose paragraphs show `paragraph_kinds`,
+/// storing an ordered item's start only when continuing its list would show a
+/// different number.
 fn with_kinds(text: &str, paragraph_kinds: &[ParagraphKind]) -> Editor {
     let mut editor = Editor::from_text(text);
     for (index, paragraph_kind) in paragraph_kinds.iter().enumerate() {
@@ -75,7 +116,11 @@ fn with_kinds(text: &str, paragraph_kinds: &[ParagraphKind]) -> Editor {
         }
         kind(&mut editor, index, *paragraph_kind);
     }
-    assert_eq!(kinds(&editor), paragraph_kinds);
+    assert_eq!(
+        kinds(&editor),
+        paragraph_kinds,
+        "the setup should produce the requested kinds and numbers"
+    );
     editor.clear_history();
     editor
 }
@@ -83,14 +128,15 @@ fn with_kinds(text: &str, paragraph_kinds: &[ParagraphKind]) -> Editor {
 fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
     editor
         .set_selection(Selection::caret(Position::new(paragraph, byte)))
-        .unwrap();
+        .expect("callers place the caret on a grapheme boundary of an existing paragraph");
 }
 
+/// Deletes the break between paragraph `paragraph` and the one before it.
 fn join_with_previous(editor: &mut Editor, paragraph: usize) {
     let end = editor
         .document()
         .paragraph(paragraph - 1)
-        .unwrap()
+        .expect("callers pass a paragraph that has a previous one")
         .text()
         .len();
     editor
@@ -98,12 +144,14 @@ fn join_with_previous(editor: &mut Editor, paragraph: usize) {
             Position::new(paragraph - 1, end)..Position::new(paragraph, 0),
             "",
         )
-        .unwrap();
+        .expect("the range spans exactly one paragraph break");
 }
 
 fn kind(editor: &mut Editor, paragraph: usize, kind: ParagraphKind) {
     caret(editor, paragraph, 0);
-    editor.set_paragraph_kind(kind).unwrap();
+    editor
+        .set_paragraph_kind(kind)
+        .expect("no IME composition is active, and callers pass valid heading levels");
 }
 
 fn style(editor: &mut Editor, paragraph: usize, start: usize, end: usize, patch: StylePatch) {
@@ -112,8 +160,10 @@ fn style(editor: &mut Editor, paragraph: usize, start: usize, end: usize, patch:
             Position::new(paragraph, start),
             Position::new(paragraph, end),
         ))
-        .unwrap();
-    editor.apply_style(patch).unwrap();
+        .expect("callers select between grapheme boundaries of an existing paragraph");
+    editor
+        .apply_style(patch)
+        .expect("no IME composition is active");
 }
 
 #[test]
@@ -232,7 +282,7 @@ fn replace_all_adjacent_combining_replacements_use_original_match_ranges() {
     assert_eq!(spans[0].range, 0..4);
     assert!(spans[0].style.bold);
     assert!(!spans[0].style.italic);
-    assert!(textloom::Document::from_bytes(&editor.document().to_bytes()).is_ok());
+    assert!(Document::from_bytes(&editor.document().to_bytes()).is_ok());
     assert!(editor.undo());
     assert_eq!(Fragment::from_document(editor.document()), before);
     assert!(editor.redo());
@@ -300,7 +350,7 @@ fn replace_all_preserves_untouched_allocations_inside_and_outside_its_changed_ra
     assert!(!Arc::ptr_eq(&before[3], &editor.document().paragraphs()[3]));
     assert!(editor.undo());
     for (source, restored) in before.iter().zip(editor.document().paragraphs()) {
-        assert!(Arc::ptr_eq(source, restored));
+        assert!(Arc::ptr_eq(source, restored), "{source:?}");
     }
 }
 
@@ -329,7 +379,7 @@ fn structural_replace_all_shares_untouched_paragraphs_after_index_shifts() {
     }
     assert!(editor.undo());
     for (source, restored) in before.iter().zip(editor.document().paragraphs()) {
-        assert!(Arc::ptr_eq(source, restored));
+        assert!(Arc::ptr_eq(source, restored), "{source:?}");
     }
 }
 
@@ -369,29 +419,81 @@ fn replace_all_joins_shared_paragraphs_and_normalizes_the_final_caret_and_styles
             editor
                 .replace_all("\n", replacement, SearchOptions::default())
                 .unwrap(),
-            1
+            1,
+            "{suffix:?} -> {replacement:?}"
         );
-        assert_eq!(editor.document().plain_text(), "a\u{301}b");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 3)));
+        assert_eq!(
+            editor.document().plain_text(),
+            "a\u{301}b",
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 3)),
+            "{suffix:?} -> {replacement:?}"
+        );
         let paragraph = editor.document().paragraph(0).unwrap();
-        assert_eq!(paragraph.kind(), ParagraphKind::Heading { level: 2 });
-        assert_eq!(paragraph.spans().len(), 2);
-        assert_eq!(paragraph.spans()[0].range, 0..3);
-        assert!(paragraph.spans()[0].style.italic);
-        assert!(!paragraph.spans()[0].style.bold);
-        assert_eq!(paragraph.spans()[1].range, 3..4);
-        assert!(paragraph.spans()[1].style.bold);
-        assert!(!paragraph.spans()[1].style.italic);
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(Fragment::from_document(editor.document()), before);
-        assert_eq!(editor.selection(), selection);
+        assert_eq!(
+            paragraph.kind(),
+            ParagraphKind::Heading { level: 2 },
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert_eq!(paragraph.spans().len(), 2, "{suffix:?} -> {replacement:?}");
+        assert_eq!(
+            paragraph.spans()[0].range,
+            0..3,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert!(
+            paragraph.spans()[0].style.italic,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert!(
+            !paragraph.spans()[0].style.bold,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert_eq!(
+            paragraph.spans()[1].range,
+            3..4,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert!(
+            paragraph.spans()[1].style.bold,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert!(
+            !paragraph.spans()[1].style.italic,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert_eq!(editor.undo_len(), 1, "{suffix:?} -> {replacement:?}");
+        assert!(editor.undo(), "{suffix:?} -> {replacement:?}");
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            before,
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert_eq!(
+            editor.selection(),
+            selection,
+            "{suffix:?} -> {replacement:?}"
+        );
         for (source, restored) in paragraphs.iter().zip(editor.document().paragraphs()) {
-            assert!(Arc::ptr_eq(source, restored));
+            assert!(
+                Arc::ptr_eq(source, restored),
+                "{suffix:?} -> {replacement:?}"
+            );
         }
-        assert!(editor.redo());
-        assert_eq!(editor.document().plain_text(), "a\u{301}b");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 3)));
+        assert!(editor.redo(), "{suffix:?} -> {replacement:?}");
+        assert_eq!(
+            editor.document().plain_text(),
+            "a\u{301}b",
+            "{suffix:?} -> {replacement:?}"
+        );
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 3)),
+            "{suffix:?} -> {replacement:?}"
+        );
     }
 }
 
@@ -416,7 +518,7 @@ fn sparse_identical_replacements_preserve_empty_paragraph_metadata_and_allocatio
     assert_eq!(editor.undo_len(), 0);
     assert_eq!(editor.selection(), Selection::caret(Position::new(4, 5)));
     for (source, unchanged) in paragraphs.iter().zip(editor.document().paragraphs()) {
-        assert!(Arc::ptr_eq(source, unchanged));
+        assert!(Arc::ptr_eq(source, unchanged), "{source:?}");
     }
 }
 
@@ -424,7 +526,7 @@ fn sparse_identical_replacements_preserve_empty_paragraph_metadata_and_allocatio
 fn structural_replace_all_continues_ordered_numbering_and_undo_restores_metadata() {
     let mut editor = Editor::from_text("one\nkeep\none\ntail");
     editor.select_all();
-    editor.set_paragraph_kind(ord(1, 7)).unwrap();
+    editor.set_paragraph_kind(ordered(1, 7)).unwrap();
     let before = Fragment::from_document(editor.document());
     editor.clear_history();
     assert_eq!(
@@ -434,7 +536,7 @@ fn structural_replace_all_continues_ordered_numbering_and_undo_restores_metadata
         2
     );
     assert_eq!(editor.document().plain_text(), "x\ny\nkeep\nx\ny\ntail");
-    let expected: Vec<_> = (7..13).map(|number| ord(1, number)).collect();
+    let expected: Vec<_> = (7..13).map(|number| ordered(1, number)).collect();
     assert_eq!(kinds(&editor), expected);
     assert_eq!(
         stored_kinds(&editor)[1..],
@@ -466,14 +568,15 @@ fn replace_all_preserves_surviving_suffix_paragraph_metadata() {
             .find(query, SearchOptions::default())
             .remove(0);
         let source = Fragment::from_document(original.document());
-        let mut sequential = Editor::new(textloom::Document::from_fragment(&source));
+        let mut sequential = Editor::new(Document::from_fragment(&source));
         sequential.replace_range(range, replacement).unwrap();
-        let mut batch = Editor::new(textloom::Document::from_fragment(&source));
+        let mut batch = Editor::new(Document::from_fragment(&source));
         assert_eq!(
             batch
                 .replace_all(query, replacement, SearchOptions::default())
                 .unwrap(),
-            1
+            1,
+            "{text:?}"
         );
         assert_eq!(
             Fragment::from_document(batch.document()),
@@ -487,13 +590,13 @@ fn replace_all_preserves_surviving_suffix_paragraph_metadata() {
 fn deleting_complete_ordered_item_keeps_its_number_for_surviving_same_indent_item() {
     let mut editor = Editor::from_text("a\nb\nc");
     editor.select_all();
-    editor.set_paragraph_kind(ord(1, 4)).unwrap();
+    editor.set_paragraph_kind(ordered(1, 4)).unwrap();
     let before = Fragment::from_document(editor.document());
     let range = editor
         .document()
         .find("a\n", SearchOptions::default())
         .remove(0);
-    let mut single = Editor::new(textloom::Document::from_fragment(&before));
+    let mut single = Editor::new(Document::from_fragment(&before));
     single.replace_range(range, "").unwrap();
     editor.clear_history();
     assert_eq!(
@@ -507,11 +610,11 @@ fn deleting_complete_ordered_item_keeps_its_number_for_surviving_same_indent_ite
         Fragment::from_document(editor.document()),
         Fragment::from_document(single.document())
     );
-    assert_eq!(kinds(&editor), [ord(1, 4), ord(1, 5)]);
+    assert_eq!(kinds(&editor), [ordered(1, 4), ordered(1, 5)]);
     assert_eq!(
         stored_kinds(&editor),
         [
-            ord(1, 4),
+            ordered(1, 4),
             ParagraphKind::Ordered {
                 indent: 1,
                 start: None
@@ -523,16 +626,18 @@ fn deleting_complete_ordered_item_keeps_its_number_for_surviving_same_indent_ite
     assert_eq!(Fragment::from_document(editor.document()), before);
 }
 
-fn replace_sequentially(
-    source: &Fragment,
-    query: &str,
-    replacement: &str,
-) -> (Vec<(String, ParagraphKind)>, Vec<ParagraphKind>) {
-    let mut editor = Editor::new(textloom::Document::from_fragment(source));
+/// Replaces every match of `query` in `source` one `replace_range` call at a
+/// time, as the oracle for `replace_all`.
+fn replace_sequentially(source: &Fragment, query: &str, replacement: &str) -> Outcome {
+    let mut editor = Editor::new(Document::from_fragment(source));
     let matches = editor.document().find(query, SearchOptions::default());
     let normalized = replacement.replace("\r\n", "\n").replace('\r', "\n");
     let breaks = normalized.matches('\n').count();
-    let last_chunk = normalized.rsplit('\n').next().unwrap().len();
+    let last_chunk = normalized
+        .rsplit('\n')
+        .next()
+        .expect("`rsplit` yields at least one piece")
+        .len();
     let mut shift: Option<(Position, Position)> = None;
     for range in matches {
         let map = |position: Position| match shift {
@@ -546,7 +651,9 @@ fn replace_sequentially(
             None => position,
         };
         let (start, end) = (map(range.start), map(range.end));
-        editor.replace_range(start..end, replacement).unwrap();
+        editor
+            .replace_range(start..end, replacement)
+            .expect("earlier replacements shift later matches to valid positions");
         let suffix = if breaks == 0 {
             Position::new(start.paragraph, start.byte + last_chunk)
         } else {
@@ -554,18 +661,18 @@ fn replace_sequentially(
         };
         shift = Some((range.end, suffix));
     }
-    (lines(&editor), stored_kinds(&editor))
+    outcome(&editor)
 }
 
 #[test]
 fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restore_metadata() {
-    let tokens = ["a", "b", "β", "🦀", "👩‍💻", "e\u{301}", "\n"];
+    let tokens = ["a", "b", "β", "🦀", "👩\u{200d}💻", "e\u{301}", "\n"];
     let queries = [
         "a",
         "b",
         "β",
         "🦀",
-        "👩‍💻",
+        "👩\u{200d}💻",
         "e\u{301}",
         "\n",
         "a\n",
@@ -578,7 +685,7 @@ fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restor
         "X",
         "x\ny",
         "\u{301}",
-        "👨‍💻",
+        "👨\u{200d}💻",
         "e\u{301}",
         "\r\nZ",
         "\n\nX\n",
@@ -637,7 +744,7 @@ fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restor
             for replacement in replacements {
                 let normalized_replacement = replacement.replace("\r\n", "\n").replace('\r', "\n");
                 let expected = text.replace(&normalized_query, &normalized_replacement);
-                let mut editor = Editor::new(textloom::Document::from_fragment(&before));
+                let mut editor = Editor::new(Document::from_fragment(&before));
                 let selection = Selection::new(editor.document().end(), Position::default());
                 editor.set_selection(selection).unwrap();
                 assert_eq!(
@@ -653,20 +760,45 @@ fn deterministic_unicode_batch_replacements_match_plain_string_oracle_and_restor
                     "text {text:?}, query {query:?}, replacement {replacement:?}"
                 );
                 assert_eq!(
-                    (lines(&editor), stored_kinds(&editor)),
+                    outcome(&editor),
                     replace_sequentially(&before, query, replacement),
                     "sequential kinds for {text:?}, query {query:?}, replacement {replacement:?}"
                 );
                 let after = Fragment::from_document(editor.document());
                 if editor.can_undo() {
-                    assert_eq!(editor.undo_len(), 1);
-                    assert!(editor.undo());
-                    assert_eq!(Fragment::from_document(editor.document()), before);
-                    assert_eq!(editor.selection(), selection);
-                    assert!(editor.redo());
-                    assert_eq!(Fragment::from_document(editor.document()), after);
+                    assert_eq!(
+                        editor.undo_len(),
+                        1,
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
+                    assert!(
+                        editor.undo(),
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
+                    assert_eq!(
+                        Fragment::from_document(editor.document()),
+                        before,
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
+                    assert_eq!(
+                        editor.selection(),
+                        selection,
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
+                    assert!(
+                        editor.redo(),
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
+                    assert_eq!(
+                        Fragment::from_document(editor.document()),
+                        after,
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
                 } else {
-                    assert_eq!(after, before);
+                    assert_eq!(
+                        after, before,
+                        "text {text:?}, query {query:?}, replacement {replacement:?}"
+                    );
                 }
             }
         }
@@ -711,9 +843,10 @@ fn replace_all_no_matches_and_identical_replacement_do_not_add_history_or_revisi
             editor
                 .replace_all(query, "x", SearchOptions::default())
                 .unwrap(),
-            0
+            0,
+            "{query:?}"
         );
-        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.selection(), selection, "{query:?}");
     }
     assert_eq!(
         editor
@@ -733,42 +866,64 @@ fn replace_all_no_matches_and_identical_replacement_do_not_add_history_or_revisi
 fn find_next_and_previous_skip_selected_matches_wrap_and_leave_misses_unchanged() {
     let mut editor = Editor::from_text("a x a\na");
     let options = SearchOptions::default();
-    assert!(editor.find_next("a", options, false).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Stop).unwrap());
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 0), Position::new(0, 1))
     );
-    assert!(editor.find_next("a", options, false).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Stop).unwrap());
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 4), Position::new(0, 5))
     );
-    assert!(editor.find_next("a", options, false).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Stop).unwrap());
     let last = editor.selection();
     assert_eq!(
         last,
         Selection::new(Position::new(1, 0), Position::new(1, 1))
     );
-    assert!(!editor.find_next("a", options, false).unwrap());
+    assert!(!editor.find_next("a", options, SearchWrap::Stop).unwrap());
     assert_eq!(editor.selection(), last);
-    assert!(editor.find_next("a", options, true).unwrap());
+    assert!(editor.find_next("a", options, SearchWrap::Around).unwrap());
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 0), Position::new(0, 1))
     );
-    assert!(!editor.find_previous("a", options, false).unwrap());
-    assert!(editor.find_previous("a", options, true).unwrap());
+    assert!(
+        !editor
+            .find_previous("a", options, SearchWrap::Stop)
+            .unwrap()
+    );
+    assert!(
+        editor
+            .find_previous("a", options, SearchWrap::Around)
+            .unwrap()
+    );
     assert_eq!(editor.selection(), last);
-    assert!(editor.find_previous("a", options, false).unwrap());
+    assert!(
+        editor
+            .find_previous("a", options, SearchWrap::Stop)
+            .unwrap()
+    );
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(0, 4), Position::new(0, 5))
     );
     let selected = editor.selection();
     for query in ["missing", ""] {
-        assert!(!editor.find_next(query, options, true).unwrap());
-        assert!(!editor.find_previous(query, options, true).unwrap());
-        assert_eq!(editor.selection(), selected);
+        assert!(
+            !editor
+                .find_next(query, options, SearchWrap::Around)
+                .unwrap(),
+            "{query:?}"
+        );
+        assert!(
+            !editor
+                .find_previous(query, options, SearchWrap::Around)
+                .unwrap(),
+            "{query:?}"
+        );
+        assert_eq!(editor.selection(), selected, "{query:?}");
     }
     assert_eq!(editor.undo_len(), 0);
     assert_eq!(editor.document().revision(), 0);
@@ -782,7 +937,7 @@ fn find_navigation_handles_backward_selections_and_crossparagraph_matches() {
         .unwrap();
     assert!(
         editor
-            .find_next("one\ntwo", SearchOptions::default(), false)
+            .find_next("one\ntwo", SearchOptions::default(), SearchWrap::Stop)
             .unwrap()
     );
     assert_eq!(
@@ -791,7 +946,7 @@ fn find_navigation_handles_backward_selections_and_crossparagraph_matches() {
     );
     assert!(
         editor
-            .find_previous("one\ntwo", SearchOptions::default(), false)
+            .find_previous("one\ntwo", SearchOptions::default(), SearchWrap::Stop)
             .unwrap()
     );
     assert_eq!(
@@ -822,9 +977,9 @@ fn word_deletion_includes_intervening_whitespace_and_remains_one_undo_step() {
 
 #[test]
 fn word_deletion_preserves_unicode_graphemes_and_selection_direction_on_undo() {
-    let mut editor = Editor::from_text("cafe\u{301}  👩‍💻 word");
+    let mut editor = Editor::from_text("cafe\u{301}  👩\u{200d}💻 word");
     editor.delete_word_forward().unwrap();
-    assert_eq!(editor.document().plain_text(), "  👩‍💻 word");
+    assert_eq!(editor.document().plain_text(), "  👩\u{200d}💻 word");
     assert!(
         editor
             .document()
@@ -837,7 +992,7 @@ fn word_deletion_preserves_unicode_graphemes_and_selection_direction_on_undo() {
     assert_eq!(editor.document().plain_text(), "");
     assert!(editor.undo());
     assert!(editor.undo());
-    assert_eq!(editor.document().plain_text(), "  👩‍💻 word");
+    assert_eq!(editor.document().plain_text(), "  👩\u{200d}💻 word");
     let mut editor = Editor::from_text("abc def");
     let selection = Selection::new(Position::new(0, 6), Position::new(0, 1));
     editor.set_selection(selection).unwrap();
@@ -863,12 +1018,12 @@ fn word_deletion_and_movement_stop_at_symbol_and_emoji_runs() {
         editor.delete_word_backward().unwrap();
         assert_eq!(editor.document().plain_text(), expected, "{text:?}");
     }
-    let mut editor = Editor::from_text("a, 👩‍💻 b");
+    let mut editor = Editor::from_text("a, 👩\u{200d}💻 b");
     let mut stops = Vec::new();
     loop {
         let before = editor.selection().focus;
         editor
-            .move_cursor(textloom::Movement::WordForward, false)
+            .move_cursor(Movement::WordForward, SelectionMode::Move)
             .unwrap();
         if editor.selection().focus == before {
             break;
@@ -905,7 +1060,7 @@ fn indent_mixed_selection_excludes_endpoint_at_next_paragraph_start() {
     let mut editor = Editor::from_text("body\nheading\nbullet\nordered\nexcluded\nclamp");
     kind(&mut editor, 1, ParagraphKind::Heading { level: 2 });
     kind(&mut editor, 2, ParagraphKind::Bullet { indent: 2 });
-    kind(&mut editor, 3, ord(2, 9));
+    kind(&mut editor, 3, ordered(2, 9));
     kind(&mut editor, 4, ParagraphKind::Bullet { indent: 1 });
     kind(&mut editor, 5, ParagraphKind::Bullet { indent: 255 });
     let selection = Selection::new(Position::new(4, 0), Position::new(0, 0));
@@ -919,25 +1074,34 @@ fn indent_mixed_selection_excludes_endpoint_at_next_paragraph_start() {
         editor.document().paragraph(2).unwrap().kind(),
         ParagraphKind::Bullet { indent: 3 }
     );
-    assert_eq!(editor.document().paragraph(3).unwrap().kind(), ord(3, 9));
+    assert_eq!(
+        editor.document().paragraph(3).unwrap().kind(),
+        ordered(3, 9)
+    );
     for index in [0, 1, 4, 5] {
-        assert!(Arc::ptr_eq(
-            &before.paragraphs()[index],
-            &editor.document().paragraphs()[index]
-        ));
+        assert!(
+            Arc::ptr_eq(
+                &before.paragraphs()[index],
+                &editor.document().paragraphs()[index]
+            ),
+            "paragraph {index}"
+        );
     }
     assert!(editor.undo());
     assert_eq!(Fragment::from_document(editor.document()), before);
     assert_eq!(editor.selection(), selection);
     assert!(editor.redo());
-    assert_eq!(editor.document().paragraph(3).unwrap().kind(), ord(3, 9));
+    assert_eq!(
+        editor.document().paragraph(3).unwrap().kind(),
+        ordered(3, 9)
+    );
 }
 
 #[test]
 fn outdent_zero_level_items_becomes_body_and_other_items_decrease_one_level() {
     let mut editor = Editor::from_text("a\nb\nc");
     kind(&mut editor, 0, ParagraphKind::Bullet { indent: 0 });
-    kind(&mut editor, 1, ord(0, 17));
+    kind(&mut editor, 1, ordered(0, 17));
     kind(&mut editor, 2, ParagraphKind::Bullet { indent: 1 });
     style(
         &mut editor,
@@ -1013,11 +1177,11 @@ fn operations_reject_active_ime_without_mutating_content_selection_or_history() 
     let selection = editor.selection();
     let options = SearchOptions::default();
     assert_eq!(
-        editor.find_next("word", options, true),
+        editor.find_next("word", options, SearchWrap::Around),
         Err(Error::CompositionActive)
     );
     assert_eq!(
-        editor.find_previous("word", options, true),
+        editor.find_previous("word", options, SearchWrap::Around),
         Err(Error::CompositionActive)
     );
     assert_eq!(
@@ -1125,7 +1289,11 @@ fn typing_over_a_selection_from_a_paragraph_start_matches_deleting_it_first() {
         deleted.delete_backward().unwrap();
         deleted.insert_text("X").unwrap();
         assert_eq!(lines(&typed), lines(&deleted), "{end:?}");
-        assert_eq!(typed.document().paragraph(0).unwrap().kind(), BODY);
+        assert_eq!(
+            typed.document().paragraph(0).unwrap().kind(),
+            BODY,
+            "{end:?}"
+        );
         let mut replaced = with_kinds("Title\nbody", &[H1, BODY]);
         let query = replaced.document().text(Position::default()..end).unwrap();
         replaced
@@ -1175,13 +1343,13 @@ fn pasting_lines_over_a_selection_from_a_paragraph_start_matches_deleting_it_fir
         ),
         (
             "a\nb\nc",
-            vec![ord(0, 1), ord(0, 5), ord(0, 6)],
+            vec![ordered(0, 1), ordered(0, 5), ordered(0, 6)],
             Position::new(1, 0),
             "x\ny",
             vec![
-                line("x", ord(0, 5)),
-                line("yb", ord(0, 6)),
-                line("c", ord(0, 7)),
+                line("x", ordered(0, 5)),
+                line("yb", ordered(0, 6)),
+                line("c", ordered(0, 7)),
             ],
         ),
     ] {
@@ -1267,13 +1435,13 @@ fn seeded_documents_replace_selections_like_deleting_them_first() {
             for _ in 0..next(3) {
                 let start = text.len();
                 text.push_str(["a", "bc", "e\u{301}"][next(3)]);
-                spans.push(Span {
-                    range: start..text.len(),
-                    style: styles[next(styles.len())],
-                    link: None,
-                });
+                spans.push(Span::new(
+                    start..text.len(),
+                    styles[next(styles.len())],
+                    None,
+                ));
             }
-            Paragraph::new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
+            Paragraph::try_new(&text, spans, paragraph_kinds[next(paragraph_kinds.len())]).unwrap()
         }));
         let positions: Vec<_> = document
             .paragraphs()
@@ -1353,7 +1521,7 @@ fn rich_paste_without_a_copied_paragraph_break_keeps_the_destination_kind() {
         [line("Tibody text", ParagraphKind::Bullet { indent: 0 })]
     );
 
-    let mut numbered = with_kinds("it", &[ord(0, 7)]);
+    let mut numbered = with_kinds("it", &[ordered(0, 7)]);
     numbered.select_all();
     let item_text = numbered.selected_fragment();
     caret(&mut numbered, 0, 1);
@@ -1371,9 +1539,9 @@ fn rich_paste_without_a_copied_paragraph_break_keeps_the_destination_kind() {
         let mut editor = with_kinds("Title", &[H1]);
         let revision = editor.document().revision();
         editor.insert_fragment(&fragment).unwrap();
-        assert_eq!(lines(&editor), [line("Title", H1)]);
-        assert_eq!(editor.undo_len(), 0);
-        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(lines(&editor), [line("Title", H1)], "{fragment:?}");
+        assert_eq!(editor.undo_len(), 0, "{fragment:?}");
+        assert_eq!(editor.document().revision(), revision, "{fragment:?}");
     }
 
     let mut tail = with_kinds("Title", &[H1]);
@@ -1415,7 +1583,7 @@ fn rich_and_plain_paste_choose_the_same_paragraph_kinds() {
         ),
         (
             "a\nb\nc\nd",
-            &[ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)],
+            &[ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)],
             Position::new(0, 1),
             Position::new(2, 0),
             "x",
@@ -1435,21 +1603,21 @@ fn rich_and_plain_paste_choose_the_same_paragraph_kinds() {
 
 #[test]
 fn rich_paste_into_a_list_keeps_source_numbering_and_renumbers_the_rest() {
-    let mut source = with_kinds("x\ny\nz", &[ord(0, 5), ord(0, 6), ord(0, 7)]);
+    let mut source = with_kinds("x\ny\nz", &[ordered(0, 5), ordered(0, 6), ordered(0, 7)]);
     source.select_all();
     let items = source.selected_fragment();
-    let mut editor = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut editor = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     let following = Arc::clone(&editor.document().paragraphs()[2]);
     caret(&mut editor, 1, 0);
     editor.insert_fragment(&items).unwrap();
     assert_eq!(
         lines(&editor),
         [
-            line("a", ord(0, 1)),
-            line("x", ord(0, 5)),
-            line("y", ord(0, 6)),
-            line("zb", ord(0, 7)),
-            line("c", ord(0, 8)),
+            line("a", ordered(0, 1)),
+            line("x", ordered(0, 5)),
+            line("y", ordered(0, 6)),
+            line("zb", ordered(0, 7)),
+            line("c", ordered(0, 8)),
         ]
     );
     assert!(Arc::ptr_eq(&following, &editor.document().paragraphs()[4]));
@@ -1461,9 +1629,12 @@ fn rich_paste_into_a_list_keeps_source_numbering_and_renumbers_the_rest() {
     );
     assert_eq!(editor.undo_len(), 1);
     assert!(editor.undo());
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(0, 3)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 3)]
+    );
 
-    let mut lines_source = with_kinds("p\nq\nr", &[ord(0, 1), ord(0, 2), BODY]);
+    let mut lines_source = with_kinds("p\nq\nr", &[ordered(0, 1), ordered(0, 2), BODY]);
     lines_source
         .set_selection(Selection::new(Position::new(0, 0), Position::new(2, 0)))
         .unwrap();
@@ -1475,17 +1646,17 @@ fn rich_paste_into_a_list_keeps_source_numbering_and_renumbers_the_rest() {
             start: Some(1)
         }
     );
-    let mut destination = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut destination = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     caret(&mut destination, 1, 0);
     destination.insert_fragment(&copied).unwrap();
     assert_eq!(
         lines(&destination),
         [
-            line("a", ord(0, 1)),
-            line("p", ord(0, 1)),
-            line("q", ord(0, 2)),
-            line("b", ord(0, 3)),
-            line("c", ord(0, 4)),
+            line("a", ordered(0, 1)),
+            line("p", ordered(0, 1)),
+            line("q", ordered(0, 2)),
+            line("b", ordered(0, 3)),
+            line("c", ordered(0, 4)),
         ]
     );
     assert!(
@@ -1498,16 +1669,16 @@ fn rich_paste_into_a_list_keeps_source_numbering_and_renumbers_the_rest() {
         .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 0)))
         .unwrap();
     let continuation = lines_source.selected_fragment();
-    let mut destination = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut destination = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     caret(&mut destination, 1, 0);
     destination.insert_fragment(&continuation).unwrap();
     assert_eq!(
         lines(&destination),
         [
-            line("a", ord(0, 1)),
-            line("q", ord(0, 2)),
-            line("b", ord(0, 3)),
-            line("c", ord(0, 4)),
+            line("a", ordered(0, 1)),
+            line("q", ordered(0, 2)),
+            line("b", ordered(0, 3)),
+            line("c", ordered(0, 4)),
         ]
     );
     assert!(!destination.document().to_html().contains("value="));
@@ -1515,10 +1686,16 @@ fn rich_paste_into_a_list_keeps_source_numbering_and_renumbers_the_rest() {
 
 #[test]
 fn indenting_and_outdenting_renumber_the_runs_items_leave_and_join() {
-    let mut editor = with_kinds("A\nB\nC\nD", &[ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+    let mut editor = with_kinds(
+        "A\nB\nC\nD",
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)],
+    );
     caret(&mut editor, 1, 0);
     editor.indent_list().unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(1, 1), ord(0, 2), ord(0, 3)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(1, 1), ordered(0, 2), ordered(0, 3)]
+    );
     assert_eq!(editor.undo_len(), 1);
     assert_eq!(
         editor.document().to_html(),
@@ -1526,59 +1703,83 @@ fn indenting_and_outdenting_renumber_the_runs_items_leave_and_join() {
     );
     caret(&mut editor, 2, 0);
     editor.indent_list().unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(1, 1), ord(1, 2), ord(0, 2)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(1, 1), ordered(1, 2), ordered(0, 2)]
+    );
     editor.outdent_list().unwrap();
     caret(&mut editor, 1, 0);
     editor.outdent_list().unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)]
+    );
     assert!(editor.undo());
     assert!(editor.undo());
     assert!(editor.undo());
     assert!(editor.undo());
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)]
+    );
 
-    let mut selection = with_kinds("A\nB\nC\nD", &[ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+    let mut selection = with_kinds(
+        "A\nB\nC\nD",
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)],
+    );
     selection
         .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 1)))
         .unwrap();
     selection.indent_list().unwrap();
     assert_eq!(
         kinds(&selection),
-        [ord(0, 1), ord(1, 1), ord(1, 2), ord(0, 2)]
+        [ordered(0, 1), ordered(1, 1), ordered(1, 2), ordered(0, 2)]
     );
     assert_eq!(selection.undo_len(), 1);
 
-    let mut nested = with_kinds("A\nB\nC", &[ord(0, 1), ord(1, 1), ord(0, 2)]);
+    let mut nested = with_kinds("A\nB\nC", &[ordered(0, 1), ordered(1, 1), ordered(0, 2)]);
     caret(&mut nested, 1, 0);
     nested.outdent_list().unwrap();
-    assert_eq!(kinds(&nested), [ord(0, 1), ord(0, 2), ord(0, 3)]);
+    assert_eq!(
+        kinds(&nested),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 3)]
+    );
 
-    let mut parent = with_kinds("a\nx\ny\nb", &[ord(0, 1), ord(1, 1), ord(1, 2), ord(0, 2)]);
+    let mut parent = with_kinds(
+        "a\nx\ny\nb",
+        &[ordered(0, 1), ordered(1, 1), ordered(1, 2), ordered(0, 2)],
+    );
     caret(&mut parent, 1, 0);
     parent.outdent_list().unwrap();
-    assert_eq!(kinds(&parent), [ord(0, 1), ord(0, 2), ord(1, 1), ord(0, 3)]);
+    assert_eq!(
+        kinds(&parent),
+        [ordered(0, 1), ordered(0, 2), ordered(1, 1), ordered(0, 3)]
+    );
 
-    let mut first = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut first = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     caret(&mut first, 0, 0);
     first.outdent_list().unwrap();
-    assert_eq!(kinds(&first), [BODY, ord(0, 1), ord(0, 2)]);
+    assert_eq!(kinds(&first), [BODY, ordered(0, 1), ordered(0, 2)]);
 }
 
 #[test]
 fn ordered_runs_continue_past_nested_items() {
-    let mut editor = with_kinds("a\nx\nb", &[ord(0, 1), ord(1, 1), ord(0, 2)]);
+    let mut editor = with_kinds("a\nx\nb", &[ordered(0, 1), ordered(1, 1), ordered(0, 2)]);
     caret(&mut editor, 0, 1);
     editor.insert_paragraph().unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(1, 1), ord(0, 3)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 2), ordered(1, 1), ordered(0, 3)]
+    );
     assert!(!editor.document().to_html().contains("value="));
     let mut ended = with_kinds(
         "a\nx\nb\nbody\nc",
         &[
-            ord(1, 1),
+            ordered(1, 1),
             ParagraphKind::Bullet { indent: 1 },
-            ord(1, 5),
+            ordered(1, 5),
             BODY,
-            ord(1, 9),
+            ordered(1, 9),
         ],
     );
     caret(&mut ended, 0, 1);
@@ -1586,91 +1787,118 @@ fn ordered_runs_continue_past_nested_items() {
     assert_eq!(
         kinds(&ended),
         [
-            ord(1, 1),
-            ord(1, 2),
+            ordered(1, 1),
+            ordered(1, 2),
             ParagraphKind::Bullet { indent: 1 },
-            ord(1, 5),
+            ordered(1, 5),
             BODY,
-            ord(1, 9)
+            ordered(1, 9)
         ]
     );
 
-    let mut restart = with_kinds("A\nsub\nB", &[ord(0, 1), ord(1, 1), ord(0, 2)]);
+    let mut restart = with_kinds("A\nsub\nB", &[ordered(0, 1), ordered(1, 1), ordered(0, 2)]);
     caret(&mut restart, 0, 0);
-    restart.set_paragraph_kind(ord(0, 5)).unwrap();
-    assert_eq!(kinds(&restart), [ord(0, 5), ord(1, 1), ord(0, 6)]);
+    restart.set_paragraph_kind(ordered(0, 5)).unwrap();
+    assert_eq!(
+        kinds(&restart),
+        [ordered(0, 5), ordered(1, 1), ordered(0, 6)]
+    );
     restart
         .set_selection(Selection::new(Position::new(0, 0), Position::new(1, 0)))
         .unwrap();
     restart.delete_backward().unwrap();
-    assert_eq!(kinds(&restart), [ord(1, 1), ord(0, 1)]);
+    assert_eq!(kinds(&restart), [ordered(1, 1), ordered(0, 1)]);
 }
 
 #[test]
 fn explicit_restarts_survive_structural_edits_earlier_in_the_list() {
-    let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), ord(0, 2), ord(0, 1), ord(0, 2)]);
+    let mut editor = with_kinds(
+        "a\nb\nc\nd",
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 1), ordered(0, 2)],
+    );
     caret(&mut editor, 0, 1);
     editor.insert_paragraph().unwrap();
     assert_eq!(
         kinds(&editor),
-        [ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 1), ord(0, 2)]
+        [
+            ordered(0, 1),
+            ordered(0, 2),
+            ordered(0, 3),
+            ordered(0, 1),
+            ordered(0, 2)
+        ]
     );
     join_with_previous(&mut editor, 2);
     join_with_previous(&mut editor, 1);
     assert_eq!(editor.document().plain_text(), "ab\nc\nd");
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 1), ord(0, 2)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 1), ordered(0, 2)]
+    );
 }
 
 #[test]
 fn removing_an_item_from_a_list_closes_its_numbering_gap() {
-    let mut editor = with_kinds("one\n\nthree", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut editor = with_kinds(
+        "one\n\nthree",
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 3)],
+    );
     caret(&mut editor, 1, 0);
     editor.insert_paragraph().unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), BODY, ord(0, 2)]);
+    assert_eq!(kinds(&editor), [ordered(0, 1), BODY, ordered(0, 2)]);
     assert_eq!(editor.undo_len(), 1);
     assert!(editor.undo());
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(0, 3)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 3)]
+    );
 
-    let mut converted = with_kinds("a\nb\nc\nd", &[ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+    let mut converted = with_kinds(
+        "a\nb\nc\nd",
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)],
+    );
     converted
         .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 1)))
         .unwrap();
     converted.set_paragraph_kind(H1).unwrap();
-    assert_eq!(kinds(&converted), [ord(0, 1), H1, H1, ord(0, 1)]);
+    assert_eq!(kinds(&converted), [ordered(0, 1), H1, H1, ordered(0, 1)]);
 
-    let mut first = with_kinds("a\nb", &[ord(0, 4), ord(0, 5)]);
+    let mut first = with_kinds("a\nb", &[ordered(0, 4), ordered(0, 5)]);
     caret(&mut first, 0, 0);
     first
         .set_paragraph_kind(ParagraphKind::Bullet { indent: 1 })
         .unwrap();
     assert_eq!(
         kinds(&first),
-        [ParagraphKind::Bullet { indent: 1 }, ord(0, 1)]
+        [ParagraphKind::Bullet { indent: 1 }, ordered(0, 1)]
     );
 
-    let mut joined = with_kinds("x\na\nb", &[BODY, ord(0, 1), ord(0, 2)]);
+    let mut joined = with_kinds("x\na\nb", &[BODY, ordered(0, 1), ordered(0, 2)]);
     join_with_previous(&mut joined, 1);
-    assert_eq!(lines(&joined), [line("xa", BODY), line("b", ord(0, 1))]);
+    assert_eq!(lines(&joined), [line("xa", BODY), line("b", ordered(0, 1))]);
 
     let mut restart = with_kinds(
         "a\nb\nc\nd",
-        &[ord(0, 1), ord(0, 2), ord(0, 10), ord(0, 11)],
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 10), ordered(0, 11)],
     );
     restart
         .set_selection(Selection::new(Position::new(2, 0), Position::new(3, 0)))
         .unwrap();
     restart.delete_backward().unwrap();
-    assert_eq!(kinds(&restart), [ord(0, 1), ord(0, 2), ord(0, 10)]);
+    assert_eq!(
+        kinds(&restart),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 10)]
+    );
     let mut kept = with_kinds(
         "a\nb\nc\nd",
-        &[ord(0, 1), ord(0, 2), ord(0, 10), ord(0, 11)],
+        &[ordered(0, 1), ordered(0, 2), ordered(0, 10), ordered(0, 11)],
     );
     kept.set_selection(Selection::new(Position::new(0, 0), Position::new(2, 0)))
         .unwrap();
     kept.delete_backward().unwrap();
-    assert_eq!(kinds(&kept), [ord(0, 10), ord(0, 11)]);
+    assert_eq!(kinds(&kept), [ordered(0, 10), ordered(0, 11)]);
 
-    let mut pasted = with_kinds("aa\nbb\ncc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut pasted = with_kinds("aa\nbb\ncc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     pasted
         .set_selection(Selection::new(Position::new(0, 0), Position::new(1, 1)))
         .unwrap();
@@ -1681,24 +1909,24 @@ fn removing_an_item_from_a_list_closes_its_numbering_gap() {
         lines(&pasted),
         [
             line("p", BODY),
-            line("qb", ord(0, 1)),
-            line("cc", ord(0, 2))
+            line("qb", ordered(0, 1)),
+            line("cc", ordered(0, 2))
         ]
     );
 }
 
 #[test]
 fn replace_all_numbers_lists_like_sequential_replacement() {
-    let mut batch = with_kinds("a\na\nb", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut batch = with_kinds("a\na\nb", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     assert_eq!(
         batch
             .replace_all("a\n", "", SearchOptions::default())
             .unwrap(),
         2
     );
-    assert_eq!(lines(&batch), [line("b", ord(0, 1))]);
+    assert_eq!(lines(&batch), [line("b", ordered(0, 1))]);
 
-    let paragraph_kinds = [BODY, ord(0, 5), ord(0, 9), BODY];
+    let paragraph_kinds = [BODY, ordered(0, 5), ordered(0, 9), BODY];
     let mut batch = with_kinds("x\na\nb\nx", &paragraph_kinds);
     let mut sequential = with_kinds("x\na\nb\nx", &paragraph_kinds);
     batch
@@ -1711,7 +1939,7 @@ fn replace_all_numbers_lists_like_sequential_replacement() {
         .replace_range(Position::new(0, 0)..Position::new(0, 1), "y\nz")
         .unwrap();
     assert_eq!(lines(&batch), lines(&sequential));
-    assert_eq!(batch.document().paragraph(3).unwrap().kind(), ord(0, 9));
+    assert_eq!(batch.document().paragraph(3).unwrap().kind(), ordered(0, 9));
 }
 
 #[test]
@@ -1733,17 +1961,17 @@ fn formatting_large_paragraphs_remains_undoable_within_default_history_limits() 
 
     let line = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n";
     let text = line.repeat(2 * 1024 * 1024 / line.len());
-    let mut document = Editor::from_text(&text);
-    document.insert_text("x").unwrap();
-    document.select_all();
-    document.apply_style(bold).unwrap();
-    assert_eq!(document.undo_len(), 2);
-    assert!(document.history_bytes() <= HistoryLimits::default().max_bytes);
-    let bytes = document.history_bytes();
-    assert!(document.undo());
-    assert_eq!(document.history_bytes(), bytes);
-    assert!(document.undo());
-    assert_eq!(document.document().plain_text(), text);
+    let mut many_paragraphs = Editor::from_text(&text);
+    many_paragraphs.insert_text("x").unwrap();
+    many_paragraphs.select_all();
+    many_paragraphs.apply_style(bold).unwrap();
+    assert_eq!(many_paragraphs.undo_len(), 2);
+    assert!(many_paragraphs.history_bytes() <= HistoryLimits::default().max_bytes);
+    let bytes = many_paragraphs.history_bytes();
+    assert!(many_paragraphs.undo());
+    assert_eq!(many_paragraphs.history_bytes(), bytes);
+    assert!(many_paragraphs.undo());
+    assert_eq!(many_paragraphs.document().plain_text(), text);
 }
 
 #[test]
@@ -1755,11 +1983,11 @@ fn deterministic_list_edits_are_reversible_and_keep_documents_valid() {
         seed ^= seed << 17;
         (seed % bound as u64) as usize
     };
-    for _ in 0..40 {
+    for case in 0..40 {
         let mut editor = Editor::from_text("a\nb\nc\nd\ne\nf\ng");
         editor.select_all();
-        editor.set_paragraph_kind(ord(0, 1)).unwrap();
-        for _ in 0..30 {
+        editor.set_paragraph_kind(ordered(0, 1)).unwrap();
+        for step in 0..30 {
             let paragraphs = editor.document().paragraphs().len();
             let paragraph = next(paragraphs);
             let len = editor.document().paragraph(paragraph).unwrap().text().len();
@@ -1803,19 +2031,32 @@ fn deterministic_list_edits_are_reversible_and_keep_documents_valid() {
                 }
             }
             let after = Fragment::from_document(editor.document());
-            let restored = textloom::Document::from_bytes(&editor.document().to_bytes()).unwrap();
-            editor.document().to_html();
+            let restored = Document::from_bytes(&editor.document().to_bytes()).unwrap();
+            // Exporting any edited document must not panic.
+            let _ = editor.document().to_html();
             let numbered = kinds(&editor);
-            assert_eq!(numbered, shown(&restored));
+            assert_eq!(numbered, shown(&restored), "case {case}, step {step}");
             if editor.undo_len() > undo_len {
-                assert!(editor.undo());
-                assert_eq!(Fragment::from_document(editor.document()), before);
-                assert_eq!(kinds(&editor), shown(&Document::from_fragment(&before)));
-                assert!(editor.redo());
-                assert_eq!(Fragment::from_document(editor.document()), after);
-                assert_eq!(kinds(&editor), numbered);
+                assert!(editor.undo(), "case {case}, step {step}");
+                assert_eq!(
+                    Fragment::from_document(editor.document()),
+                    before,
+                    "case {case}, step {step}"
+                );
+                assert_eq!(
+                    kinds(&editor),
+                    shown(&Document::from_fragment(&before)),
+                    "case {case}, step {step}"
+                );
+                assert!(editor.redo(), "case {case}, step {step}");
+                assert_eq!(
+                    Fragment::from_document(editor.document()),
+                    after,
+                    "case {case}, step {step}"
+                );
+                assert_eq!(kinds(&editor), numbered, "case {case}, step {step}");
             } else {
-                assert_eq!(after, before);
+                assert_eq!(after, before, "case {case}, step {step}");
             }
         }
     }
@@ -1823,7 +2064,7 @@ fn deterministic_list_edits_are_reversible_and_keep_documents_valid() {
 
 #[test]
 fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
-    let mut editor = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 7)]);
+    let mut editor = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 7)]);
     caret(&mut editor, 2, 0);
     editor
         .insert_fragment(&Fragment::from_text("x\ny"))
@@ -1831,14 +2072,17 @@ fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
     assert_eq!(
         lines(&editor),
         [
-            line("a", ord(0, 1)),
-            line("b", ord(0, 2)),
+            line("a", ordered(0, 1)),
+            line("b", ordered(0, 2)),
             line("x", BODY),
-            line("yc", ord(0, 7))
+            line("yc", ordered(0, 7))
         ]
     );
 
-    let mut editor = with_kinds("Intro\nSteps\none\ntwo", &[BODY, H1, ord(0, 1), ord(0, 2)]);
+    let mut editor = with_kinds(
+        "Intro\nSteps\none\ntwo",
+        &[BODY, H1, ordered(0, 1), ordered(0, 2)],
+    );
     let original = Fragment::from_document(editor.document());
     editor
         .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 0)))
@@ -1848,19 +2092,19 @@ fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
     editor.insert_fragment(&cut).unwrap();
     assert_eq!(Fragment::from_document(editor.document()), original);
 
-    let mut source = with_kinds("x\ny\nz", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut source = with_kinds("x\ny\nz", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     source.select_all();
     let items = source.selected_fragment();
-    let mut editor = with_kinds("Title\nnext", &[ord(0, 3), ord(0, 4)]);
+    let mut editor = with_kinds("Title\nnext", &[ordered(0, 3), ordered(0, 4)]);
     caret(&mut editor, 0, 2);
     editor.insert_fragment(&items).unwrap();
     assert_eq!(
         lines(&editor),
         [
-            line("Tix", ord(0, 3)),
-            line("y", ord(0, 4)),
-            line("ztle", ord(0, 5)),
-            line("next", ord(0, 6))
+            line("Tix", ordered(0, 3)),
+            line("y", ordered(0, 4)),
+            line("ztle", ordered(0, 5)),
+            line("next", ordered(0, 6))
         ]
     );
     assert_eq!(
@@ -1871,7 +2115,7 @@ fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
         }
     );
 
-    for (pasted, heading, numbers) in [
+    for (pasted, heading, (moved_number, next_number)) in [
         ("x\np\nz", false, (4, 5)),
         ("x\nHeading\nz", true, (1, 2)),
         ("x\nHeading\np\nq\nz", true, (1, 2)),
@@ -1882,15 +2126,15 @@ fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
         }
         source.select_all();
         let fragment = source.selected_fragment();
-        let mut editor = with_kinds("Title\nnext", &[ord(0, 3), ord(0, 4)]);
+        let mut editor = with_kinds("Title\nnext", &[ordered(0, 3), ordered(0, 4)]);
         caret(&mut editor, 0, 2);
         editor.insert_fragment(&fragment).unwrap();
         let count = editor.document().paragraphs().len();
         assert_eq!(
             lines(&editor)[count - 2..],
             [
-                line("ztle", ord(0, numbers.0)),
-                line("next", ord(0, numbers.1))
+                line("ztle", ordered(0, moved_number)),
+                line("next", ordered(0, next_number))
             ],
             "{pasted:?}"
         );
@@ -1899,7 +2143,8 @@ fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
             ParagraphKind::Ordered {
                 indent: 0,
                 start: None
-            }
+            },
+            "{pasted:?}"
         );
     }
 }
@@ -1907,7 +2152,7 @@ fn rich_paste_keeps_the_ordinal_of_destination_text_it_moves_down() {
 #[test]
 fn removed_items_pass_their_ordinals_only_within_their_own_run() {
     let text = "a\nbody\nc\nd";
-    let paragraph_kinds = [ord(0, 6), BODY, ord(0, 1), ord(0, 2)];
+    let paragraph_kinds = [ordered(0, 6), BODY, ordered(0, 1), ordered(0, 2)];
     let mut one_step = with_kinds(text, &paragraph_kinds);
     one_step
         .replace_range(Position::new(0, 0)..Position::new(2, 0), "")
@@ -1920,18 +2165,18 @@ fn removed_items_pass_their_ordinals_only_within_their_own_run() {
     }
     assert_eq!(
         lines(&one_step),
-        [line("c", ord(0, 1)), line("d", ord(0, 2))]
+        [line("c", ordered(0, 1)), line("d", ordered(0, 2))]
     );
     assert_eq!(lines(&two_steps), lines(&one_step));
 
-    let mut nested = with_kinds("x\ny\nz", &[ord(1, 4), ord(0, 8), ord(1, 1)]);
+    let mut nested = with_kinds("x\ny\nz", &[ordered(1, 4), ordered(0, 8), ordered(1, 1)]);
     nested
         .set_selection(Selection::new(Position::new(0, 0), Position::new(2, 0)))
         .unwrap();
     nested.delete_backward().unwrap();
-    assert_eq!(lines(&nested), [line("z", ord(1, 1))]);
+    assert_eq!(lines(&nested), [line("z", ordered(1, 1))]);
 
-    let mut copied = with_kinds("a\nbody\nc", &[ord(0, 6), BODY, ord(0, 1)]);
+    let mut copied = with_kinds("a\nbody\nc", &[ordered(0, 6), BODY, ordered(0, 1)]);
     let original = Fragment::from_document(copied.document());
     copied
         .set_selection(Selection::new(Position::new(0, 0), Position::new(2, 0)))
@@ -1941,7 +2186,14 @@ fn removed_items_pass_their_ordinals_only_within_their_own_run() {
     assert_eq!(Fragment::from_document(copied.document()), original);
     assert_eq!(copied.undo_len(), 0);
 
-    let paragraph_kinds = [BODY, BODY, ord(2, 1), BODY, ord(1, 1), ord(2, 4)];
+    let paragraph_kinds = [
+        BODY,
+        BODY,
+        ordered(2, 1),
+        BODY,
+        ordered(1, 1),
+        ordered(2, 4),
+    ];
     let mut batch = with_kinds("a  c\n\nb\n\nd\nc", &paragraph_kinds);
     assert_eq!(
         batch
@@ -1949,7 +2201,10 @@ fn removed_items_pass_their_ordinals_only_within_their_own_run() {
             .unwrap(),
         2
     );
-    assert_eq!(lines(&batch), [line("a  cbd", BODY), line("c", ord(2, 4))]);
+    assert_eq!(
+        lines(&batch),
+        [line("a  cbd", BODY), line("c", ordered(2, 4))]
+    );
 }
 
 #[test]
@@ -2013,13 +2268,23 @@ fn replace_all_matches_at_paragraph_ends_take_styles_like_sequential_replacement
         }
         let mut sequential = Editor::new(batch.document().clone());
         caret(&mut sequential, 0, 0);
-        assert_eq!(batch.replace_all(query, replacement, options).unwrap(), 2);
+        assert_eq!(
+            batch.replace_all(query, replacement, options).unwrap(),
+            2,
+            "{text:?}"
+        );
         for _ in 0..2 {
-            assert!(sequential.find_next(query, options, false).unwrap());
+            assert!(
+                sequential
+                    .find_next(query, options, SearchWrap::Stop)
+                    .unwrap(),
+                "{text:?}"
+            );
             assert!(
                 sequential
                     .replace_selected_match(query, replacement, options)
-                    .unwrap()
+                    .unwrap(),
+                "{text:?}"
             );
         }
         let spans: Vec<_> = batch.document().paragraphs()[0]
@@ -2051,13 +2316,14 @@ fn replace_all_joining_many_paragraphs_into_growing_clusters_styles_like_sequent
             let mut sequential = Editor::new(batch.document().clone());
             assert_eq!(
                 batch.replace_all("\n", replacement, options).unwrap(),
-                count - 1
+                count - 1,
+                "{unit:?}, count {count}"
             );
             let [paragraph] = batch.document().paragraphs() else {
                 panic!("matches join every paragraph");
             };
             let text = format!("{unit}{}", format!("{replacement}{unit}").repeat(count - 1));
-            assert_eq!(paragraph.text(), text);
+            assert_eq!(paragraph.text(), text, "{unit:?}, count {count}");
             let bold_end = bold_bytes.unwrap_or(text.len());
             let mut expected = vec![(0..bold_end, true)];
             if bold_end < text.len() {
@@ -2071,11 +2337,15 @@ fn replace_all_joining_many_paragraphs_into_growing_clusters_styles_like_sequent
             assert_eq!(spans, expected, "{unit:?}");
             if count < 16 {
                 caret(&mut sequential, 0, 0);
-                while sequential.find_next("\n", options, false).unwrap() {
+                while sequential
+                    .find_next("\n", options, SearchWrap::Stop)
+                    .unwrap()
+                {
                     assert!(
                         sequential
                             .replace_selected_match("\n", replacement, options)
-                            .unwrap()
+                            .unwrap(),
+                        "{unit:?}"
                     );
                 }
                 assert_eq!(
@@ -2096,32 +2366,32 @@ fn edits_in_long_nested_lists_follow_distant_parents() {
     }
     let mut editor = Editor::from_text(&text);
     editor.select_all();
-    editor.set_paragraph_kind(ord(1, 1)).unwrap();
+    editor.set_paragraph_kind(ordered(1, 1)).unwrap();
     caret(&mut editor, 0, 0);
-    editor.set_paragraph_kind(ord(0, 3)).unwrap();
-    let expected: Vec<_> = std::iter::once(ord(0, 3))
-        .chain((1..=200).map(|ordinal| ord(1, ordinal)))
+    editor.set_paragraph_kind(ordered(0, 3)).unwrap();
+    let expected: Vec<_> = iter::once(ordered(0, 3))
+        .chain((1..=200).map(|ordinal| ordered(1, ordinal)))
         .collect();
     assert_eq!(kinds(&editor), expected);
 
     caret(&mut editor, 200, 5);
     editor.insert_paragraph().unwrap();
-    assert_eq!(kinds(&editor)[201], ord(1, 201));
+    assert_eq!(kinds(&editor)[201], ordered(1, 201));
     editor.insert_paragraph().unwrap();
-    assert_eq!(kinds(&editor)[201], ord(0, 4));
+    assert_eq!(kinds(&editor)[201], ordered(0, 4));
 
     caret(&mut editor, 150, 0);
     editor.outdent_list().unwrap();
     let numbered = kinds(&editor);
     assert_eq!(
         numbered[149..153],
-        [ord(1, 149), ord(0, 4), ord(1, 1), ord(1, 2)]
+        [ordered(1, 149), ordered(0, 4), ordered(1, 1), ordered(1, 2)]
     );
-    assert_eq!(numbered[200..], [ord(1, 50), ord(0, 5)]);
+    assert_eq!(numbered[200..], [ordered(1, 50), ordered(0, 5)]);
     assert!(editor.undo());
     assert_eq!(
         kinds(&editor)[149..152],
-        [ord(1, 149), ord(1, 150), ord(1, 151)]
+        [ordered(1, 149), ordered(1, 150), ordered(1, 151)]
     );
 
     let mut bullets = Editor::from_text(&["item"; 300].join("\n"));
@@ -2142,18 +2412,16 @@ fn edits_in_long_nested_lists_follow_distant_parents() {
     );
 }
 
-fn document_with(lines: &[(String, ParagraphKind)]) -> Document {
-    Document::from_paragraphs(lines.iter().map(|(text, kind)| {
-        let spans = if text.is_empty() {
+/// Builds an unstyled document with one paragraph per line.
+fn document_with(lines: &[Line]) -> Document {
+    Document::from_paragraphs(lines.iter().map(|line| {
+        let spans = if line.text.is_empty() {
             Vec::new()
         } else {
-            vec![Span {
-                range: 0..text.len(),
-                style: InlineStyle::default(),
-                link: None,
-            }]
+            vec![Span::new(0..line.text.len(), InlineStyle::default(), None)]
         };
-        Paragraph::new(text, spans, *kind).unwrap()
+        Paragraph::try_new(&line.text, spans, line.kind)
+            .expect("one span covering the whole text, or none for empty text, is valid")
     }))
 }
 
@@ -2187,21 +2455,24 @@ fn seeded_list_documents_paste_over_themselves_and_batch_kinds_follow_sequential
                     start: (next(10) >= 7).then(|| 1 + next(9) as u32),
                 },
             };
-            source.push((text, paragraph_kind));
+            source.push(Line {
+                text,
+                kind: paragraph_kind,
+            });
         }
         let document = document_with(&source);
         let original = Fragment::from_document(&document);
         let mut position = || {
             let paragraph = next(source.len());
-            Position::new(paragraph, next(source[paragraph].0.len() + 1))
+            Position::new(paragraph, next(source[paragraph].text.len() + 1))
         };
-        let (a, b) = (position(), position());
+        let (anchor, focus) = (position(), position());
 
         let mut pasted = Editor::new(document.clone());
-        pasted.set_selection(Selection::new(a, b)).unwrap();
+        pasted.set_selection(Selection::new(anchor, focus)).unwrap();
         let copied = pasted.selected_fragment();
         pasted.insert_fragment(&copied).unwrap();
-        let context = format!("case {case}: {source:?} {a:?}..{b:?}");
+        let context = format!("case {case}: {source:?} {anchor:?}..{focus:?}");
         assert_eq!(
             pasted.document().plain_text(),
             document.plain_text(),
@@ -2237,7 +2508,7 @@ fn seeded_list_documents_paste_over_themselves_and_batch_kinds_follow_sequential
             .replace_all(query, replacement, SearchOptions::default())
             .unwrap();
         assert_eq!(
-            (lines(&batch), stored_kinds(&batch)),
+            outcome(&batch),
             replace_sequentially(&original, query, replacement),
             "case {case}: {source:?} {query:?} -> {replacement:?}"
         );
@@ -2251,72 +2522,109 @@ fn kind_changes_never_rewrite_other_paragraphs_and_reverse_exactly() {
         start: None,
     };
     for (converted, after) in [
-        (BODY, [ord(0, 2), ord(0, 3)]),
-        (ParagraphKind::Quote, [ord(0, 2), ord(0, 3)]),
-        (ParagraphKind::Bullet { indent: 0 }, [ord(0, 2), ord(0, 3)]),
-        (H1, [ord(0, 1), ord(0, 2)]),
+        (BODY, [ordered(0, 2), ordered(0, 3)]),
+        (ParagraphKind::Quote, [ordered(0, 2), ordered(0, 3)]),
+        (
+            ParagraphKind::Bullet { indent: 0 },
+            [ordered(0, 2), ordered(0, 3)],
+        ),
+        (H1, [ordered(0, 1), ordered(0, 2)]),
     ] {
-        let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+        let mut editor = with_kinds(
+            "a\nb\nc\nd",
+            &[ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)],
+        );
         let original = stored_kinds(&editor);
         kind(&mut editor, 1, converted);
-        assert_eq!(kinds(&editor), [ord(0, 1), converted, after[0], after[1]]);
-        assert_eq!(stored_kinds(&editor)[2..], original[2..]);
-        assert_eq!(editor.undo_len(), 1);
+        assert_eq!(
+            kinds(&editor),
+            [ordered(0, 1), converted, after[0], after[1]],
+            "{converted:?}"
+        );
+        assert_eq!(stored_kinds(&editor)[2..], original[2..], "{converted:?}");
+        assert_eq!(editor.undo_len(), 1, "{converted:?}");
         kind(&mut editor, 1, continuing(0));
-        assert_eq!(stored_kinds(&editor), original);
-        assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+        assert_eq!(stored_kinds(&editor), original, "{converted:?}");
+        assert_eq!(
+            kinds(&editor),
+            [ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)],
+            "{converted:?}"
+        );
     }
-    let mut body = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut body = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     kind(&mut body, 1, BODY);
     assert_eq!(
         body.document().to_html(),
         "<div style=\"white-space:pre-wrap\"><ol start=\"1\"><li>a</li></ol><p>b</p><ol start=\"2\"><li>c</li></ol></div>"
     );
 
-    let mut restart = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 10), ord(0, 11)]);
+    let mut restart = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 10), ordered(0, 11)]);
     kind(&mut restart, 1, BODY);
-    assert_eq!(kinds(&restart), [ord(0, 1), BODY, ord(0, 2)]);
-    let mut first = with_kinds("a\nb\nc", &[ord(0, 5), ord(0, 6), ord(0, 7)]);
+    assert_eq!(kinds(&restart), [ordered(0, 1), BODY, ordered(0, 2)]);
+    let mut first = with_kinds("a\nb\nc", &[ordered(0, 5), ordered(0, 6), ordered(0, 7)]);
     first
         .set_selection(Selection::new(Position::new(0, 0), Position::new(1, 1)))
         .unwrap();
     first.set_paragraph_kind(H1).unwrap();
-    assert_eq!(kinds(&first), [H1, H1, ord(0, 1)]);
+    assert_eq!(kinds(&first), [H1, H1, ordered(0, 1)]);
 
     let mut nested = with_kinds(
         "a\nx\nb\ny\nc",
-        &[ord(0, 1), ord(1, 1), ord(0, 2), ord(1, 1), ord(0, 3)],
+        &[
+            ordered(0, 1),
+            ordered(1, 1),
+            ordered(0, 2),
+            ordered(1, 1),
+            ordered(0, 3),
+        ],
     );
     kind(&mut nested, 2, BODY);
     assert_eq!(
         kinds(&nested),
-        [ord(0, 1), ord(1, 1), BODY, ord(1, 2), ord(0, 2)]
+        [
+            ordered(0, 1),
+            ordered(1, 1),
+            BODY,
+            ordered(1, 2),
+            ordered(0, 2)
+        ]
     );
-    let mut inner = with_kinds("a\nx\nb", &[ord(0, 1), ord(1, 1), ord(0, 2)]);
+    let mut inner = with_kinds("a\nx\nb", &[ordered(0, 1), ordered(1, 1), ordered(0, 2)]);
     kind(&mut inner, 1, BODY);
-    assert_eq!(kinds(&inner), [ord(0, 1), BODY, ord(0, 2)]);
-    let mut bullet = with_kinds("a\nx\nb", &[ord(0, 1), ord(1, 1), ord(0, 2)]);
+    assert_eq!(kinds(&inner), [ordered(0, 1), BODY, ordered(0, 2)]);
+    let mut bullet = with_kinds("a\nx\nb", &[ordered(0, 1), ordered(1, 1), ordered(0, 2)]);
     kind(&mut bullet, 1, ParagraphKind::Bullet { indent: 1 });
     assert_eq!(stored_kinds(&bullet)[2], continuing(0));
     assert_eq!(bullet.document().list_number(2), Some(2));
 
-    let mut note = with_kinds("a\nnote\nc\nd", &[ord(0, 1), BODY, ord(0, 2), ord(0, 3)]);
+    let mut note = with_kinds(
+        "a\nnote\nc\nd",
+        &[ordered(0, 1), BODY, ordered(0, 2), ordered(0, 3)],
+    );
     kind(&mut note, 1, continuing(0));
-    assert_eq!(kinds(&note), [ord(0, 1), ord(0, 2), ord(0, 3), ord(0, 4)]);
+    assert_eq!(
+        kinds(&note),
+        [ordered(0, 1), ordered(0, 2), ordered(0, 3), ordered(0, 4)]
+    );
     assert_eq!(stored_kinds(&note)[2], continuing(0));
-    let mut kept = with_kinds("a\nnote\nc", &[ord(0, 1), BODY, ord(0, 5)]);
+    let mut kept = with_kinds("a\nnote\nc", &[ordered(0, 1), BODY, ordered(0, 5)]);
     kind(&mut kept, 1, continuing(0));
-    assert_eq!(kinds(&kept), [ord(0, 1), ord(0, 2), ord(0, 5)]);
+    assert_eq!(kinds(&kept), [ordered(0, 1), ordered(0, 2), ordered(0, 5)]);
 
-    let mut indented = with_kinds("a\nb\nc", &[ord(0, 1), ord(0, 2), ord(0, 3)]);
+    let mut indented = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(0, 2), ordered(0, 3)]);
     caret(&mut indented, 1, 0);
     indented.indent_list().unwrap();
     assert_eq!(stored_kinds(&indented)[2], continuing(0));
-    assert_eq!(kinds(&indented), [ord(0, 1), ord(1, 1), ord(0, 2)]);
+    assert_eq!(
+        kinds(&indented),
+        [ordered(0, 1), ordered(1, 1), ordered(0, 2)]
+    );
 
     let mut long = with_kinds(
         &["item"; 50].join("\n"),
-        &(1..=50).map(|number| ord(0, number)).collect::<Vec<_>>(),
+        &(1..=50)
+            .map(|number| ordered(0, number))
+            .collect::<Vec<_>>(),
     );
     let paragraphs = long.document().paragraphs().to_vec();
     caret(&mut long, 10, 4);
@@ -2325,7 +2633,7 @@ fn kind_changes_never_rewrite_other_paragraphs_and_reverse_exactly() {
         .unwrap();
     long.delete_backward().unwrap();
     assert_eq!(long.document().paragraphs()[10..], paragraphs[11..]);
-    let expected: Vec<_> = (1..=49).map(|number| ord(0, number)).collect();
+    let expected: Vec<_> = (1..=49).map(|number| ordered(0, number)).collect();
     assert_eq!(kinds(&long), expected);
 }
 
@@ -2343,7 +2651,7 @@ fn numbered_list(items: &[&str]) -> Editor {
             indent: 0,
             start: None,
         })
-        .unwrap();
+        .expect("no IME composition is active");
     editor.clear_history();
     editor
 }
@@ -2381,15 +2689,18 @@ fn joining_an_item_into_the_previous_one_and_adding_items_keeps_numbers_consecut
 
 #[test]
 fn toggling_list_items_off_and_on_restores_their_lists_exactly() {
-    let original = [ord(0, 5), ord(0, 6), ord(0, 7)];
+    let original = [ordered(0, 5), ordered(0, 6), ordered(0, 7)];
     let mut editor = with_kinds("a\nb\nc", &original);
     let stored = stored_kinds(&editor);
     kind(&mut editor, 0, BODY);
-    kind(&mut editor, 0, ord(0, 5));
+    kind(&mut editor, 0, ordered(0, 5));
     assert_eq!(stored_kinds(&editor), stored);
     assert_eq!(kinds(&editor), original);
 
-    let mut nested = with_kinds("one\nsub\ntwo", &[ord(0, 1), ord(1, 1), ord(0, 2)]);
+    let mut nested = with_kinds(
+        "one\nsub\ntwo",
+        &[ordered(0, 1), ordered(1, 1), ordered(0, 2)],
+    );
     let stored = stored_kinds(&nested);
     kind(&mut nested, 1, ParagraphKind::Quote);
     kind(
@@ -2401,10 +2712,13 @@ fn toggling_list_items_off_and_on_restores_their_lists_exactly() {
         },
     );
     assert_eq!(stored_kinds(&nested), stored);
-    kind(&mut nested, 0, ord(0, 5));
-    assert_eq!(kinds(&nested), [ord(0, 5), ord(1, 1), ord(0, 6)]);
+    kind(&mut nested, 0, ordered(0, 5));
+    assert_eq!(
+        kinds(&nested),
+        [ordered(0, 5), ordered(1, 1), ordered(0, 6)]
+    );
 
-    let mut restarted = with_kinds("a\nb", &[ord(0, 1), ord(0, 1)]);
+    let mut restarted = with_kinds("a\nb", &[ordered(0, 1), ordered(0, 1)]);
     let stored = stored_kinds(&restarted);
     kind(&mut restarted, 0, BODY);
     kind(
@@ -2416,7 +2730,7 @@ fn toggling_list_items_off_and_on_restores_their_lists_exactly() {
         },
     );
     assert_eq!(stored_kinds(&restarted), stored);
-    assert_eq!(kinds(&restarted), [ord(0, 1), ord(0, 1)]);
+    assert_eq!(kinds(&restarted), [ordered(0, 1), ordered(0, 1)]);
 }
 
 #[test]
@@ -2443,7 +2757,10 @@ fn seeded_kind_changes_and_their_reversal_restore_stored_kinds_exactly() {
                         start: (next(4) == 0).then(|| 1 + next(6) as u32),
                     },
                 };
-                (format!("p{index}"), kind)
+                Line {
+                    text: format!("p{index}"),
+                    kind,
+                }
             })
             .collect();
         let document = document_with(&lines);
@@ -2463,17 +2780,17 @@ fn seeded_kind_changes_and_their_reversal_restore_stored_kinds_exactly() {
         };
         let mut editor = Editor::new(document);
         kind(&mut editor, index, converted);
-        for (other, (before, after)) in original
+        let paragraph_pairs = original
             .paragraphs()
             .iter()
             .zip(editor.document().paragraphs())
-            .enumerate()
-        {
+            .enumerate();
+        for (other, (before, after)) in paragraph_pairs {
             if other != index {
                 assert!(Arc::ptr_eq(before, after), "case {case}: {lines:?}");
             }
         }
-        kind(&mut editor, index, lines[index].1);
+        kind(&mut editor, index, lines[index].kind);
         assert_eq!(
             Fragment::from_document(editor.document()),
             original,
@@ -2492,34 +2809,43 @@ fn numbered_list_command_extends_a_list_right_before_it_or_starts_one() {
         indent: 0,
         start: Some(1),
     };
-    let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), ord(0, 2), BODY, BODY]);
+    let mut editor = with_kinds("a\nb\nc\nd", &[ordered(0, 1), ordered(0, 2), BODY, BODY]);
     caret(&mut editor, 2, 0);
     editor.apply_numbered_list(0).unwrap();
     assert_eq!(stored_kinds(&editor)[2], continuing);
-    assert_eq!(kinds(&editor)[2], ord(0, 3));
-    let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), BODY, BODY, BODY]);
+    assert_eq!(kinds(&editor)[2], ordered(0, 3));
+    let mut editor = with_kinds("a\nb\nc\nd", &[ordered(0, 1), BODY, BODY, BODY]);
     editor
         .set_selection(Selection::new(Position::new(2, 0), Position::new(3, 1)))
         .unwrap();
     editor.apply_numbered_list(0).unwrap();
     assert_eq!(stored_kinds(&editor)[2..], [new_list, continuing]);
-    assert_eq!(kinds(&editor)[2..], [ord(0, 1), ord(0, 2)]);
+    assert_eq!(kinds(&editor)[2..], [ordered(0, 1), ordered(0, 2)]);
     assert_eq!(editor.undo_len(), 1);
     let revision = editor.document().revision();
     editor.apply_numbered_list(0).unwrap();
     assert_eq!(editor.document().revision(), revision);
     assert_eq!(editor.undo_len(), 1);
-    let mut editor = with_kinds("a\nb\nc", &[ord(0, 5), BODY, ord(0, 9)]);
+    let mut editor = with_kinds("a\nb\nc", &[ordered(0, 5), BODY, ordered(0, 9)]);
     editor.select_all();
     editor.apply_numbered_list(0).unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 5), ord(0, 6), ord(0, 7)]);
-    let mut editor = with_kinds("a\nb\nc", &[ord(0, 1), ord(1, 1), BODY]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 5), ordered(0, 6), ordered(0, 7)]
+    );
+    let mut editor = with_kinds("a\nb\nc", &[ordered(0, 1), ordered(1, 1), BODY]);
     caret(&mut editor, 2, 0);
     editor.apply_numbered_list(1).unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(1, 1), ord(1, 2)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(1, 1), ordered(1, 2)]
+    );
     caret(&mut editor, 1, 0);
     editor.apply_numbered_list(0).unwrap();
-    assert_eq!(kinds(&editor), [ord(0, 1), ord(0, 2), ord(1, 1)]);
+    assert_eq!(
+        kinds(&editor),
+        [ordered(0, 1), ordered(0, 2), ordered(1, 1)]
+    );
     editor.update_composition("x", None).unwrap();
     assert_eq!(editor.apply_numbered_list(0), Err(Error::CompositionActive));
 }
@@ -2530,18 +2856,22 @@ fn numbered_list_command_extends_a_list_whose_last_item_is_nested() {
         indent,
         start: None,
     };
-    for nested in [ord(1, 1), ParagraphKind::Bullet { indent: 1 }] {
-        let mut editor = with_kinds("one\nsub\ntwo", &[ord(0, 1), nested, BODY]);
+    for nested in [ordered(1, 1), ParagraphKind::Bullet { indent: 1 }] {
+        let mut editor = with_kinds("one\nsub\ntwo", &[ordered(0, 1), nested, BODY]);
         caret(&mut editor, 2, 0);
         editor.apply_numbered_list(0).unwrap();
         assert_eq!(stored_kinds(&editor)[2], continuing(0), "{nested:?}");
-        assert_eq!(kinds(&editor), [ord(0, 1), nested, ord(0, 2)]);
+        assert_eq!(
+            kinds(&editor),
+            [ordered(0, 1), nested, ordered(0, 2)],
+            "{nested:?}"
+        );
     }
     let mut editor = with_kinds(
         "a\nb\nc\nd",
         &[
-            ord(0, 1),
-            ord(1, 1),
+            ordered(0, 1),
+            ordered(1, 1),
             ParagraphKind::Bullet { indent: 2 },
             BODY,
         ],
@@ -2549,13 +2879,13 @@ fn numbered_list_command_extends_a_list_whose_last_item_is_nested() {
     caret(&mut editor, 3, 0);
     editor.apply_numbered_list(1).unwrap();
     assert_eq!(stored_kinds(&editor)[3], continuing(1));
-    assert_eq!(kinds(&editor)[3], ord(1, 2));
+    assert_eq!(kinds(&editor)[3], ordered(1, 2));
 
     let bullet = ParagraphKind::Bullet { indent: 0 };
     for before in [bullet, H1] {
-        let mut editor = with_kinds("a\nb\nc\nd", &[ord(0, 1), before, ord(1, 1), BODY]);
+        let mut editor = with_kinds("a\nb\nc\nd", &[ordered(0, 1), before, ordered(1, 1), BODY]);
         caret(&mut editor, 3, 0);
         editor.apply_numbered_list(0).unwrap();
-        assert_eq!(stored_kinds(&editor)[3], ord(0, 1), "{before:?}");
+        assert_eq!(stored_kinds(&editor)[3], ordered(0, 1), "{before:?}");
     }
 }

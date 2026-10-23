@@ -44,14 +44,14 @@ assert!(editor.redo());
 - LF, CRLF, lone CR, and U+2029 are paragraph breaks on import and insertion. U+2028 LINE SEPARATOR is a soft line break within a paragraph: `insert_line_break()` (Shift+Enter) inserts one in the typing style, keeping the paragraph's kind and the typing undo step. Plain-text export and selected text write soft breaks as LF and HTML as `<br>`; a search query's U+2028 matches soft breaks, while its LF, CRLF, CR, or U+2029 matches only paragraph breaks.
 
 ```rust
-use textloom::{Editor, SearchOptions, StylePatch};
+use textloom::{Editor, SearchOptions, SearchWrap, StylePatch};
 
 let mut editor = Editor::from_text("one two one");
 let options = SearchOptions::default();
 // A Replace button replaces the current match, then selects the next one.
-assert!(editor.find_next("one", options, true).unwrap());
+assert!(editor.find_next("one", options, SearchWrap::Around).unwrap());
 assert!(editor.replace_selected_match("one", "1", options).unwrap());
-assert!(editor.find_next("one", options, true).unwrap());
+assert!(editor.find_next("one", options, SearchWrap::Around).unwrap());
 editor.mark_saved(); // For example, after writing the document to a file.
 
 editor
@@ -88,7 +88,7 @@ assert_eq!(numbers, [None, Some(1), None, Some(2)]);
 // Fill "Rust 1.95" with Excel's Yellow, then link it.
 editor.set_selection(Selection::new(Position::new(1, 8), Position::new(1, 17))).unwrap();
 editor.apply_style(StylePatch { background: Some(Some(Color::YELLOW)), ..Default::default() }).unwrap();
-let link = Link::new("https://www.rust-lang.org/").unwrap();
+let link = Link::try_new("https://www.rust-lang.org/").unwrap();
 editor.set_link(Some(link.clone())).unwrap();
 assert_eq!(editor.selected_link(), Some(link));
 let html = editor.document().to_html();
@@ -98,7 +98,7 @@ assert!(html.contains("background-color:#ffff00"));
 
 Positions are `(paragraph index, UTF-8 byte offset)`. Document selections must land at extended grapheme boundaries: combining marks, emoji sequences, and flags cannot be split. Invalid public input returns an error before mutation. IME preedit selections use native UTF-8 scalar boundaries because a composition can contain unfinished graphemes.
 
-`Document::paragraphs()` exposes immutable shared paragraphs and normalized style spans with their links. `plain_text()` and clipboard selection export omit visual list markers. `Paragraph` also maps grapheme/scalar indexes to UTF-8 bytes for custom GUI integrations. Importers build validated rich paragraphs, whose text excludes CR, LF, and U+2029, with `Paragraph::new()` and assemble them with `Document::from_paragraphs()`. `Editor`, `Document`, `Paragraph`, and `Fragment` are `Send + Sync`; cloned editors share unchanged paragraphs and keep independent history.
+`Document::paragraphs()` exposes immutable shared paragraphs and normalized style spans with their links. `plain_text()` and clipboard selection export omit visual list markers. `Paragraph` also maps grapheme/scalar indexes to UTF-8 bytes for custom GUI integrations. Importers build validated rich paragraphs, whose text excludes CR, LF, and U+2029, with `Paragraph::try_new()` and assemble them with `Document::from_paragraphs()`. `Editor`, `Document`, `Paragraph`, and `Fragment` are `Send + Sync`; cloned editors share unchanged paragraphs and keep independent history.
 
 `SelectionStyle` uses `Some(true)` for uniformly enabled emphasis, `Some(false)` for uniformly disabled emphasis, and `None` for mixed values. Its foreground and background fields use `None` for mixed values, `Some(None)` for the renderer's default color or no fill throughout, and `Some(Some(color))` for one explicit color throughout. The summary ignores paragraph separators and empty paragraphs; a selection containing only separators uses the pending typing style. Reading it does not allocate or change selection, history, or IME state. Typing over a selection uses the style of its first selected grapheme in either direction; a caret uses the text before it, and moves that leave the selection unchanged keep a pending caret style.
 
@@ -418,7 +418,7 @@ Dependencies are locked, actions are pinned to commit SHAs, and jobs have time l
 
 ## Stable release policy
 
-Textloom 1.x follows semantic versioning for its documented public API and feature names. These enums are `#[non_exhaustive]`, so keep a fallback arm when matching them: the error enums (`Error`, `FragmentError`, `AccessKitError`, and the egui `AccessibilityError`), `ParagraphKind`, `Movement`, `InlineAttribute`, `AccessibleAction`, and the winit `ClipboardEvent`. `Composition`, `DecodeLimits`, `AccessibleParagraph`, `AccessibilityOutcome`, `RichTextEditorOutput`, and the winit `InputOutcome` are non-exhaustive structs that may gain fields; start `DecodeLimits` from `DecodeLimits::default()` or `UNLIMITED` and assign fields. `InlineStyle`, `StylePatch`, `SelectionStyle`, `SearchOptions`, `HistoryLimits`, `Position`, `Selection`, `Color`, and `Span` stay exhaustive, so adding a field requires a major release. Before 1.0, `ParagraphKind` gained `Quote`, and the `start` of `Ordered` became an optional explicit start (`Option<u32>`) instead of the displayed number; `InlineStyle`, `StylePatch`, and `SelectionStyle` gained `background`; `Span` gained `link`; `AccessibilityOutcome` stopped implementing `Copy`; and `Error` and `FragmentError` gained `InvalidLink`. `Editor`, `Document`, `Paragraph`, and `Fragment` remain `Send + Sync`, checked at compile time. Public adapter types use egui 0.37, winit 0.30, and AccessKit 0.25. Breaking upgrades to those exposed types require a Textloom major release. Exact error messages and benchmark timings may change.
+Textloom 1.x follows semantic versioning for its documented public API and feature names. These enums are `#[non_exhaustive]`, so keep a fallback arm when matching them: the error enums (`Error`, `FragmentError`, `AccessKitError`, and the egui `AccessibilityError`), `ParagraphKind`, `Movement`, `InlineAttribute`, `AccessibleAction`, and the winit `ClipboardEvent`. `Composition`, `DecodeLimits`, `Span`, `AccessibleParagraph`, `AccessibilityOutcome`, `RichTextEditorOutput`, and the winit `InputOutcome` are non-exhaustive structs that may gain fields; start `DecodeLimits` from `DecodeLimits::default()` or `UNLIMITED` and assign fields, and build a `Span` with `Span::new`. `InlineStyle`, `StylePatch`, `SelectionStyle`, `SearchOptions`, `HistoryLimits`, `Position`, `Selection`, `Color`, `AccessiblePosition`, and `AccessibleSelection` stay exhaustive, so adding a field requires a major release; so do the two-way enums `SelectionMode`, `SearchWrap`, `accessibility::Focus`, and the winit `CommandModifier`. Before 1.0, `ParagraphKind` gained `Quote`, and the `start` of `Ordered` became an optional explicit start (`Option<u32>`) instead of the displayed number; `InlineStyle`, `StylePatch`, and `SelectionStyle` gained `background`; `Span` gained `link`; `AccessibilityOutcome` stopped implementing `Copy`; and `Error` and `FragmentError` gained `InvalidLink`. `Editor`, `Document`, `Paragraph`, and `Fragment` remain `Send + Sync`, checked at compile time. Public adapter types use egui 0.37, winit 0.30, and AccessKit 0.25. Breaking upgrades to those exposed types require a Textloom major release. Exact error messages and benchmark timings may change.
 
 TLFR is versioned independently of the crate: 1.x writes version 2 and keeps reading versions 1 and 2, whose bytes and meanings remain stable, including the list numbering rule that determines how stored kinds display. Unicode segmentation is pinned to version 1.13.3 (Unicode 17.0) because grapheme rules determine valid persisted style boundaries. Minimum Rust version increases, if needed, are announced in minor or major releases.
 

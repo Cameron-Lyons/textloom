@@ -6,6 +6,21 @@ use super::{Document, LINE_SEPARATOR};
 use crate::{Error, Position};
 
 impl Document {
+    /// Returns the range that double-click word selection selects at
+    /// `position`.
+    ///
+    /// The range is the Unicode word-boundary segment (UAX #29) that contains
+    /// the grapheme after `position`, such as a word, a run of spaces, or a
+    /// punctuation character, widened to grapheme boundaries. At the end of a
+    /// paragraph or before a soft line break, the grapheme before `position`
+    /// is used instead. The range is empty at `position` in an empty
+    /// paragraph, at a paragraph start before a soft line break, and between
+    /// two soft line breaks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPosition`] if `position` is not a valid
+    /// position in this document.
     pub fn word_range_at(&self, position: Position) -> Result<Range<Position>, Error> {
         self.validate_position(position)?;
         let paragraph = &self.paragraphs[position.paragraph];

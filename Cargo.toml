@@ -63,7 +63,19 @@ required-features = ["egui"]
 
 [lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
 
 [lints.clippy]
 all = "warn"
+# Google Rust Style Guide rules that Clippy checks outside its default lints.
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
+needless_for_each = "warn"
+ref_option = "warn"
+return_self_not_must_use = "warn"
+unwrap_used = "warn"
+wildcard_imports = "warn"
 

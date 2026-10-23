@@ -1,3 +1,7 @@
+//! Tests rich-text fragments: copying and rich paste, the native TLFR encoding
+//! (layout, version 1 compatibility, decode limits, and rejection of malformed
+//! input), and HTML export of styles, colors, lists, quotes, and line breaks.
+
 use std::sync::Arc;
 
 use textloom::{
@@ -6,9 +10,13 @@ use textloom::{
 };
 
 fn select_paragraph(editor: &mut Editor, index: usize) {
-    editor.select_paragraph(index).unwrap();
+    editor
+        .select_paragraph(index)
+        .expect("callers pass the index of an existing paragraph");
 }
 
+/// Builds a fragment with every inline style, both colors, a heading, a bullet,
+/// ordered items with explicit starts, and text that needs HTML escaping.
 fn rich_fragment() -> Fragment {
     let mut editor = Editor::from_text("<Hello> & \"世界\" e\u{301}\nitem\nnested\nlast\n");
     select_paragraph(&mut editor, 0);
@@ -22,26 +30,26 @@ fn rich_fragment() -> Fragment {
             foreground: Some(Some(Color([0, 128, 255, 127]))),
             background: Some(Some(Color([255, 255, 0, 64]))),
         })
-        .unwrap();
+        .expect("no IME composition is active");
     editor
         .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 7)))
-        .unwrap();
+        .expect("\"<Hello>\" is seven ASCII bytes at the start of the first paragraph");
     editor
         .apply_style(StylePatch {
             bold: Some(false),
             ..Default::default()
         })
-        .unwrap();
+        .expect("no IME composition is active");
     editor
         .set_paragraph_kind(ParagraphKind::Heading { level: 3 })
-        .unwrap();
+        .expect("no IME composition is active, and heading level 3 is valid");
     select_paragraph(&mut editor, 1);
     editor
         .apply_style(StylePatch {
             background: Some(Some(Color::YELLOW)),
             ..Default::default()
         })
-        .unwrap();
+        .expect("no IME composition is active");
     for (index, kind) in [
         (1, ParagraphKind::Bullet { indent: 0 }),
         (
@@ -60,7 +68,9 @@ fn rich_fragment() -> Fragment {
         ),
     ] {
         select_paragraph(&mut editor, index);
-        editor.set_paragraph_kind(kind).unwrap();
+        editor
+            .set_paragraph_kind(kind)
+            .expect("no IME composition is active");
     }
     Fragment::from_document(editor.document())
 }
@@ -70,7 +80,7 @@ fn fragment_shares_paragraphs_and_plain_import_normalizes_line_breaks() {
     let document = Document::from_text("a\r\nb\rc\n");
     let fragment = Fragment::from_document(&document);
     for (source, copied) in document.paragraphs().iter().zip(fragment.paragraphs()) {
-        assert!(Arc::ptr_eq(source, copied));
+        assert!(Arc::ptr_eq(source, copied), "{source:?}");
     }
     assert_eq!(fragment.plain_text(), "a\nb\nc\n");
     assert_eq!(fragment, Fragment::from_text("a\nb\nc\n"));
@@ -86,10 +96,10 @@ fn native_roundtrip_preserves_text_all_styles_paragraph_kinds_and_empty_edges() 
         rich_fragment(),
     ] {
         let bytes = fragment.to_bytes();
-        assert_eq!(&bytes[..5], b"TLFR\x02");
+        assert_eq!(&bytes[..5], b"TLFR\x02", "{fragment:?}");
         let decoded = Fragment::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, fragment);
-        assert_eq!(decoded.to_bytes(), bytes);
+        assert_eq!(decoded, fragment, "{fragment:?}");
+        assert_eq!(decoded.to_bytes(), bytes, "{fragment:?}");
     }
 }
 
@@ -116,7 +126,7 @@ fn document_interchange_and_rich_paste_preserve_metadata_in_one_undo_step() {
     let document = Document::from_fragment(&fragment);
     assert_eq!(Fragment::from_document(&document), fragment);
     for (source, copied) in fragment.paragraphs().iter().zip(document.paragraphs()) {
-        assert!(Arc::ptr_eq(source, copied));
+        assert!(Arc::ptr_eq(source, copied), "{source:?}");
     }
     let mut editor = Editor::default();
     editor.insert_fragment(&fragment).unwrap();
@@ -298,12 +308,13 @@ fn empty_single_paragraph_paste_preserves_blocks_and_restores_document_typing_st
     ];
     for destination in kinds {
         for source in kinds {
-            let fragment = Fragment::from_document(&Document::from_paragraphs([Paragraph::new(
-                "",
-                Vec::new(),
-                source,
-            )
-            .unwrap()]));
+            let fragment =
+                Fragment::from_document(&Document::from_paragraphs([Paragraph::try_new(
+                    "",
+                    Vec::new(),
+                    source,
+                )
+                .unwrap()]));
             for text in ["", "e\u{301}x"] {
                 let mut editor = Editor::from_text(text);
                 editor.set_paragraph_kind(destination).unwrap();
@@ -320,12 +331,35 @@ fn empty_single_paragraph_paste_preserves_blocks_and_restores_document_typing_st
                     editor.mark_saved();
                     let before = editor.document().clone();
                     editor.insert_fragment(&fragment).unwrap();
-                    assert_eq!(editor.document(), &before);
-                    assert_eq!(editor.selection(), Selection::caret(position));
-                    assert_eq!(editor.typing_style(), before.style_at(position));
-                    assert_eq!(editor.document().paragraph(0).unwrap().kind(), destination);
-                    assert_eq!(editor.undo_len(), 0);
-                    assert!(!editor.is_modified());
+                    assert_eq!(
+                        editor.document(),
+                        &before,
+                        "{source:?} into {destination:?}, text {text:?}, byte {byte}"
+                    );
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::caret(position),
+                        "{source:?} into {destination:?}, text {text:?}, byte {byte}"
+                    );
+                    assert_eq!(
+                        editor.typing_style(),
+                        before.style_at(position),
+                        "{source:?} into {destination:?}, text {text:?}, byte {byte}"
+                    );
+                    assert_eq!(
+                        editor.document().paragraph(0).unwrap().kind(),
+                        destination,
+                        "{source:?} into {destination:?}, text {text:?}, byte {byte}"
+                    );
+                    assert_eq!(
+                        editor.undo_len(),
+                        0,
+                        "{source:?} into {destination:?}, text {text:?}, byte {byte}"
+                    );
+                    assert!(
+                        !editor.is_modified(),
+                        "{source:?} into {destination:?}, text {text:?}, byte {byte}"
+                    );
                 }
             }
         }
@@ -403,7 +437,7 @@ fn rich_paste_normalizes_emoji_joins_without_splitting_style_runs() {
         .unwrap();
     let before = Fragment::from_document(editor.document());
     editor.insert_fragment(&source.selected_fragment()).unwrap();
-    assert_eq!(editor.document().plain_text(), "👩‍💻X");
+    assert_eq!(editor.document().plain_text(), "👩\u{200d}💻X");
     assert_eq!(editor.selection().focus, Position::new(0, 11));
     let spans = editor.document().paragraph(0).unwrap().spans();
     assert_eq!(spans[0].range, 0..11);
@@ -415,7 +449,7 @@ fn rich_paste_normalizes_emoji_joins_without_splitting_style_runs() {
     assert!(editor.undo());
     assert_eq!(Fragment::from_document(editor.document()), before);
     assert!(editor.redo());
-    assert_eq!(editor.document().plain_text(), "👩‍💻X");
+    assert_eq!(editor.document().plain_text(), "👩\u{200d}💻X");
 }
 
 fn header(paragraphs: u64) -> Vec<u8> {
@@ -430,19 +464,34 @@ fn versioned_header(version: u8, paragraphs: u64) -> Vec<u8> {
 }
 
 fn paragraph(kind: &[u8], text: &[u8], spans: &[(u64, u8)]) -> Vec<u8> {
-    versioned_paragraphs(1, &[(kind, text, spans)])
+    versioned_paragraphs(1, &[RawParagraph::new(kind, text, spans)])
 }
 
-type RawParagraph<'a> = (&'a [u8], &'a [u8], &'a [(u64, u8)]);
+/// The fields of one paragraph in a hand-built native fragment, which may be
+/// deliberately invalid.
+struct RawParagraph<'bytes> {
+    /// The paragraph kind tag followed by its payload, such as a heading level.
+    kind: &'bytes [u8],
+    /// The paragraph text, normally UTF-8.
+    text: &'bytes [u8],
+    /// Each span's end byte offset and style flags.
+    spans: &'bytes [(u64, u8)],
+}
+
+impl<'bytes> RawParagraph<'bytes> {
+    fn new(kind: &'bytes [u8], text: &'bytes [u8], spans: &'bytes [(u64, u8)]) -> Self {
+        Self { kind, text, spans }
+    }
+}
 
 fn versioned_paragraphs(version: u8, paragraphs: &[RawParagraph<'_>]) -> Vec<u8> {
     let mut output = versioned_header(version, paragraphs.len() as u64);
-    for (kind, text, spans) in paragraphs {
-        output.extend_from_slice(kind);
-        output.extend_from_slice(&(text.len() as u64).to_le_bytes());
-        output.extend_from_slice(text);
-        output.extend_from_slice(&(spans.len() as u64).to_le_bytes());
-        for &(end, flags) in *spans {
+    for paragraph in paragraphs {
+        output.extend_from_slice(paragraph.kind);
+        output.extend_from_slice(&(paragraph.text.len() as u64).to_le_bytes());
+        output.extend_from_slice(paragraph.text);
+        output.extend_from_slice(&(paragraph.spans.len() as u64).to_le_bytes());
+        for &(end, flags) in paragraph.spans {
             output.extend_from_slice(&end.to_le_bytes());
             output.push(flags);
         }
@@ -460,14 +509,14 @@ fn numbers(document: &Document) -> Vec<Option<u32>> {
 fn version_two_encoding_has_fixed_architecture_independent_layout() {
     assert_eq!(
         Fragment::from_text("a").to_bytes(),
-        versioned_paragraphs(2, &[(&[0], b"a", &[(1, 0)])])
+        versioned_paragraphs(2, &[RawParagraph::new(&[0], b"a", &[(1, 0)])])
     );
     assert_eq!(
         Fragment::default().to_bytes(),
-        versioned_paragraphs(2, &[(&[0], b"", &[])])
+        versioned_paragraphs(2, &[RawParagraph::new(&[0], b"", &[])])
     );
     let document = Document::from_paragraphs([
-        Paragraph::new(
+        Paragraph::try_new(
             "",
             Vec::new(),
             ParagraphKind::Ordered {
@@ -476,7 +525,7 @@ fn version_two_encoding_has_fixed_architecture_independent_layout() {
             },
         )
         .unwrap(),
-        Paragraph::new(
+        Paragraph::try_new(
             "",
             Vec::new(),
             ParagraphKind::Ordered {
@@ -488,14 +537,20 @@ fn version_two_encoding_has_fixed_architecture_independent_layout() {
     ]);
     assert_eq!(
         document.to_bytes(),
-        versioned_paragraphs(2, &[(&[4, 3], b"", &[]), (&[5, 4, 4, 3, 2, 1], b"", &[])])
+        versioned_paragraphs(
+            2,
+            &[
+                RawParagraph::new(&[4, 3], b"", &[]),
+                RawParagraph::new(&[5, 4, 4, 3, 2, 1], b"", &[])
+            ]
+        )
     );
 }
 
 #[test]
 fn version_one_rich_fixture_remains_readable_and_reencodes_as_version_two() {
     let bytes = include_bytes!("fixtures/native-v1.tlfr");
-    let mut editor = Editor::from_text("\nAé👩‍💻\ne\u{301}\nZ\n");
+    let mut editor = Editor::from_text("\nAé👩\u{200d}💻\ne\u{301}\nZ\n");
     select_paragraph(&mut editor, 1);
     editor
         .set_paragraph_kind(ParagraphKind::Heading { level: 6 })
@@ -566,17 +621,14 @@ fn version_two_rich_fixture_remains_readable_and_byte_identical() {
     let version_one = Fragment::from_bytes(include_bytes!("fixtures/native-v1.tlfr")).unwrap();
     let plain = |text: &str| {
         (!text.is_empty())
-            .then(|| Span {
-                range: 0..text.len(),
-                style: InlineStyle::default(),
-                link: None,
-            })
+            .then(|| Span::new(0..text.len(), InlineStyle::default(), None))
             .into_iter()
             .collect()
     };
     let item = |text: &str, indent, start| {
         Arc::new(
-            Paragraph::new(text, plain(text), ParagraphKind::Ordered { indent, start }).unwrap(),
+            Paragraph::try_new(text, plain(text), ParagraphKind::Ordered { indent, start })
+                .unwrap(),
         )
     };
     let mut paragraphs = version_one.paragraphs()[..4].to_vec();
@@ -636,7 +688,7 @@ fn version_one_ordinals_read_as_continuations_unless_they_restart() {
     ];
     let paragraphs: Vec<RawParagraph<'_>> = kinds
         .iter()
-        .map(|kind| (kind.as_slice(), b"".as_slice(), [].as_slice()))
+        .map(|kind| RawParagraph::new(kind, b"", &[]))
         .collect();
     let document = Document::from_bytes(&versioned_paragraphs(1, &paragraphs)).unwrap();
     let starts: Vec<_> = document
@@ -680,33 +732,65 @@ fn each_version_accepts_only_its_own_paragraph_kinds() {
     let legacy = [3, 0, 1, 0, 0, 0];
     for kind in [&[4, 0][..], &restart, &[6]] {
         assert_eq!(
-            Fragment::from_bytes(&versioned_paragraphs(1, &[(kind, b"", &[])])),
-            Err(FragmentError::InvalidParagraphKind)
+            Fragment::from_bytes(&versioned_paragraphs(
+                1,
+                &[RawParagraph::new(kind, b"", &[])]
+            )),
+            Err(FragmentError::InvalidParagraphKind),
+            "{kind:?}"
         );
-        assert!(Fragment::from_bytes(&versioned_paragraphs(2, &[(kind, b"", &[])])).is_ok());
+        assert!(
+            Fragment::from_bytes(&versioned_paragraphs(
+                2,
+                &[RawParagraph::new(kind, b"", &[])]
+            ))
+            .is_ok(),
+            "{kind:?}"
+        );
     }
-    assert!(Fragment::from_bytes(&versioned_paragraphs(1, &[(&legacy, b"", &[])])).is_ok());
+    assert!(
+        Fragment::from_bytes(&versioned_paragraphs(
+            1,
+            &[RawParagraph::new(&legacy, b"", &[])]
+        ))
+        .is_ok()
+    );
     for kind in [&legacy[..], &[7], &[255]] {
         assert_eq!(
-            Fragment::from_bytes(&versioned_paragraphs(2, &[(kind, b"", &[])])),
-            Err(FragmentError::InvalidParagraphKind)
+            Fragment::from_bytes(&versioned_paragraphs(
+                2,
+                &[RawParagraph::new(kind, b"", &[])]
+            )),
+            Err(FragmentError::InvalidParagraphKind),
+            "{kind:?}"
         );
     }
     for flags in [64, 128, 192] {
         assert_eq!(
-            Fragment::from_bytes(&versioned_paragraphs(1, &[(&[0], b"a", &[(1, flags)])])),
-            Err(FragmentError::InvalidStyle)
+            Fragment::from_bytes(&versioned_paragraphs(
+                1,
+                &[RawParagraph::new(&[0], b"a", &[(1, flags)])]
+            )),
+            Err(FragmentError::InvalidStyle),
+            "flags {flags}"
         );
     }
     for flags in [64, 128] {
         assert_eq!(
-            Fragment::from_bytes(&versioned_paragraphs(2, &[(&[0], b"a", &[(1, flags)])])),
-            Err(FragmentError::Truncated)
+            Fragment::from_bytes(&versioned_paragraphs(
+                2,
+                &[RawParagraph::new(&[0], b"a", &[(1, flags)])]
+            )),
+            Err(FragmentError::Truncated),
+            "flags {flags}"
         );
     }
     for version in [0, 3, 255] {
         assert_eq!(
-            Fragment::from_bytes(&versioned_paragraphs(version, &[(&[0], b"", &[])])),
+            Fragment::from_bytes(&versioned_paragraphs(
+                version,
+                &[RawParagraph::new(&[0], b"", &[])]
+            )),
             Err(FragmentError::UnsupportedVersion(version))
         );
     }
@@ -742,7 +826,8 @@ fn rejects_bad_signature_version_lengths_counts_and_unknown_kinds() {
     for count in [1_000_001, u64::MAX] {
         assert_eq!(
             Fragment::from_bytes(&header(count)),
-            Err(FragmentError::LimitExceeded)
+            Err(FragmentError::LimitExceeded),
+            "count {count}"
         );
     }
     assert_eq!(
@@ -764,7 +849,8 @@ fn rejects_bad_signature_version_lengths_counts_and_unknown_kinds() {
     for kind in [&[4][..], &[1, 0], &[1, 7]] {
         assert_eq!(
             Fragment::from_bytes(&paragraph(kind, b"", &[])),
-            Err(FragmentError::InvalidParagraphKind)
+            Err(FragmentError::InvalidParagraphKind),
+            "{kind:?}"
         );
     }
 }
@@ -778,13 +864,15 @@ fn rejects_invalid_utf8_line_breaks_noncovering_spans_and_grapheme_splits() {
     for text in [b"a\nb".as_slice(), b"a\rb"] {
         assert_eq!(
             Fragment::from_bytes(&paragraph(&[0], text, &[(3, 0)])),
-            Err(FragmentError::InvalidParagraphText)
+            Err(FragmentError::InvalidParagraphText),
+            "{text:?}"
         );
     }
     for spans in [&[][..], &[(0, 0)], &[(2, 0)], &[(1, 0), (1, 1)]] {
         assert_eq!(
             Fragment::from_bytes(&paragraph(&[0], b"a", spans)),
-            Err(FragmentError::InvalidSpans)
+            Err(FragmentError::InvalidSpans),
+            "{spans:?}"
         );
     }
     assert_eq!(
@@ -841,11 +929,11 @@ fn fills_encode_after_the_foreground_and_survive_rich_paste() {
         input.extend_from_slice(&Color::YELLOW.0[..length]);
         let decoded = Fragment::from_bytes(&input);
         match error {
-            Some(error) => assert_eq!(decoded, Err(error)),
+            Some(error) => assert_eq!(decoded, Err(error), "length {length}"),
             None => {
                 let style = decoded.unwrap().paragraphs()[0].spans()[0].style;
-                assert_eq!(style.background, Some(Color::YELLOW));
-                assert_eq!(style.foreground, None);
+                assert_eq!(style.background, Some(Color::YELLOW), "length {length}");
+                assert_eq!(style.foreground, None, "length {length}");
             }
         }
     }
@@ -921,20 +1009,27 @@ fn html_colors_preserve_channels_and_alpha_with_rounding_or_truncating_importers
             })
             .unwrap();
         let html = editor.document().to_html();
-        assert_eq!(Fragment::from_document(editor.document()).to_html(), html);
+        assert_eq!(
+            Fragment::from_document(editor.document()).to_html(),
+            html,
+            "alpha {alpha}"
+        );
         if alpha == 255 {
             assert!(html.contains("color:#2a64c8\""));
         } else {
-            let opacity = html
+            let opacity: f64 = html
                 .split_once("color:rgba(42,100,200,")
                 .unwrap()
                 .1
                 .split_once(')')
                 .unwrap()
                 .0
-                .parse::<f64>()
+                .parse()
                 .unwrap();
-            assert!((0.0..=1.0).contains(&opacity));
+            assert!(
+                (0.0..=1.0).contains(&opacity),
+                "alpha {alpha}: opacity {opacity}"
+            );
             assert_eq!((opacity * 255.0).round() as u8, alpha);
             assert_eq!((opacity * 255.0).trunc() as u8, alpha);
         }
@@ -1111,7 +1206,8 @@ fn decode_limits_reject_oversized_input_and_trusted_limits_accept_it() {
     ] {
         assert_eq!(
             decode(paragraphs, spans, length),
-            Err(FragmentError::LimitExceeded)
+            Err(FragmentError::LimitExceeded),
+            "limits ({paragraphs}, {spans}, {length})"
         );
     }
     assert!(decode(3, 3, bytes.len()).is_ok());
@@ -1131,7 +1227,8 @@ fn decode_limits_reject_oversized_input_and_trusted_limits_accept_it() {
                 &[b'T', b'L', b'F', b'R', version],
                 DecodeLimits::UNLIMITED
             ),
-            Err(FragmentError::Truncated)
+            Err(FragmentError::Truncated),
+            "version {version}"
         );
     }
 
@@ -1238,18 +1335,14 @@ fn quotes_encode_as_version_two_tag_six_and_export_one_blockquote_per_run() {
 
     let quote = |text: &str| {
         let spans = (!text.is_empty())
-            .then(|| Span {
-                range: 0..text.len(),
-                style: InlineStyle::default(),
-                link: None,
-            })
+            .then(|| Span::new(0..text.len(), InlineStyle::default(), None))
             .into_iter()
             .collect();
-        Paragraph::new(text, spans, ParagraphKind::Quote).unwrap()
+        Paragraph::try_new(text, spans, ParagraphKind::Quote).unwrap()
     };
     assert_eq!(
         Document::from_paragraphs([quote("")]).to_bytes(),
-        versioned_paragraphs(2, &[(&[6], b"", &[])])
+        versioned_paragraphs(2, &[RawParagraph::new(&[6], b"", &[])])
     );
     let bytes = document.to_bytes();
     let decoded = Document::from_bytes(&bytes).unwrap();
@@ -1370,7 +1463,11 @@ fn copied_list_items_export_the_numbers_they_showed_without_changing_native_byte
         indent,
         start: None,
     };
-    let kinds: Vec<_> = copied.paragraphs().iter().map(|p| p.kind()).collect();
+    let kinds: Vec<_> = copied
+        .paragraphs()
+        .iter()
+        .map(|paragraph| paragraph.kind())
+        .collect();
     assert_eq!(
         kinds,
         [
@@ -1423,21 +1520,19 @@ fn copied_list_items_export_the_numbers_they_showed_without_changing_native_byte
 #[test]
 fn paragraph_separators_cannot_appear_inside_paragraph_text() {
     let text = "a\u{2029}b";
-    let spans = || {
-        vec![Span {
-            range: 0..text.len(),
-            style: InlineStyle::default(),
-            link: None,
-        }]
-    };
+    let spans = || vec![Span::new(0..text.len(), InlineStyle::default(), None)];
     assert_eq!(
-        Paragraph::new(text, spans(), ParagraphKind::Body),
+        Paragraph::try_new(text, spans(), ParagraphKind::Body),
         Err(Error::InvalidFragment)
     );
     let raw = |version| {
         versioned_paragraphs(
             version,
-            &[(&[0], text.as_bytes(), &[(text.len() as u64, 0)])],
+            &[RawParagraph::new(
+                &[0],
+                text.as_bytes(),
+                &[(text.len() as u64, 0)],
+            )],
         )
     };
     assert_eq!(

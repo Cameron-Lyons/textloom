@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.0
+
+Unreleased. The code follows the
+[Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html),
+which changes some public API names and types from 1.0.0-rc.1. Every public
+item is documented.
+
+- `Error`, `FragmentError`, `AccessKitError`, and the egui
+  `AccessibilityError` implement `Copy`. `AccessibilitySnapshot` implements
+  `Clone` and `Copy`; `AccessKitAdapter`, `WinitAdapter`, and
+  `RichTextEditorOutput` implement `Clone`; `Movement` implements `Hash`.
+
+### Migration from 1.0.0-rc.1
+
+- `Editor::move_cursor` takes a `SelectionMode` instead of a `bool`:
+  `SelectionMode::Extend` for `true` and `SelectionMode::Move` for `false`.
+- `Editor::find_next` and `find_previous` take a `SearchWrap` instead of a
+  `bool`: `SearchWrap::Around` for `true` and `SearchWrap::Stop` for `false`.
+- `AccessibilitySnapshot::new` and `AccessKitAdapter::update` take an
+  `accessibility::Focus` instead of a `bool`: `Focus::Focused` for `true` and
+  `Focus::Unfocused` for `false`.
+- Constructors that return a `Result` are named `try_new`: `Link::try_new`,
+  `Paragraph::try_new`, and `AccessKitAdapter::try_new`.
+- `AccessKitAdapter::to_text_position` and `from_text_position` are
+  `text_position` and `editor_position`, since they convert their argument
+  rather than the adapter.
+- `Span` is `#[non_exhaustive]`, so it can gain fields in a minor release.
+  Build spans with `Span::new(range, style, link)` instead of a struct
+  expression.
+- `Color::STANDARD` lists `NamedColor`s, with `name` and `color` fields,
+  instead of `(name, color)` tuples.
+- `AccessKitAdapter::locate_link` and `locate_text_run` return the
+  document range (`Range<Position>`) instead of a paragraph index and byte
+  range tuple.
+
 ## 1.0.0-rc.1
 
 2026-10-22. Release candidate for 1.0.0, the first stable release of the native

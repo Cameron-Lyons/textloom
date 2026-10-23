@@ -3,9 +3,22 @@
 //! column-zero vertical moves let the authored sequences be checked without
 //! macOS, font metrics, or editor bindings.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
+use std::iter;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use super::*;
+use serde_json::{Value, json};
+
+use super::{
+    APPLESCRIPT, ClipboardCheck, CopyScope, Key, Machine, PASTE, Probe, Ran, Recipient,
+    SHORTCUT_UNICODE, Signal, System, TITLE,
+};
+use crate::{Result, TempDir};
 
 type Ignored = Box<dyn Fn(&str, &str) -> bool>;
 
@@ -32,8 +45,35 @@ struct Editor {
     text: Vec<String>,
     anchor: usize,
     focus: usize,
-    history: Vec<(Vec<String>, usize, usize)>,
+    history: Vec<Snapshot>,
     undo_count: usize,
+}
+
+/// The oracle's document and selection before an edit, for undo.
+struct Snapshot {
+    text: Vec<String>,
+    anchor: usize,
+    focus: usize,
+}
+
+/// Where the lines of the oracle's document start and end, as token indexes.
+struct Lines {
+    /// Each line's first token.
+    starts: Vec<usize>,
+    /// Each line's break token, or the document's end for the last line.
+    ends: Vec<usize>,
+    /// The line that holds the focus.
+    current: usize,
+}
+
+impl Lines {
+    /// The start of the line `step` lines away from the current one.
+    fn start_of(&self, step: isize) -> Result<usize, String> {
+        self.current
+            .checked_add_signed(step)
+            .and_then(|line| self.starts.get(line).copied())
+            .ok_or_else(|| "vertical move left the document".to_owned())
+    }
 }
 
 impl Editor {
@@ -43,36 +83,45 @@ impl Editor {
         self.focus = caret;
     }
 
-    fn boundaries(&self, soft: bool) -> (Vec<usize>, Vec<usize>, usize) {
+    /// The paragraphs, or with `soft` the visual lines, of the document.
+    fn boundaries(&self, soft: bool) -> Lines {
         let mut ends: Vec<usize> = (0..self.text.len())
             .filter(|&index| self.text[index] == "\n" || (soft && self.text[index] == "\u{2028}"))
             .collect();
-        let starts: Vec<usize> = std::iter::once(0)
+        let starts: Vec<usize> = iter::once(0)
             .chain(ends.iter().map(|end| end + 1))
             .collect();
-        let row = starts
+        let current = starts
             .iter()
             .rposition(|&start| start <= self.focus)
             .unwrap_or(0);
         ends.push(self.text.len());
-        (starts, ends, row)
+        Lines {
+            starts,
+            ends,
+            current,
+        }
     }
 
-    fn selection(&self) -> (usize, usize) {
-        (self.anchor.min(self.focus), self.anchor.max(self.focus))
+    fn selection(&self) -> Range<usize> {
+        self.anchor.min(self.focus)..self.anchor.max(self.focus)
     }
 
     fn selected(&self) -> String {
-        let (start, end) = self.selection();
-        self.text[start..end].concat().replace('\u{2028}', "\n")
+        self.text[self.selection()]
+            .concat()
+            .replace('\u{2028}', "\n")
     }
 
     fn replace(&mut self, start: usize, end: usize, text: &str) -> Result<(), String> {
         if start > end || end > self.text.len() {
             return Err(format!("edit {start}..{end} is outside the document"));
         }
-        self.history
-            .push((self.text.clone(), self.anchor, self.focus));
+        self.history.push(Snapshot {
+            text: self.text.clone(),
+            anchor: self.anchor,
+            focus: self.focus,
+        });
         let inserted = tokens(text);
         let caret = start + inserted.len();
         self.text.splice(start..end, inserted);
@@ -81,18 +130,13 @@ impl Editor {
         Ok(())
     }
 
-    fn row(rows: &[usize], row: usize, step: isize) -> Result<usize, String> {
-        row.checked_add_signed(step)
-            .and_then(|row| rows.get(row).copied())
-            .ok_or_else(|| "vertical move left the document".to_owned())
-    }
-
-    fn column_zero(&self) -> Result<(Vec<usize>, usize), String> {
-        let (rows, _, row) = self.boundaries(true);
-        if self.focus != rows[row] {
+    /// The visual lines, provided the focus is at the start of one.
+    fn column_zero(&self) -> Result<Lines, String> {
+        let lines = self.boundaries(true);
+        if self.focus != lines.starts[lines.current] {
             return Err("vertical fixture must start at column zero".to_owned());
         }
-        Ok((rows, row))
+        Ok(lines)
     }
 
     fn step(&self, forward: bool) -> Result<usize, String> {
@@ -111,26 +155,30 @@ impl Editor {
         match command {
             "command-keycode" | "command-shift-keycode" => match value {
                 "51" => {
-                    let (starts, _, row) = self.boundaries(true);
-                    self.replace(starts[row], self.focus, "")?;
+                    let lines = self.boundaries(true);
+                    self.replace(lines.starts[lines.current], self.focus, "")?;
                 }
                 "124" => {
-                    let (_, ends, row) = self.boundaries(true);
-                    target = Some(ends[row]);
+                    let lines = self.boundaries(true);
+                    target = Some(lines.ends[lines.current]);
                 }
                 "125" => target = Some(self.text.len()),
                 "126" => target = Some(0),
                 _ => return Err(format!("unexpected Command key {value}")),
             },
             "control-chord" | "control-shift-chord" => {
-                let (starts, ends, paragraph) = self.boundaries(false);
+                let Lines {
+                    starts,
+                    ends,
+                    current: paragraph,
+                } = self.boundaries(false);
                 match value {
                     "a" => target = Some(starts[paragraph]),
                     "e" => target = Some(ends[paragraph]),
                     "b" | "f" => target = Some(self.step(value == "f")?),
                     "p" | "n" => {
-                        let (rows, row) = self.column_zero()?;
-                        target = Some(Self::row(&rows, row, if value == "p" { -1 } else { 1 })?);
+                        let step = if value == "p" { -1 } else { 1 };
+                        target = Some(self.column_zero()?.start_of(step)?);
                     }
                     "h" => {
                         let start = self.step(false)?;
@@ -141,7 +189,11 @@ impl Editor {
                 }
             }
             "option-keycode" | "option-shift-keycode" => {
-                let (starts, ends, paragraph) = self.boundaries(false);
+                let Lines {
+                    starts,
+                    ends,
+                    current: paragraph,
+                } = self.boundaries(false);
                 match value {
                     "126" => {
                         let at_start = usize::from(self.focus == starts[paragraph]);
@@ -157,10 +209,7 @@ impl Editor {
             "keycode" | "shift-keycode" => match value {
                 "36" => self.replace(self.focus, self.focus, "\u{2028}")?,
                 "123" | "124" => target = Some(self.step(value == "124")?),
-                "125" => {
-                    let (rows, row) = self.column_zero()?;
-                    target = Some(Self::row(&rows, row, 1)?);
-                }
+                "125" => target = Some(self.column_zero()?.start_of(1)?),
                 _ => return Err(format!("unexpected key {value}")),
             },
             "type" => self.replace(self.focus, self.focus, value)?,
@@ -179,12 +228,18 @@ impl Editor {
     }
 }
 
+/// A command the probe ran, with the input it gave the command.
+struct Invocation {
+    arguments: Vec<String>,
+    input: Option<String>,
+}
+
 /// The desktop the probe sees: System Events actions edit the oracle's
 /// document, and the pasteboard, its inspector, and pbpaste follow it.
 #[derive(Default)]
 struct Fake {
     clock: f64,
-    commands: Vec<(Vec<String>, Option<String>)>,
+    commands: Vec<Invocation>,
     actions: Vec<(String, String)>,
     editor: Editor,
     pasteboard: String,
@@ -197,7 +252,7 @@ struct Fake {
     polls: HashMap<u32, VecDeque<Option<i32>>>,
     waits: HashMap<u32, VecDeque<Option<i32>>>,
     wait_calls: Vec<(u32, f64)>,
-    signals: Vec<(u32, Signal, bool)>,
+    signals: Vec<(u32, Signal, Recipient)>,
 }
 
 fn ran(code: i32, stdout: impl Into<Vec<u8>>, stderr: &str) -> Ran {
@@ -250,8 +305,8 @@ impl Fake {
                 Ok(())
             }
             ("chord", "v") => {
-                let (start, end) = editor.selection();
-                editor.replace(start, end, &self.pasteboard)
+                let selection = editor.selection();
+                editor.replace(selection.start, selection.end, &self.pasteboard)
             }
             ("chord", "c") => {
                 self.pasteboard = editor.selected();
@@ -259,7 +314,11 @@ impl Fake {
                 Ok(())
             }
             ("chord", "z") => match editor.history.pop() {
-                Some((text, anchor, focus)) => {
+                Some(Snapshot {
+                    text,
+                    anchor,
+                    focus,
+                }) => {
                     (editor.text, editor.anchor, editor.focus) = (text, anchor, focus);
                     editor.undo_count += 1;
                     Ok(())
@@ -302,8 +361,10 @@ impl Fake {
 
 impl System for Fake {
     fn run(&mut self, arguments: &[String], input: Option<&str>, _timeout: f64) -> Result<Ran> {
-        self.commands
-            .push((arguments.to_vec(), input.map(str::to_owned)));
+        self.commands.push(Invocation {
+            arguments: arguments.to_vec(),
+            input: input.map(str::to_owned),
+        });
         Ok(match arguments[0].as_str() {
             "/usr/bin/osascript" => self.osascript(&arguments[2..]),
             "/usr/bin/env" if arguments[2] == "/usr/bin/pbcopy" => {
@@ -348,8 +409,8 @@ impl System for Fake {
             .flatten())
     }
 
-    fn signal(&mut self, pid: u32, signal: Signal, group: bool) {
-        self.signals.push((pid, signal, group));
+    fn signal(&mut self, pid: u32, signal: Signal, recipient: Recipient) {
+        self.signals.push((pid, signal, recipient));
     }
 
     fn monotonic(&self) -> f64 {
@@ -370,9 +431,9 @@ struct Replay {
 
 impl Replay {
     fn new(fake: Fake) -> Self {
-        let work = TempDir::new("textloom-macos-test-work-").unwrap();
-        let output = TempDir::new("textloom-macos-test-output-").unwrap();
-        let probe = Probe::new(
+        let work = TempDir::try_new("textloom-macos-test-work-").unwrap();
+        let output = TempDir::try_new("textloom-macos-test-output-").unwrap();
+        let probe = Probe::try_new(
             fake,
             PathBuf::from("unused"),
             output.path().to_path_buf(),
@@ -419,11 +480,13 @@ fn fixture_uses_public_utf8_clipboard_input_and_native_paste() {
         .fake()
         .commands
         .iter()
-        .map(|(arguments, input)| match arguments[0].as_str() {
-            "/usr/bin/osascript" => format!("{} {}", arguments[2], arguments[5]),
-            "/usr/bin/env" => format!("{} {input:?}", arguments[1..].join(" ")),
-            _ => arguments[1..].join(" "),
-        })
+        .map(
+            |Invocation { arguments, input }| match arguments[0].as_str() {
+                "/usr/bin/osascript" => format!("{} {}", arguments[2], arguments[5]),
+                "/usr/bin/env" => format!("{} {input:?}", arguments[1..].join(" ")),
+                _ => arguments[1..].join(" "),
+            },
+        )
         .collect();
     let input = format!("{:?}", Some(SHORTCUT_UNICODE));
     assert_eq!(
@@ -451,7 +514,7 @@ fn selection_check_preserves_selection_and_requires_exact_copy_before_success() 
             101,
             "selection",
             "e\u{301}",
-            &[("control-shift-chord", "b")],
+            &[Key::new("control-shift-chord", "b")],
             None,
         )
         .unwrap();
@@ -484,7 +547,13 @@ fn copy_requires_fresh_generation_and_codepoint_exact_unicode_with_trailing_lf()
         fake.editor.load(&expected, 0);
         fake.editor.focus = fake.editor.text.len();
         let mut replay = Replay::new(fake);
-        let result = replay.probe.copy(101, TITLE, &expected, false, false);
+        let result = replay.probe.copy(
+            101,
+            TITLE,
+            &expected,
+            ClipboardCheck::Plain,
+            CopyScope::Selection,
+        );
         if actual == expected {
             assert_eq!(result.unwrap()["plain_utf8_exact"], true);
         } else {
@@ -499,18 +568,24 @@ fn copy_requires_fresh_generation_and_codepoint_exact_unicode_with_trailing_lf()
         let inspected: Vec<_> = fake
             .commands
             .iter()
-            .filter(|(arguments, _)| arguments[0].ends_with("/macos-clipboard"))
+            .filter(|invocation| invocation.arguments[0].ends_with("/macos-clipboard"))
             .collect();
-        assert_eq!(inspected[1].0[1..], ["plain".to_owned(), expected.clone()]);
+        assert_eq!(
+            inspected[1].arguments[1..],
+            ["plain".to_owned(), expected.clone()]
+        );
         assert!(fake.generation > 7, "the copy published a fresh generation");
-        assert_eq!(fake.commands.last().unwrap().0, strings(&PASTE));
+        assert_eq!(
+            fake.commands.last().unwrap().arguments,
+            super::strings(&PASTE)
+        );
     }
 }
 
 #[test]
 fn binary_runner_preserves_unicode_crlf_cr_and_lf_without_a_desktop() {
     let payload = format!("e\u{301}{WOMAN_TECHNOLOGIST}\r\nx\ry\n").into_bytes();
-    let directory = TempDir::new("textloom-macos-test-").unwrap();
+    let directory = TempDir::try_new("textloom-macos-test-").unwrap();
     let path = directory.path().join("payload");
     fs::write(&path, &payload).unwrap();
     let mut machine = Machine::new(Arc::default());
@@ -563,7 +638,7 @@ fn deletion_checks_full_document_then_single_undo_exact_restoration() {
             101,
             "deletion",
             &after,
-            &[("control-chord", "h")],
+            &[Key::new("control-chord", "h")],
             Some(SHORTCUT_UNICODE),
         )
         .unwrap();
@@ -602,7 +677,7 @@ fn failed_edit_or_undo_assertion_never_records_success() {
                 101,
                 "deletion",
                 "a e\u{301} z",
-                &[("control-chord", "d")],
+                &[Key::new("control-chord", "d")],
                 Some(SHORTCUT_UNICODE),
             )
             .unwrap_err()
@@ -739,17 +814,20 @@ fn added_system_events_actions_deliver_only_the_requested_modifiers() {
 #[test]
 fn document_urls_match_textedit_documents() {
     assert_eq!(
-        file_uri(Path::new("/tmp/a b/c~d.rtf")),
+        super::file_uri(Path::new("/tmp/a b/c~d.rtf")),
         "file:///tmp/a%20b/c~d.rtf"
     );
     assert_eq!(
-        file_uri(Path::new("/tmp/caf\u{e9}")),
+        super::file_uri(Path::new("/tmp/caf\u{e9}")),
         "file:///tmp/caf%C3%A9"
     );
     let replay = Replay::new(Fake::default());
-    let (absolute, resolved) = &replay.probe.document_urls["textloom-html-import"];
-    assert!(absolute.starts_with("file:///") && absolute.ends_with("/textloom-html-import.rtf"));
-    assert!(resolved.ends_with("/textloom-html-import.rtf"));
+    let document = &replay.probe.document_urls["textloom-html-import"];
+    assert!(
+        document.absolute.starts_with("file:///")
+            && document.absolute.ends_with("/textloom-html-import.rtf")
+    );
+    assert!(document.resolved.ends_with("/textloom-html-import.rtf"));
 }
 
 #[test]
@@ -771,11 +849,11 @@ fn native_exit_race_still_reaps_all_children() {
         let error = replay.probe.cleanup().unwrap_err().to_string();
         assert!(error.contains("did not all close"), "{error}");
         let fake = replay.fake();
-        let mut signals = vec![(101, Signal::Terminate, true)];
+        let mut signals = vec![(101, Signal::Terminate, Recipient::ProcessGroup)];
         if during_kill {
-            signals.push((101, Signal::Kill, true));
+            signals.push((101, Signal::Kill, Recipient::ProcessGroup));
         }
-        signals.push((102, Signal::Terminate, true));
+        signals.push((102, Signal::Terminate, Recipient::ProcessGroup));
         assert_eq!(fake.signals, signals);
         let waits = if during_kill { 2 } else { 1 };
         assert_eq!(
@@ -815,7 +893,10 @@ fn textedit_exit_race_still_confirms_absence() {
         let mut replay = Replay::new(fake);
         replay.probe.textedit_pid = Some(103);
         replay.probe.cleanup().unwrap();
-        assert_eq!(replay.fake().signals, [(103, Signal::Terminate, false)]);
+        assert_eq!(
+            replay.fake().signals,
+            [(103, Signal::Terminate, Recipient::Process)]
+        );
         assert!(replay.fake().textedit.is_empty());
         assert_eq!(
             replay.probe.observations["cleanup"]["textedit_process_absent"],

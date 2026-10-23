@@ -1,48 +1,62 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
+//! Tests links: target validation, how typing, formatting, replacement, and
+//! paste treat linked text, caret link queries, undo history costs, and the
+//! encoding of links in the native format and HTML export.
+
+use std::collections::hash_map::DefaultHasher;
+use std::ops::Range;
 
 use textloom::{
     Color, Document, Editor, Error, Fragment, FragmentError, InlineStyle, Link, Movement,
-    Paragraph, ParagraphKind, Position, SearchOptions, Selection, Span, StylePatch,
+    Paragraph, ParagraphKind, Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,
 };
 
 fn link(target: &str) -> Link {
-    Link::new(target).unwrap()
+    Link::try_new(target).expect("callers pass short targets without control characters")
 }
 
-fn select(editor: &mut Editor, paragraph: usize, bytes: std::ops::Range<usize>) {
+fn select(editor: &mut Editor, paragraph: usize, bytes: Range<usize>) {
     editor
         .set_selection(Selection::new(
             Position::new(paragraph, bytes.start),
             Position::new(paragraph, bytes.end),
         ))
-        .unwrap();
+        .expect("callers select between grapheme boundaries of an existing paragraph");
 }
 
 fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
     editor
         .set_selection(Selection::caret(Position::new(paragraph, byte)))
-        .unwrap();
+        .expect("callers place the caret on a grapheme boundary of an existing paragraph");
 }
 
-fn runs(editor: &Editor, index: usize) -> Vec<(String, Option<String>)> {
-    let paragraph = editor.document().paragraph(index).unwrap();
+/// The text of one span and the target of its link, if any.
+#[derive(Debug, PartialEq)]
+struct Run {
+    text: String,
+    link: Option<String>,
+}
+
+/// Returns the spans of paragraph `index` as [`Run`]s.
+fn runs(editor: &Editor, index: usize) -> Vec<Run> {
+    let paragraph = editor
+        .document()
+        .paragraph(index)
+        .expect("callers pass the index of an existing paragraph");
     paragraph
         .spans()
         .iter()
-        .map(|span| {
-            (
-                paragraph.text()[span.range.clone()].to_owned(),
-                span.link.as_ref().map(ToString::to_string),
-            )
+        .map(|span| Run {
+            text: paragraph.text()[span.range.clone()].to_owned(),
+            link: span.link.as_ref().map(ToString::to_string),
         })
         .collect()
 }
 
-fn run(text: &str, target: Option<&str>) -> (String, Option<String>) {
-    (text.to_owned(), target.map(str::to_owned))
+fn run(text: &str, target: Option<&str>) -> Run {
+    Run {
+        text: text.to_owned(),
+        link: target.map(str::to_owned),
+    }
 }
 
 fn linked_editor() -> Editor {
@@ -50,12 +64,14 @@ fn linked_editor() -> Editor {
     caret(&mut editor, 0, 6);
     editor
         .insert_link("example", link("https://example.com"))
-        .unwrap();
+        .expect("no IME composition is active");
     editor.clear_history();
     editor
 }
 
 fn hash(link: &Link) -> u64 {
+    use std::hash::{Hash, Hasher};
+
     let mut hasher = DefaultHasher::new();
     link.hash(&mut hasher);
     hasher.finish()
@@ -64,20 +80,28 @@ fn hash(link: &Link) -> u64 {
 #[test]
 fn link_targets_are_validated_and_compare_by_text() {
     for invalid in ["", "a\0b", "tab\there", "line\nbreak", "\u{7f}", "\u{85}"] {
-        assert_eq!(Link::new(invalid), Err(Error::InvalidLink), "{invalid:?}");
+        assert_eq!(
+            Link::try_new(invalid),
+            Err(Error::InvalidLink),
+            "{invalid:?}"
+        );
     }
     for separator in ["\u{2028}", "\u{2029}"] {
         assert_eq!(
-            Link::new(&format!("https://example.com/{separator}")),
-            Err(Error::InvalidLink)
+            Link::try_new(&format!("https://example.com/{separator}")),
+            Err(Error::InvalidLink),
+            "{separator:?}"
         );
     }
     let longest = "a".repeat(Link::MAX_LEN);
-    assert_eq!(Link::new(&longest).unwrap().as_str().len(), 64 * 1024);
-    assert_eq!(Link::new(&format!("{longest}a")), Err(Error::InvalidLink));
+    assert_eq!(Link::try_new(&longest).unwrap().as_str().len(), 64 * 1024);
+    assert_eq!(
+        Link::try_new(&format!("{longest}a")),
+        Err(Error::InvalidLink)
+    );
 
-    let unicode = link("https://例え.jp/パス?q=café#👩‍💻");
-    assert_eq!(unicode.as_str(), "https://例え.jp/パス?q=café#👩‍💻");
+    let unicode = link("https://例え.jp/パス?q=café#👩\u{200d}💻");
+    assert_eq!(unicode.as_str(), "https://例え.jp/パス?q=café#👩\u{200d}💻");
     assert_eq!(unicode.to_string(), unicode.as_str());
     assert_eq!(format!("{:?}", link("mailto:a@b")), "Link(\"mailto:a@b\")");
     let separate = link(unicode.as_str());
@@ -93,12 +117,8 @@ fn runs_merge_only_when_their_style_and_link_agree() {
         bold: true,
         ..InlineStyle::default()
     };
-    let span = |range, style, target: Option<&str>| Span {
-        range,
-        style,
-        link: target.map(link),
-    };
-    let paragraph = Paragraph::new(
+    let span = |range, style, target: Option<&str>| Span::new(range, style, target.map(link));
+    let paragraph = Paragraph::try_new(
         "abcdefgh",
         vec![
             span(0..1, InlineStyle::default(), Some("https://a")),
@@ -146,11 +166,11 @@ fn runs_merge_only_when_their_style_and_link_agree() {
         Position::new(0, 9),
         Position::new(1, 0),
     ] {
-        assert_eq!(document.link_at(missing), None);
-        assert_eq!(document.link_range_at(missing), None);
+        assert_eq!(document.link_at(missing), None, "{missing:?}");
+        assert_eq!(document.link_range_at(missing), None, "{missing:?}");
     }
-    let emoji = Document::from_paragraphs([Paragraph::new(
-        "👩‍💻",
+    let emoji = Document::from_paragraphs([Paragraph::try_new(
+        "👩\u{200d}💻",
         vec![span(0..11, InlineStyle::default(), Some("https://a"))],
         ParagraphKind::Body,
     )
@@ -362,7 +382,8 @@ fn insert_link_replaces_the_selection_and_defaults_to_its_target() {
     for index in 0..2 {
         assert_eq!(
             editor.document().link_at(Position::new(index, 0)),
-            Some(&target)
+            Some(&target),
+            "paragraph {index}"
         );
     }
     assert_eq!(editor.undo_len(), 1);
@@ -382,23 +403,21 @@ fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
         (17..18, false, Some(first.clone())),
         (18..19, true, Some(first.clone())),
     ]
-    .map(|(range, bold, link)| Span {
-        range,
-        style: InlineStyle {
-            bold,
-            ..InlineStyle::default()
-        },
-        link,
+    .map(|(range, bold, link)| {
+        Span::new(
+            range,
+            InlineStyle {
+                bold,
+                ..InlineStyle::default()
+            },
+            link,
+        )
     });
     let document = Document::from_paragraphs([
-        Paragraph::new("é👩‍💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
-        Paragraph::new(
+        Paragraph::try_new("é👩\u{200d}💻ab  cd", spans.to_vec(), ParagraphKind::Body).unwrap(),
+        Paragraph::try_new(
             "next",
-            vec![Span {
-                range: 0..4,
-                style: InlineStyle::default(),
-                link: None,
-            }],
+            vec![Span::new(0..4, InlineStyle::default(), None)],
             ParagraphKind::Body,
         )
         .unwrap(),
@@ -420,18 +439,19 @@ fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
         let selection = editor.selection();
         assert_eq!(editor.selected_link().as_ref(), target, "byte {byte}");
         editor.set_link(Some(replacement.clone())).unwrap();
-        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.selection(), selection, "byte {byte}");
         let changed = editor.document().to_bytes();
         assert_eq!(
             editor.document().paragraph(0).unwrap().spans().len(),
-            spans.len()
+            spans.len(),
+            "byte {byte}"
         );
         for (before, after) in spans
             .iter()
             .zip(editor.document().paragraph(0).unwrap().spans())
         {
-            assert_eq!(after.range, before.range);
-            assert_eq!(after.style, before.style);
+            assert_eq!(after.range, before.range, "byte {byte}");
+            assert_eq!(after.style, before.style, "byte {byte}");
             let expected = if range
                 .as_ref()
                 .is_some_and(|range| range.contains(&before.range.start))
@@ -442,13 +462,13 @@ fn caret_link_queries_and_edits_agree_at_styled_unicode_boundaries() {
             };
             assert_eq!(after.link.as_ref(), expected, "byte {byte}");
         }
-        assert_eq!(editor.undo(), range.is_some());
-        assert_eq!(editor.document().to_bytes(), original);
-        assert_eq!(editor.selection(), selection);
-        assert_eq!(editor.selected_link().as_ref(), target);
+        assert_eq!(editor.undo(), range.is_some(), "byte {byte}");
+        assert_eq!(editor.document().to_bytes(), original, "byte {byte}");
+        assert_eq!(editor.selection(), selection, "byte {byte}");
+        assert_eq!(editor.selected_link().as_ref(), target, "byte {byte}");
         if range.is_some() {
-            assert!(editor.redo());
-            assert_eq!(editor.document().to_bytes(), changed);
+            assert!(editor.redo(), "byte {byte}");
+            assert_eq!(editor.document().to_bytes(), changed, "byte {byte}");
         }
     }
     let mut editor = Editor::new(document);
@@ -778,7 +798,9 @@ fn history_charges_a_link_shared_by_many_paragraphs_once() {
     let target = format!("https://example.com/{}", "x".repeat(Link::MAX_LEN - 20));
     let long = link(&target);
     let mut editor = Editor::from_text(&vec!["word"; 200].join("\n"));
-    editor.move_cursor(Movement::DocumentEnd, false).unwrap();
+    editor
+        .move_cursor(Movement::DocumentEnd, SelectionMode::Move)
+        .unwrap();
     editor.insert_text(" earlier").unwrap();
     editor.select_all();
     editor.set_link(Some(long)).unwrap();

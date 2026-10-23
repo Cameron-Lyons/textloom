@@ -1,33 +1,42 @@
+//! Tests `Editor` commands and their undo history: grapheme-safe movement and
+//! deletion, selection, formatting and selection styles, typing groups and
+//! history limits, IME composition, transactions (including rollback when the
+//! host panics), saved state, list and quote paragraphs, and soft line breaks.
+
+use std::mem;
+use std::ops::Range;
 use std::sync::Arc;
+
 use textloom::{
     Color, Document, Editor, Error, Fragment, HistoryLimits, InlineAttribute, InlineStyle,
-    Movement, Paragraph, ParagraphKind, Position, Selection, SelectionStyle, Span, StylePatch,
+    Movement, Paragraph, ParagraphKind, Position, Selection, SelectionMode, SelectionStyle, Span,
+    StylePatch,
 };
 
 fn caret(editor: &mut Editor, paragraph: usize, byte: usize) {
     editor
         .set_selection(Selection::caret(Position::new(paragraph, byte)))
-        .unwrap();
+        .expect("callers place the caret on a grapheme boundary of an existing paragraph");
 }
 
 #[test]
 fn extended_graphemes_are_indivisible_for_movement_and_deletion() {
-    let mut editor = Editor::from_text("a👩‍💻e\u{301}🇺🇳z");
-    let clusters = ["a", "👩‍💻", "e\u{301}", "🇺🇳", "z"];
+    let mut editor = Editor::from_text("a👩\u{200d}💻e\u{301}🇺🇳z");
+    let clusters = ["a", "👩\u{200d}💻", "e\u{301}", "🇺🇳", "z"];
     let mut byte = 0;
     for cluster in clusters {
         editor
-            .move_cursor(Movement::GraphemeForward, false)
+            .move_cursor(Movement::GraphemeForward, SelectionMode::Move)
             .unwrap();
         byte += cluster.len();
-        assert_eq!(editor.selection().focus.byte, byte);
+        assert_eq!(editor.selection().focus.byte, byte, "after {cluster:?}");
     }
     editor.delete_backward().unwrap();
     editor.break_history_group();
     editor.delete_backward().unwrap();
-    assert_eq!(editor.document().plain_text(), "a👩‍💻e\u{301}");
+    assert_eq!(editor.document().plain_text(), "a👩\u{200d}💻e\u{301}");
     assert!(editor.undo());
-    assert_eq!(editor.document().plain_text(), "a👩‍💻e\u{301}🇺🇳");
+    assert_eq!(editor.document().plain_text(), "a👩\u{200d}💻e\u{301}🇺🇳");
     caret(&mut editor, 0, 1);
     editor.delete_forward().unwrap();
     assert_eq!(editor.document().plain_text(), "ae\u{301}🇺🇳");
@@ -38,11 +47,14 @@ fn invalid_selection_is_atomic() {
     let mut editor = Editor::from_text("e\u{301}🦀");
     let original = editor.selection();
     for byte in [1, 2, 4, 99] {
-        assert!(matches!(
-            editor.set_selection(Selection::caret(Position::new(0, byte))),
-            Err(Error::InvalidPosition(_))
-        ));
-        assert_eq!(editor.selection(), original);
+        assert!(
+            matches!(
+                editor.set_selection(Selection::caret(Position::new(0, byte))),
+                Err(Error::InvalidPosition(_))
+            ),
+            "byte {byte}"
+        );
+        assert_eq!(editor.selection(), original, "byte {byte}");
     }
     assert!(
         editor
@@ -54,7 +66,7 @@ fn invalid_selection_is_atomic() {
 
 #[test]
 fn style_lookup_rejects_invalid_utf8_and_grapheme_positions() {
-    let mut editor = Editor::from_text("é e\u{301} 👩‍💻");
+    let mut editor = Editor::from_text("é e\u{301} 👩\u{200d}💻");
     editor.select_all();
     editor
         .apply_style(StylePatch {
@@ -230,7 +242,7 @@ fn formatting_only_paragraph_breaks_updates_typing_style_without_history() {
 
 #[test]
 fn selection_style_reports_independent_mixed_attributes_inside_unicode_runs() {
-    let mut editor = Editor::from_text("a👩‍💻e\u{301}z");
+    let mut editor = Editor::from_text("a👩\u{200d}💻e\u{301}z");
     let red = Color([255, 0, 0, 255]);
     let blue = Color([0, 0, 255, 255]);
     editor
@@ -441,9 +453,12 @@ fn selection_style_all_mixed_attributes_remain_mixed_after_later_matching_runs()
 
 #[test]
 fn repeated_selection_style_queries_follow_edits_history_rollbacks_and_clones() {
+    /// Computes the selection style on a fresh editor, without any cached state.
     fn uncached(editor: &Editor) -> SelectionStyle {
         let mut fresh = Editor::new(editor.document().clone());
-        fresh.set_selection(editor.selection()).unwrap();
+        fresh
+            .set_selection(editor.selection())
+            .expect("the selection is valid in the editor whose document was cloned");
         fresh.selection_style()
     }
 
@@ -690,9 +705,10 @@ fn fill_color_formats_independently_types_on_and_undoes_like_excel() {
 fn standard_colors_follow_excels_palette_order() {
     let palette: Vec<_> = Color::STANDARD
         .iter()
-        .map(|(name, Color([red, green, blue, alpha]))| {
-            assert_eq!(*alpha, 255, "{name} is opaque");
-            (*name, format!("#{red:02X}{green:02X}{blue:02X}"))
+        .map(|standard| {
+            let Color([red, green, blue, alpha]) = standard.color;
+            assert_eq!(alpha, 255, "{} is opaque", standard.name);
+            (standard.name, format!("#{red:02X}{green:02X}{blue:02X}"))
         })
         .collect();
     let expected = [
@@ -720,7 +736,7 @@ fn standard_colors_follow_excels_palette_order() {
         Color::DARK_BLUE,
         Color::PURPLE,
     ];
-    assert_eq!(Color::STANDARD.map(|(_, color)| color), constants);
+    assert_eq!(Color::STANDARD.map(|standard| standard.color), constants);
 }
 
 #[test]
@@ -735,18 +751,19 @@ fn unicode_typing_coalesces_joined_graphemes_into_one_reversible_delta() {
     let before_style = editor.typing_style();
     for text in ["a", "\u{301}", "👩", "\u{200d}", "💻"] {
         editor.insert_text(text).unwrap();
-        assert_eq!(editor.undo_len(), 1);
+        assert_eq!(editor.undo_len(), 1, "after {text:?}");
         assert!(
             editor
                 .document()
                 .validate_position(editor.selection().focus)
-                .is_ok()
+                .is_ok(),
+            "after {text:?}"
         );
     }
     let after = Fragment::from_document(editor.document());
     let selection = editor.selection();
     let bytes = editor.history_bytes();
-    assert_eq!(editor.document().plain_text(), "a\u{301}👩‍💻");
+    assert_eq!(editor.document().plain_text(), "a\u{301}👩\u{200d}💻");
     assert!(editor.undo());
     assert_eq!(editor.document().plain_text(), "");
     assert_eq!(editor.selection(), Selection::default());
@@ -773,22 +790,22 @@ fn either_zero_history_limit_disables_retention_and_reenabling_starts_a_fresh_ch
     ] {
         let mut editor = Editor::default();
         editor.insert_text("old").unwrap();
-        assert!(editor.undo());
+        assert!(editor.undo(), "{limits:?}");
         editor.set_history_limits(limits);
         for text in ["a", "b", "c"] {
             editor.insert_text(text).unwrap();
-            assert_eq!(editor.undo_len(), 0);
-            assert_eq!(editor.redo_len(), 0);
-            assert_eq!(editor.history_bytes(), 0);
+            assert_eq!(editor.undo_len(), 0, "{limits:?}, after {text:?}");
+            assert_eq!(editor.redo_len(), 0, "{limits:?}, after {text:?}");
+            assert_eq!(editor.history_bytes(), 0, "{limits:?}, after {text:?}");
         }
         editor.set_history_limits(HistoryLimits::default());
         editor.insert_text("new").unwrap();
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "abc");
-        assert!(!editor.undo());
-        assert!(editor.redo());
-        assert_eq!(editor.document().plain_text(), "abcnew");
+        assert_eq!(editor.undo_len(), 1, "{limits:?}");
+        assert!(editor.undo(), "{limits:?}");
+        assert_eq!(editor.document().plain_text(), "abc", "{limits:?}");
+        assert!(!editor.undo(), "{limits:?}");
+        assert!(editor.redo(), "{limits:?}");
+        assert_eq!(editor.document().plain_text(), "abcnew", "{limits:?}");
     }
 }
 
@@ -859,7 +876,8 @@ fn heading_enter_returns_to_body() {
 
 #[test]
 fn accessible_full_value_replacement_keeps_the_document_start_kind_and_style() {
-    use textloom::accessibility::{AccessibleAction, apply_action};
+    use textloom::accessibility::{self, AccessibleAction};
+
     let heading = ParagraphKind::Heading { level: 1 };
     let bullet = ParagraphKind::Bullet { indent: 0 };
     let started = ParagraphKind::Ordered {
@@ -890,12 +908,16 @@ fn accessible_full_value_replacement_keeps_the_document_start_kind_and_style() {
         let selection = Selection::caret(Position::new(1, 9));
         editor.set_selection(selection).unwrap();
         let typing_style = editor.typing_style();
-        assert!(typing_style.bold);
+        assert!(typing_style.bold, "{start_kind:?} {text:?}");
         let original = editor.document().paragraphs().to_vec();
         let steps = editor.undo_len();
 
-        apply_action(&mut editor, AccessibleAction::ReplaceAllText(text)).unwrap();
-        assert_eq!(editor.document().plain_text(), text);
+        accessibility::apply_action(&mut editor, AccessibleAction::ReplaceAllText(text)).unwrap();
+        assert_eq!(
+            editor.document().plain_text(),
+            text,
+            "{start_kind:?} {text:?}"
+        );
         assert_eq!(kinds(&editor), expected, "{start_kind:?} {text:?}");
         assert!(
             editor
@@ -903,18 +925,30 @@ fn accessible_full_value_replacement_keeps_the_document_start_kind_and_style() {
                 .paragraphs()
                 .iter()
                 .flat_map(|paragraph| paragraph.spans())
-                .all(|span| !span.style.bold)
+                .all(|span| !span.style.bold),
+            "{start_kind:?} {text:?}"
         );
-        assert!(!editor.typing_style().bold);
-        assert_eq!(editor.undo_len(), steps + 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().paragraphs(), original);
-        assert_eq!(editor.selection(), selection);
-        assert_eq!(editor.typing_style(), typing_style);
+        assert!(!editor.typing_style().bold, "{start_kind:?} {text:?}");
+        assert_eq!(editor.undo_len(), steps + 1, "{start_kind:?} {text:?}");
+        assert!(editor.undo(), "{start_kind:?} {text:?}");
+        assert_eq!(
+            editor.document().paragraphs(),
+            original,
+            "{start_kind:?} {text:?}"
+        );
+        assert_eq!(editor.selection(), selection, "{start_kind:?} {text:?}");
+        assert_eq!(
+            editor.typing_style(),
+            typing_style,
+            "{start_kind:?} {text:?}"
+        );
 
         editor.select_all();
         editor.insert_text(text).unwrap();
-        assert!(kinds(&editor).iter().all(|kind| *kind == BODY));
+        assert!(
+            kinds(&editor).iter().all(|kind| *kind == BODY),
+            "{start_kind:?} {text:?}"
+        );
     }
 }
 
@@ -1105,6 +1139,7 @@ fn history_limits_discard_farthest_redo_and_preserve_the_next_steps() {
     assert_eq!(editor.history_bytes(), 0);
 }
 
+/// Returns whether `editor` shares every paragraph allocation with `document`.
 fn identical(editor: &Editor, document: &Document) -> bool {
     let paragraphs = editor.document().paragraphs();
     paragraphs.len() == document.paragraphs().len()
@@ -1256,11 +1291,17 @@ fn joining_and_splitting_paragraphs_are_reversible() {
 fn vertical_movement_preserves_grapheme_column_across_short_paragraph() {
     let mut editor = Editor::from_text("abcdef\nx\n🦀🦀🦀🦀🦀🦀");
     caret(&mut editor, 0, 5);
-    editor.move_cursor(Movement::ParagraphDown, false).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Move)
+        .unwrap();
     assert_eq!(editor.selection().focus, Position::new(1, 1));
-    editor.move_cursor(Movement::ParagraphDown, false).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphDown, SelectionMode::Move)
+        .unwrap();
     assert_eq!(editor.selection().focus, Position::new(2, 20));
-    editor.move_cursor(Movement::ParagraphUp, true).unwrap();
+    editor
+        .move_cursor(Movement::ParagraphUp, SelectionMode::Extend)
+        .unwrap();
     assert_eq!(
         editor.selection(),
         Selection::new(Position::new(2, 20), Position::new(1, 1))
@@ -1279,10 +1320,10 @@ fn combining_insertions_and_joins_leave_valid_carets() {
             .validate_position(editor.selection().focus)
             .is_ok()
     );
-    let mut editor = Editor::from_text("👩\n‍💻");
+    let mut editor = Editor::from_text("👩\n\u{200d}💻");
     caret(&mut editor, 1, 0);
     editor.delete_backward().unwrap();
-    assert_eq!(editor.document().plain_text(), "👩‍💻");
+    assert_eq!(editor.document().plain_text(), "👩\u{200d}💻");
     assert!(
         editor
             .document()
@@ -1300,7 +1341,7 @@ fn deterministic_edit_sequence_matches_plain_text_and_roundtrips_history() {
     });
     let mut plain = String::new();
     let mut state = 123456789_u64;
-    for _ in 0..300 {
+    for step in 0..300 {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         let position = editor.document().end();
         editor.set_selection(Selection::caret(position)).unwrap();
@@ -1314,12 +1355,13 @@ fn deterministic_edit_sequence_matches_plain_text_and_roundtrips_history() {
             plain.push_str(text);
             editor.insert_text(text).unwrap();
         }
-        assert_eq!(editor.document().plain_text(), plain);
+        assert_eq!(editor.document().plain_text(), plain, "step {step}");
         assert!(
             editor
                 .document()
                 .validate_position(editor.selection().focus)
-                .is_ok()
+                .is_ok(),
+            "step {step}"
         );
     }
     let completed = plain;
@@ -1378,7 +1420,7 @@ fn invalid_selection_preserves_active_composition_and_history() {
 
 #[test]
 fn word_movement_remains_at_grapheme_boundaries_with_prepend_and_joiners() {
-    let mut editor = Editor::from_text("\u{600}one e\u{301}clair 👩‍💻 test\nनमस्ते world");
+    let mut editor = Editor::from_text("\u{600}one e\u{301}clair 👩\u{200d}💻 test\nनमस्ते world");
     for movement in [Movement::WordForward, Movement::WordBackward] {
         editor
             .move_cursor(
@@ -1387,18 +1429,21 @@ fn word_movement_remains_at_grapheme_boundaries_with_prepend_and_joiners() {
                 } else {
                     Movement::DocumentEnd
                 },
-                false,
+                SelectionMode::Move,
             )
             .unwrap();
-        for _ in 0..20 {
+        for step in 0..20 {
             let old = editor.selection().focus;
-            editor.move_cursor(movement, false).unwrap();
+            editor.move_cursor(movement, SelectionMode::Move).unwrap();
             let new = editor.selection().focus;
-            assert!(editor.document().validate_position(new).is_ok());
+            assert!(
+                editor.document().validate_position(new).is_ok(),
+                "{movement:?} step {step}"
+            );
             if movement == Movement::WordForward {
-                assert!(new >= old);
+                assert!(new >= old, "{movement:?} step {step}");
             } else {
-                assert!(new <= old);
+                assert!(new <= old, "{movement:?} step {step}");
             }
         }
     }
@@ -1483,10 +1528,10 @@ fn mid_list_enter_renumbers_following_items_and_shares_their_text() {
     assert!(Arc::ptr_eq(&before[2], &editor.document().paragraphs()[3]));
     assert_eq!(
         editor.history_bytes() - history,
-        2 * std::mem::size_of::<Paragraph>()
+        2 * mem::size_of::<Paragraph>()
             + "two".len()
-            + 2 * std::mem::size_of::<Span>()
-            + 3 * std::mem::size_of::<Arc<Paragraph>>()
+            + 2 * mem::size_of::<Span>()
+            + 3 * mem::size_of::<Arc<Paragraph>>()
     );
     assert_eq!(
         trailing_text,
@@ -1630,16 +1675,20 @@ fn bold() -> StylePatch {
     }
 }
 
+/// Returns an editor for "Bplain" with only its first letter bold.
 fn bold_prefix_editor() -> Editor {
     let mut editor = Editor::from_text("Bplain");
     editor
         .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
-        .unwrap();
-    editor.apply_style(bold()).unwrap();
+        .expect("the first byte of ASCII text is a grapheme");
+    editor
+        .apply_style(bold())
+        .expect("no IME composition is active");
     editor
 }
 
-fn span_bold(editor: &Editor) -> Vec<(std::ops::Range<usize>, bool)> {
+/// Returns the byte range of each span in the first paragraph and whether it is bold.
+fn span_bold(editor: &Editor) -> Vec<(Range<usize>, bool)> {
     editor.document().paragraphs()[0]
         .spans()
         .iter()
@@ -1654,23 +1703,31 @@ fn typing_over_a_selection_uses_its_first_grapheme_style_in_either_direction() {
     for selection in [forward, backward] {
         let mut editor = bold_prefix_editor();
         editor.set_selection(selection).unwrap();
-        assert_eq!(editor.selection_style().bold, Some(false));
-        assert!(!editor.typing_style().bold);
+        assert_eq!(editor.selection_style().bold, Some(false), "{selection:?}");
+        assert!(!editor.typing_style().bold, "{selection:?}");
         editor.insert_text("x").unwrap();
-        assert_eq!(span_bold(&editor), [(0..1, true), (1..2, false)]);
+        assert_eq!(
+            span_bold(&editor),
+            [(0..1, true), (1..2, false)],
+            "{selection:?}"
+        );
 
         let mut editor = bold_prefix_editor();
         editor.set_selection(selection).unwrap();
         editor.update_composition("日本", None).unwrap();
         editor.commit_composition("日本").unwrap();
-        assert_eq!(span_bold(&editor), [(0..1, true), (1..7, false)]);
+        assert_eq!(
+            span_bold(&editor),
+            [(0..1, true), (1..7, false)],
+            "{selection:?}"
+        );
     }
 
     let mut editor = bold_prefix_editor();
     caret(&mut editor, 0, 3);
     for _ in 0..2 {
         editor
-            .move_cursor(Movement::GraphemeBackward, true)
+            .move_cursor(Movement::GraphemeBackward, SelectionMode::Extend)
             .unwrap();
     }
     assert_eq!(
@@ -1705,12 +1762,14 @@ fn no_op_moves_keep_a_pending_caret_style() {
         Movement::DocumentEnd,
         Movement::ParagraphDown,
     ] {
-        editor.move_cursor(movement, false).unwrap();
+        editor.move_cursor(movement, SelectionMode::Move).unwrap();
         assert!(editor.typing_style().bold, "{movement:?}");
     }
     editor.insert_text("!").unwrap();
     assert_eq!(span_bold(&editor), [(0..5, false), (5..6, true)]);
-    editor.move_cursor(Movement::DocumentStart, false).unwrap();
+    editor
+        .move_cursor(Movement::DocumentStart, SelectionMode::Move)
+        .unwrap();
     assert!(!editor.typing_style().bold);
 }
 
@@ -1854,13 +1913,25 @@ fn typing_over_a_selection_continues_as_one_undo_step() {
         for character in ["t", "h", "e", "r", "e"] {
             editor.insert_text(character).unwrap();
         }
-        assert_eq!(editor.document().plain_text(), "hello there");
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "hello world");
-        assert_eq!(editor.selection(), selection);
-        assert!(editor.redo());
-        assert_eq!(editor.document().plain_text(), "hello there");
+        assert_eq!(
+            editor.document().plain_text(),
+            "hello there",
+            "{selection:?}"
+        );
+        assert_eq!(editor.undo_len(), 1, "{selection:?}");
+        assert!(editor.undo(), "{selection:?}");
+        assert_eq!(
+            editor.document().plain_text(),
+            "hello world",
+            "{selection:?}"
+        );
+        assert_eq!(editor.selection(), selection, "{selection:?}");
+        assert!(editor.redo(), "{selection:?}");
+        assert_eq!(
+            editor.document().plain_text(),
+            "hello there",
+            "{selection:?}"
+        );
     }
 
     let mut editor = Editor::from_text("ab\ncd\nef");
@@ -1918,8 +1989,14 @@ fn transactions_record_several_commands_as_one_undo_step() {
     assert_eq!(editor.undo_len(), 5);
 }
 
+// Deliberately uses `panic::catch_unwind` to test unwind safety, the one place
+// this repository departs from the style guide's rule against it: only catching
+// the unwind can show that a transaction whose closure panics rolls back.
+#[cfg(panic = "unwind")]
 #[test]
 fn failed_transactions_roll_back_without_changing_history() {
+    use std::panic;
+
     let mut editor = Editor::from_text("one");
     caret(&mut editor, 0, 3);
     editor.insert_text(" two").unwrap();
@@ -1950,7 +2027,7 @@ fn failed_transactions_roll_back_without_changing_history() {
     assert!(editor.redo());
     assert_eq!(editor.document().plain_text(), "one two three");
 
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let panicked = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let _ = editor.transaction(|editor| -> Result<(), Error> {
             editor.insert_text("lost")?;
             panic!("host failure");
@@ -2031,8 +2108,15 @@ fn transactions_respect_history_limits_and_roll_back_without_history() {
     assert_eq!(editor.document().plain_text(), "a\nb\nc\n");
 }
 
+// Deliberately uses `panic::catch_unwind` to test unwind safety, the one place
+// this repository departs from the style guide's rule against it: only catching
+// the unwind can show that a panicking transaction keeps an editor its closure
+// assigned.
+#[cfg(panic = "unwind")]
 #[test]
 fn transactions_keep_an_editor_that_replaced_the_original() {
+    use std::panic;
+
     let mut editor = Editor::from_text("old");
     editor
         .transaction(|editor| {
@@ -2051,7 +2135,7 @@ fn transactions_keep_an_editor_that_replaced_the_original() {
     });
     assert_eq!(result, Err(Error::InvalidRange));
     assert_eq!(editor.selected_text(), "abc");
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let panicked = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let _ = editor.transaction(|editor| -> Result<(), Error> {
             *editor = Editor::from_text("new");
             panic!("host failure");
@@ -2075,20 +2159,26 @@ fn transactions_keep_an_editor_that_replaced_the_original() {
     assert_eq!(editor.document().plain_text(), "a");
 }
 
+// Deliberately uses `panic::catch_unwind` to test unwind safety, the one place
+// this repository departs from the style guide's rule against it: only catching
+// the unwind can show what a moved editor keeps when its transaction panics.
+#[cfg(panic = "unwind")]
 #[test]
 fn displaced_transaction_snapshots_keep_undo_after_success_error_and_panic() {
+    use std::panic;
+
     for outcome in 0..3 {
         let mut editor = Editor::from_text("abc");
         caret(&mut editor, 0, 1);
         let before = editor.selection();
         let mut displaced = None;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             editor.transaction(|editor| -> Result<(), Error> {
                 editor.insert_text("é")?;
                 editor.apply_style(bold())?;
                 editor.mark_saved();
                 editor.update_composition("仮", Some(0..3))?;
-                displaced = Some(std::mem::replace(editor, Editor::from_text("replacement")));
+                displaced = Some(mem::replace(editor, Editor::from_text("replacement")));
                 match outcome {
                     0 => Ok(()),
                     1 => Err(Error::InvalidRange),
@@ -2096,31 +2186,59 @@ fn displaced_transaction_snapshots_keep_undo_after_success_error_and_panic() {
                 }
             })
         }));
-        assert_eq!(result.is_err(), outcome == 2);
+        assert_eq!(result.is_err(), outcome == 2, "outcome {outcome}");
         if let Ok(result) = result {
-            assert_eq!(result.is_err(), outcome == 1);
+            assert_eq!(result.is_err(), outcome == 1, "outcome {outcome}");
         }
-        assert_eq!(editor.document().plain_text(), "replacement");
-        assert!(!editor.can_undo());
+        assert_eq!(
+            editor.document().plain_text(),
+            "replacement",
+            "outcome {outcome}"
+        );
+        assert!(!editor.can_undo(), "outcome {outcome}");
         let mut displaced = displaced.unwrap();
-        assert_eq!(displaced.document().plain_text(), "aébc");
-        assert_eq!(displaced.composition().unwrap().text, "仮");
-        assert!(!displaced.is_modified());
-        assert_eq!((displaced.undo_len(), displaced.redo_len()), (1, 0));
+        assert_eq!(
+            displaced.document().plain_text(),
+            "aébc",
+            "outcome {outcome}"
+        );
+        assert_eq!(
+            displaced.composition().unwrap().text,
+            "仮",
+            "outcome {outcome}"
+        );
+        assert!(!displaced.is_modified(), "outcome {outcome}");
+        assert_eq!(
+            (displaced.undo_len(), displaced.redo_len()),
+            (1, 0),
+            "outcome {outcome}"
+        );
         let bytes = displaced.history_bytes();
-        assert!(bytes > 0);
-        assert_eq!(displaced.history_bytes(), bytes);
-        assert!(displaced.undo());
-        assert_eq!(displaced.document().plain_text(), "abc");
-        assert_eq!(displaced.selection(), before);
-        assert!(!displaced.typing_style().bold);
-        assert!(displaced.composition().is_none());
-        assert!(displaced.is_modified());
-        assert!(displaced.redo());
-        assert_eq!(displaced.document().plain_text(), "aébc");
-        assert_eq!(displaced.selection(), Selection::caret(Position::new(0, 3)));
-        assert!(displaced.typing_style().bold);
-        assert!(!displaced.is_modified());
+        assert!(bytes > 0, "outcome {outcome}");
+        assert_eq!(displaced.history_bytes(), bytes, "outcome {outcome}");
+        assert!(displaced.undo(), "outcome {outcome}");
+        assert_eq!(
+            displaced.document().plain_text(),
+            "abc",
+            "outcome {outcome}"
+        );
+        assert_eq!(displaced.selection(), before, "outcome {outcome}");
+        assert!(!displaced.typing_style().bold, "outcome {outcome}");
+        assert!(displaced.composition().is_none(), "outcome {outcome}");
+        assert!(displaced.is_modified(), "outcome {outcome}");
+        assert!(displaced.redo(), "outcome {outcome}");
+        assert_eq!(
+            displaced.document().plain_text(),
+            "aébc",
+            "outcome {outcome}"
+        );
+        assert_eq!(
+            displaced.selection(),
+            Selection::caret(Position::new(0, 3)),
+            "outcome {outcome}"
+        );
+        assert!(displaced.typing_style().bold, "outcome {outcome}");
+        assert!(!displaced.is_modified(), "outcome {outcome}");
     }
 }
 
@@ -2132,13 +2250,24 @@ fn returned_transaction_snapshots_seal_before_later_caret_and_typing_changes() {
             .transaction(|editor| {
                 editor.insert_text("x")?;
                 editor.apply_style(bold())?;
-                Ok(std::mem::take(editor))
+                Ok(mem::take(editor))
             })
             .unwrap();
-        assert_eq!(owner.document().plain_text(), "");
+        assert_eq!(
+            owner.document().plain_text(),
+            "",
+            "read_history_first {read_history_first}"
+        );
         if read_history_first {
-            assert_eq!(moved.undo_len(), 1);
-            assert!(moved.history_bytes() > 0);
+            assert_eq!(
+                moved.undo_len(),
+                1,
+                "read_history_first {read_history_first}"
+            );
+            assert!(
+                moved.history_bytes() > 0,
+                "read_history_first {read_history_first}"
+            );
         }
         moved
             .set_selection(Selection::caret(moved.document().end()))
@@ -2150,15 +2279,41 @@ fn returned_transaction_snapshots_seal_before_later_caret_and_typing_changes() {
             })
             .unwrap();
         moved.update_composition("pending", None).unwrap();
-        assert!(moved.undo());
-        assert_eq!(moved.document().plain_text(), "abc");
-        assert_eq!(moved.selection(), Selection::default());
-        assert_eq!(moved.typing_style(), InlineStyle::default());
-        assert!(moved.redo());
-        assert_eq!(moved.document().plain_text(), "xabc");
-        assert_eq!(moved.selection(), Selection::caret(Position::new(0, 1)));
-        assert!(moved.typing_style().bold);
-        assert!(!moved.typing_style().italic);
+        assert!(moved.undo(), "read_history_first {read_history_first}");
+        assert_eq!(
+            moved.document().plain_text(),
+            "abc",
+            "read_history_first {read_history_first}"
+        );
+        assert_eq!(
+            moved.selection(),
+            Selection::default(),
+            "read_history_first {read_history_first}"
+        );
+        assert_eq!(
+            moved.typing_style(),
+            InlineStyle::default(),
+            "read_history_first {read_history_first}"
+        );
+        assert!(moved.redo(), "read_history_first {read_history_first}");
+        assert_eq!(
+            moved.document().plain_text(),
+            "xabc",
+            "read_history_first {read_history_first}"
+        );
+        assert_eq!(
+            moved.selection(),
+            Selection::caret(Position::new(0, 1)),
+            "read_history_first {read_history_first}"
+        );
+        assert!(
+            moved.typing_style().bold,
+            "read_history_first {read_history_first}"
+        );
+        assert!(
+            !moved.typing_style().italic,
+            "read_history_first {read_history_first}"
+        );
     }
 }
 
@@ -2184,17 +2339,17 @@ fn detached_transaction_queries_apply_limits_and_keep_noop_redo() {
         let mut moved = owner
             .transaction(|editor| {
                 editor.insert_text("x")?;
-                Ok(std::mem::take(editor))
+                Ok(mem::take(editor))
             })
             .unwrap();
         let retained = usize::from(limits.max_entries != 0 && limits.max_bytes != 0);
-        assert_eq!(moved.undo_len(), retained);
-        assert_eq!(moved.redo_len(), 0);
-        assert_eq!(moved.history_bytes() > 0, retained != 0);
-        assert_eq!(moved.undo(), retained != 0);
+        assert_eq!(moved.undo_len(), retained, "{limits:?}");
+        assert_eq!(moved.redo_len(), 0, "{limits:?}");
+        assert_eq!(moved.history_bytes() > 0, retained != 0, "{limits:?}");
+        assert_eq!(moved.undo(), retained != 0, "{limits:?}");
         if retained != 0 {
-            assert_eq!(moved.document().plain_text(), "priorabc");
-            assert!(!moved.can_undo());
+            assert_eq!(moved.document().plain_text(), "priorabc", "{limits:?}");
+            assert!(!moved.can_undo(), "{limits:?}");
         }
     }
 
@@ -2205,7 +2360,7 @@ fn detached_transaction_queries_apply_limits_and_keep_noop_redo() {
     let mut moved = owner
         .transaction(|editor| {
             editor.apply_style(bold())?;
-            Ok(std::mem::take(editor))
+            Ok(mem::take(editor))
         })
         .unwrap();
     assert_eq!((moved.undo_len(), moved.redo_len()), (0, 1));
@@ -2218,7 +2373,7 @@ fn detached_transaction_queries_apply_limits_and_keep_noop_redo() {
         let mut moved = owner
             .transaction(|editor| {
                 editor.insert_text("kept")?;
-                Ok(std::mem::take(editor))
+                Ok(mem::take(editor))
             })
             .unwrap();
         if clear {
@@ -2232,12 +2387,13 @@ fn detached_transaction_queries_apply_limits_and_keep_noop_redo() {
         }
         assert_eq!(
             (moved.undo_len(), moved.redo_len(), moved.history_bytes()),
-            (0, 0, 0)
+            (0, 0, 0),
+            "clear {clear}"
         );
         moved.insert_text("!").unwrap();
-        assert!(moved.undo());
-        assert_eq!(moved.document().plain_text(), "kept");
-        assert!(!moved.can_undo());
+        assert!(moved.undo(), "clear {clear}");
+        assert_eq!(moved.document().plain_text(), "kept", "clear {clear}");
+        assert!(!moved.can_undo(), "clear {clear}");
     }
 }
 
@@ -2250,10 +2406,12 @@ fn nested_displacement_can_return_to_its_outer_guard_or_escape_it() {
             outer.insert_text("a")?;
             let mut moved = outer.transaction(|inner| {
                 inner.insert_text("b")?;
-                Ok(std::mem::take(inner))
+                Ok(mem::take(inner))
             })?;
-            // The outer transaction still owns this snapshot until its scope ends.
-            assert!(!moved.undo());
+            assert!(
+                !moved.undo(),
+                "reattach {reattach}: the outer transaction still owns this snapshot"
+            );
             moved.insert_text("c")?;
             if reattach {
                 *outer = moved;
@@ -2262,17 +2420,29 @@ fn nested_displacement_can_return_to_its_outer_guard_or_escape_it() {
             }
             Err(Error::InvalidRange)
         });
-        assert_eq!(result, Err(Error::InvalidRange));
+        assert_eq!(result, Err(Error::InvalidRange), "reattach {reattach}");
         if reattach {
-            assert_eq!(owner.document().plain_text(), "original");
-            assert!(!owner.can_undo());
+            assert_eq!(
+                owner.document().plain_text(),
+                "original",
+                "reattach {reattach}"
+            );
+            assert!(!owner.can_undo(), "reattach {reattach}");
         } else {
-            assert_eq!(owner.document().plain_text(), "");
+            assert_eq!(owner.document().plain_text(), "", "reattach {reattach}");
             let mut moved = escaped.unwrap();
-            assert_eq!(moved.document().plain_text(), "abcoriginal");
-            assert_eq!(moved.undo_len(), 1);
-            assert!(moved.undo());
-            assert_eq!(moved.document().plain_text(), "original");
+            assert_eq!(
+                moved.document().plain_text(),
+                "abcoriginal",
+                "reattach {reattach}"
+            );
+            assert_eq!(moved.undo_len(), 1, "reattach {reattach}");
+            assert!(moved.undo(), "reattach {reattach}");
+            assert_eq!(
+                moved.document().plain_text(),
+                "original",
+                "reattach {reattach}"
+            );
         }
     }
 }
@@ -2286,54 +2456,89 @@ fn swapped_transaction_editors_keep_their_own_guard_identity() {
             left.insert_text("a")?;
             right.transaction(|right| {
                 right.insert_text("b")?;
-                std::mem::swap(left, right);
+                mem::swap(left, right);
                 Ok(())
             })?;
-            assert_eq!(left.undo_len(), 1);
-            assert!(!right.undo());
+            assert_eq!(left.undo_len(), 1, "swap_back {swap_back}");
+            assert!(!right.undo(), "swap_back {swap_back}");
             if swap_back {
-                std::mem::swap(left, &mut right);
+                mem::swap(left, &mut right);
             }
             Err(Error::InvalidRange)
         });
-        assert_eq!(result, Err(Error::InvalidRange));
+        assert_eq!(result, Err(Error::InvalidRange), "swap_back {swap_back}");
         if swap_back {
-            assert_eq!(left.document().plain_text(), "left");
-            assert!(!left.can_undo());
-            assert_eq!(right.document().plain_text(), "bright");
-            assert!(right.undo());
-            assert_eq!(right.document().plain_text(), "right");
+            assert_eq!(
+                left.document().plain_text(),
+                "left",
+                "swap_back {swap_back}"
+            );
+            assert!(!left.can_undo(), "swap_back {swap_back}");
+            assert_eq!(
+                right.document().plain_text(),
+                "bright",
+                "swap_back {swap_back}"
+            );
+            assert!(right.undo(), "swap_back {swap_back}");
+            assert_eq!(
+                right.document().plain_text(),
+                "right",
+                "swap_back {swap_back}"
+            );
         } else {
-            assert_eq!(left.document().plain_text(), "bright");
-            assert_eq!(right.document().plain_text(), "aleft");
-            assert!(left.undo());
-            assert!(right.undo());
-            assert_eq!(left.document().plain_text(), "right");
-            assert_eq!(right.document().plain_text(), "left");
+            assert_eq!(
+                left.document().plain_text(),
+                "bright",
+                "swap_back {swap_back}"
+            );
+            assert_eq!(
+                right.document().plain_text(),
+                "aleft",
+                "swap_back {swap_back}"
+            );
+            assert!(left.undo(), "swap_back {swap_back}");
+            assert!(right.undo(), "swap_back {swap_back}");
+            assert_eq!(
+                left.document().plain_text(),
+                "right",
+                "swap_back {swap_back}"
+            );
+            assert_eq!(
+                right.document().plain_text(),
+                "left",
+                "swap_back {swap_back}"
+            );
         }
     }
 }
 
+// Deliberately uses `panic::catch_unwind` to test unwind safety, the one place
+// this repository departs from the style guide's rule against it: only catching
+// the unwind can show how a transaction that panics on another thread finishes.
+#[cfg(panic = "unwind")]
 #[test]
 fn detached_outer_scope_waits_for_a_live_transaction_on_another_thread() {
+    use std::sync::mpsc;
+    use std::{panic, thread};
+
     for outcome in 0..3 {
         let mut owner = Editor::from_text("original");
-        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
-        let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (continue_sender, continue_receiver) = mpsc::channel();
         let worker = owner
             .transaction(|editor| {
                 editor.insert_text("outer ")?;
-                let mut moved = std::mem::take(editor);
-                let worker = std::thread::spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut moved = mem::take(editor);
+                let worker = thread::spawn(move || {
+                    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                         moved.transaction(|editor| -> Result<(), Error> {
                             editor.insert_text("inner ")?;
                             ready_sender.send(()).unwrap();
                             continue_receiver.recv().unwrap();
-                            // The outer guard has ended, but this guard is still active.
                             assert_eq!(
                                 (editor.undo_len(), editor.redo_len(), editor.history_bytes()),
-                                (0, 0, 0)
+                                (0, 0, 0),
+                                "outcome {outcome}: the outer guard ended, but this one is active"
                             );
                             editor.insert_text("later ")?;
                             match outcome {
@@ -2343,9 +2548,9 @@ fn detached_outer_scope_waits_for_a_live_transaction_on_another_thread() {
                             }
                         })
                     }));
-                    assert_eq!(result.is_err(), outcome == 2);
+                    assert_eq!(result.is_err(), outcome == 2, "outcome {outcome}");
                     if let Ok(result) = result {
-                        assert_eq!(result.is_err(), outcome == 1);
+                        assert_eq!(result.is_err(), outcome == 1, "outcome {outcome}");
                     }
                     moved
                 });
@@ -2355,18 +2560,22 @@ fn detached_outer_scope_waits_for_a_live_transaction_on_another_thread() {
             .unwrap();
         continue_sender.send(()).unwrap();
         let mut moved = worker.join().unwrap();
-        assert_eq!(owner.document().plain_text(), "");
+        assert_eq!(owner.document().plain_text(), "", "outcome {outcome}");
         let expected = if outcome == 0 {
             "outer inner later original"
         } else {
             "outer original"
         };
-        assert_eq!(moved.document().plain_text(), expected);
-        assert_eq!(moved.undo_len(), 1);
-        assert!(moved.undo());
-        assert_eq!(moved.document().plain_text(), "original");
-        assert!(moved.redo());
-        assert_eq!(moved.document().plain_text(), expected);
+        assert_eq!(moved.document().plain_text(), expected, "outcome {outcome}");
+        assert_eq!(moved.undo_len(), 1, "outcome {outcome}");
+        assert!(moved.undo(), "outcome {outcome}");
+        assert_eq!(
+            moved.document().plain_text(),
+            "original",
+            "outcome {outcome}"
+        );
+        assert!(moved.redo(), "outcome {outcome}");
+        assert_eq!(moved.document().plain_text(), expected, "outcome {outcome}");
     }
 }
 
@@ -2536,10 +2745,10 @@ fn repeated_saved_state_reads_follow_all_edit_commands_and_disabled_history() {
         }),
         ("link", |editor| {
             editor.select_all();
-            editor.set_link(Some(Link::new("https://example.com")?))
+            editor.set_link(Some(Link::try_new("https://example.com")?))
         }),
         ("insert link", |editor| {
-            editor.insert_link("link", Link::new("https://example.com")?)
+            editor.insert_link("link", Link::try_new("https://example.com")?)
         }),
         ("paragraph kind", |editor| {
             editor.set_paragraph_kind(ParagraphKind::Quote)
@@ -2600,8 +2809,14 @@ fn repeated_saved_state_reads_follow_all_edit_commands_and_disabled_history() {
     }
 }
 
+// Deliberately uses `panic::catch_unwind` to test unwind safety, the one place
+// this repository departs from the style guide's rule against it: only catching
+// the unwind can show that a panicking transaction restores the saved state.
+#[cfg(panic = "unwind")]
 #[test]
 fn cached_saved_state_survives_clone_branches_and_nested_transaction_rollbacks() {
+    use std::panic;
+
     let mut editor = Editor::from_text("abc");
     editor.insert_text("x").unwrap();
     assert!(editor.is_modified());
@@ -2637,7 +2852,7 @@ fn cached_saved_state_survives_clone_branches_and_nested_transaction_rollbacks()
     branch.insert_text("inner").unwrap();
     assert!(!branch.is_modified());
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let _ = branch.transaction(|editor| -> Result<(), Error> {
             editor.insert_text("lost")?;
             assert!(editor.is_modified());
@@ -2784,22 +2999,22 @@ fn undo_redo_and_select_all_cancel_preedit_without_changing_content() {
                 false
             }
         };
-        assert!(!applied);
-        assert!(editor.composition().is_none());
-        assert_eq!(editor.document().plain_text(), "abcd");
-        assert_eq!(editor.document().revision(), 0);
+        assert!(!applied, "command {command}");
+        assert!(editor.composition().is_none(), "command {command}");
+        assert_eq!(editor.document().plain_text(), "abcd", "command {command}");
+        assert_eq!(editor.document().revision(), 0, "command {command}");
         let expected = if command == 2 {
             Selection::new(Position::default(), Position::new(0, 4))
         } else {
             replacement
         };
-        assert_eq!(editor.selection(), expected);
+        assert_eq!(editor.selection(), expected, "command {command}");
     }
 }
 
 #[test]
 fn word_selection_expands_word_boundaries_inside_graphemes() {
-    for grapheme in ["\u{600}🦀", "\u{600}👩‍💻", "\u{600}🇺🇸", "\u{600}。"] {
+    for grapheme in ["\u{600}🦀", "\u{600}👩\u{200d}💻", "\u{600}🇺🇸", "\u{600}。"] {
         let mut editor = Editor::from_text(&format!("prefix {grapheme}"));
         let start = Position::new(0, "prefix ".len());
         let end = editor.document().end();
@@ -2810,24 +3025,37 @@ fn word_selection_expands_word_boundaries_inside_graphemes() {
                 Selection::new(start, end),
                 "{grapheme:?}"
             );
-            assert_eq!(editor.selected_text(), grapheme);
+            assert_eq!(
+                editor.selected_text(),
+                grapheme,
+                "{grapheme:?} at {position:?}"
+            );
         }
         let inside = Position::new(0, start.byte + '\u{600}'.len_utf8());
         assert_eq!(
             editor.select_word_at(inside),
-            Err(Error::InvalidPosition(inside))
+            Err(Error::InvalidPosition(inside)),
+            "{grapheme:?}"
         );
-        assert_eq!(editor.selection(), Selection::new(start, end));
+        assert_eq!(
+            editor.selection(),
+            Selection::new(start, end),
+            "{grapheme:?}"
+        );
         editor.insert_text("replacement").unwrap();
-        assert_eq!(editor.document().plain_text(), "prefix replacement");
-        assert!(editor.undo());
-        assert_eq!(editor.selected_text(), grapheme);
+        assert_eq!(
+            editor.document().plain_text(),
+            "prefix replacement",
+            "{grapheme:?}"
+        );
+        assert!(editor.undo(), "{grapheme:?}");
+        assert_eq!(editor.selected_text(), grapheme, "{grapheme:?}");
     }
 }
 
 #[test]
 fn word_and_paragraph_selection_follow_pointer_conventions() {
-    let mut editor = Editor::from_text("cafe\u{301} 👩‍💻 end.\n\nnext");
+    let mut editor = Editor::from_text("cafe\u{301} 👩\u{200d}💻 end.\n\nnext");
     let word = |editor: &mut Editor, byte: usize| {
         editor.select_word_at(Position::new(0, byte)).unwrap();
         let range = editor.selection().range();
@@ -3045,19 +3273,32 @@ fn soft_line_breaks_keep_paragraph_kinds_and_join_typing_undo() {
         editor.insert_text("cd").unwrap();
         let paragraph = editor.document().paragraph(0).unwrap();
         assert_eq!(editor.document().paragraphs().len(), 1, "{kind:?}");
-        assert_eq!(paragraph.kind(), kind);
-        assert_eq!(paragraph.text(), "ab\u{2028}\u{2028}cd");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 10)));
-        assert_eq!(editor.document().plain_text(), "ab\n\ncd");
+        assert_eq!(paragraph.kind(), kind, "{kind:?}");
+        assert_eq!(paragraph.text(), "ab\u{2028}\u{2028}cd", "{kind:?}");
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 10)),
+            "{kind:?}"
+        );
+        assert_eq!(editor.document().plain_text(), "ab\n\ncd", "{kind:?}");
         assert_eq!(
             editor.undo_len(),
-            usize::from(kind != ParagraphKind::Body) + 1
+            usize::from(kind != ParagraphKind::Body) + 1,
+            "{kind:?}"
         );
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "ab");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 2)));
-        assert!(editor.redo());
-        assert_eq!(editor.document().paragraph(0).unwrap().text().len(), 10);
+        assert!(editor.undo(), "{kind:?}");
+        assert_eq!(editor.document().plain_text(), "ab", "{kind:?}");
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 2)),
+            "{kind:?}"
+        );
+        assert!(editor.redo(), "{kind:?}");
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().text().len(),
+            10,
+            "{kind:?}"
+        );
     }
 
     let mut editor = Editor::from_text("");
@@ -3100,20 +3341,48 @@ fn soft_line_breaks_keep_paragraph_kinds_and_join_typing_undo() {
 #[test]
 fn movement_and_deletion_cross_soft_line_breaks_as_whitespace_graphemes() {
     let mut editor = Editor::from_text("ab\u{2028}cd");
-    let focus = |editor: &mut Editor, movement, extend| {
-        editor.move_cursor(movement, extend).unwrap();
+    let focus = |editor: &mut Editor, movement, mode| {
+        editor.move_cursor(movement, mode).unwrap();
         editor.selection().focus.byte
     };
     caret(&mut editor, 0, 5);
-    assert_eq!(focus(&mut editor, Movement::GraphemeBackward, false), 2);
-    assert_eq!(focus(&mut editor, Movement::GraphemeForward, true), 5);
+    assert_eq!(
+        focus(&mut editor, Movement::GraphemeBackward, SelectionMode::Move),
+        2
+    );
+    assert_eq!(
+        focus(
+            &mut editor,
+            Movement::GraphemeForward,
+            SelectionMode::Extend
+        ),
+        5
+    );
     assert_eq!(editor.selected_text(), "\n");
-    assert_eq!(focus(&mut editor, Movement::ParagraphEnd, false), 7);
-    assert_eq!(focus(&mut editor, Movement::WordBackward, false), 5);
-    assert_eq!(focus(&mut editor, Movement::WordBackward, false), 0);
-    assert_eq!(focus(&mut editor, Movement::WordForward, false), 2);
-    assert_eq!(focus(&mut editor, Movement::WordForward, false), 7);
-    assert_eq!(focus(&mut editor, Movement::ParagraphStart, false), 0);
+    assert_eq!(
+        focus(&mut editor, Movement::ParagraphEnd, SelectionMode::Move),
+        7
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordBackward, SelectionMode::Move),
+        5
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordBackward, SelectionMode::Move),
+        0
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordForward, SelectionMode::Move),
+        2
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::WordForward, SelectionMode::Move),
+        7
+    );
+    assert_eq!(
+        focus(&mut editor, Movement::ParagraphStart, SelectionMode::Move),
+        0
+    );
     assert_eq!(
         editor.document().word_range_at(Position::new(0, 2)),
         Ok(Position::new(0, 0)..Position::new(0, 2))
@@ -3126,9 +3395,17 @@ fn movement_and_deletion_cross_soft_line_breaks_as_whitespace_graphemes() {
         } else {
             editor.delete_backward().unwrap();
         }
-        assert_eq!(editor.document().plain_text(), "abcd");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 2)));
-        assert!(editor.undo());
+        assert_eq!(
+            editor.document().plain_text(),
+            "abcd",
+            "byte {byte}, forward {forward}"
+        );
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 2)),
+            "byte {byte}, forward {forward}"
+        );
+        assert!(editor.undo(), "byte {byte}, forward {forward}");
     }
     caret(&mut editor, 0, 5);
     editor.delete_word_backward().unwrap();

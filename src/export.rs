@@ -1,9 +1,7 @@
-use std::{fmt::Write, sync::Arc};
+use std::sync::Arc;
 
-use crate::{
-    Color, Link, Paragraph, ParagraphKind,
-    document::{LINE_SEPARATOR, Levels},
-};
+use crate::model::{LINE_SEPARATOR, Levels};
+use crate::{Color, Link, Paragraph, ParagraphKind};
 
 pub(crate) fn plain_text(paragraphs: &[Arc<Paragraph>]) -> String {
     let capacity = paragraphs
@@ -43,6 +41,8 @@ struct List {
 }
 
 pub(crate) fn html(paragraphs: &[Arc<Paragraph>], mut numbers: Levels) -> String {
+    use std::fmt::Write as _;
+
     let mut output = String::from("<div style=\"white-space:pre-wrap\">");
     let mut lists: Vec<List> = Vec::new();
     let mut quoting = false;
@@ -62,8 +62,8 @@ pub(crate) fn html(paragraphs: &[Arc<Paragraph>], mut numbers: Levels) -> String
             _ => None,
         };
         if let Some((kind, indent, start)) = current {
-            while lists.last().is_some_and(|list| list.indent > indent) {
-                close_list(&mut output, lists.pop().unwrap().kind);
+            while let Some(list) = lists.pop_if(|list| list.indent > indent) {
+                close_list(&mut output, list.kind);
             }
             if let Some(list) = lists.pop_if(|list| list.indent == indent && list.kind != kind) {
                 close_list(&mut output, list.kind);
@@ -77,7 +77,7 @@ pub(crate) fn html(paragraphs: &[Arc<Paragraph>], mut numbers: Levels) -> String
                 match kind {
                     ListKind::Bullet => output.push_str("<ul>"),
                     ListKind::Ordered => {
-                        write!(output, "<ol start=\"{start}\">").unwrap();
+                        write!(output, "<ol start=\"{start}\">").expect(STRING_WRITE);
                     }
                 }
                 lists.push(List {
@@ -86,9 +86,11 @@ pub(crate) fn html(paragraphs: &[Arc<Paragraph>], mut numbers: Levels) -> String
                     next: u64::from(start),
                 });
             }
-            let list = lists.last_mut().unwrap();
+            let list = lists
+                .last_mut()
+                .expect("this item's list was either open already or opened above");
             if kind == ListKind::Ordered && list.next != u64::from(start) {
-                write!(output, "<li value=\"{start}\">").unwrap();
+                write!(output, "<li value=\"{start}\">").expect(STRING_WRITE);
             } else {
                 output.push_str("<li>");
             }
@@ -103,9 +105,9 @@ pub(crate) fn html(paragraphs: &[Arc<Paragraph>], mut numbers: Levels) -> String
             }
             match paragraph.kind() {
                 ParagraphKind::Heading { level } => {
-                    write!(output, "<h{level}>").unwrap();
+                    write!(output, "<h{level}>").expect(STRING_WRITE);
                     inline(&mut output, paragraph);
-                    write!(output, "</h{level}>").unwrap();
+                    write!(output, "</h{level}>").expect(STRING_WRITE);
                 }
                 _ => {
                     output.push_str("<p>");
@@ -125,6 +127,8 @@ pub(crate) fn html(paragraphs: &[Arc<Paragraph>], mut numbers: Levels) -> String
     output.push_str("</div>");
     output
 }
+
+const STRING_WRITE: &str = "writing to a String does not fail";
 
 fn close_list(output: &mut String, kind: ListKind) {
     output.push_str(match kind {
@@ -221,11 +225,13 @@ fn is_safe_href(link: &Link) -> bool {
 }
 
 fn css_color(output: &mut String, Color([red, green, blue, alpha]): Color) {
+    use std::fmt::Write as _;
+
     if alpha == 255 {
-        write!(output, "#{red:02x}{green:02x}{blue:02x}").unwrap();
+        write!(output, "#{red:02x}{green:02x}{blue:02x}").expect(STRING_WRITE);
     } else {
         let opacity = (u32::from(alpha) * 1_000_000).div_ceil(255);
-        write!(output, "rgba({red},{green},{blue},0.{opacity:06})").unwrap();
+        write!(output, "rgba({red},{green},{blue},0.{opacity:06})").expect(STRING_WRITE);
     }
 }
 

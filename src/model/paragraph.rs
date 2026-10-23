@@ -1,33 +1,54 @@
-use std::{
-    fmt,
-    ops::Range,
-    sync::{Arc, OnceLock},
-};
+use std::fmt::{self, Debug, Formatter};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
+use crate::types::Direction;
 use crate::{Error, InlineStyle, Link, ParagraphKind, StylePatch};
 
+/// A run of a [`Paragraph`]'s text with one style and link.
+///
+/// A paragraph's spans cover its text in order, without gaps or overlaps.
+/// Their ranges are nonempty and end on extended grapheme cluster boundaries,
+/// and neighboring spans differ in style or link, because paragraphs merge
+/// runs that agree.
+///
+/// Fields may be added in minor releases, so build a span with
+/// [`Span::new`] rather than a struct expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Span {
+    /// The run's byte range in the paragraph's text.
     pub range: Range<usize>,
+    /// The run's character formatting.
     pub style: InlineStyle,
+    /// The run's hyperlink target, or `None` if it is not linked.
     pub link: Option<Link>,
 }
 
 impl Span {
+    /// Creates a span that gives the UTF-8 byte `range` of a paragraph's text
+    /// `style` and, if `link` is `Some`, a hyperlink.
+    ///
+    /// [`Paragraph::try_new`] checks that its spans fit the text.
+    #[must_use]
+    pub fn new(range: Range<usize>, style: InlineStyle, link: Option<Link>) -> Self {
+        Self { range, style, link }
+    }
+
     fn continues(&self, style: InlineStyle, link: Option<&Link>) -> bool {
         self.style == style && self.link.as_ref() == link
     }
 }
 
-pub(crate) struct SpanCursor<'a> {
-    spans: &'a [Span],
+pub(crate) struct SpanCursor<'spans> {
+    spans: &'spans [Span],
     index: usize,
 }
 
-impl<'a> SpanCursor<'a> {
-    pub(crate) fn new(spans: &'a [Span]) -> Self {
+impl<'spans> SpanCursor<'spans> {
+    pub(crate) fn new(spans: &'spans [Span]) -> Self {
         Self { spans, index: 0 }
     }
 
@@ -36,7 +57,7 @@ impl<'a> SpanCursor<'a> {
         self.index
     }
 
-    pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'a Link>) {
+    pub(crate) fn at(&mut self, byte: usize) -> (InlineStyle, Option<&'spans Link>) {
         while self
             .spans
             .get(self.index)
@@ -52,6 +73,22 @@ impl<'a> SpanCursor<'a> {
     }
 }
 
+/// One paragraph of a [`Document`](crate::Document): immutable text with
+/// formatting runs and a block kind.
+///
+/// The text never contains CR, LF, or U+2029 PARAGRAPH SEPARATOR, because
+/// paragraph breaks separate paragraphs instead; it may contain U+2028 LINE
+/// SEPARATOR as a soft line break. The [`spans`](Paragraph::spans) cover the
+/// text. Documents, fragments, and undo history share paragraphs through
+/// [`Arc`]. A paragraph builds its grapheme, scalar, and word indexes when
+/// they are first needed and shares them with copies of it that differ only
+/// in kind or formatting.
+///
+/// Byte offsets are UTF-8 offsets into [`text`](Paragraph::text). The
+/// conversion methods map them to and from grapheme indexes (extended
+/// grapheme clusters, what a reader sees as one character) and scalar indexes
+/// (Unicode scalar values, Rust `char`s) for GUI and accessibility
+/// integrations. ASCII text needs no indexes.
 #[derive(Clone)]
 pub struct Paragraph {
     pub(super) text: Arc<str>,
@@ -77,8 +114,8 @@ impl PartialEq for Paragraph {
 
 impl Eq for Paragraph {}
 
-impl fmt::Debug for Paragraph {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Paragraph {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Paragraph")
             .field("text", &&*self.text)
             .field("spans", &&*self.spans)
@@ -88,22 +125,43 @@ impl fmt::Debug for Paragraph {
 }
 
 impl Paragraph {
-    pub fn new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
-        let paragraph = Self::from_parts(text, spans, kind)?;
+    /// Creates a validated paragraph from text, formatting runs, and a block
+    /// kind, for importers that assemble documents with
+    /// [`Document::from_paragraphs`](crate::Document::from_paragraphs).
+    ///
+    /// `spans` must cover `text` contiguously from byte 0 to its end with
+    /// nonempty ranges whose ends fall on extended grapheme cluster
+    /// boundaries, so empty text takes no spans. Neighboring spans with an
+    /// equal style and link are merged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeadingLevel`] for a heading level outside
+    /// `1..=6`, and [`Error::InvalidFragment`] if the spans do not cover the
+    /// text as described or the text contains CR, LF, or U+2029.
+    pub fn try_new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
+        let paragraph = Self::try_from_parts(text, spans, kind)?;
         if text.contains(['\r', '\n', '\u{2029}']) {
             return Err(Error::InvalidFragment);
         }
         Ok(paragraph)
     }
 
+    /// Returns the paragraph's text.
+    #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// Returns the formatting runs, which cover the text in order; empty text
+    /// has none.
+    #[must_use]
     pub fn spans(&self) -> &[Span] {
         &self.spans
     }
 
+    /// Returns the paragraph's block kind.
+    #[must_use]
     pub fn kind(&self) -> ParagraphKind {
         self.kind
     }
@@ -112,6 +170,11 @@ impl Paragraph {
         self.ascii
     }
 
+    /// Returns the number of extended grapheme clusters in the text.
+    ///
+    /// For non-ASCII text, this builds the grapheme index if it is not built
+    /// yet.
+    #[must_use]
     pub fn grapheme_count(&self) -> usize {
         if self.ascii {
             self.text.len()
@@ -120,6 +183,11 @@ impl Paragraph {
         }
     }
 
+    /// Returns the byte offset where grapheme `index` starts, or the text's
+    /// length when `index` equals the [grapheme count](Paragraph::grapheme_count).
+    ///
+    /// Returns `None` for larger indexes.
+    #[must_use]
     pub fn byte_from_grapheme(&self, index: usize) -> Option<usize> {
         if index == 0 || self.ascii {
             (index <= self.text.len()).then_some(index)
@@ -128,6 +196,11 @@ impl Paragraph {
         }
     }
 
+    /// Returns the index of the grapheme that starts at `byte`, or the
+    /// [grapheme count](Paragraph::grapheme_count) at the end of the text.
+    ///
+    /// Returns `None` if `byte` is past the end or not a grapheme boundary.
+    #[must_use]
     pub fn grapheme_index(&self, byte: usize) -> Option<usize> {
         if byte == 0 {
             Some(0)
@@ -140,14 +213,30 @@ impl Paragraph {
         }
     }
 
+    /// Returns the nearest grapheme boundary before `byte`, or 0 if `byte` is
+    /// 0.
+    ///
+    /// `byte` need not be a boundary itself, and offsets past the end give
+    /// the text's length.
+    #[must_use]
     pub fn previous_grapheme(&self, byte: usize) -> usize {
         self.boundary_at_or_before(byte.saturating_sub(1))
     }
 
+    /// Returns the nearest grapheme boundary after `byte`, or the text's
+    /// length if there is none.
+    ///
+    /// `byte` need not be a boundary itself.
+    #[must_use]
     pub fn next_grapheme(&self, byte: usize) -> usize {
         self.boundary_at_or_after(byte.saturating_add(1))
     }
 
+    /// Returns `byte` if it is a grapheme boundary, and otherwise the nearest
+    /// boundary before it.
+    ///
+    /// Offsets past the end give the text's length.
+    #[must_use]
     pub fn boundary_at_or_before(&self, byte: usize) -> usize {
         if byte == 0 || byte >= self.text.len() || self.ascii {
             byte.min(self.text.len())
@@ -160,7 +249,7 @@ impl Paragraph {
             while !self.text.is_char_boundary(byte) {
                 byte -= 1;
             }
-            self.local_grapheme_boundary(byte, false)
+            self.local_grapheme_boundary(byte, Direction::Backward)
                 .unwrap_or_else(|| {
                     let boundaries = self.grapheme_boundaries();
                     boundaries[boundaries
@@ -170,6 +259,11 @@ impl Paragraph {
         }
     }
 
+    /// Returns `byte` if it is a grapheme boundary, and otherwise the nearest
+    /// boundary after it.
+    ///
+    /// Offsets past the end give the text's length.
+    #[must_use]
     pub fn boundary_at_or_after(&self, byte: usize) -> usize {
         if byte == 0 || byte >= self.text.len() || self.ascii {
             byte.min(self.text.len())
@@ -182,12 +276,13 @@ impl Paragraph {
             while !self.text.is_char_boundary(byte) {
                 byte += 1;
             }
-            self.local_grapheme_boundary(byte, true).unwrap_or_else(|| {
-                let boundaries = self.grapheme_boundaries();
-                boundaries[boundaries
-                    .partition_point(|offset| *offset < byte)
-                    .min(boundaries.len() - 1)]
-            })
+            self.local_grapheme_boundary(byte, Direction::Forward)
+                .unwrap_or_else(|| {
+                    let boundaries = self.grapheme_boundaries();
+                    boundaries[boundaries
+                        .partition_point(|offset| *offset < byte)
+                        .min(boundaries.len() - 1)]
+                })
         }
     }
 
@@ -199,33 +294,37 @@ impl Paragraph {
         } else if let Some(boundaries) = self.cached_grapheme_boundaries() {
             boundaries.binary_search(&byte).is_ok()
         } else {
-            let (chunk, start) = self.grapheme_context(byte);
+            let context = self.grapheme_context(byte);
             GraphemeCursor::new(byte, self.text.len(), true)
-                .is_boundary(chunk, start)
+                .is_boundary(context.chunk, context.start)
                 .unwrap_or_else(|_| self.grapheme_boundaries().binary_search(&byte).is_ok())
         }
     }
 
-    fn local_grapheme_boundary(&self, byte: usize, forward: bool) -> Option<usize> {
-        let (chunk, start) = self.grapheme_context(byte);
+    fn local_grapheme_boundary(&self, byte: usize, direction: Direction) -> Option<usize> {
+        let context = self.grapheme_context(byte);
         let mut cursor = GraphemeCursor::new(byte, self.text.len(), true);
-        if cursor.is_boundary(chunk, start).ok()? {
+        if cursor.is_boundary(context.chunk, context.start).ok()? {
             return Some(byte);
         }
-        Some(if forward {
-            cursor
-                .next_boundary(chunk, start)
+        Some(match direction {
+            Direction::Forward => cursor
+                .next_boundary(context.chunk, context.start)
                 .ok()?
-                .unwrap_or(self.text.len())
-        } else {
-            cursor.prev_boundary(chunk, start).ok()?.unwrap_or(0)
+                .unwrap_or(self.text.len()),
+            Direction::Backward => cursor
+                .prev_boundary(context.chunk, context.start)
+                .ok()?
+                .unwrap_or(0),
         })
     }
 
-    fn grapheme_context(&self, byte: usize) -> (&str, usize) {
+    fn grapheme_context(&self, byte: usize) -> GraphemeContext<'_> {
         grapheme_context(&self.text, byte)
     }
 
+    /// Returns the number of Unicode scalar values (`char`s) in the text.
+    #[must_use]
     pub fn scalar_count(&self) -> usize {
         if self.ascii {
             self.text.len()
@@ -236,6 +335,11 @@ impl Paragraph {
         }
     }
 
+    /// Returns the byte offset of scalar `index`, or the text's length when
+    /// `index` equals the [scalar count](Paragraph::scalar_count).
+    ///
+    /// Returns `None` for larger indexes.
+    #[must_use]
     pub fn byte_from_scalar(&self, index: usize) -> Option<usize> {
         if index == 0 || self.ascii {
             (index <= self.text.len()).then_some(index)
@@ -244,6 +348,11 @@ impl Paragraph {
         }
     }
 
+    /// Returns the index of the scalar that starts at `byte`, or the
+    /// [scalar count](Paragraph::scalar_count) at the end of the text.
+    ///
+    /// Returns `None` if `byte` is past the end or inside a character.
+    #[must_use]
     pub fn scalar_index(&self, byte: usize) -> Option<usize> {
         if byte == 0 {
             Some(0)
@@ -256,6 +365,13 @@ impl Paragraph {
         }
     }
 
+    /// Returns the nearest start of a word before `byte`, or 0 if there is
+    /// none.
+    ///
+    /// Words follow Unicode word segmentation (UAX #29), a run of
+    /// punctuation, symbols, or emoji also counts as a word, and whitespace is
+    /// skipped. The result is a grapheme boundary.
+    #[must_use]
     pub fn previous_word(&self, byte: usize) -> usize {
         if byte == 0 {
             return 0;
@@ -271,6 +387,12 @@ impl Paragraph {
         self.boundary_at_or_before(byte)
     }
 
+    /// Returns the nearest end of a word after `byte`, or the text's length if
+    /// there is none.
+    ///
+    /// Words are as for [`previous_word`](Paragraph::previous_word). The
+    /// result is a grapheme boundary.
+    #[must_use]
     pub fn next_word(&self, byte: usize) -> usize {
         if byte >= self.text.len() {
             return self.text.len();
@@ -468,7 +590,7 @@ impl Paragraph {
         }
     }
 
-    pub(crate) fn from_parts(
+    pub(crate) fn try_from_parts(
         text: &str,
         mut spans: Vec<Span>,
         kind: ParagraphKind,
@@ -485,9 +607,9 @@ impl Paragraph {
             if !text.is_char_boundary(byte) {
                 return false;
             }
-            let (chunk, start) = grapheme_context(text, byte);
+            let context = grapheme_context(text, byte);
             GraphemeCursor::new(byte, text.len(), true)
-                .is_boundary(chunk, start)
+                .is_boundary(context.chunk, context.start)
                 .unwrap_or_else(|_| {
                     boundaries
                         .get_or_insert_with(|| text.grapheme_indices(true).map(|(byte, _)| byte))
@@ -622,9 +744,9 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
         return raw;
     }
     if raw[..raw.len() - 1].iter().all(|span| {
-        let (chunk, start) = grapheme_context(text, span.range.end);
+        let context = grapheme_context(text, span.range.end);
         GraphemeCursor::new(span.range.end, text.len(), true)
-            .is_boundary(chunk, start)
+            .is_boundary(context.chunk, context.start)
             .unwrap_or(false)
     }) {
         return raw;
@@ -638,7 +760,16 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
     result
 }
 
-fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
+// A window of text around a byte offset, for `GraphemeCursor` queries that would otherwise
+// need the whole text. Callers fall back to the full grapheme index when the cursor needs
+// context beyond the window.
+struct GraphemeContext<'text> {
+    chunk: &'text str,
+    // Byte offset of `chunk` in the whole text.
+    start: usize,
+}
+
+fn grapheme_context(text: &str, byte: usize) -> GraphemeContext<'_> {
     const CONTEXT_BYTES: usize = 64;
     let mut start = byte.saturating_sub(CONTEXT_BYTES);
     let mut end = byte.saturating_add(CONTEXT_BYTES).min(text.len());
@@ -648,7 +779,10 @@ fn grapheme_context(text: &str, byte: usize) -> (&str, usize) {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    (&text[start..end], start)
+    GraphemeContext {
+        chunk: &text[start..end],
+        start,
+    }
 }
 
 fn word_stops(text: &str) -> Vec<Range<usize>> {
@@ -727,7 +861,7 @@ mod tests {
             italic: true,
             ..InlineStyle::default()
         };
-        let link = Link::new("https://example.com").unwrap();
+        let link = Link::try_new("https://example.com").unwrap();
         let spans = [
             Span {
                 range: 0..2,
@@ -751,9 +885,13 @@ mod tests {
             let expected = current.map_or((InlineStyle::default(), None), |index| {
                 (spans[index].style, spans[index].link.as_ref())
             });
-            assert_eq!(cursor.at(byte), expected);
+            assert_eq!(cursor.at(byte), expected, "byte {byte}");
             #[cfg(feature = "accesskit")]
-            assert_eq!(cursor.index(), current.unwrap_or(spans.len()));
+            assert_eq!(
+                cursor.index(),
+                current.unwrap_or(spans.len()),
+                "byte {byte}"
+            );
         }
 
         let paragraph = Paragraph::styled(
@@ -806,10 +944,10 @@ mod tests {
                 char::UNICODE_VERSION
             );
         }
-        // U+0558 is unassigned in the pinned Unicode 17 tables and a letter in Unicode 18.
         assert_eq!(
             word_stops("ab \u{558}\u{558}\u{558} cd"),
-            [0..2, 3..9, 10..12]
+            [0..2, 3..9, 10..12],
+            "U+0558 is unassigned in the pinned Unicode 17 tables and a letter in Unicode 18"
         );
     }
 }

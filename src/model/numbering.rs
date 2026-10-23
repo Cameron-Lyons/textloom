@@ -92,13 +92,26 @@ impl Levels {
     }
 }
 
-pub(super) fn numbers(paragraphs: &[Arc<Paragraph>]) -> Arc<[(usize, u32)]> {
+/// An ordered list item and the number it displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NumberedItem {
+    /// The item's paragraph index in the document.
+    pub(crate) paragraph: usize,
+    pub(crate) number: u32,
+}
+
+pub(super) fn numbers(paragraphs: &[Arc<Paragraph>]) -> Arc<[NumberedItem]> {
     let mut levels = Levels::default();
-    paragraphs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, paragraph)| levels.push(paragraph.kind).map(|number| (index, number)))
-        .collect()
+    let mut numbers = Vec::new();
+    for (paragraph_index, paragraph) in paragraphs.iter().enumerate() {
+        if let Some(number) = levels.push(paragraph.kind) {
+            numbers.push(NumberedItem {
+                paragraph: paragraph_index,
+                number,
+            });
+        }
+    }
+    numbers.into()
 }
 
 pub(crate) fn same_effect(before: ParagraphKind, after: ParagraphKind) -> bool {
@@ -153,7 +166,11 @@ mod tests {
 
     fn numbered(kinds: &[ParagraphKind]) -> Vec<Option<u32>> {
         let mut levels = Levels::default();
-        kinds.iter().map(|kind| levels.push(*kind)).collect()
+        let mut numbers = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            numbers.push(levels.push(*kind));
+        }
+        numbers
     }
 
     fn paragraphs(kinds: &[ParagraphKind]) -> Vec<Arc<Paragraph>> {
@@ -289,7 +306,8 @@ mod tests {
         ] {
             assert_eq!(
                 surviving_kind([ordered(1, Some(5)), barrier], ordered(1, None)),
-                ordered(1, None)
+                ordered(1, None),
+                "{barrier:?}"
             );
         }
         assert_eq!(

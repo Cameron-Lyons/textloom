@@ -1,7 +1,13 @@
+//! Fuzzes the native TLFR decoder with seeded random mutations of valid
+//! version 1 and version 2 fragments. Each mutated input must either be rejected
+//! or decode to a fragment that re-encodes canonically and can be pasted,
+//! exported, and undone.
+
 use textloom::{
     Color, Document, Editor, Fragment, Link, ParagraphKind, Position, Selection, StylePatch,
 };
 
+/// A xorshift64 pseudorandom generator, so that every run tests the same inputs.
 struct Generator(u64);
 
 impl Generator {
@@ -17,20 +23,33 @@ impl Generator {
     }
 }
 
+/// Applies `patch` to the first occurrence of `text` in paragraph `paragraph`.
 fn style(editor: &mut Editor, paragraph: usize, text: &str, patch: StylePatch) {
-    let paragraph_text = editor.document().paragraph(paragraph).unwrap().text();
-    let start = paragraph_text.find(text).unwrap();
+    let paragraph_text = editor
+        .document()
+        .paragraph(paragraph)
+        .expect("callers pass a paragraph of the fixture text")
+        .text();
+    let start = paragraph_text
+        .find(text)
+        .expect("callers pass text that occurs in the paragraph");
     editor
         .set_selection(Selection::new(
             Position::new(paragraph, start),
             Position::new(paragraph, start + text.len()),
         ))
-        .unwrap();
-    editor.apply_style(patch).unwrap();
+        .expect("a substring found in the paragraph has grapheme boundaries at both ends");
+    editor
+        .apply_style(patch)
+        .expect("no IME composition is active");
 }
 
+/// Builds a fragment with every paragraph kind, style flag, both colors, and
+/// links, over text that needs HTML escaping and has multi-scalar graphemes.
 fn styled_fragment() -> Fragment {
-    let mut editor = Editor::from_text("<b>Hi</b> & \"世界\" e\u{301} 👨‍👩‍👧 🇺🇸\nitem\nnested\n\nlast");
+    let mut editor = Editor::from_text(
+        "<b>Hi</b> & \"世界\" e\u{301} 👨\u{200d}👩\u{200d}👧 🇺🇸\nitem\nnested\n\nlast",
+    );
     style(
         &mut editor,
         0,
@@ -55,7 +74,7 @@ fn styled_fragment() -> Fragment {
     style(
         &mut editor,
         0,
-        "👨‍👩‍👧",
+        "👨\u{200d}👩\u{200d}👧",
         StylePatch {
             strikethrough: Some(true),
             code: Some(true),
@@ -72,17 +91,21 @@ fn styled_fragment() -> Fragment {
         let start = editor
             .document()
             .paragraph(paragraph)
-            .unwrap()
+            .expect("each case names a paragraph of the fixture text")
             .text()
             .find(text)
-            .unwrap();
+            .expect("each case names text that occurs in its paragraph");
         editor
             .set_selection(Selection::new(
                 Position::new(paragraph, start),
                 Position::new(paragraph, start + text.len()),
             ))
-            .unwrap();
-        editor.set_link(Some(Link::new(target).unwrap())).unwrap();
+            .expect("a substring found in the paragraph has grapheme boundaries at both ends");
+        let link =
+            Link::try_new(target).expect("each target is a short URL without control characters");
+        editor
+            .set_link(Some(link))
+            .expect("no IME composition is active");
     }
     style(
         &mut editor,
@@ -107,8 +130,10 @@ fn styled_fragment() -> Fragment {
     ] {
         editor
             .set_selection(Selection::caret(Position::new(paragraph, 0)))
-            .unwrap();
-        editor.set_paragraph_kind(kind).unwrap();
+            .expect("each case names a paragraph of the fixture text");
+        editor
+            .set_paragraph_kind(kind)
+            .expect("no IME composition is active, and heading level 6 is valid");
     }
     Fragment::from_document(editor.document())
 }
@@ -153,20 +178,38 @@ fn mutate(bytes: &mut Vec<u8>, seeds: &[Vec<u8>], generator: &mut Generator) {
     }
 }
 
-fn version_one_ordinals(bytes: &[u8]) -> Vec<(usize, u32)> {
-    let length = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+/// The list number that a version 1 fragment stores for an ordered paragraph.
+struct StoredOrdinal {
+    paragraph: usize,
+    ordinal: u32,
+}
+
+/// Returns the list numbers stored in `bytes`, a version 1 fragment that
+/// [`Fragment::from_bytes`] accepted.
+fn version_one_ordinals(bytes: &[u8]) -> Vec<StoredOrdinal> {
+    let length = |at: usize| {
+        let field: [u8; 8] = bytes[at..at + 8]
+            .try_into()
+            .expect("a range of eight bytes converts to an eight-byte array");
+        u64::from_le_bytes(field) as usize
+    };
+    // The paragraph count follows the signature and version byte, and the first
+    // paragraph follows the count.
     let mut at = 13;
     let mut ordinals = Vec::new();
-    for index in 0..length(5) {
+    for paragraph in 0..length(5) {
         at += 1;
         match bytes[at - 1] {
             0 => {}
             1 | 2 => at += 1,
             _ => {
-                ordinals.push((
-                    index,
-                    u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()),
-                ));
+                let field: [u8; 4] = bytes[at + 1..at + 5]
+                    .try_into()
+                    .expect("a range of four bytes converts to a four-byte array");
+                ordinals.push(StoredOrdinal {
+                    paragraph,
+                    ordinal: u32::from_le_bytes(field),
+                });
                 at += 5;
             }
         }
@@ -211,8 +254,12 @@ fn randomly_corrupted_tlfr_is_rejected_or_canonical_and_usable() {
                 "case {case}"
             );
             let document = Document::from_bytes(&bytes).unwrap();
-            for (index, ordinal) in version_one_ordinals(&bytes) {
-                assert_eq!(document.list_number(index), Some(ordinal), "case {case}");
+            for stored in version_one_ordinals(&bytes) {
+                assert_eq!(
+                    document.list_number(stored.paragraph),
+                    Some(stored.ordinal),
+                    "case {case}"
+                );
             }
         } else {
             versions[1] += 1;
@@ -231,7 +278,8 @@ fn randomly_corrupted_tlfr_is_rejected_or_canonical_and_usable() {
         let original = editor.document().to_bytes();
         editor.insert_fragment(&fragment).unwrap();
         let document = editor.document();
-        document.to_html();
+        // Exporting any accepted fragment must not panic.
+        let _ = document.to_html();
         let saved = document.to_bytes();
         assert_eq!(
             Document::from_bytes(&saved).unwrap().to_bytes(),

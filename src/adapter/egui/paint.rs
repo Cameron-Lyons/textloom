@@ -1,17 +1,20 @@
 use super::layout::{ParagraphLayoutView, ParagraphLayouts};
 use crate::{Document, Position, Selection};
-use egui::{
-    Color32, FontFamily, FontId, Galley, Pos2, Rect,
-    epaint::{FontsView, text::Glyph},
-    text::{CharIndex, LayoutJob},
-};
-use std::{
-    collections::HashMap,
-    ops::{Range, RangeInclusive},
-    sync::Arc,
-};
+use egui::epaint::FontsView;
+use egui::epaint::text::Glyph;
+use egui::text::{CharIndex, LayoutJob};
+use egui::{Color32, FontFamily, FontId, Galley, Pos2, Rect};
+use std::collections::HashMap;
+use std::ops::{Range, RangeInclusive};
+use std::slice;
+use std::sync::Arc;
 
-pub(super) type BackgroundRanges<'a> = (&'a [Range<Position>], Color32);
+// Sorted, nonoverlapping document ranges and the fill painted behind them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BackgroundRanges<'ranges> {
+    pub(super) ranges: &'ranges [Range<Position>],
+    pub(super) fill: Color32,
+}
 
 #[derive(Clone, Default)]
 pub(super) struct PaintCache {
@@ -100,7 +103,10 @@ impl PaintCache {
                 row_starts: row_starts(source),
                 used: true,
             });
-        debug_assert!(Arc::ptr_eq(&cached.source, source));
+        debug_assert!(
+            Arc::ptr_eq(&cached.source, source),
+            "painted galleys are keyed by source address, which the retained source keeps unique"
+        );
         cached.used = true;
         (cached.current.clone(), cached.row_starts.clone())
     }
@@ -118,7 +124,8 @@ pub(super) fn paint_document(
     layouts: &ParagraphLayouts,
     origin: Pos2,
     backgrounds: &[BackgroundRanges<'_>],
-    selection: Option<(Selection, Color32)>,
+    selection: Option<Selection>,
+    selection_fill: Color32,
     family: &FontFamily,
     text_color: Color32,
     quote_color: Color32,
@@ -149,29 +156,32 @@ pub(super) fn paint_document(
         }));
         cache.end();
     });
-    let mut bar: Option<Rect> = None;
-    for next in visible
+    // Consecutive quote paragraphs share one bar; the trailing `None` flushes the last one.
+    let quote_bars = visible
         .iter()
         .map(|paragraph| paragraph.layout.quote_bar)
-        .chain([None])
-    {
-        match (&mut bar, next) {
-            (Some(bar), Some(next)) => bar.max.y = next.bottom(),
+        .chain([None]);
+    let mut bar: Option<Rect> = None;
+    for next in quote_bars {
+        match (bar.take(), next) {
+            (Some(mut current), Some(next)) => {
+                current.max.y = next.bottom();
+                bar = Some(current);
+            }
             (None, next) => bar = next,
-            (Some(_), None) => {
-                let quote = bar.take().expect("matched a bar");
+            (Some(quote), None) => {
                 painter.rect_filled(quote.translate(origin.to_vec2()), 0.0, quote_color);
             }
         }
     }
-    let selection_range = selection.map(|(selection, color)| (selection.range(), color));
-    let layers = backgrounds.iter().copied().chain(
-        selection_range
-            .as_ref()
-            .map(|(range, color)| (std::slice::from_ref(range), *color)),
-    );
+    let selection_range = selection.map(Selection::range);
+    let selection_layer = selection_range.as_ref().map(|range| BackgroundRanges {
+        ranges: slice::from_ref(range),
+        fill: selection_fill,
+    });
+    let layers = backgrounds.iter().copied().chain(selection_layer);
     let window = visible_window(document, &visible, first);
-    for (ranges, color) in layers {
+    for BackgroundRanges { ranges, fill } in layers {
         for range in visible_ranges(ranges, window.as_ref()) {
             if range.start >= range.end
                 || !fits(document, range.start)
@@ -205,7 +215,7 @@ pub(super) fn paint_document(
                     origin,
                     char_start..char_end,
                     includes_break,
-                    color,
+                    fill,
                 );
             }
         }
@@ -281,8 +291,8 @@ fn visible_ranges<'a>(
     &ranges[start..end]
 }
 
-struct VisibleParagraph<'a> {
-    layout: ParagraphLayoutView<'a>,
+struct VisibleParagraph<'layout> {
+    layout: ParagraphLayoutView<'layout>,
     galley: Arc<Galley>,
     marker: Option<Arc<Galley>>,
     row_starts: Arc<[usize]>,

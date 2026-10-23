@@ -1,8 +1,6 @@
-use super::{
-    Cache,
-    layout::{Appearance, LayoutCache, ParagraphLayouts},
-};
-use crate::{Composition, Document, Editor, Error, InlineStyle, Position, Selection};
+use super::Cache;
+use super::layout::{Appearance, LayoutCache, ParagraphLayouts};
+use crate::{Composition, Document, Editor, Error, InlineStyle, Position, Selection, model};
 use egui::Ui;
 use std::sync::Arc;
 
@@ -93,7 +91,7 @@ fn replace_preedit(
     composition: &Composition,
     style: InlineStyle,
 ) -> bool {
-    let inline = |text: &str| !crate::document::normalize_newlines(text).contains('\n');
+    let inline = |text: &str| !model::normalize_newlines(text).contains('\n');
     if !inline(previous) || !inline(&composition.text) {
         return false;
     }
@@ -128,7 +126,7 @@ fn preedit_selection(
 }
 
 fn position_after_prefix(document: &Document, start: Position, prefix: &str) -> Position {
-    let normalized = crate::document::normalize_newlines(prefix);
+    let normalized = model::normalize_newlines(prefix);
     let paragraphs = normalized.bytes().filter(|byte| *byte == b'\n').count();
     let byte = if paragraphs == 0 {
         start.byte + normalized.len()

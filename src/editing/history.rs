@@ -1,17 +1,27 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
-use crate::document::Delta;
+use crate::model::{Delta, Replay};
 use crate::{Document, InlineStyle, Selection};
 
+/// Bounds on retained undo and redo history, set with
+/// [`Editor::set_history_limits`](crate::Editor::set_history_limits).
+///
+/// When history exceeds a bound, the oldest undo steps are discarded first,
+/// then the redo steps farthest from the current state, so a single step
+/// larger than `max_bytes` is not kept. A zero bound disables history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "built with struct update syntax from `HistoryLimits::default()`; a new field is a major release"
+)]
 pub struct HistoryLimits {
+    /// The maximum number of undo and redo steps together; 256 by default.
     pub max_entries: usize,
+    /// The maximum estimated memory of undo and redo steps together, in
+    /// bytes, as [`Editor::history_bytes`](crate::Editor::history_bytes)
+    /// reports it; 8 MiB by default.
     pub max_bytes: usize,
 }
 
@@ -80,13 +90,27 @@ struct Transaction {
     scope: Weak<()>,
     deltas: Vec<Delta>,
     before: EditState,
-    marks: Vec<(usize, Weak<()>)>,
+    marks: Vec<Mark>,
+}
+
+// Where a nested transaction began: the number of deltas recorded before it, and a weak
+// handle to the scope token that its guard holds.
+#[derive(Clone)]
+struct Mark {
+    deltas: usize,
+    scope: Weak<()>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct TransactionLevel {
     token: u64,
     depth: usize,
+}
+
+// A newly opened transaction level and the scope token that its guard keeps alive.
+pub(super) struct OpenTransaction {
+    pub(super) level: TransactionLevel,
+    pub(super) scope: Arc<()>,
 }
 
 #[derive(Default)]
@@ -128,7 +152,7 @@ impl History {
                 && transaction
                     .marks
                     .iter()
-                    .all(|(_, scope)| scope.strong_count() == 0)
+                    .all(|mark| mark.scope.strong_count() == 0)
         })
     }
 
@@ -172,7 +196,7 @@ impl History {
             while transaction
                 .marks
                 .last()
-                .is_some_and(|(_, scope)| scope.strong_count() == 0)
+                .is_some_and(|mark| mark.scope.strong_count() == 0)
             {
                 transaction.marks.pop();
                 transaction.depth -= 1;
@@ -223,7 +247,7 @@ impl History {
         }
         let entry = self.undo.pop_back()?;
         for delta in entry.deltas.iter().rev() {
-            document.replay(delta, false);
+            document.replay(delta, Replay::Undo);
         }
         let state = entry.before;
         self.redo.push_back(entry);
@@ -236,7 +260,7 @@ impl History {
         }
         let entry = self.redo.pop_back()?;
         for delta in &entry.deltas {
-            document.replay(delta, true);
+            document.replay(delta, Replay::Redo);
         }
         let state = entry.after;
         self.undo.push_back(entry);
@@ -252,7 +276,7 @@ impl History {
     ) {
         self.normalize(before);
         if let Some(transaction) = &mut self.transaction {
-            let floor = transaction.marks.last().map_or(0, |(mark, _)| *mark);
+            let floor = transaction.marks.last().map_or(0, |mark| mark.deltas);
             let pending = transaction.deltas.len();
             match transaction.deltas.last_mut() {
                 Some(previous) if pending > floor && extends(previous, &delta) => {
@@ -276,7 +300,10 @@ impl History {
                     && previous.can_extend(&delta)
             });
         if merge {
-            let previous = self.undo.back_mut().expect("checked entry");
+            let previous = self
+                .undo
+                .back_mut()
+                .expect("merging requires the previous undo entry checked above");
             self.bytes = self.bytes.saturating_sub(previous.bytes);
             previous.deltas[0].after = delta.after;
             previous.after = after;
@@ -289,23 +316,24 @@ impl History {
         self.enforce_limits();
     }
 
-    pub(super) fn begin_transaction(&mut self, before: EditState) -> (TransactionLevel, Arc<()>) {
+    pub(super) fn begin_transaction(&mut self, before: EditState) -> OpenTransaction {
         self.normalize(before);
         static TOKENS: AtomicU64 = AtomicU64::new(0);
         self.break_group();
         let scope = Arc::new(());
         if let Some(transaction) = &mut self.transaction {
-            transaction
-                .marks
-                .push((transaction.deltas.len(), Arc::downgrade(&scope)));
+            transaction.marks.push(Mark {
+                deltas: transaction.deltas.len(),
+                scope: Arc::downgrade(&scope),
+            });
             transaction.depth += 1;
-            (
-                TransactionLevel {
+            OpenTransaction {
+                level: TransactionLevel {
                     token: transaction.token,
                     depth: transaction.depth,
                 },
                 scope,
-            )
+            }
         } else {
             let token = TOKENS.fetch_add(1, Ordering::Relaxed);
             self.transaction = Some(Transaction {
@@ -316,7 +344,10 @@ impl History {
                 before,
                 marks: Vec::new(),
             });
-            (TransactionLevel { token, depth: 1 }, scope)
+            OpenTransaction {
+                level: TransactionLevel { token, depth: 1 },
+                scope,
+            }
         }
     }
 
@@ -366,10 +397,10 @@ impl History {
         let mark = transaction
             .marks
             .pop()
-            .map_or(0, |(mark, _)| mark)
+            .map_or(0, |mark| mark.deltas)
             .min(transaction.deltas.len());
         for delta in transaction.deltas.drain(mark..).rev() {
-            document.replay(&delta, false);
+            document.replay(&delta, Replay::Undo);
         }
         transaction.depth -= 1;
         if transaction.depth == 0 {

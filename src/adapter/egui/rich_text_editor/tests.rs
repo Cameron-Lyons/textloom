@@ -1,4 +1,27 @@
-use super::*;
+//! Unit tests for the `RichTextEditor` widget: keyboard, pointer, clipboard, IME, and
+//! accessibility input, and the layout, painting, and scrolling built from the document.
+
+use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::sync::Arc;
+use std::{array, mem};
+
+use egui::text::{CCursor, CharIndex};
+use egui::{
+    Color32, Event, FontFamily, FontId, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Stroke, Vec2,
+};
+
+use super::{Cache, PADDING, PARAGRAPH_GAP, RichClipboard, RichTextEditor, RichTextEditorOutput};
+use crate::adapter::egui::accessibility::AccessibilityError;
+use crate::adapter::egui::input::InputOptions;
+use crate::adapter::egui::layout::{Appearance, ParagraphLayouts};
+use crate::adapter::egui::navigation::CaretPlacement;
+use crate::adapter::egui::paint::{BackgroundRanges, PaintCache};
+use crate::adapter::egui::{input, input_routing, layout, navigation, paint};
+use crate::{
+    Color, Document, Editor, Error, Fragment, InlineAttribute, Link, ParagraphKind, Position,
+    SearchOptions, Selection, StylePatch,
+};
 
 fn frame(
     context: &egui::Context,
@@ -88,13 +111,13 @@ impl RichClipboard for TestClipboard {
 }
 
 fn styled_clipboard_editor() -> Editor {
-    let mut editor = Editor::from_text("café 日本語👩🏽‍💻\nsecond");
+    let mut editor = Editor::from_text("café 日本語👩🏽\u{200d}💻\nsecond");
     editor.select_all();
     editor
         .apply_style(StylePatch {
             bold: Some(true),
             italic: Some(true),
-            foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
+            foreground: Some(Some(Color([42, 100, 200, 255]))),
             ..Default::default()
         })
         .unwrap();
@@ -136,7 +159,8 @@ fn rich_copy_and_cut_capture_styles_before_deletion_and_preserve_undo() {
             vec![
                 ClipboardCall::Copy(fragment.clone()),
                 ClipboardCall::Copy(fragment.clone()),
-            ]
+            ],
+            "accept_copy={accept_copy}"
         );
         let copied: Vec<_> = output
             .platform_output
@@ -153,12 +177,20 @@ fn rich_copy_and_cut_capture_styles_before_deletion_and_preserve_undo() {
             let text = fragment.plain_text();
             assert_eq!(copied, vec![text.as_str(), text.as_str()]);
         }
-        assert_eq!(editor.document().plain_text(), "");
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(Fragment::from_document(editor.document()), fragment);
-        assert_eq!(editor.selection(), selection);
-        assert!(!editor.can_undo());
+        assert_eq!(
+            editor.document().plain_text(),
+            "",
+            "accept_copy={accept_copy}"
+        );
+        assert_eq!(editor.undo_len(), 1, "accept_copy={accept_copy}");
+        assert!(editor.undo(), "accept_copy={accept_copy}");
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            fragment,
+            "accept_copy={accept_copy}"
+        );
+        assert_eq!(editor.selection(), selection, "accept_copy={accept_copy}");
+        assert!(!editor.can_undo(), "accept_copy={accept_copy}");
 
         editor
             .set_selection(Selection::caret(Position::default()))
@@ -173,9 +205,12 @@ fn rich_copy_and_cut_capture_styles_before_deletion_and_preserve_undo() {
             true,
             Some(&mut clipboard),
         );
-        assert!(clipboard.calls.is_empty());
-        assert!(output.platform_output.commands.is_empty());
-        assert!(!editor.can_undo());
+        assert!(clipboard.calls.is_empty(), "accept_copy={accept_copy}");
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "accept_copy={accept_copy}"
+        );
+        assert!(!editor.can_undo(), "accept_copy={accept_copy}");
     }
 }
 
@@ -235,8 +270,16 @@ fn rich_copy_supersedes_earlier_plain_and_image_commands_with_later_plain_fallba
                         .id(id)
                         .rich_clipboard(&mut clipboard)
                         .show(ui);
-                    assert!(response.errors.is_empty());
-                    assert!(response.accessibility_errors.is_empty());
+                    assert!(
+                        response.errors.is_empty(),
+                        "later_plain_fallback={later_plain_fallback}: {:?}",
+                        response.errors
+                    );
+                    assert!(
+                        response.accessibility_errors.is_empty(),
+                        "later_plain_fallback={later_plain_fallback}: {:?}",
+                        response.accessibility_errors
+                    );
                 });
             },
         );
@@ -256,6 +299,7 @@ fn rich_copy_supersedes_earlier_plain_and_image_commands_with_later_plain_fallba
 fn rich_paste_replaces_selection_in_one_undo_step_with_plain_fallback() {
     let fragment = styled_clipboard_editor().selected_fragment();
     for payload in [Some(fragment.clone()), None] {
+        let rich = payload.is_some();
         let context = egui::Context::default();
         let mut editor = Editor::from_text("original");
         editor.select_all();
@@ -275,22 +319,36 @@ fn rich_paste_replaces_selection_in_one_undo_step_with_plain_fallback() {
         );
         assert_eq!(
             clipboard.calls,
-            vec![ClipboardCall::Paste(fragment.plain_text())]
+            vec![ClipboardCall::Paste(fragment.plain_text())],
+            "rich={rich}"
         );
-        assert_eq!(editor.document().plain_text(), fragment.plain_text());
+        assert_eq!(
+            editor.document().plain_text(),
+            fragment.plain_text(),
+            "rich={rich}"
+        );
         let expected = payload.unwrap_or_else(|| Fragment::from_text(&fragment.plain_text()));
-        assert_eq!(Fragment::from_document(editor.document()), expected);
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            expected,
+            "rich={rich}"
+        );
         assert_eq!(
             editor.selection(),
-            Selection::caret(editor.document().end())
+            Selection::caret(editor.document().end()),
+            "rich={rich}"
         );
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "original");
-        assert_eq!(editor.selection(), selection);
-        assert!(!editor.can_undo());
-        assert!(editor.redo());
-        assert_eq!(Fragment::from_document(editor.document()), expected);
+        assert_eq!(editor.undo_len(), 1, "rich={rich}");
+        assert!(editor.undo(), "rich={rich}");
+        assert_eq!(editor.document().plain_text(), "original", "rich={rich}");
+        assert_eq!(editor.selection(), selection, "rich={rich}");
+        assert!(!editor.can_undo(), "rich={rich}");
+        assert!(editor.redo(), "rich={rich}");
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            expected,
+            "rich={rich}"
+        );
     }
 }
 
@@ -339,14 +397,18 @@ fn shifted_command_paste_pastes_plain_text_without_the_rich_clipboard() {
             (Vec::new(), Fragment::from_text(&text))
         };
         assert_eq!(clipboard.calls, calls, "{modifiers:?}");
-        assert_eq!(Fragment::from_document(editor.document()), expected);
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            expected,
+            "{modifiers:?}"
+        );
         assert_eq!(
             context.input(|input| input.events.clone()),
             vec![Event::ModifiersChanged(modifiers)]
         );
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "original");
+        assert_eq!(editor.undo_len(), 1, "{modifiers:?}");
+        assert!(editor.undo(), "{modifiers:?}");
+        assert_eq!(editor.document().plain_text(), "original", "{modifiers:?}");
     }
 }
 
@@ -387,10 +449,17 @@ fn paste_uses_modifiers_before_the_event_and_ignores_later_changes() {
                     Some(&mut clipboard),
                 );
                 let expected = if rich {
-                    assert_eq!(clipboard.calls, vec![ClipboardCall::Paste(text.clone())]);
+                    assert_eq!(
+                        clipboard.calls,
+                        vec![ClipboardCall::Paste(text.clone())],
+                        "{command:?}, warm={warm}, rich={rich}"
+                    );
                     fragment.clone()
                 } else {
-                    assert!(clipboard.calls.is_empty());
+                    assert!(
+                        clipboard.calls.is_empty(),
+                        "{command:?}, warm={warm}, rich={rich}"
+                    );
                     Fragment::from_text(&text)
                 };
                 assert_eq!(
@@ -398,9 +467,17 @@ fn paste_uses_modifiers_before_the_event_and_ignores_later_changes() {
                     expected,
                     "{command:?}, warm={warm}, rich={rich}"
                 );
-                assert_eq!(editor.undo_len(), 1);
-                assert!(editor.undo());
-                assert_eq!(editor.document().plain_text(), "original");
+                assert_eq!(
+                    editor.undo_len(),
+                    1,
+                    "{command:?}, warm={warm}, rich={rich}"
+                );
+                assert!(editor.undo(), "{command:?}, warm={warm}, rich={rich}");
+                assert_eq!(
+                    editor.document().plain_text(),
+                    "original",
+                    "{command:?}, warm={warm}, rich={rich}"
+                );
             }
         }
     }
@@ -483,10 +560,11 @@ fn paste_preserves_modifiers_held_across_unfocused_and_idle_frames() {
             true,
             Some(&mut clipboard),
         );
-        assert!(clipboard.calls.is_empty());
+        assert!(clipboard.calls.is_empty(), "{command:?}");
         assert_eq!(
             Fragment::from_document(editor.document()),
-            Fragment::from_text(&text)
+            Fragment::from_text(&text),
+            "{command:?}"
         );
 
         editor.select_all();
@@ -499,8 +577,16 @@ fn paste_preserves_modifiers_held_across_unfocused_and_idle_frames() {
             true,
             Some(&mut clipboard),
         );
-        assert_eq!(clipboard.calls, vec![ClipboardCall::Paste(text.clone())]);
-        assert_eq!(Fragment::from_document(editor.document()), fragment);
+        assert_eq!(
+            clipboard.calls,
+            vec![ClipboardCall::Paste(text.clone())],
+            "{command:?}"
+        );
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            fragment,
+            "{command:?}"
+        );
     }
 }
 
@@ -522,13 +608,22 @@ fn routed_paste_keeps_its_modifiers_across_focus_passes_and_queued_input() {
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        for index in if reversed { [1, 0] } else { [0, 1] } {
+                        let order = if reversed { [1, 0] } else { [0, 1] };
+                        for index in order {
                             let output = RichTextEditor::new(&mut editors[index])
                                 .id(Id::unique(index))
                                 .rich_clipboard(&mut clipboards[index])
                                 .show(ui);
-                            assert!(output.errors.is_empty());
-                            assert!(output.accessibility_errors.is_empty());
+                            assert!(
+                                output.errors.is_empty(),
+                                "editor {index}: {:?}",
+                                output.errors
+                            );
+                            assert!(
+                                output.accessibility_errors.is_empty(),
+                                "editor {index}: {:?}",
+                                output.accessibility_errors
+                            );
                         }
                     });
                 },
@@ -544,12 +639,12 @@ fn routed_paste_keeps_its_modifiers_across_focus_passes_and_queued_input() {
             for rich in [false, true] {
                 let context = egui::Context::default();
                 context.enable_accesskit();
-                install_input_routing(&context);
+                input_routing::install_input_routing(&context);
                 context.options_mut(|options| {
-                    options.max_passes = std::num::NonZeroUsize::new(max_passes).unwrap();
+                    options.max_passes = NonZeroUsize::new(max_passes).unwrap();
                 });
                 let mut editors = [Editor::default(), Editor::default()];
-                let mut clipboards = std::array::from_fn(|_| TestClipboard {
+                let mut clipboards = array::from_fn(|_| TestClipboard {
                     fragment: Some(fragment.clone()),
                     ..Default::default()
                 });
@@ -586,16 +681,27 @@ fn routed_paste_keeps_its_modifiers_across_focus_passes_and_queued_input() {
                 for _ in 0..4 {
                     run(&context, &mut editors, &mut clipboards, vec![], reversed);
                 }
-                assert_eq!(editors[0].document().plain_text(), "");
-                assert!(clipboards[0].calls.is_empty());
+                assert_eq!(
+                    editors[0].document().plain_text(),
+                    "",
+                    "max_passes={max_passes}, reversed={reversed}, rich={rich}"
+                );
+                assert!(
+                    clipboards[0].calls.is_empty(),
+                    "max_passes={max_passes}, reversed={reversed}, rich={rich}"
+                );
                 let expected = if rich {
                     assert_eq!(
                         clipboards[1].calls,
-                        vec![ClipboardCall::Paste(text.clone())]
+                        vec![ClipboardCall::Paste(text.clone())],
+                        "max_passes={max_passes}, reversed={reversed}, rich={rich}"
                     );
                     fragment.clone()
                 } else {
-                    assert!(clipboards[1].calls.is_empty());
+                    assert!(
+                        clipboards[1].calls.is_empty(),
+                        "max_passes={max_passes}, reversed={reversed}, rich={rich}"
+                    );
                     Fragment::from_text(&text)
                 };
                 assert_eq!(
@@ -721,10 +827,22 @@ fn rich_clipboard_ignores_empty_paste_and_active_preedit() {
             true,
             Some(&mut clipboard),
         );
-        assert_eq!(clipboard.calls, vec![ClipboardCall::Copy(fragment.clone())]);
-        assert_eq!(editor.composition(), composition.as_ref());
-        assert_eq!(Fragment::from_document(editor.document()), fragment);
-        assert!(!editor.can_undo());
+        assert_eq!(
+            clipboard.calls,
+            vec![ClipboardCall::Copy(fragment.clone())],
+            "preedit={preedit:?}"
+        );
+        assert_eq!(
+            editor.composition(),
+            composition.as_ref(),
+            "preedit={preedit:?}"
+        );
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            fragment,
+            "preedit={preedit:?}"
+        );
+        assert!(!editor.can_undo(), "preedit={preedit:?}");
 
         clipboard.calls.clear();
         clipboard_frame(
@@ -802,7 +920,7 @@ fn caret_cut_preserves_an_empty_preedit_for_its_normal_commit() {
             let output = clipboard_frame(
                 &context,
                 &mut editor,
-                std::mem::take(&mut events),
+                mem::take(&mut events),
                 true,
                 false,
                 true,
@@ -830,14 +948,35 @@ fn caret_cut_preserves_an_empty_preedit_for_its_normal_commit() {
             true,
             Some(&mut clipboard),
         );
-        assert_eq!(editor.document().plain_text(), "abc한");
-        assert!(editor.composition().is_none());
-        assert!(clipboard.calls.is_empty());
-        assert!(output.platform_output.commands.is_empty());
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "abc");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 3)));
-        assert!(!editor.can_undo());
+        assert_eq!(
+            editor.document().plain_text(),
+            "abc한",
+            "separate_frame={separate_frame}"
+        );
+        assert!(
+            editor.composition().is_none(),
+            "separate_frame={separate_frame}"
+        );
+        assert!(
+            clipboard.calls.is_empty(),
+            "separate_frame={separate_frame}"
+        );
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "separate_frame={separate_frame}"
+        );
+        assert!(editor.undo(), "separate_frame={separate_frame}");
+        assert_eq!(
+            editor.document().plain_text(),
+            "abc",
+            "separate_frame={separate_frame}"
+        );
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 3)),
+            "separate_frame={separate_frame}"
+        );
+        assert!(!editor.can_undo(), "separate_frame={separate_frame}");
     }
 }
 
@@ -862,11 +1001,25 @@ fn rich_clipboard_does_not_access_host_when_disabled_or_unfocused() {
             enabled,
             Some(&mut clipboard),
         );
-        assert!(clipboard.calls.is_empty());
-        assert!(output.platform_output.commands.is_empty());
-        assert_eq!(context.input(|input| input.events.clone()), events);
-        assert_eq!(Fragment::from_document(editor.document()), fragment);
-        assert!(!editor.can_undo());
+        assert!(
+            clipboard.calls.is_empty(),
+            "enabled={enabled}, focused={focused}"
+        );
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "enabled={enabled}, focused={focused}"
+        );
+        assert_eq!(
+            context.input(|input| input.events.clone()),
+            events,
+            "enabled={enabled}, focused={focused}"
+        );
+        assert_eq!(
+            Fragment::from_document(editor.document()),
+            fragment,
+            "enabled={enabled}, focused={focused}"
+        );
+        assert!(!editor.can_undo(), "enabled={enabled}, focused={focused}");
     }
 }
 
@@ -980,7 +1133,7 @@ fn key(key: Key, modifiers: Modifiers) -> Event {
 
 #[test]
 fn widget_window_and_escape_blur_separate_typing_undo_groups() {
-    for blur in 0..3 {
+    for blur in ["widget", "window", "escape"] {
         let context = egui::Context::default();
         let mut editor = Editor::default();
         frame(
@@ -989,46 +1142,61 @@ fn widget_window_and_escape_blur_separate_typing_undo_groups() {
             vec![Event::Text("a".into()), Event::Text("b".into())],
             true,
         );
-        assert_eq!(editor.undo_len(), 1);
+        assert_eq!(editor.undo_len(), 1, "{blur} blur");
         let id = context.memory(|memory| memory.focused()).unwrap();
-        if blur == 0 {
+        if blur == "widget" {
             context.memory_mut(|memory| memory.surrender_focus(id));
         }
         let mut events = vec![Event::Text("ignored".into())];
-        if blur == 2 {
+        if blur == "escape" {
             events.insert(0, key(Key::Escape, Modifiers::NONE));
         }
         context
             .run_ui(
                 egui::RawInput {
-                    focused: blur != 1,
+                    focused: blur != "window",
                     events,
                     ..Default::default()
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
                         let output = RichTextEditor::new(&mut editor).id(id).show(ui);
-                        assert!(!output.response.has_focus());
-                        assert!(output.errors.is_empty());
-                        assert!(output.accessibility_errors.is_empty());
+                        assert!(!output.response.has_focus(), "{blur} blur");
+                        assert!(output.errors.is_empty(), "{blur} blur: {:?}", output.errors);
+                        assert!(
+                            output.accessibility_errors.is_empty(),
+                            "{blur} blur: {:?}",
+                            output.accessibility_errors
+                        );
                     });
                 },
             )
             .drop_without_applying_deltas();
-        assert_eq!(editor.document().plain_text(), "ab");
+        assert_eq!(editor.document().plain_text(), "ab", "{blur} blur");
         frame(
             &context,
             &mut editor,
             vec![Event::Text("c".into()), Event::Text("d".into())],
             true,
         );
-        assert_eq!(editor.document().plain_text(), "abcd");
-        assert_eq!(editor.undo_len(), 2);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "ab");
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "");
+        assert_eq!(editor.document().plain_text(), "abcd", "{blur} blur");
+        assert_eq!(editor.undo_len(), 2, "{blur} blur");
+        assert!(editor.undo(), "{blur} blur");
+        assert_eq!(editor.document().plain_text(), "ab", "{blur} blur");
+        assert!(editor.undo(), "{blur} blur");
+        assert_eq!(editor.document().plain_text(), "", "{blur} blur");
     }
+}
+
+/// What [`scrolling_frame`] observed about the editor inside its scroll area.
+struct ScrollFrame {
+    output: egui::FullOutput,
+    /// The scroll area's clamped offset at the end of the frame.
+    offset: Vec2,
+    /// The scroll area's inner rectangle.
+    viewport: Rect,
+    /// Whether the editor's rectangle intersects the visible part of the scroll area.
+    visible: bool,
 }
 
 fn scrolling_frame(
@@ -1037,7 +1205,7 @@ fn scrolling_frame(
     events: Vec<Event>,
     focus: bool,
     preceding_space: f32,
-) -> (egui::FullOutput, Vec2, Rect, bool) {
+) -> ScrollFrame {
     let mut offset = Vec2::ZERO;
     let mut viewport = Rect::NOTHING;
     let mut visible = false;
@@ -1074,7 +1242,12 @@ fn scrolling_frame(
         },
     );
     output.textures_delta.clear();
-    (output, offset, viewport, visible)
+    ScrollFrame {
+        output,
+        offset,
+        viewport,
+        visible,
+    }
 }
 
 fn appearance() -> Appearance {
@@ -1182,7 +1355,7 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
     editor
         .set_selection(Selection::new(Position::new(1, 0), Position::new(1, 3)))
         .unwrap();
-    let text = "あ\r\n👩‍💻";
+    let text = "あ\r\n👩\u{200d}💻";
     editor.update_composition(text, Some(0..3)).unwrap();
     let first = cached_preview_frame(&context, &mut cache, &editor, &appearance);
     let identity = cache.preview.as_ref().unwrap().document.content_identity();
@@ -1231,14 +1404,17 @@ fn preedit_cursor_changes_reuse_document_and_layout_with_unicode_and_newlines() 
     let preview = cache.preview.as_ref().unwrap();
     assert!(first.identity().ptr_eq(&restored.identity()));
     assert_eq!(preview.caret, Position::new(1, 0));
-    assert_eq!(preview.document.plain_text(), "first\nあ\n👩‍💻\nlast");
+    assert_eq!(
+        preview.document.plain_text(),
+        "first\nあ\n👩\u{200d}💻\nlast"
+    );
     assert_eq!(editor.document().plain_text(), "first\nOLD\nlast");
     assert!(!editor.can_undo());
 }
 
 #[test]
 fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
-    let link = Link::new("https://example.com").unwrap();
+    let link = Link::try_new("https://example.com").unwrap();
     let mut linked = Editor::from_text("before  after");
     linked
         .set_selection(Selection::caret(Position::new(0, 7)))
@@ -1248,7 +1424,7 @@ fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
     styled
         .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
         .unwrap();
-    styled.toggle_style(crate::InlineAttribute::Bold).unwrap();
+    styled.toggle_style(InlineAttribute::Bold).unwrap();
     styled
         .set_selection(Selection::caret(Position::new(1, 0)))
         .unwrap();
@@ -1264,122 +1440,148 @@ fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
             start: None,
         })
         .unwrap();
-    type Step = (&'static str, Option<Range<usize>>);
+    /// A composition update: the preedit text and its selected byte range.
+    struct Step {
+        text: &'static str,
+        selection: Option<Range<usize>>,
+    }
+    fn preedit(text: &'static str) -> Step {
+        Step {
+            text,
+            selection: None,
+        }
+    }
+    fn preedit_selecting(text: &'static str, selection: Range<usize>) -> Step {
+        Step {
+            text,
+            selection: Some(selection),
+        }
+    }
     let cases: Vec<(Editor, Selection, Vec<Step>)> = vec![
         (
             Editor::from_text("first\nOLD\nlast"),
             Selection::new(Position::new(1, 0), Position::new(1, 3)),
             vec![
-                ("k", None),
-                ("か", Some(3..3)),
-                ("かn", None),
-                ("かん", Some(0..3)),
-                ("漢字", None),
+                preedit("k"),
+                preedit_selecting("か", 3..3),
+                preedit("かn"),
+                preedit_selecting("かん", 0..3),
+                preedit("漢字"),
             ],
         ),
         (
             Editor::from_text("cafe\nx"),
             Selection::caret(Position::new(0, 4)),
             vec![
-                ("\u{301}", None),
-                ("\u{301}x", None),
-                ("y", None),
-                ("\u{301}", None),
-                ("z", None),
+                preedit("\u{301}"),
+                preedit("\u{301}x"),
+                preedit("y"),
+                preedit("\u{301}"),
+                preedit("z"),
             ],
         ),
         (
             Editor::from_text("ab\u{301}cd"),
             Selection::caret(Position::new(0, 4)),
             vec![
-                ("x", None),
-                ("xe", None),
-                ("x", None),
-                ("", None),
-                ("q", None),
-                ("q\u{301}", None),
+                preedit("x"),
+                preedit("xe"),
+                preedit("x"),
+                preedit(""),
+                preedit("q"),
+                preedit("q\u{301}"),
             ],
         ),
         (
             Editor::from_text("🇺🇸🇨"),
             Selection::caret(Position::new(0, 12)),
-            vec![("🇦", None), ("🇦🇺", None), ("x", None), ("🇦", None)],
+            vec![preedit("🇦"), preedit("🇦🇺"), preedit("x"), preedit("🇦")],
         ),
         (
             Editor::from_text("👩\u{200d}x"),
             Selection::caret(Position::new(0, 7)),
-            vec![("a", None), ("\u{200d}", None), ("💻", None), ("b", None)],
+            vec![
+                preedit("a"),
+                preedit("\u{200d}"),
+                preedit("💻"),
+                preedit("b"),
+            ],
         ),
         (
             Editor::from_text("\u{301}abc"),
             Selection::caret(Position::new(0, 0)),
             vec![
-                ("e", None),
-                ("ex", None),
-                ("e", None),
-                ("f", None),
-                ("e", None),
+                preedit("e"),
+                preedit("ex"),
+                preedit("e"),
+                preedit("f"),
+                preedit("e"),
             ],
         ),
         (
             Editor::from_text("\u{1161}z"),
             Selection::caret(Position::new(0, 0)),
             vec![
-                ("\u{1100}", None),
-                ("a\u{1100}", None),
-                ("\u{1100}", None),
-                ("b", None),
+                preedit("\u{1100}"),
+                preedit("a\u{1100}"),
+                preedit("\u{1100}"),
+                preedit("b"),
             ],
         ),
         (
             Editor::from_text("🇸x"),
             Selection::caret(Position::new(0, 0)),
             vec![
-                ("🇺", None),
-                ("🇺🇦", None),
-                ("🇺🇦🇺", None),
-                ("q", None),
-                ("🇺", None),
+                preedit("🇺"),
+                preedit("🇺🇦"),
+                preedit("🇺🇦🇺"),
+                preedit("q"),
+                preedit("🇺"),
             ],
         ),
         (
             linked.clone(),
             Selection::caret(Position::new(0, 10)),
-            vec![("a", None), ("ab", None), ("abc", Some(1..2)), ("z", None)],
+            vec![
+                preedit("a"),
+                preedit("ab"),
+                preedit_selecting("abc", 1..2),
+                preedit("z"),
+            ],
         ),
         (
             linked,
             Selection::caret(Position::new(0, 7)),
-            vec![("a", None), ("ab", None), ("abc", None)],
+            vec![preedit("a"), preedit("ab"), preedit("abc")],
         ),
         (
             styled.clone(),
             Selection::new(Position::new(0, 0), Position::new(2, 3)),
             vec![
-                ("a", None),
-                ("ab", None),
-                ("a\nb", None),
-                ("abc", None),
-                ("a\r\nb", None),
-                ("x\u{2029}y", None),
-                ("q", None),
+                preedit("a"),
+                preedit("ab"),
+                preedit("a\nb"),
+                preedit("abc"),
+                preedit("a\r\nb"),
+                preedit("x\u{2029}y"),
+                preedit("q"),
             ],
         ),
         (
             styled.clone(),
             Selection::new(Position::new(1, 3), Position::new(3, 2)),
             vec![
-                ("a", None),
-                ("ab", None),
-                ("abc", None),
-                ("", None),
-                ("d", None),
+                preedit("a"),
+                preedit("ab"),
+                preedit("abc"),
+                preedit(""),
+                preedit("d"),
             ],
         ),
         (
             styled,
             Selection::new(Position::new(0, 5), Position::new(0, 2)),
-            vec![("a\u{2028}b", None), ("ab", None), ("a\u{2028}", None)],
+            vec![preedit("a\u{2028}b"), preedit("ab"), preedit("a\u{2028}")],
         ),
     ];
     let appearance = appearance();
@@ -1388,7 +1590,7 @@ fn preedit_text_updates_edit_the_preview_in_place_like_fresh_previews() {
         let context = egui::Context::default();
         let mut retained = Cache::default();
         editor.set_selection(replacement).unwrap();
-        for (step, (text, selection)) in steps.into_iter().enumerate() {
+        for (step, Step { text, selection }) in steps.into_iter().enumerate() {
             let previous = retained
                 .preview
                 .as_ref()
@@ -1562,10 +1764,13 @@ fn structural_layout_updates_retain_edges_and_match_a_fresh_cache() {
     editor.insert_paragraph().unwrap();
     let split = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     for (before, after) in [(0, 0), (2, 3), (3, 4)] {
-        assert!(Arc::ptr_eq(
-            &original.get(before).unwrap().galley,
-            &split.get(after).unwrap().galley
-        ));
+        assert!(
+            Arc::ptr_eq(
+                &original.get(before).unwrap().galley,
+                &split.get(after).unwrap().galley
+            ),
+            "before={before}, after={after}"
+        );
     }
     assert_eq!(original.get(1).unwrap().galley.job.text, "second");
     assert_eq!(split.get(1).unwrap().galley.job.text, "sec");
@@ -1593,24 +1798,30 @@ fn structural_layout_updates_retain_edges_and_match_a_fresh_cache() {
         let updated = cached_layout_frame(&context, &mut cache, &editor, &appearance);
         let mut fresh = Cache::default();
         let expected = cached_layout_frame(&context, &mut fresh, &editor, &appearance);
-        assert_eq!(updated.len(), expected.len());
+        assert_eq!(updated.len(), expected.len(), "step={step}");
         for index in 0..updated.len() {
             assert_eq!(
                 cache.layout.layouts.char_offset(index),
-                fresh.layout.layouts.char_offset(index)
+                fresh.layout.layouts.char_offset(index),
+                "step={step}, paragraph={index}"
             );
             assert_eq!(
                 cache.layout.layouts.contains_list(index..index + 1),
-                fresh.layout.layouts.contains_list(index..index + 1)
+                fresh.layout.layouts.contains_list(index..index + 1),
+                "step={step}, paragraph={index}"
             );
         }
         for (actual, expected) in updated.iter().zip(expected.iter()) {
-            assert_eq!(actual.rect, expected.rect);
-            assert_eq!(actual.marker_position, expected.marker_position);
-            assert_eq!(actual.galley.job, expected.galley.job);
+            assert_eq!(actual.rect, expected.rect, "step={step}");
+            assert_eq!(
+                actual.marker_position, expected.marker_position,
+                "step={step}"
+            );
+            assert_eq!(actual.galley.job, expected.galley.job, "step={step}");
             assert_eq!(
                 actual.marker.as_ref().map(|marker| &marker.job),
-                expected.marker.as_ref().map(|marker| &marker.job)
+                expected.marker.as_ref().map(|marker| &marker.job),
+                "step={step}"
             );
         }
     }
@@ -1647,7 +1858,8 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             );
             assert_eq!(
                 actual_layout.galley.rows.len(),
-                expected_layout.galley.rows.len()
+                expected_layout.galley.rows.len(),
+                "step={step}, paragraph={index}"
             );
             assert_eq!(
                 actual_layout.rect, expected_layout.rect,
@@ -1658,8 +1870,15 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                 "step={step}, paragraph={index}"
             );
             assert_eq!(
-                actual_layout.marker.as_ref().map(|m| (&m.job, m.size())),
-                expected_layout.marker.as_ref().map(|m| (&m.job, m.size()))
+                actual_layout
+                    .marker
+                    .as_ref()
+                    .map(|marker| (&marker.job, marker.size())),
+                expected_layout
+                    .marker
+                    .as_ref()
+                    .map(|marker| (&marker.job, marker.size())),
+                "step={step}, paragraph={index}"
             );
             assert_eq!(
                 actual.char_offset(index),
@@ -1675,13 +1894,26 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             }
             let actual_view = actual.views_range(index..index + 1).next().unwrap();
             let expected_view = expected.views_range(index..index + 1).next().unwrap();
-            assert_eq!(actual_view.rect, expected_view.rect);
-            assert_eq!(actual_view.rect, actual_layout.rect);
-            assert_eq!(actual_view.marker_position, expected_view.marker_position);
-            assert_eq!(actual_view.galley.job, expected_view.galley.job);
             assert_eq!(
-                actual_view.marker.map(|m| &m.job),
-                expected_view.marker.map(|m| &m.job)
+                actual_view.rect, expected_view.rect,
+                "step={step}, paragraph={index}"
+            );
+            assert_eq!(
+                actual_view.rect, actual_layout.rect,
+                "step={step}, paragraph={index}"
+            );
+            assert_eq!(
+                actual_view.marker_position, expected_view.marker_position,
+                "step={step}, paragraph={index}"
+            );
+            assert_eq!(
+                actual_view.galley.job, expected_view.galley.job,
+                "step={step}, paragraph={index}"
+            );
+            assert_eq!(
+                actual_view.marker.map(|marker| &marker.job),
+                expected_view.marker.map(|marker| &marker.job),
+                "step={step}, paragraph={index}"
             );
             for y in [
                 actual_layout.rect.top(),
@@ -1690,18 +1922,27 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             ] {
                 assert_eq!(
                     actual.first_bottom_at_least(y),
-                    expected.first_bottom_at_least(y)
+                    expected.first_bottom_at_least(y),
+                    "step={step}, paragraph={index}, y={y}"
                 );
-                assert_eq!(actual.first_top_after(y), expected.first_top_after(y));
-                assert_eq!(actual.paragraph_at_y(y), expected.paragraph_at_y(y));
+                assert_eq!(
+                    actual.first_top_after(y),
+                    expected.first_top_after(y),
+                    "step={step}, paragraph={index}, y={y}"
+                );
+                assert_eq!(
+                    actual.paragraph_at_y(y),
+                    expected.paragraph_at_y(y),
+                    "step={step}, paragraph={index}, y={y}"
+                );
                 for x in [
                     actual_layout.rect.left() - 1.0,
                     actual_layout.rect.center().x,
                     actual_layout.rect.right() + 1.0,
                 ] {
                     assert_eq!(
-                        hit_test(editor, actual, Vec2::new(x, y)),
-                        hit_test(editor, expected, Vec2::new(x, y)),
+                        navigation::hit_test(editor, actual, Vec2::new(x, y)),
+                        navigation::hit_test(editor, expected, Vec2::new(x, y)),
                         "step={step}, paragraph={index}, point={x},{y}"
                     );
                 }
@@ -1710,25 +1951,29 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             for grapheme in [0, source.grapheme_count() / 2, source.grapheme_count()] {
                 let position = Position::new(index, source.byte_from_grapheme(grapheme).unwrap());
                 for affinity in [false, true] {
-                    let actual_caret =
-                        document_caret_rect(document, actual, origin, position, affinity);
-                    let expected_caret =
-                        document_caret_rect(document, expected, origin, position, affinity);
+                    let actual_caret = navigation::document_caret_rect(
+                        document, actual, origin, position, affinity,
+                    );
+                    let expected_caret = navigation::document_caret_rect(
+                        document, expected, origin, position, affinity,
+                    );
                     assert_eq!(
                         actual_caret, expected_caret,
                         "step={step}, position={position:?}, affinity={affinity}"
                     );
                     let point = actual_caret.center() - origin;
                     assert_eq!(
-                        hit_test(editor, actual, point),
-                        hit_test(editor, expected, point)
+                        navigation::hit_test(editor, actual, point),
+                        navigation::hit_test(editor, expected, point),
+                        "step={step}, position={position:?}, affinity={affinity}"
                     );
                 }
             }
         }
         assert_eq!(
             actual.char_offset(actual.len()),
-            expected.char_offset(expected.len())
+            expected.char_offset(expected.len()),
+            "step={step}"
         );
     }
 
@@ -1743,9 +1988,9 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
     }
 
     let context = egui::Context::default();
-    let source = (0..160)
-        .map(|index| format!("{index}: café e\u{301} 👩‍💻 日本語 words\n"))
-        .collect::<String>();
+    let source: String = (0..160)
+        .map(|index| format!("{index}: café e\u{301} 👩\u{200d}💻 日本語 words\n"))
+        .collect();
     let mut editor = Editor::from_text(&source);
     let mut retained = Cache::default();
     let mut appearance = appearance();
@@ -1813,8 +2058,8 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                     editor.insert_text(" skipped ").unwrap();
                 }
             }
-            7 => assert!(editor.undo()),
-            8 => assert!(editor.redo()),
+            7 => assert!(editor.undo(), "step={step}"),
+            8 => assert!(editor.redo(), "step={step}"),
             9 => {
                 let end = editor.document().paragraph(3).unwrap().text().len();
                 let fragment = editor
@@ -1832,13 +2077,17 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             }
             12 => {
                 set_middle(&mut editor, index);
-                editor.update_composition("あ\n👩‍💻", Some(3..3)).unwrap();
+                editor
+                    .update_composition("あ\n👩\u{200d}💻", Some(3..3))
+                    .unwrap();
             }
-            13 => editor.update_composition("あ\n👩‍💻", Some(4..4)).unwrap(),
+            13 => editor
+                .update_composition("あ\n👩\u{200d}💻", Some(4..4))
+                .unwrap(),
             14 => editor
                 .update_composition("日本e\u{301}", Some(6..9))
                 .unwrap(),
-            15 => assert!(editor.cancel_composition()),
+            15 => assert!(editor.cancel_composition(), "step={step}"),
             16 => {
                 editor.update_composition("", None).unwrap();
                 editor.commit_composition("x\n日本").unwrap();
@@ -1869,7 +2118,7 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
             },
             _ => unreachable!(),
         }
-        assert!(editor.document().paragraphs().len() >= 100);
+        assert!(editor.document().paragraphs().len() >= 100, "step={step}");
         let mut fresh = Cache::default();
         context
             .run_ui(egui::RawInput::default(), |ui| {
@@ -1878,7 +2127,8 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                 compare_layouts(&editor, &actual, &expected, step);
                 assert_eq!(
                     retained.plain_text(editor.document()),
-                    fresh.plain_text(editor.document())
+                    fresh.plain_text(editor.document()),
+                    "step={step}"
                 );
                 for index in [
                     0,
@@ -1891,12 +2141,14 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                     );
                     assert_eq!(
                         retained.char_offset(editor.document(), position),
-                        fresh.char_offset(editor.document(), position)
+                        fresh.char_offset(editor.document(), position),
+                        "step={step}, paragraph={index}"
                     );
                 }
                 assert_eq!(
                     retained.selection_contains_list(&editor),
-                    fresh.selection_contains_list(&editor)
+                    fresh.selection_contains_list(&editor),
+                    "step={step}, paragraph={index}"
                 );
                 let actual_preview = retained.layout_preview(ui, &editor, &appearance).unwrap();
                 let expected_preview = fresh.layout_preview(ui, &editor, &appearance).unwrap();
@@ -1910,10 +2162,14 @@ fn retained_layouts_match_fresh_frames_through_mixed_edits_and_environment_chang
                     let expected_preview = fresh.preview.as_ref().unwrap();
                     assert_eq!(
                         actual_preview.document.to_bytes(),
-                        expected_preview.document.to_bytes()
+                        expected_preview.document.to_bytes(),
+                        "step={step}"
                     );
-                    assert_eq!(actual_preview.caret, expected_preview.caret);
-                    assert_eq!(actual_preview.selection, expected_preview.selection);
+                    assert_eq!(actual_preview.caret, expected_preview.caret, "step={step}");
+                    assert_eq!(
+                        actual_preview.selection, expected_preview.selection,
+                        "step={step}"
+                    );
                     let preview_editor = Editor::new(actual_preview.document.clone());
                     compare_layouts(&preview_editor, &actual, &expected, step);
                 }
@@ -1977,7 +2233,7 @@ fn malformed_shaping_retries_preserve_rendered_text_styles_and_widget_navigation
         .apply_style(StylePatch {
             italic: Some(true),
             underline: Some(true),
-            foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
+            foreground: Some(Some(Color([42, 100, 200, 255]))),
             ..Default::default()
         })
         .unwrap();
@@ -2028,12 +2284,23 @@ fn malformed_shaping_retries_preserve_rendered_text_styles_and_widget_navigation
             .find(|span| span.range.contains(&section.byte_range.start.0))
             .unwrap()
             .style;
-        assert_eq!(section.format.italics, style.italic);
-        assert_eq!(section.format.underline != Stroke::NONE, style.underline);
+        assert_eq!(
+            section.format.italics, style.italic,
+            "section {:?}",
+            section.byte_range
+        );
+        assert_eq!(
+            section.format.underline != Stroke::NONE,
+            style.underline,
+            "section {:?}",
+            section.byte_range
+        );
         if let Some(color) = style.foreground {
             assert_eq!(
                 section.format.color,
-                Color32::from_rgba_unmultiplied(color.0[0], color.0[1], color.0[2], color.0[3])
+                Color32::from_rgba_unmultiplied(color.0[0], color.0[1], color.0[2], color.0[3]),
+                "section {:?}",
+                section.byte_range
             );
         }
     }
@@ -2074,7 +2341,7 @@ fn malformed_shaping_retries_preserve_rendered_text_styles_and_widget_navigation
 fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
     let context = egui::Context::default();
     let mut cache = Cache::default();
-    let editor = Editor::from_text("atlas glyphs café 👩‍💻\nunchanged paragraph");
+    let editor = Editor::from_text("atlas glyphs café 👩\u{200d}💻\nunchanged paragraph");
     let appearance = appearance();
     let mut previous = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     for change_hinting in [true, false] {
@@ -2088,11 +2355,20 @@ fn font_probe_refreshes_layouts_when_text_options_recreate_the_atlas() {
         });
         let refreshed = cached_layout_frame(&context, &mut cache, &editor, &appearance);
         for (old, new) in previous.iter().zip(refreshed.iter()) {
-            assert!(!Arc::ptr_eq(&old.galley, &new.galley));
-            assert_eq!(old.galley.job.text, new.galley.job.text);
+            assert!(
+                !Arc::ptr_eq(&old.galley, &new.galley),
+                "change_hinting={change_hinting}"
+            );
+            assert_eq!(
+                old.galley.job.text, new.galley.job.text,
+                "change_hinting={change_hinting}"
+            );
         }
         let idle = cached_layout_frame(&context, &mut cache, &editor, &appearance);
-        assert!(refreshed.identity().ptr_eq(&idle.identity()));
+        assert!(
+            refreshed.identity().ptr_eq(&idle.identity()),
+            "change_hinting={change_hinting}"
+        );
         previous = refreshed;
     }
 }
@@ -2370,18 +2646,21 @@ fn command_navigation_and_altgr_preserve_platform_shortcut_semantics() {
 fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
     let context = egui::Context::default();
     context.set_os(egui::os::OperatingSystem::Mac);
-    let text = "prefix\ncafé e\u{301}👩🏽‍💻\u{2028}tail\nlast";
+    let text = "prefix\ncafé e\u{301}👩🏽\u{200d}💻\u{2028}tail\nlast";
     let start = Position::new(1, "café e\u{301}".len());
     for (key, expected) in [
         (Key::A, Position::new(1, 0)),
         (
             Key::E,
-            Position::new(1, "café e\u{301}👩🏽‍💻\u{2028}tail".len()),
+            Position::new(1, "café e\u{301}👩🏽\u{200d}💻\u{2028}tail".len()),
         ),
         (Key::B, Position::new(1, "café ".len())),
-        (Key::F, Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+        (Key::F, Position::new(1, "café e\u{301}👩🏽\u{200d}💻".len())),
         (Key::ArrowLeft, Position::new(1, 0)),
-        (Key::ArrowRight, Position::new(1, "café e\u{301}👩🏽‍💻".len())),
+        (
+            Key::ArrowRight,
+            Position::new(1, "café e\u{301}👩🏽\u{200d}💻".len()),
+        ),
     ] {
         for extend in [false, true] {
             let mut editor = Editor::from_text(text);
@@ -2399,13 +2678,13 @@ fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
             );
             assert_eq!(
                 editor.document().plain_text(),
-                text.replace('\u{2028}', "\n")
+                text.replace('\u{2028}', "\n"),
+                "{key:?} shift={extend}"
             );
-            assert!(!editor.can_undo());
+            assert!(!editor.can_undo(), "{key:?} shift={extend}");
         }
     }
 
-    // Control-P/N traverse visual lines, including a soft break within a paragraph.
     let mut editor = Editor::from_text("aaa\u{2028}aaa\u{2028}aaa");
     let start = Position::new(0, "aaa\u{2028}aa".len());
     editor.set_selection(Selection::caret(start)).unwrap();
@@ -2417,7 +2696,8 @@ fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
     );
     assert_eq!(
         editor.selection(),
-        Selection::new(start, Position::new(0, 2))
+        Selection::new(start, Position::new(0, 2)),
+        "Control-P moves to the previous visual line, across a soft break within the paragraph"
     );
     frame(
         &context,
@@ -2425,9 +2705,12 @@ fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
         vec![key(Key::N, Modifiers::CTRL)],
         true,
     );
-    assert_eq!(editor.selection(), Selection::caret(start));
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(start),
+        "Control-N moves to the next visual line, across a soft break within the paragraph"
+    );
 
-    // Runtime platform selection keeps Windows Control-A as Select All.
     context.set_os(egui::os::OperatingSystem::Windows);
     frame(
         &context,
@@ -2435,19 +2718,23 @@ fn macos_control_navigation_preserves_graphemes_and_shift_anchors() {
         vec![key(Key::A, Modifiers::CTRL | Modifiers::COMMAND)],
         true,
     );
-    assert_eq!(editor.selected_text(), editor.document().plain_text());
+    assert_eq!(
+        editor.selected_text(),
+        editor.document().plain_text(),
+        "runtime platform selection keeps Windows Control-A as Select All"
+    );
 }
 
 #[test]
 fn macos_control_deletion_is_grapheme_safe_undoable_and_guarded() {
     let context = egui::Context::default();
     context.set_os(egui::os::OperatingSystem::Mac);
-    let text = "a e\u{301}👩🏽‍💻 z";
+    let text = "a e\u{301}👩🏽\u{200d}💻 z";
     let caret = Selection::caret(Position::new(0, "a e\u{301}".len()));
     for (key, expected) in [
-        (Key::H, "a 👩🏽‍💻 z"),
+        (Key::H, "a 👩🏽\u{200d}💻 z"),
         (Key::D, "a e\u{301} z"),
-        (Key::Backspace, "a 👩🏽‍💻 z"),
+        (Key::Backspace, "a 👩🏽\u{200d}💻 z"),
     ] {
         let mut editor = Editor::from_text(text);
         editor.set_selection(caret).unwrap();
@@ -2458,10 +2745,10 @@ fn macos_control_deletion_is_grapheme_safe_undoable_and_guarded() {
             true,
         );
         assert_eq!(editor.document().plain_text(), expected, "{key:?}");
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), text);
-        assert_eq!(editor.selection(), caret);
+        assert_eq!(editor.undo_len(), 1, "{key:?}");
+        assert!(editor.undo(), "{key:?}");
+        assert_eq!(editor.document().plain_text(), text, "{key:?}");
+        assert_eq!(editor.selection(), caret, "{key:?}");
         frame_options(
             &context,
             &mut editor,
@@ -2469,7 +2756,7 @@ fn macos_control_deletion_is_grapheme_safe_undoable_and_guarded() {
             true,
             true,
         );
-        assert_eq!(editor.document().plain_text(), text);
+        assert_eq!(editor.document().plain_text(), text, "{key:?}");
         editor.update_composition("候", None).unwrap();
         frame(
             &context,
@@ -2477,8 +2764,8 @@ fn macos_control_deletion_is_grapheme_safe_undoable_and_guarded() {
             vec![self::key(key, Modifiers::CTRL)],
             true,
         );
-        assert_eq!(editor.document().plain_text(), text);
-        assert_eq!(editor.composition().unwrap().text, "候");
+        assert_eq!(editor.document().plain_text(), text, "{key:?}");
+        assert_eq!(editor.composition().unwrap().text, "候", "{key:?}");
         editor.cancel_composition();
     }
 }
@@ -2490,7 +2777,7 @@ fn macos_option_vertical_navigation_visits_paragraph_boundaries() {
     }
     let context = egui::Context::default();
     context.set_os(egui::os::OperatingSystem::Mac);
-    let text = "many words that wrap onto several visual lines\n\ncafé 👩🏽‍💻 tail\nlast";
+    let text = "many words that wrap onto several visual lines\n\ncafé 👩🏽\u{200d}💻 tail\nlast";
     for (key, start, targets) in [
         (
             Key::ArrowUp,
@@ -2508,7 +2795,7 @@ fn macos_option_vertical_navigation_visits_paragraph_boundaries() {
             vec![
                 Position::new(0, text.find('\n').unwrap()),
                 Position::new(1, 0),
-                Position::new(2, "café 👩🏽‍💻 tail".len()),
+                Position::new(2, "café 👩🏽\u{200d}💻 tail".len()),
                 Position::new(3, 4),
                 Position::new(3, 4),
             ],
@@ -2537,7 +2824,7 @@ fn macos_option_vertical_navigation_visits_paragraph_boundaries() {
                     "{key:?} shift={extend}"
                 );
             }
-            assert!(!editor.can_undo());
+            assert!(!editor.can_undo(), "{key:?} shift={extend}");
         }
     }
 }
@@ -2549,7 +2836,7 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
     }
     let command = Modifiers::MAC_CMD | Modifiers::COMMAND;
     for text in [
-        "keep\u{2028}café e\u{301}👩🏽‍💻 tail",
+        "keep\u{2028}café e\u{301}👩🏽\u{200d}💻 tail",
         "first second third fourth fifth sixth seventh eighth ninth tenth eleventh",
     ] {
         let context = egui::Context::default();
@@ -2558,8 +2845,8 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
         widget_frame(&context, &mut editor, vec![], None, true, narrow);
         let cache = widget_cache(&context);
         let galley = &cache.layout.layouts.get(0).unwrap().galley;
-        assert!(galley.rows.len() > 1);
-        let last_scalar = galley.rows[..galley.rows.len() - 1]
+        assert!(galley.rows.len() > 1, "{text:?}");
+        let last_scalar: usize = galley.rows[..galley.rows.len() - 1]
             .iter()
             .map(|row| row.char_count_including_newline().0)
             .sum();
@@ -2579,26 +2866,31 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
         );
         assert_eq!(
             editor.document().paragraph(0).unwrap().text(),
-            &text[..row_start]
+            &text[..row_start],
+            "{text:?}"
         );
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().paragraph(0).unwrap().text(), text);
-        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.undo_len(), 1, "{text:?}");
+        assert!(editor.undo(), "{text:?}");
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().text(),
+            text,
+            "{text:?}"
+        );
+        assert_eq!(editor.selection(), selection, "{text:?}");
     }
 
     for reverse in [false, true] {
         let context = egui::Context::default();
-        let text = "keep\u{2028}café 👩🏽‍💻 tail";
+        let text = "keep\u{2028}café 👩🏽\u{200d}💻 tail";
         let mut editor = Editor::from_text(text);
-        let (a, b) = (
+        let (start, end) = (
             Position::new(0, "keep\u{2028}".len()),
-            Position::new(0, "keep\u{2028}café 👩🏽‍💻".len()),
+            Position::new(0, "keep\u{2028}café 👩🏽\u{200d}💻".len()),
         );
         let selection = if reverse {
-            Selection::new(b, a)
+            Selection::new(end, start)
         } else {
-            Selection::new(a, b)
+            Selection::new(start, end)
         };
         editor.set_selection(selection).unwrap();
         frame(
@@ -2609,18 +2901,23 @@ fn command_backspace_keeps_previous_soft_and_wrapped_visual_lines() {
         );
         assert_eq!(
             editor.document().paragraph(0).unwrap().text(),
-            "keep\u{2028} tail"
+            "keep\u{2028} tail",
+            "reverse={reverse}"
         );
-        assert!(editor.undo());
-        assert_eq!(editor.document().paragraph(0).unwrap().text(), text);
-        assert_eq!(editor.selection(), selection);
+        assert!(editor.undo(), "reverse={reverse}");
+        assert_eq!(
+            editor.document().paragraph(0).unwrap().text(),
+            text,
+            "reverse={reverse}"
+        );
+        assert_eq!(editor.selection(), selection, "reverse={reverse}");
     }
 }
 
 #[test]
 fn command_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
-    let text = "prefix\ncafé 👩🏽‍💻 tail";
-    let end = Position::new(1, "café 👩🏽‍💻".len());
+    let text = "prefix\ncafé 👩🏽\u{200d}💻 tail";
+    let end = Position::new(1, "café 👩🏽\u{200d}💻".len());
     let caret = Selection::caret(end);
     for selection in [
         caret,
@@ -2643,9 +2940,10 @@ fn command_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
                 "prefix\n tail"
             } else {
                 "p tail"
-            }
+            },
+            "{selection:?}"
         );
-        assert_eq!(editor.undo_len(), 1);
+        assert_eq!(editor.undo_len(), 1, "{selection:?}");
         if selection == caret {
             let revision = editor.document().revision();
             frame(
@@ -2657,9 +2955,9 @@ fn command_backspace_deletes_to_paragraph_start_and_undo_restores_selection() {
             assert_eq!(editor.document().revision(), revision);
             assert_eq!(editor.undo_len(), 1);
         }
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), text);
-        assert_eq!(editor.selection(), selection);
+        assert!(editor.undo(), "{selection:?}");
+        assert_eq!(editor.document().plain_text(), text, "{selection:?}");
+        assert_eq!(editor.selection(), selection, "{selection:?}");
     }
 }
 
@@ -2706,9 +3004,10 @@ fn command_backspace_respects_read_only_ime_and_modifier_guards() {
                 "one tw"
             } else {
                 "one "
-            }
+            },
+            "{modifiers:?}"
         );
-        assert!(editor.undo());
+        assert!(editor.undo(), "{modifiers:?}");
     }
 }
 
@@ -2917,7 +3216,7 @@ fn unfocused_widget_leaves_text_events_for_host() {
 fn ime_preedit_is_transient_then_commits_once() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("hello");
-    let preedit = "に\r\n👩‍💻e\u{301}";
+    let preedit = "に\r\n👩\u{200d}💻e\u{301}";
     frame(
         &context,
         &mut editor,
@@ -2949,9 +3248,15 @@ fn ime_preedit_is_transient_then_commits_once() {
 
 #[test]
 fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges() {
-    let long_unicode = "に\r\n👩‍💻e\u{301}".repeat(9);
+    let long_unicode = "に\r\n👩\u{200d}💻e\u{301}".repeat(9);
     let long_ascii = "a".repeat(65);
-    for text in ["", "plain", "に\r\n👩‍💻e\u{301}", &long_unicode, &long_ascii] {
+    for text in [
+        "",
+        "plain",
+        "に\r\n👩\u{200d}💻e\u{301}",
+        &long_unicode,
+        &long_ascii,
+    ] {
         let boundaries: Vec<_> = text
             .char_indices()
             .map(|(byte, _)| byte)
@@ -2960,7 +3265,7 @@ fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges(
         for start in 0..boundaries.len() {
             for end in start..boundaries.len() {
                 assert_eq!(
-                    preedit_byte_range(text, &(start..end)),
+                    navigation::preedit_byte_range(text, &(start..end)),
                     Ok(boundaries[start]..boundaries[end]),
                     "text={text:?}, scalars={start}..{end}"
                 );
@@ -2979,8 +3284,9 @@ fn preedit_scalar_ranges_preserve_raw_unicode_offsets_and_reject_invalid_ranges(
             usize::MAX..usize::MAX,
         ] {
             assert_eq!(
-                preedit_byte_range(text, &range),
-                Err(Error::InvalidCompositionSelection)
+                navigation::preedit_byte_range(text, &range),
+                Err(Error::InvalidCompositionSelection),
+                "text={text:?}, range={range:?}"
             );
         }
     }
@@ -3006,8 +3312,8 @@ fn rejected_native_preedit_ranges_preserve_the_active_composition() {
             .run_ui(
                 egui::RawInput {
                     events: vec![Event::Ime(ImeEvent::Preedit {
-                        text: "changed\r\n👩‍💻".into(),
-                        active_range_chars: Some(range),
+                        text: "changed\r\n👩\u{200d}💻".into(),
+                        active_range_chars: Some(range.clone()),
                     })],
                     ..Default::default()
                 },
@@ -3020,10 +3326,14 @@ fn rejected_native_preedit_ranges_preserve_the_active_composition() {
                 },
             )
             .drop_without_applying_deltas();
-        assert_eq!(errors, vec![Error::InvalidCompositionSelection]);
-        assert_eq!(editor.composition(), composition.as_ref());
-        assert_eq!(editor.document().plain_text(), "hello");
-        assert!(!editor.can_undo());
+        assert_eq!(
+            errors,
+            vec![Error::InvalidCompositionSelection],
+            "{range:?}"
+        );
+        assert_eq!(editor.composition(), composition.as_ref(), "{range:?}");
+        assert_eq!(editor.document().plain_text(), "hello", "{range:?}");
+        assert!(!editor.can_undo(), "{range:?}");
     }
 }
 
@@ -3081,14 +3391,30 @@ fn emphasis_shortcuts_normalize_mixed_selections_in_both_directions() {
                     Key::I => style.italic,
                     _ => style.underline,
                 };
-                assert_eq!(actual, Some(enabled));
-                assert_eq!(editor.selection(), selection);
+                assert_eq!(
+                    actual,
+                    Some(enabled),
+                    "{shortcut:?}, reverse={reverse}, enabled={enabled}"
+                );
+                assert_eq!(
+                    editor.selection(),
+                    selection,
+                    "{shortcut:?}, reverse={reverse}, enabled={enabled}"
+                );
             }
-            assert_eq!(editor.undo_len(), 2);
-            assert!(editor.undo());
-            assert!(editor.undo());
-            assert_eq!(editor.document().to_bytes(), original);
-            assert_eq!(editor.selection(), selection);
+            assert_eq!(editor.undo_len(), 2, "{shortcut:?}, reverse={reverse}");
+            assert!(editor.undo(), "{shortcut:?}, reverse={reverse}");
+            assert!(editor.undo(), "{shortcut:?}, reverse={reverse}");
+            assert_eq!(
+                editor.document().to_bytes(),
+                original,
+                "{shortcut:?}, reverse={reverse}"
+            );
+            assert_eq!(
+                editor.selection(),
+                selection,
+                "{shortcut:?}, reverse={reverse}"
+            );
         }
     }
 }
@@ -3117,7 +3443,7 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
                     link_color: Color32::LIGHT_BLUE,
                     width: 400.0,
                 };
-                let job = paragraph_job(
+                let job = layout::paragraph_job(
                     editor.document().paragraph(0).expect("paragraph"),
                     &appearance,
                     400.0,
@@ -3134,8 +3460,15 @@ fn formatting_shortcut_produces_formatted_layout_sections() {
 
 #[test]
 fn character_hit_positions_snap_to_whole_graphemes() {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let context = egui::Context::default();
-    for text in ["", "plain", "a👨‍👩‍👧‍👦e\u{301} 🇺🇸", "\u{600}a b"] {
+    for text in [
+        "",
+        "plain",
+        "a👨\u{200d}👩\u{200d}👧\u{200d}👦e\u{301} 🇺🇸",
+        "\u{600}a b",
+    ] {
         let editor = Editor::from_text(text);
         let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
         let layout = layouts.get(0).unwrap();
@@ -3147,7 +3480,9 @@ fn character_hit_positions_snap_to_whole_graphemes() {
         let mut previous = 0;
         let mut x = layout.rect.left() - 4.0;
         while x < layout.rect.left() + layout.galley.rect.right() + 4.0 {
-            let (position, _) = hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y));
+            let position =
+                navigation::hit_test(&editor, &layouts, Vec2::new(x, layout.rect.center().y))
+                    .position;
             assert!(
                 boundaries.contains(&position.byte) && position.byte >= previous,
                 "text={text:?}, x={x}, byte={}",
@@ -3168,7 +3503,7 @@ fn clicks_inside_multi_scalar_graphemes_snap_to_the_visually_nearer_edge() {
         let editor = Editor::from_text(&text);
         let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
         let caret = |byte| {
-            document_caret_rect(
+            navigation::document_caret_rect(
                 editor.document(),
                 &layouts,
                 Pos2::ZERO,
@@ -3181,7 +3516,7 @@ fn clicks_inside_multi_scalar_graphemes_snap_to_the_visually_nearer_edge() {
         for (fraction, expected) in [(0.25, 1), (0.75, end)] {
             let point = left.to_vec2() + (right - left) * fraction;
             assert_eq!(
-                hit_test(&editor, &layouts, point).0,
+                navigation::hit_test(&editor, &layouts, point).position,
                 Position::new(0, expected),
                 "text={text:?}, fraction={fraction}"
             );
@@ -3199,7 +3534,7 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
     let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
     let rows = &layouts.get(0).unwrap().galley.rows;
     assert!(rows.len() >= 3);
-    let last_start = rows[..rows.len() - 1]
+    let last_start: usize = rows[..rows.len() - 1]
         .iter()
         .map(|row| row.char_count_including_newline().0)
         .sum();
@@ -3211,16 +3546,17 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
         .unwrap();
     let origin = Pos2::new(10.0, 10.0);
     let color = Color32::from_rgb(4, 5, 6);
-    let rectangles = |selection| {
+    let rectangles = |selection| -> Vec<Rect> {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            paint_document(
+            paint::paint_document(
                 ui.painter(),
                 &mut PaintCache::default(),
                 editor.document(),
                 &layouts,
                 origin,
                 &[],
-                Some((selection, color)),
+                Some(selection),
+                color,
                 &FontFamily::Proportional,
                 Color32::WHITE,
                 Color32::GRAY,
@@ -3236,7 +3572,7 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
                 }
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect()
     };
     let selected = rectangles(Selection::new(Position::new(0, byte), Position::new(1, 0)));
     assert_eq!(selected.len(), 1);
@@ -3249,9 +3585,14 @@ fn selection_paints_hard_break_only_after_the_final_wrapped_row() {
 
     let selected = rectangles(Selection::new(Position::default(), Position::new(1, 0)));
     assert_eq!(selected.len(), rows.len());
-    for (index, (rect, row)) in selected.iter().zip(rows).enumerate() {
+    let selected_rows = selected.iter().zip(rows);
+    for (index, (rect, row)) in selected_rows.enumerate() {
         let extension = if index + 1 == rows.len() { 5.0 } else { 0.0 };
-        assert_eq!(rect.right(), origin.x + row.rect().right() + extension);
+        assert_eq!(
+            rect.right(),
+            origin.x + row.rect().right() + extension,
+            "row {index}"
+        );
     }
 }
 
@@ -3277,7 +3618,11 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
                             .min_rows(1)
                             .read_only(read_only)
                             .show(ui);
-                        assert!(output.errors.is_empty());
+                        assert!(
+                            output.errors.is_empty(),
+                            "read_only={read_only}: {:?}",
+                            output.errors
+                        );
                         rect = output.response.rect;
                     },
                 )
@@ -3287,7 +3632,7 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
         let rect = run_frame(vec![]);
         let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
         let layout = &cache.layout.layouts.get(0).unwrap();
-        assert!(layout.galley.rows.len() >= 3);
+        assert!(layout.galley.rows.len() >= 3, "read_only={read_only}");
         let row = &layout.galley.rows[0];
         let pointer = rect.min
             + Vec2::splat(PADDING)
@@ -3307,10 +3652,11 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
             .navigation
             .as_ref()
             .expect("pointer affinity");
-        assert!(!navigation.prefer_next_row);
+        assert!(!navigation.prefer_next_row, "read_only={read_only}");
         assert_eq!(
             navigation.selection.focus.byte,
-            row.char_count_including_newline().0
+            row.char_count_including_newline().0,
+            "read_only={read_only}"
         );
         let source = &cache.layout.layouts.caches(0..1).next().unwrap().paragraph;
         assert_eq!(
@@ -3329,13 +3675,17 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
                     prefer_next_row: navigation.prefer_next_row,
                 })
                 .row,
-            0
+            0,
+            "read_only={read_only}"
         );
 
         let caret_rect = cache.interaction.caret_rect;
         run_frame(vec![key(Key::F1, Modifiers::NONE)]);
         let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
-        assert_eq!(cache.interaction.caret_rect, caret_rect);
+        assert_eq!(
+            cache.interaction.caret_rect, caret_rect,
+            "read_only={read_only}"
+        );
         for shortcut in [Key::B, Key::I, Key::U] {
             run_frame(vec![key(shortcut, Modifiers::COMMAND)]);
             let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
@@ -3373,7 +3723,8 @@ fn clicking_a_wrap_seam_keeps_the_caret_on_the_clicked_row() {
                     prefer_next_row: navigation.prefer_next_row,
                 })
                 .row,
-            1
+            1,
+            "read_only={read_only}"
         );
     }
 }
@@ -3383,7 +3734,12 @@ fn focused_clipped_editor_scrolls_to_input_and_keeps_ime_geometry() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("original");
     scrolling_frame(&context, &mut editor, vec![], false, 500.0);
-    let (output, offset, _, visible) = scrolling_frame(
+    let ScrollFrame {
+        output,
+        offset,
+        visible,
+        ..
+    } = scrolling_frame(
         &context,
         &mut editor,
         vec![Event::Text("typed ".into())],
@@ -3397,8 +3753,12 @@ fn focused_clipped_editor_scrolls_to_input_and_keeps_ime_geometry() {
         "focused input must bring the caret into view: {offset:?}"
     );
     assert!(output.platform_output.ime.is_some());
-    let (output, _, viewport, visible) =
-        scrolling_frame(&context, &mut editor, vec![], true, 500.0);
+    let ScrollFrame {
+        output,
+        viewport,
+        visible,
+        ..
+    } = scrolling_frame(&context, &mut editor, vec![], true, 500.0);
     assert!(visible);
     assert!(viewport.contains_rect(output.platform_output.ime.unwrap().cursor_rect));
 }
@@ -3407,14 +3767,16 @@ fn focused_clipped_editor_scrolls_to_input_and_keeps_ime_geometry() {
 fn external_selection_changes_scroll_the_focused_caret_into_view() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text(&format!("{}end", "line\n".repeat(20)));
-    let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+    let ScrollFrame { offset, .. } = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     assert_eq!(offset.y, 0.0);
     editor
         .set_selection(Selection::caret(editor.document().end()))
         .unwrap();
-    let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+    let ScrollFrame { offset, .. } = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     assert!(offset.y > 100.0);
-    let (output, _, viewport, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+    let ScrollFrame {
+        output, viewport, ..
+    } = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     assert!(viewport.contains_rect(output.platform_output.ime.unwrap().cursor_rect));
     assert!(!editor.can_undo());
 }
@@ -3426,7 +3788,7 @@ fn growing_preedit_scrolls_after_its_new_height_is_allocated() {
     scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     let text = format!("{}end", "line\n".repeat(20));
     let cursor = text.chars().count();
-    let (_, offset, _, _) = scrolling_frame(
+    let ScrollFrame { offset, .. } = scrolling_frame(
         &context,
         &mut editor,
         vec![Event::Ime(ImeEvent::Preedit {
@@ -3445,13 +3807,15 @@ fn growing_preedit_scrolls_after_its_new_height_is_allocated() {
         .data(|data| data.get_temp::<Cache>(Id::unique("scroll editor")))
         .unwrap();
     assert!(cache.interaction.scroll_to_caret);
-    let (_, offset, _, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+    let ScrollFrame { offset, .. } = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     assert!(offset.y > 100.0);
     let cache = context
         .data(|data| data.get_temp::<Cache>(Id::unique("scroll editor")))
         .unwrap();
     assert!(!cache.interaction.scroll_to_caret);
-    let (output, _, viewport, _) = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
+    let ScrollFrame {
+        output, viewport, ..
+    } = scrolling_frame(&context, &mut editor, vec![], true, 0.0);
     assert!(viewport.contains_rect(output.platform_output.ime.unwrap().cursor_rect));
     assert!(editor.composition().is_some());
     assert!(!editor.can_undo());
@@ -3534,9 +3898,17 @@ fn empty_paste_preserves_selection_and_typing_history() {
             vec![Event::Paste(String::new())],
             true,
         );
-        assert_eq!(editor.composition(), composition.as_ref());
-        assert_eq!(editor.document().plain_text(), "original");
-        assert!(!editor.can_undo());
+        assert_eq!(
+            editor.composition(),
+            composition.as_ref(),
+            "preedit={preedit:?}"
+        );
+        assert_eq!(
+            editor.document().plain_text(),
+            "original",
+            "preedit={preedit:?}"
+        );
+        assert!(!editor.can_undo(), "preedit={preedit:?}");
     }
 }
 
@@ -3548,7 +3920,7 @@ fn double_click_at_paragraph_end_selects_the_trailing_word() {
     };
     for (text, expected) in [
         ("hello café", "café"),
-        ("hello 👩🏽‍💻", "👩🏽‍💻"),
+        ("hello 👩🏽\u{200d}💻", "👩🏽\u{200d}💻"),
         ("hello 🇺🇸🇨🇦", "🇨🇦"),
         ("e\u{301}", "e\u{301}"),
         ("hello ", " "),
@@ -3670,7 +4042,11 @@ fn paste_then_alt_vertical_navigation_uses_the_platforms_current_layout() {
                 ],
                 true,
             );
-            assert_eq!(editor.document().plain_text(), "first\nsecond");
+            assert_eq!(
+                editor.document().plain_text(),
+                "first\nsecond",
+                "{os:?} shift={shift}"
+            );
             assert_eq!(editor.selection().focus, Position::new(0, 5), "{os:?}");
             assert_eq!(
                 editor.selection().anchor,
@@ -3815,7 +4191,11 @@ fn ignored_keys_and_pending_style_shortcuts_preserve_the_navigation_column() {
                 true,
                 read_only,
             );
-            assert_eq!(editor.selection().focus, Position::new(1, 1));
+            assert_eq!(
+                editor.selection().focus,
+                Position::new(1, 1),
+                "{ignored:?}, read_only={read_only}"
+            );
             frame_options(
                 &context,
                 &mut editor,
@@ -3823,11 +4203,14 @@ fn ignored_keys_and_pending_style_shortcuts_preserve_the_navigation_column() {
                 true,
                 read_only,
             );
-            assert!(context.input(|input| if consumed {
-                input.events.is_empty()
-            } else {
-                input.events == [ignored.clone()]
-            }));
+            assert!(
+                context.input(|input| if consumed {
+                    input.events.is_empty()
+                } else {
+                    input.events == [ignored.clone()]
+                }),
+                "{ignored:?}, read_only={read_only}"
+            );
             frame_options(
                 &context,
                 &mut editor,
@@ -3859,9 +4242,17 @@ fn moves_and_edits_that_keep_the_selection_reset_the_navigation_column() {
             vec![key(Key::ArrowDown, Modifiers::NONE)],
             true,
         );
-        assert_eq!(editor.selection().focus, Position::new(1, 1));
+        assert_eq!(
+            editor.selection().focus,
+            Position::new(1, 1),
+            "{stationary:?}"
+        );
         frame(&context, &mut editor, vec![stationary.clone()], true);
-        assert_eq!(editor.document().plain_text(), "aaaaaaaaa\nx");
+        assert_eq!(
+            editor.document().plain_text(),
+            "aaaaaaaaa\nx",
+            "{stationary:?}"
+        );
         assert_eq!(
             editor.selection().focus,
             Position::new(1, 1),
@@ -3900,7 +4291,11 @@ fn stationary_visual_moves_keep_a_pending_typing_style() {
         assert_eq!(editor.selection(), Selection::caret(end), "{stationary:?}");
         assert!(editor.typing_style().bold, "{stationary:?}");
         frame(&context, &mut editor, vec![Event::Text("!".into())], true);
-        assert_eq!(editor.document().plain_text(), "plain\ntext!");
+        assert_eq!(
+            editor.document().plain_text(),
+            "plain\ntext!",
+            "{stationary:?}"
+        );
         assert!(
             editor.document().style_at(editor.document().end()).bold,
             "{stationary:?}"
@@ -3929,18 +4324,25 @@ fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() 
         (Key::ArrowUp, 1, 12),
         (Key::ArrowUp, 0, 8),
     ] {
-        assert!(handle_key(
-            &mut editor,
-            context.os(),
-            key,
-            None,
-            Modifiers::NONE,
-            &layouts,
-            &mut navigation,
-            &mut errors,
-            &input_options(false),
-        ));
-        assert_eq!(editor.selection().focus.byte, expected_byte);
+        assert!(
+            input::handle_key(
+                &mut editor,
+                context.os(),
+                key,
+                None,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                &input_options(false),
+            ),
+            "{key:?} to row {expected_row}"
+        );
+        assert_eq!(
+            editor.selection().focus.byte,
+            expected_byte,
+            "{key:?} to row {expected_row}"
+        );
         let navigation = navigation.as_ref().unwrap();
         let cursor = CCursor {
             index: CharIndex(expected_byte),
@@ -3953,7 +4355,8 @@ fn vertical_navigation_preserves_wrapped_row_affinity_and_horizontal_position() 
                 .galley
                 .layout_from_cursor(cursor)
                 .row,
-            expected_row
+            expected_row,
+            "{key:?} to row {expected_row}"
         );
     }
     assert!(errors.is_empty());
@@ -3990,22 +4393,31 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
         (Key::ArrowUp, 1, 0, Some(0)),
         (Key::ArrowUp, 0, 0, Some(0)),
     ] {
-        assert!(handle_key(
-            &mut editor,
-            context.os(),
-            key,
-            None,
-            Modifiers::NONE,
-            &layouts,
-            &mut navigation,
-            &mut errors,
-            &input_options(false),
-        ));
+        assert!(
+            input::handle_key(
+                &mut editor,
+                context.os(),
+                key,
+                None,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                &input_options(false),
+            ),
+            "{key:?} to paragraph {paragraph}, row {row}"
+        );
         let focus = editor.selection().focus;
         editor.document().validate_position(focus).unwrap();
-        assert_eq!(focus.paragraph, paragraph);
+        assert_eq!(
+            focus.paragraph, paragraph,
+            "{key:?} to paragraph {paragraph}, row {row}"
+        );
         if let Some(byte) = byte {
-            assert_eq!(focus.byte, byte);
+            assert_eq!(
+                focus.byte, byte,
+                "{key:?} to paragraph {paragraph}, row {row}"
+            );
         }
         let cursor = CCursor {
             index: CharIndex(
@@ -4025,7 +4437,8 @@ fn vertical_navigation_crosses_combining_graphemes_split_at_indented_wraps() {
                 .galley
                 .layout_from_cursor(cursor)
                 .row,
-            row
+            row,
+            "{key:?} to paragraph {paragraph}, row {row}"
         );
     }
     assert!(errors.is_empty());
@@ -4048,7 +4461,7 @@ fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
     );
     let y = layout.rect.center().y;
     let x = |byte| {
-        document_caret_rect(
+        navigation::document_caret_rect(
             editor.document(),
             &layouts,
             Pos2::ZERO,
@@ -4067,8 +4480,10 @@ fn carets_and_clicks_step_through_ligatures_one_letter_at_a_time() {
         } else {
             assert!(left < right, "{:?}", &text[pair[0]..pair[1]]);
             assert_eq!(
-                hit_test(&editor, &layouts, Vec2::new(left, y)).0,
-                Position::new(0, pair[0])
+                navigation::hit_test(&editor, &layouts, Vec2::new(left, y)).position,
+                Position::new(0, pair[0]),
+                "{:?}",
+                &text[pair[0]..pair[1]]
             );
         }
     }
@@ -4081,7 +4496,7 @@ fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_
     let mut editor = Editor::from_text(&format!("{narrow}\na🇺🇸b\n{narrow}"));
     let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance());
     let x = |paragraph, byte| {
-        document_caret_rect(
+        navigation::document_caret_rect(
             editor.document(),
             &layouts,
             Pos2::ZERO,
@@ -4110,18 +4525,21 @@ fn vertical_navigation_onto_multi_scalar_graphemes_lands_on_the_visually_nearer_
             .unwrap();
         let mut navigation = None;
         let mut errors = Vec::new();
-        assert!(handle_key(
-            &mut editor,
-            context.os(),
-            key,
-            None,
-            Modifiers::NONE,
-            &layouts,
-            &mut navigation,
-            &mut errors,
-            &input_options(false),
-        ));
-        assert!(errors.is_empty());
+        assert!(
+            input::handle_key(
+                &mut editor,
+                context.os(),
+                key,
+                None,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                &input_options(false),
+            ),
+            "{key:?} from column {column}"
+        );
+        assert!(errors.is_empty(), "{key:?} from column {column}");
         assert_eq!(
             editor.selection().focus,
             Position::new(1, expected),
@@ -4153,34 +4571,41 @@ fn vertical_navigation_roundtrips_graphemes_spanning_entire_visual_rows() {
         (Key::ArrowUp, 1, 2),
         (Key::ArrowUp, 0, 0),
     ] {
-        assert!(handle_key(
-            &mut editor,
-            context.os(),
-            key,
-            None,
-            Modifiers::NONE,
-            &layouts,
-            &mut navigation,
-            &mut errors,
-            &input_options(false),
-        ));
+        assert!(
+            input::handle_key(
+                &mut editor,
+                context.os(),
+                key,
+                None,
+                Modifiers::NONE,
+                &layouts,
+                &mut navigation,
+                &mut errors,
+                &input_options(false),
+            ),
+            "{key:?} to row {expected_row}"
+        );
         let focus = editor.selection().focus;
         editor.document().validate_position(focus).unwrap();
         assert_eq!(
             focus,
-            Position::new(0, source.byte_from_scalar(scalar).unwrap())
+            Position::new(0, source.byte_from_scalar(scalar).unwrap()),
+            "{key:?} to row {expected_row}"
         );
         let cursor = CCursor {
             index: CharIndex(scalar),
             prefer_next_row: navigation.as_ref().unwrap().prefer_next_row,
         };
         let row = galley.layout_from_cursor(cursor).row;
-        assert_eq!(row, expected_row);
-        assert!(if key == Key::ArrowDown {
-            row > previous_row
-        } else {
-            row < previous_row
-        });
+        assert_eq!(row, expected_row, "{key:?} to row {expected_row}");
+        assert!(
+            if key == Key::ArrowDown {
+                row > previous_row
+            } else {
+                row < previous_row
+            },
+            "{key:?} to row {expected_row}"
+        );
         previous_row = row;
     }
     assert!(errors.is_empty());
@@ -4297,20 +4722,32 @@ fn empty_preedit_restores_visible_selection_before_a_later_empty_commit() {
                 _ => None,
             })
             .collect();
-        assert_eq!(painted_text, ["selected 色", "second"]);
-        assert_eq!(editor.selection(), selection);
-        assert_eq!(editor.composition().unwrap().replacement, selection);
-        assert!(!editor.can_undo());
+        assert_eq!(
+            painted_text,
+            ["selected 色", "second"],
+            "backward={backward}"
+        );
+        assert_eq!(editor.selection(), selection, "backward={backward}");
+        assert_eq!(
+            editor.composition().unwrap().replacement,
+            selection,
+            "backward={backward}"
+        );
+        assert!(!editor.can_undo(), "backward={backward}");
         frame(
             &context,
             &mut editor,
             vec![Event::Ime(ImeEvent::Commit(String::new()))],
             true,
         );
-        assert_eq!(editor.document().plain_text(), "");
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "selected 色\nsecond");
-        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.document().plain_text(), "", "backward={backward}");
+        assert!(editor.undo(), "backward={backward}");
+        assert_eq!(
+            editor.document().plain_text(),
+            "selected 色\nsecond",
+            "backward={backward}"
+        );
+        assert_eq!(editor.selection(), selection, "backward={backward}");
     }
 }
 
@@ -4413,9 +4850,14 @@ fn ime_cursor_is_hidden_when_preedit_range_is_none() {
         true,
     );
     let vertical_lines = |output: &egui::FullOutput| {
-        output.shapes.iter().filter(|shape| {
-            matches!(&shape.shape, egui::epaint::Shape::LineSegment { points, .. } if points[0].x == points[1].x)
-        }).count()
+        output
+            .shapes
+            .iter()
+            .filter(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::LineSegment { points, .. }
+                    if points[0].x == points[1].x)
+            })
+            .count()
     };
     assert_eq!(vertical_lines(&hidden), 0);
     let visible = frame(
@@ -4465,9 +4907,9 @@ fn surrounding_deletion_expands_graphemes_and_undo_restores_caret() {
 
 #[test]
 fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
-    let editor = Editor::from_text("aé\n\ne\u{301}👩🏽‍💻!\nlast");
+    let editor = Editor::from_text("aé\n\ne\u{301}👩🏽\u{200d}💻!\nlast");
     let document = editor.document();
-    let focus = Position::new(2, "e\u{301}👩🏽‍💻".len());
+    let focus = Position::new(2, "e\u{301}👩🏽\u{200d}💻".len());
     for (count, expected) in [
         (0, focus),
         (1, Position::new(2, "e\u{301}".len())),
@@ -4480,8 +4922,9 @@ fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
         (usize::MAX, Position::default()),
     ] {
         assert_eq!(
-            surrounding_position(document, focus, count, false),
-            expected
+            input::surrounding_position(document, focus, count, false),
+            expected,
+            "count={count}"
         );
     }
     let focus = Position::new(0, 1);
@@ -4492,10 +4935,14 @@ fn surrounding_offsets_cross_empty_paragraphs_and_clamp_large_counts() {
         (3, Position::new(2, 0)),
         (4, Position::new(2, "e\u{301}".len())),
         (5, Position::new(2, "e\u{301}".len())),
-        (6, Position::new(2, "e\u{301}👩🏽‍💻".len())),
+        (6, Position::new(2, "e\u{301}👩🏽\u{200d}💻".len())),
         (usize::MAX, document.end()),
     ] {
-        assert_eq!(surrounding_position(document, focus, count, true), expected);
+        assert_eq!(
+            input::surrounding_position(document, focus, count, true),
+            expected,
+            "count={count}"
+        );
     }
 }
 
@@ -4532,7 +4979,8 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
     fn narrow_read_only(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
         narrow(widget).read_only(true)
     }
-    for configure in [narrow, narrow_read_only] {
+    for read_only in [false, true] {
+        let configure = if read_only { narrow_read_only } else { narrow };
         let context = egui::Context::default();
         context.enable_accesskit();
         context.global_style_mut(|style| {
@@ -4566,7 +5014,7 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
             .unwrap()
             .position(seam)
             .unwrap();
-        assert_ne!(upper, lower);
+        assert_ne!(upper, lower, "read_only={read_only}");
         let select = |position| {
             Event::AccessKitActionRequest(ActionRequest {
                 action: Action::SetTextSelection,
@@ -4587,7 +5035,11 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
                 true,
                 configure,
             );
-            assert_eq!(caret_segments(&idle), 0);
+            assert_eq!(
+                caret_segments(&idle),
+                0,
+                "read_only={read_only}, prefer_next_row={prefer_next_row}"
+            );
             time += 0.8;
             let (output, actual) = widget_frame(
                 &context,
@@ -4597,16 +5049,23 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
                 true,
                 configure,
             );
-            assert_eq!(editor.selection(), Selection::caret(seam));
+            assert_eq!(
+                editor.selection(),
+                Selection::caret(seam),
+                "read_only={read_only}, prefer_next_row={prefer_next_row}"
+            );
             assert_eq!(caret_segments(&output), 1, "moved caret must be visible");
-            let expected = document_caret_rect(
+            let expected = navigation::document_caret_rect(
                 editor.document(),
                 &cache.layout.layouts,
                 widget.response.rect.min + Vec2::splat(PADDING),
                 seam,
                 prefer_next_row,
             );
-            assert_eq!(actual.caret_rect, expected);
+            assert_eq!(
+                actual.caret_rect, expected,
+                "read_only={read_only}, prefer_next_row={prefer_next_row}"
+            );
             let update = output.platform_output.accesskit_update.unwrap();
             let node = &update
                 .nodes
@@ -4614,7 +5073,11 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
                 .find(|(id, _)| *id == Id::unique(WIDGET_ID).accesskit_id())
                 .unwrap()
                 .1;
-            assert_eq!(node.text_selection().unwrap().focus, position);
+            assert_eq!(
+                node.text_selection().unwrap().focus,
+                position,
+                "read_only={read_only}, prefer_next_row={prefer_next_row}"
+            );
         }
         widget_frame(
             &context,
@@ -4639,9 +5102,13 @@ fn accessibility_selection_preserves_requested_wrap_affinity() {
                     prefer_next_row: navigation.prefer_next_row,
                 })
                 .row,
-            1
+            1,
+            "read_only={read_only}"
         );
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "read_only={read_only}"
+        );
     }
 }
 
@@ -4700,7 +5167,7 @@ fn accessibility_emoji_selection_and_replacement_use_graphemes() {
     use egui::accesskit::{Action, ActionData, ActionRequest, Role, TextSelection, TreeId};
     let context = egui::Context::default();
     context.enable_accesskit();
-    let mut editor = Editor::from_text("a👩🏽‍💻e\u{301}");
+    let mut editor = Editor::from_text("a👩🏽\u{200d}💻e\u{301}");
     let output = frame(&context, &mut editor, vec![], true);
     let update = output
         .platform_output
@@ -4739,7 +5206,7 @@ fn accessibility_emoji_selection_and_replacement_use_graphemes() {
         })],
         true,
     );
-    assert_eq!(editor.selected_text(), "👩🏽‍💻");
+    assert_eq!(editor.selected_text(), "👩🏽\u{200d}💻");
     frame(
         &context,
         &mut editor,
@@ -4753,7 +5220,7 @@ fn accessibility_emoji_selection_and_replacement_use_graphemes() {
     );
     assert_eq!(editor.document().plain_text(), "axe\u{301}");
     assert!(editor.undo());
-    assert_eq!(editor.selected_text(), "👩🏽‍💻");
+    assert_eq!(editor.selected_text(), "👩🏽\u{200d}💻");
 }
 
 #[test]
@@ -4863,7 +5330,7 @@ fn accessibility_value_actions_interrupt_composition_and_undo_in_one_step() {
             })],
             true,
         );
-        assert!(editor.composition().is_some());
+        assert!(editor.composition().is_some(), "{action:?}");
         let id = context.memory(|memory| memory.focused()).unwrap();
         let output = frame(
             &context,
@@ -4884,13 +5351,17 @@ fn accessibility_value_actions_interrupt_composition_and_undo_in_one_step() {
                 .should_interrupt_composition,
             "{action:?}"
         );
-        assert!(editor.composition().is_none());
-        assert_eq!(editor.document().plain_text(), expected);
-        assert_eq!(editor.undo_len(), 1);
-        assert!(editor.undo());
-        assert_eq!(editor.document().plain_text(), "abc");
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 0)));
-        assert!(!editor.can_undo());
+        assert!(editor.composition().is_none(), "{action:?}");
+        assert_eq!(editor.document().plain_text(), expected, "{action:?}");
+        assert_eq!(editor.undo_len(), 1, "{action:?}");
+        assert!(editor.undo(), "{action:?}");
+        assert_eq!(editor.document().plain_text(), "abc", "{action:?}");
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 0)),
+            "{action:?}"
+        );
+        assert!(!editor.can_undo(), "{action:?}");
     }
 }
 
@@ -4923,9 +5394,9 @@ fn malformed_and_stale_accessibility_actions_are_consumed_without_edits() {
                 egui::CentralPanel::default().show(ui, |ui| {
                     let id = ui.make_persistent_id("editor");
                     let output = RichTextEditor::new(editor).id(id).show(ui);
-                    assert!(output.errors.is_empty());
-                    assert_eq!(output.accessibility_errors, vec![expected.clone()]);
-                    assert!(ui.input(|input| input.events.is_empty()));
+                    assert!(output.errors.is_empty(), "{action:?}: {:?}", output.errors);
+                    assert_eq!(output.accessibility_errors, vec![expected], "{action:?}");
+                    assert!(ui.input(|input| input.events.is_empty()), "{action:?}");
                 });
             })
             .drop_without_applying_deltas();
@@ -4944,9 +5415,9 @@ fn malformed_and_stale_accessibility_actions_are_consumed_without_edits() {
             data,
             AccessibilityError::InvalidActionData,
         );
-        assert_eq!(editor.document().plain_text(), "original");
-        assert_eq!(editor.selected_text(), "original");
-        assert!(!editor.can_undo());
+        assert_eq!(editor.document().plain_text(), "original", "{action:?}");
+        assert_eq!(editor.selected_text(), "original", "{action:?}");
+        assert!(!editor.can_undo(), "{action:?}");
     }
     editor.insert_text("external").unwrap();
     let revision = editor.document().revision();
@@ -5078,9 +5549,9 @@ fn widget_cache(context: &egui::Context) -> Cache {
         .expect("cached widget")
 }
 
-fn primary(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
+fn primary(point: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
     Event::PointerButton {
-        pos,
+        pos: point,
         button: egui::PointerButton::Primary,
         pressed,
         modifiers,
@@ -5106,7 +5577,7 @@ fn caret_point(context: &egui::Context, rect: Rect, editor: &Editor, position: P
         .map_or((editor.document(), &cache.layout.layouts), |preview| {
             (&preview.document, &preview.render_cache.layouts)
         });
-    document_caret_rect(
+    navigation::document_caret_rect(
         document,
         layouts,
         rect.min + Vec2::splat(PADDING),
@@ -5262,15 +5733,13 @@ fn pointer_press_places_the_caret_and_a_drag_extends_from_the_press_point() {
         &editor,
         Position::new(0, 13),
     );
-    for (index, events) in [
+    let frames = [
         vec![primary(press, true, Modifiers::NONE)],
         vec![Event::PointerMoved(press + Vec2::new(12.0, 0.0))],
         vec![Event::PointerMoved(end)],
         vec![primary(end, false, Modifiers::NONE)],
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    for (index, events) in frames.into_iter().enumerate() {
         widget_frame(
             &context,
             &mut editor,
@@ -5286,20 +5755,18 @@ fn pointer_press_places_the_caret_and_a_drag_extends_from_the_press_point() {
     );
 
     let selection = editor.selection();
-    let secondary = |pos, pressed| Event::PointerButton {
-        pos,
+    let secondary = |point, pressed| Event::PointerButton {
+        pos: point,
         button: egui::PointerButton::Secondary,
         pressed,
         modifiers: Modifiers::NONE,
     };
-    for (index, events) in [
+    let frames = [
         vec![Event::PointerMoved(press), secondary(press, true)],
         vec![Event::PointerMoved(press + Vec2::new(40.0, 0.0))],
         vec![secondary(press + Vec2::new(40.0, 0.0), false)],
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    for (index, events) in frames.into_iter().enumerate() {
         widget_frame(
             &context,
             &mut editor,
@@ -5348,7 +5815,11 @@ fn a_drag_batched_with_its_press_keeps_the_original_anchor() {
             false,
             unchanged,
         );
-        assert_eq!(editor.selection(), Selection::caret(Position::new(0, 3)),);
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(Position::new(0, 3)),
+            "{transform:?}",
+        );
         widget_frame(
             &context,
             &mut editor,
@@ -5360,6 +5831,7 @@ fn a_drag_batched_with_its_press_keeps_the_original_anchor() {
         assert_eq!(
             editor.selection(),
             Selection::new(Position::new(0, 3), Position::new(0, 19)),
+            "{transform:?}",
         );
     }
 }
@@ -5419,7 +5891,7 @@ fn a_drag_finishes_at_its_release_before_later_pointer_motion() {
                     )
             };
             let (press, moved, release, after) = (point(3), point(13), point(19), point(23));
-            for (index, events) in [
+            let frames = [
                 vec![
                     Event::PointerMoved(press),
                     primary(press, true, Modifiers::NONE),
@@ -5434,10 +5906,8 @@ fn a_drag_finishes_at_its_release_before_later_pointer_motion() {
                         Event::PointerMoved(after)
                     },
                 ],
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ];
+            for (index, events) in frames.into_iter().enumerate() {
                 widget_frame(
                     &context,
                     &mut editor,
@@ -5450,6 +5920,7 @@ fn a_drag_finishes_at_its_release_before_later_pointer_motion() {
             assert_eq!(
                 editor.selection(),
                 Selection::new(Position::new(0, 3), Position::new(0, 19)),
+                "{transform:?}, pointer_gone={pointer_gone}",
             );
         }
     }
@@ -5480,15 +5951,19 @@ fn two_editors_pointer_gestures(drag: bool) {
             },
             |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    let a = RichTextEditor::new(first)
+                    let first_output = RichTextEditor::new(first)
                         .id(Id::unique(WIDGET_ID))
                         .show(ui);
-                    let b = RichTextEditor::new(second)
+                    let second_output = RichTextEditor::new(second)
                         .id(Id::unique("second editor"))
                         .show(ui);
-                    assert!(a.errors.is_empty(), "{:?}", a.errors);
-                    assert!(b.errors.is_empty(), "{:?}", b.errors);
-                    rectangles = Some((a.response.rect, b.response.rect));
+                    assert!(first_output.errors.is_empty(), "{:?}", first_output.errors);
+                    assert!(
+                        second_output.errors.is_empty(),
+                        "{:?}",
+                        second_output.errors
+                    );
+                    rectangles = Some((first_output.response.rect, second_output.response.rect));
                 });
             },
         );
@@ -5558,16 +6033,18 @@ fn space_and_enter_are_text_input_not_clicks_or_ime_interruptions() {
                 .platform_output
                 .ime
                 .unwrap()
-                .should_interrupt_composition
+                .should_interrupt_composition,
+            "{key:?}"
         );
         assert!(
             !output
                 .platform_output
                 .events
                 .iter()
-                .any(|event| matches!(event, egui::output::OutputEvent::Clicked(_)))
+                .any(|event| matches!(event, egui::output::OutputEvent::Clicked(_))),
+            "{key:?}"
         );
-        assert_ne!(editor.document().plain_text(), "hello");
+        assert_ne!(editor.document().plain_text(), "hello", "{key:?}");
     }
 }
 
@@ -5581,7 +6058,7 @@ fn home_and_end_follow_wrapped_visual_rows_and_their_affinity() {
     let mut editor = Editor::from_text(text);
     widget_frame(&context, &mut editor, vec![], None, true, narrow);
     let cache = widget_cache(&context);
-    let galley = cache.layout.layouts.get(0).unwrap().galley.clone();
+    let galley = cache.layout.layouts.get(0).unwrap().galley;
     assert!(galley.rows.len() >= 3, "{}", galley.rows.len());
     let starts: Vec<usize> = galley
         .rows
@@ -5678,7 +6155,7 @@ fn page_down_and_up_move_about_one_viewport_and_keep_the_column() {
     let first = editor.selection().focus;
     assert!((3..=6).contains(&first.paragraph), "{first:?}");
     assert_eq!(first.byte, 2);
-    let (_, offset, _, _) = scrolling_frame(
+    let ScrollFrame { offset, .. } = scrolling_frame(
         &context,
         &mut editor,
         vec![key(Key::PageDown, Modifiers::SHIFT)],
@@ -5788,12 +6265,12 @@ fn selection_is_spliced_between_code_backgrounds_and_glyphs() {
 fn fills_paint_behind_glyphs_replace_code_backgrounds_and_keep_selection_visible() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("plain fill code");
-    let blue = crate::Color([0, 112, 192, 128]);
+    let blue = Color([0, 112, 192, 128]);
     for (range, patch) in [
         (
             6..10,
             StylePatch {
-                background: Some(Some(crate::Color::YELLOW)),
+                background: Some(Some(Color::YELLOW)),
                 ..Default::default()
             },
         ),
@@ -5873,14 +6350,14 @@ fn fills_paint_behind_glyphs_replace_code_backgrounds_and_keep_selection_visible
 #[test]
 fn retained_paint_reuses_galleys_until_the_font_cache_changes() {
     let context = egui::Context::default();
-    let mut editor = Editor::from_text("cached painted café 👩‍💻");
+    let mut editor = Editor::from_text("cached painted café 👩\u{200d}💻");
     let painted = |output: &egui::FullOutput| {
         output
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
                 egui::epaint::Shape::Text(text)
-                    if text.galley.job.text == "cached painted café 👩‍💻" =>
+                    if text.galley.job.text == "cached painted café 👩\u{200d}💻" =>
                 {
                     Some(text.galley.clone())
                 }
@@ -5900,26 +6377,30 @@ fn retained_paint_reuses_galleys_until_the_font_cache_changes() {
         })
         .drop_without_applying_deltas();
     let refreshed = refreshed.unwrap();
-    // The paragraph job was not resubmitted during idle frames, so egui evicted it.
-    assert!(!Arc::ptr_eq(&first, &refreshed));
+    assert!(
+        !Arc::ptr_eq(&first, &refreshed),
+        "the paragraph job was not resubmitted during idle frames, so egui evicted it"
+    );
     assert_eq!(first, refreshed);
-    // Hiding the editor also evicts its probe, but the atlas is unchanged.
     let returned = painted(&frame(&context, &mut editor, vec![], false));
-    assert!(Arc::ptr_eq(&first, &returned));
+    assert!(
+        Arc::ptr_eq(&first, &returned),
+        "hiding the editor also evicts its probe, but the atlas is unchanged"
+    );
 }
 
 #[test]
 fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes() {
     let contexts = [egui::Context::default(), egui::Context::default()];
     let mut editor = Editor::from_text(
-        "filled café and 👩‍💻 text\nordered words wrapping across several rows\nquote text",
+        "filled café and 👩\u{200d}💻 text\nordered words wrapping across several rows\nquote text",
     );
     editor
         .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 6)))
         .unwrap();
     editor
         .apply_style(StylePatch {
-            background: Some(Some(crate::Color::YELLOW)),
+            background: Some(Some(Color::YELLOW)),
             code: Some(true),
             ..Default::default()
         })
@@ -5980,7 +6461,7 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
                 editor.select_all();
                 editor
                     .apply_style(StylePatch {
-                        foreground: Some(Some(crate::Color([40, 100, 200, 255]))),
+                        foreground: Some(Some(Color([40, 100, 200, 255]))),
                         ..Default::default()
                     })
                     .unwrap();
@@ -6012,7 +6493,11 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
                             .desired_width(width)
                             .highlight_ranges(&highlights, Color32::from_rgb(20, 210, 80))
                             .show(ui);
-                        assert!(output.errors.is_empty());
+                        assert!(
+                            output.errors.is_empty(),
+                            "step={step}, context {index}: {:?}",
+                            output.errors
+                        );
                     });
                 },
             );
@@ -6027,9 +6512,7 @@ fn retained_paint_matches_fresh_widgets_after_selection_and_environment_changes(
 fn host_highlight_ranges_paint_visible_matches_and_skip_stale_ranges() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("find me\nand find you");
-    let found = editor
-        .document()
-        .find("find", crate::SearchOptions::default());
+    let found = editor.document().find("find", SearchOptions::default());
     assert_eq!(found.len(), 2);
     let ranges = [
         found[0].clone(),
@@ -6338,12 +6821,15 @@ fn a_first_queued_preedit_keeps_its_selection_before_a_click_or_blur() {
                 Selection::caret(editor.document().end()),
             );
         }
-        assert!(context.input(|input| {
-            !input
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Ime(_)))
-        }));
+        assert!(
+            context.input(|input| {
+                !input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Ime(_)))
+            }),
+            "before_click={before_click}"
+        );
     }
 
     let context = egui::Context::default();
@@ -6491,7 +6977,10 @@ fn focus_requests_that_leave_focus_in_place_keep_queued_ime_before_a_host_focus_
             true,
             unchanged,
         );
-        assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
+        assert!(
+            context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))),
+            "{target}"
+        );
         context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
         widget_frame(
             &context,
@@ -6502,8 +6991,8 @@ fn focus_requests_that_leave_focus_in_place_keep_queued_ime_before_a_host_focus_
             unchanged,
         );
         assert_eq!(editor.document().plain_text(), "你abc", "{target}");
-        assert!(editor.composition().is_none());
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(editor.composition().is_none(), "{target}");
+        assert!(context.input(|input| input.events.is_empty()), "{target}");
     }
 }
 
@@ -6545,18 +7034,23 @@ fn edits_batched_in_one_frame_relayout_without_comparing_every_paragraph() {
             unchanged,
         );
         let document = editor.document();
-        assert_eq!(document.paragraph(100).unwrap().text(), expected);
-        assert_eq!(document.paragraphs().len(), 200);
+        assert_eq!(
+            document.paragraph(100).unwrap().text(),
+            expected,
+            "blurred={blurred}"
+        );
+        assert_eq!(document.paragraphs().len(), 200, "blurred={blurred}");
         let cache = widget_cache(&context);
         assert_eq!(cache.layout.scans, scans, "blurred={blurred}");
-        assert_eq!(cache.layout.layouts.len(), 200);
+        assert_eq!(cache.layout.layouts.len(), 200, "blurred={blurred}");
         assert!(
             cache
                 .layout
                 .layouts
                 .caches(0..200)
                 .zip(document.paragraphs())
-                .all(|(cached, paragraph)| Arc::ptr_eq(&cached.paragraph, paragraph))
+                .all(|(cached, paragraph)| Arc::ptr_eq(&cached.paragraph, paragraph)),
+            "blurred={blurred}"
         );
     }
 }
@@ -6657,10 +7151,21 @@ fn blur_commit_echoes_are_ignored_after_focus_returns() {
         composing_frame(&context, &mut editor, "한");
         context.memory_mut(|memory| memory.surrender_focus(Id::unique(WIDGET_ID)));
         widget_frame(&context, &mut editor, vec![], Some(0.2), false, unchanged);
-        assert_eq!(editor.document().plain_text(), "한abc");
+        assert_eq!(
+            editor.document().plain_text(),
+            "한abc",
+            "expected={expected:?}, time={time}"
+        );
         widget_frame(&context, &mut editor, events, Some(time), true, unchanged);
-        assert_eq!(editor.document().plain_text(), expected);
-        assert!(context.input(|input| input.events.is_empty()));
+        assert_eq!(
+            editor.document().plain_text(),
+            expected,
+            "expected={expected:?}, time={time}"
+        );
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "expected={expected:?}, time={time}"
+        );
     }
 }
 
@@ -6717,9 +7222,19 @@ fn ignored_input_preserves_canceled_and_blur_commit_echoes() {
                 text,
                 "canceled={canceled}, ignored={ignored:?}",
             );
-            assert_eq!(editor.undo_len(), undo_len);
-            assert!(editor.composition().is_none());
-            assert!(context.input(|input| input.events.is_empty()));
+            assert_eq!(
+                editor.undo_len(),
+                undo_len,
+                "canceled={canceled}, ignored={ignored:?}"
+            );
+            assert!(
+                editor.composition().is_none(),
+                "canceled={canceled}, ignored={ignored:?}"
+            );
+            assert!(
+                context.input(|input| input.events.is_empty()),
+                "canceled={canceled}, ignored={ignored:?}"
+            );
         }
     }
 }
@@ -6757,8 +7272,15 @@ fn ignored_text_preserves_a_cleared_preedit() {
                     .is_some_and(|composition| composition.text.is_empty()),
                 "{ignored:?}",
             );
-            assert_eq!(editor.selected_text(), "abc");
-            assert!(!editor.can_undo());
+            assert_eq!(
+                editor.selected_text(),
+                "abc",
+                "canceled={canceled}, ignored={ignored:?}"
+            );
+            assert!(
+                !editor.can_undo(),
+                "canceled={canceled}, ignored={ignored:?}"
+            );
             let mut events = Vec::new();
             if canceled {
                 events.push(key(Key::Escape, Modifiers::NONE));
@@ -6817,8 +7339,8 @@ fn accepted_input_ends_a_previous_cancellation_echo_guard() {
             unchanged,
         );
         assert_eq!(editor.document().plain_text(), expected, "{event:?}");
-        assert!(editor.composition().is_none());
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(editor.composition().is_none(), "{event:?}");
+        assert!(context.input(|input| input.events.is_empty()), "{event:?}");
     }
 }
 
@@ -6855,7 +7377,7 @@ fn ordinary_input_cancels_a_cleared_preedit_and_rejects_its_late_commit() {
                 widget_frame(
                     &context,
                     &mut editor,
-                    std::mem::take(&mut events),
+                    mem::take(&mut events),
                     Some(0.2),
                     true,
                     unchanged,
@@ -6868,8 +7390,14 @@ fn ordinary_input_cancels_a_cleared_preedit_and_rejects_its_late_commit() {
                 expected,
                 "separate_frame={separate_frame}, event={event:?}",
             );
-            assert!(editor.composition().is_none());
-            assert!(context.input(|input| input.events.is_empty()));
+            assert!(
+                editor.composition().is_none(),
+                "separate_frame={separate_frame}, event={event:?}"
+            );
+            assert!(
+                context.input(|input| input.events.is_empty()),
+                "separate_frame={separate_frame}, event={event:?}"
+            );
         }
     }
 }
@@ -6899,7 +7427,7 @@ fn text_keys_preserve_a_cleared_preedit_until_their_text_event() {
                 widget_frame(
                     &context,
                     &mut editor,
-                    std::mem::take(&mut events),
+                    mem::take(&mut events),
                     Some(0.2),
                     true,
                     unchanged,
@@ -6918,7 +7446,10 @@ fn text_keys_preserve_a_cleared_preedit_until_their_text_event() {
                 "x",
                 "separate_frame={separate_frame}, pressed={pressed:?}",
             );
-            assert!(editor.composition().is_none());
+            assert!(
+                editor.composition().is_none(),
+                "separate_frame={separate_frame}, pressed={pressed:?}"
+            );
         }
     }
 }
@@ -6944,8 +7475,8 @@ fn rejected_preedit_ranges_preserve_canceled_commit_echoes() {
                     time: Some(0.3),
                     events: vec![
                         Event::Ime(ImeEvent::Preedit {
-                            text: "changed\r\n👩‍💻".into(),
-                            active_range_chars: Some(range),
+                            text: "changed\r\n👩\u{200d}💻".into(),
+                            active_range_chars: Some(range.clone()),
                         }),
                         Event::Ime(ImeEvent::Commit("한".into())),
                     ],
@@ -6960,11 +7491,15 @@ fn rejected_preedit_ranges_preserve_canceled_commit_echoes() {
                 },
             )
             .drop_without_applying_deltas();
-        assert_eq!(errors, vec![Error::InvalidCompositionSelection]);
-        assert_eq!(editor.document().plain_text(), "abc");
-        assert!(editor.composition().is_none());
-        assert!(!editor.can_undo());
-        assert!(context.input(|input| input.events.is_empty()));
+        assert_eq!(
+            errors,
+            vec![Error::InvalidCompositionSelection],
+            "{range:?}"
+        );
+        assert_eq!(editor.document().plain_text(), "abc", "{range:?}");
+        assert!(editor.composition().is_none(), "{range:?}");
+        assert!(!editor.can_undo(), "{range:?}");
+        assert!(context.input(|input| input.events.is_empty()), "{range:?}");
     }
 }
 
@@ -7024,11 +7559,15 @@ fn ignored_ime_events_preserve_cancellation_echoes_queued_before_blur() {
             } else {
                 vec![]
             },
+            "{ignored:?}",
         );
         assert_eq!(editor.document().plain_text(), "abc", "{ignored:?}");
-        assert!(editor.composition().is_none());
-        assert!(!editor.can_undo());
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(editor.composition().is_none(), "{ignored:?}");
+        assert!(!editor.can_undo(), "{ignored:?}");
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "{ignored:?}"
+        );
     }
 }
 
@@ -7113,7 +7652,10 @@ fn canceled_compositions_reject_late_commits_but_allow_new_preedit() {
                 }
                 _ => unreachable!(),
             }
-            assert!(editor.composition().is_none());
+            assert!(
+                editor.composition().is_none(),
+                "{cancellation}, new_preedit={new_preedit}, cleared={cleared}"
+            );
             let selection = editor.selection();
             frame(
                 &context,
@@ -7138,10 +7680,20 @@ fn canceled_compositions_reject_late_commits_but_allow_new_preedit() {
                 "{cancellation}, new_preedit={new_preedit}, cleared={cleared}",
             );
             if !new_preedit {
-                assert_eq!(editor.selection(), selection);
-                assert!(!editor.can_undo());
+                assert_eq!(
+                    editor.selection(),
+                    selection,
+                    "{cancellation}, new_preedit={new_preedit}, cleared={cleared}"
+                );
+                assert!(
+                    !editor.can_undo(),
+                    "{cancellation}, new_preedit={new_preedit}, cleared={cleared}"
+                );
             }
-            assert!(context.input(|input| input.events.is_empty()));
+            assert!(
+                context.input(|input| input.events.is_empty()),
+                "{cancellation}, new_preedit={new_preedit}, cleared={cleared}"
+            );
         }
     }
 }
@@ -7181,9 +7733,15 @@ fn ime_cancellation_precedes_a_commit_in_the_same_input_batch() {
             "abc",
             "blur={blur}, cleared={cleared}"
         );
-        assert!(editor.composition().is_none());
-        assert!(!editor.can_undo());
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(
+            editor.composition().is_none(),
+            "blur={blur}, cleared={cleared}"
+        );
+        assert!(!editor.can_undo(), "blur={blur}, cleared={cleared}");
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "blur={blur}, cleared={cleared}"
+        );
     }
 }
 
@@ -7251,12 +7809,19 @@ fn surrounding_deletion_keeps_a_following_commit_from_the_same_ime_edit() {
                 expected,
                 "blur={blur}, before_chars={before_chars}, cleared={cleared}",
             );
-            assert!(editor.composition().is_none());
+            assert!(
+                editor.composition().is_none(),
+                "blur={blur}, before_chars={before_chars}, cleared={cleared}"
+            );
             assert_eq!(
                 editor.selection(),
-                Selection::caret(editor.document().end())
+                Selection::caret(editor.document().end()),
+                "blur={blur}, before_chars={before_chars}, cleared={cleared}"
             );
-            assert!(context.input(|input| input.events.is_empty()));
+            assert!(
+                context.input(|input| input.events.is_empty()),
+                "blur={blur}, before_chars={before_chars}, cleared={cleared}"
+            );
         }
     }
 }
@@ -7281,15 +7846,32 @@ fn cleared_preedit_still_accepts_a_normal_commit() {
                 active_range_chars: None,
             })];
             if separate_frame {
-                frame(&context, &mut editor, std::mem::take(&mut events), true);
+                frame(&context, &mut editor, mem::take(&mut events), true);
             }
             events.push(Event::Ime(ImeEvent::Commit(committed.into())));
             frame(&context, &mut editor, events, true);
-            assert_eq!(editor.document().plain_text(), format!("{committed}abc"));
-            assert!(editor.composition().is_none());
-            assert!(editor.undo());
-            assert_eq!(editor.document().plain_text(), "abc");
-            assert!(!editor.can_undo());
+            assert_eq!(
+                editor.document().plain_text(),
+                format!("{committed}abc"),
+                "separate_frame={separate_frame}, committed={committed}"
+            );
+            assert!(
+                editor.composition().is_none(),
+                "separate_frame={separate_frame}, committed={committed}"
+            );
+            assert!(
+                editor.undo(),
+                "separate_frame={separate_frame}, committed={committed}"
+            );
+            assert_eq!(
+                editor.document().plain_text(),
+                "abc",
+                "separate_frame={separate_frame}, committed={committed}"
+            );
+            assert!(
+                !editor.can_undo(),
+                "separate_frame={separate_frame}, committed={committed}"
+            );
         }
     }
 }
@@ -7347,9 +7929,9 @@ fn ime_line_break_text_is_ignored_like_egui_text_edit() {
             ],
             true,
         );
-        assert_eq!(editor.document().plain_text(), "abc");
-        assert!(editor.composition().is_none());
-        assert!(context.input(|input| input.events.is_empty()));
+        assert_eq!(editor.document().plain_text(), "abc", "{text:?}");
+        assert!(editor.composition().is_none(), "{text:?}");
+        assert!(context.input(|input| input.events.is_empty()), "{text:?}");
     }
     frame(
         &context,
@@ -7502,11 +8084,11 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
             .drop_without_applying_deltas();
         offset
     };
-    let touch = |phase, pos| Event::Touch {
+    let touch = |phase, point| Event::Touch {
         device_id: egui::TouchDeviceId(1),
         id: egui::TouchId(1),
         phase,
-        pos,
+        pos: point,
         force: None,
     };
     let swipe = |run: &mut dyn FnMut(&mut Editor, Vec<Event>) -> Vec2, editor: &mut Editor| {
@@ -7751,8 +8333,12 @@ fn shortcuts_follow_shift_layout_and_read_only_policies() {
             host.to_vec(),
             "read_only={read_only}"
         );
-        assert_eq!(editor.document().plain_text(), "item");
-        assert!(!editor.can_undo());
+        assert_eq!(
+            editor.document().plain_text(),
+            "item",
+            "read_only={read_only}"
+        );
+        assert!(!editor.can_undo(), "read_only={read_only}");
 
         frame_options(
             &context,
@@ -7764,7 +8350,8 @@ fn shortcuts_follow_shift_layout_and_read_only_policies() {
         let indent = u8::from(!read_only);
         assert_eq!(
             editor.document().paragraphs()[0].kind(),
-            ParagraphKind::Bullet { indent }
+            ParagraphKind::Bullet { indent },
+            "read_only={read_only}"
         );
         frame_options(
             &context,
@@ -7775,9 +8362,13 @@ fn shortcuts_follow_shift_layout_and_read_only_policies() {
         );
         assert_eq!(
             editor.document().paragraphs()[0].kind(),
-            ParagraphKind::Bullet { indent: 0 }
+            ParagraphKind::Bullet { indent: 0 },
+            "read_only={read_only}"
         );
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "read_only={read_only}"
+        );
     }
 
     let physical = |key: Key, physical: Key, modifiers| Event::Key {
@@ -7832,10 +8423,10 @@ fn shortcuts_follow_shift_layout_and_read_only_policies() {
 #[test]
 fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
     use crate::adapter::winit::{CommandModifier, WinitAdapter};
-    use winit::{
-        event::ElementState,
-        keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey},
-    };
+    use winit::event::ElementState;
+    use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
+    /// A key of a keyboard layout: its physical code, the egui key for that physical
+    /// position, and the characters it types without and with Shift.
     type LayoutKey = (KeyCode, Key, char, char);
     let layouts: [(&str, &[LayoutKey]); 4] = [
         (
@@ -7932,7 +8523,7 @@ fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
 
                 let key = name.as_deref().and_then(Key::from_name).unwrap_or(position);
                 let mut egui_editor = start();
-                let handled = handle_key(
+                let handled = input::handle_key(
                     &mut egui_editor,
                     egui::os::OperatingSystem::Nix,
                     key,
@@ -7970,8 +8561,15 @@ fn egui_and_winit_resolve_command_chords_alike_across_layouts() {
 
 #[test]
 fn hint_uses_the_first_paragraph_indent_font_and_wrap_width() {
+    /// A text shape the frame painted.
+    struct PaintedText {
+        text: String,
+        /// The galley's rectangle at its painted position.
+        rect: Rect,
+        galley: Arc<egui::Galley>,
+    }
     let context = egui::Context::default();
-    let shapes = |editor: &mut Editor| {
+    let shapes = |editor: &mut Editor| -> Vec<PaintedText> {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             RichTextEditor::new(editor)
                 .hint_text("Write something")
@@ -7982,26 +8580,30 @@ fn hint_uses_the_first_paragraph_indent_font_and_wrap_width() {
             .shapes
             .into_iter()
             .filter_map(|shape| match shape.shape {
-                egui::epaint::Shape::Text(text) => Some((
-                    text.galley.job.text.clone(),
-                    text.galley.rect.translate(text.pos.to_vec2()),
-                    text.galley.clone(),
-                )),
+                egui::epaint::Shape::Text(text) => Some(PaintedText {
+                    text: text.galley.job.text.clone(),
+                    rect: text.galley.rect.translate(text.pos.to_vec2()),
+                    galley: text.galley.clone(),
+                }),
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect()
     };
     let mut editor = Editor::default();
     editor
         .set_paragraph_kind(ParagraphKind::Bullet { indent: 0 })
         .unwrap();
     let painted = shapes(&mut editor);
-    let marker = painted.iter().find(|(text, ..)| text == "•").unwrap().1;
+    let marker = painted
+        .iter()
+        .find(|painted| painted.text == "•")
+        .unwrap()
+        .rect;
     let hint = painted
         .iter()
-        .find(|(text, ..)| text == "Write something")
+        .find(|painted| painted.text == "Write something")
         .unwrap()
-        .1;
+        .rect;
     assert!(
         hint.left() >= marker.right(),
         "{hint:?} overlaps {marker:?}"
@@ -8015,9 +8617,9 @@ fn hint_uses_the_first_paragraph_indent_font_and_wrap_width() {
     let row = |text: &str| {
         painted
             .iter()
-            .find(|(painted, ..)| painted == text)
+            .find(|painted| painted.text == text)
             .unwrap()
-            .2
+            .galley
             .rows[0]
             .rect()
             .height()
@@ -8165,7 +8767,7 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
     assert_eq!(galley.rows.len(), 4);
     assert!(galley.rows[..3].iter().all(|row| row.ends_with_newline));
     let caret = |byte, prefer_next_row| {
-        document_caret_rect(
+        navigation::document_caret_rect(
             editor.document(),
             &layouts,
             Pos2::ZERO,
@@ -8176,14 +8778,31 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
     let row_top = |row: usize| layout.rect.top() + galley.rows[row].min_y();
     for prefer_next_row in [false, true] {
         let before = caret(2, prefer_next_row);
-        assert_eq!(before.top(), row_top(0));
+        assert_eq!(
+            before.top(),
+            row_top(0),
+            "prefer_next_row={prefer_next_row}"
+        );
         assert_eq!(
             before.left(),
-            layout.rect.left() + galley.rows[0].rect().right()
+            layout.rect.left() + galley.rows[0].rect().right(),
+            "prefer_next_row={prefer_next_row}"
         );
-        assert_eq!(caret(5, prefer_next_row).top(), row_top(1));
-        assert_eq!(caret(10, prefer_next_row).top(), row_top(2));
-        assert_eq!(caret(13, prefer_next_row).top(), row_top(3));
+        assert_eq!(
+            caret(5, prefer_next_row).top(),
+            row_top(1),
+            "prefer_next_row={prefer_next_row}"
+        );
+        assert_eq!(
+            caret(10, prefer_next_row).top(),
+            row_top(2),
+            "prefer_next_row={prefer_next_row}"
+        );
+        assert_eq!(
+            caret(13, prefer_next_row).top(),
+            row_top(3),
+            "prefer_next_row={prefer_next_row}"
+        );
     }
     let point = |row: usize, x: f32| {
         let row = &galley.rows[row];
@@ -8191,15 +8810,18 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
     };
     let past = galley.rows[0].rect().right() + 20.0;
     assert_eq!(
-        hit_test(&editor, &layouts, point(0, past)),
-        (Position::new(0, 2), false)
+        navigation::hit_test(&editor, &layouts, point(0, past)),
+        CaretPlacement {
+            position: Position::new(0, 2),
+            prefer_next_row: false,
+        }
     );
     assert_eq!(
-        hit_test(&editor, &layouts, point(2, past)).0,
+        navigation::hit_test(&editor, &layouts, point(2, past)).position,
         Position::new(0, 10)
     );
     assert_eq!(
-        hit_test(&editor, &layouts, point(1, 0.0)).0,
+        navigation::hit_test(&editor, &layouts, point(1, 0.0)).position,
         Position::new(0, 5)
     );
 }
@@ -8214,16 +8836,20 @@ fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
     let origin = Pos2::new(10.0, 10.0);
     let color = Color32::from_rgb(4, 5, 6);
     let range = |start, end| Position::new(0, start)..Position::new(0, end);
-    let rectangles = |selection: Option<Selection>, highlights: &[Range<Position>]| {
+    let rectangles = |selection: Option<Selection>, highlights: &[Range<Position>]| -> Vec<Rect> {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            paint_document(
+            paint::paint_document(
                 ui.painter(),
                 &mut PaintCache::default(),
                 editor.document(),
                 &layouts,
                 origin,
-                &[(highlights, color)],
-                selection.map(|selection| (selection, color)),
+                &[BackgroundRanges {
+                    ranges: highlights,
+                    fill: color,
+                }],
+                selection,
+                color,
                 &FontFamily::Proportional,
                 Color32::WHITE,
                 Color32::GRAY,
@@ -8239,17 +8865,22 @@ fn selection_and_highlights_paint_soft_line_breaks_at_row_ends() {
                 }
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect()
     };
     let all = rectangles(
         Some(Selection::new(Position::default(), editor.document().end())),
         &[],
     );
     assert_eq!(all.len(), 4);
-    for (index, (rect, row)) in all.iter().zip(rows).enumerate() {
+    let painted_rows = all.iter().zip(rows);
+    for (index, (rect, row)) in painted_rows.enumerate() {
         let extension = if index < 3 { 5.0 } else { 0.0 };
-        assert_eq!(rect.top(), origin.y + row.rect().top());
-        assert_eq!(rect.right(), origin.x + row.rect().right() + extension);
+        assert_eq!(rect.top(), origin.y + row.rect().top(), "row {index}");
+        assert_eq!(
+            rect.right(),
+            origin.x + row.rect().right() + extension,
+            "row {index}"
+        );
     }
     assert_eq!(rectangles(None, &[range(0, 14)]), all);
     let second = rectangles(
@@ -8269,7 +8900,7 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text(&format!(
         "{}\nmatch tail\n\nmatch",
-        "café 👩‍💻 match नमस्ते 🇺🇸 \u{2028}".repeat(16)
+        "café 👩\u{200d}💻 match नमस्ते 🇺🇸 \u{2028}".repeat(16)
     ));
     let mut cache = Cache::default();
     let mut appearance = appearance();
@@ -8293,7 +8924,7 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
         let document = editor.document();
         let rows = layouts.get(0).unwrap().galley.rows.len();
         assert!(rows > 30, "rows={rows}");
-        let found = document.find("match", crate::SearchOptions::default());
+        let found = document.find("match", SearchOptions::default());
         let tail = document.paragraph(1).unwrap().text().len();
         let spans = [
             found[found.len() / 2].start..Position::new(1, 2),
@@ -8311,18 +8942,28 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
             .collect();
         let paint = |paint_cache: &mut PaintCache, clip: Rect, selection: Selection| {
             let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                paint_document(
+                paint::paint_document(
                     &ui.painter().with_clip_rect(clip),
                     paint_cache,
                     document,
                     &layouts,
                     origin,
                     &[
-                        (&found, colors[0]),
-                        (&spans, colors[1]),
-                        (&scalars, colors[3]),
+                        BackgroundRanges {
+                            ranges: &found,
+                            fill: colors[0],
+                        },
+                        BackgroundRanges {
+                            ranges: &spans,
+                            fill: colors[1],
+                        },
+                        BackgroundRanges {
+                            ranges: &scalars,
+                            fill: colors[3],
+                        },
                     ],
-                    Some((selection, colors[2])),
+                    Some(selection),
+                    colors[2],
                     &FontFamily::Proportional,
                     Color32::WHITE,
                     Color32::GRAY,
@@ -8338,14 +8979,15 @@ fn clipped_highlights_and_selection_paint_the_unclipped_rows_inside_the_clip() {
                     }
                     _ => None,
                 })
-                .collect::<Vec<_>>()
+                .collect()
         };
         let bottom = origin.y + layouts.content_height().unwrap() + 20.0;
         for selection in [
             Selection::new(found[3].end, found[found.len() - 4].start),
             Selection::new(Position::default(), document.end()),
         ] {
-            let full = paint(&mut PaintCache::default(), Rect::EVERYTHING, selection);
+            let full: Vec<(Color32, Rect)> =
+                paint(&mut PaintCache::default(), Rect::EVERYTHING, selection);
             assert!(full.len() > rows, "edit={edit}");
             let mut top = 0.5;
             while top < bottom {
@@ -8386,7 +9028,13 @@ fn ime_preview_lays_out_soft_line_breaks_in_its_preedit() {
     let preview = cache.preview.as_ref().unwrap();
     assert_eq!(preview.document.paragraphs().len(), 1);
     assert_eq!(preview.caret, Position::new(0, 8));
-    let caret = document_caret_rect(&preview.document, &layouts, Pos2::ZERO, preview.caret, true);
+    let caret = navigation::document_caret_rect(
+        &preview.document,
+        &layouts,
+        Pos2::ZERO,
+        preview.caret,
+        true,
+    );
     assert_eq!(
         caret.top(),
         layout.rect.top() + layout.galley.rows[2].min_y()
@@ -8431,7 +9079,7 @@ fn link_frame(
 }
 
 fn linked_widget_editor() -> (Editor, Link) {
-    let link = Link::new("https://example.com/docs").unwrap();
+    let link = Link::try_new("https://example.com/docs").unwrap();
     let mut editor = Editor::from_text("Visit example now");
     editor
         .set_selection(Selection::new(Position::new(0, 6), Position::new(0, 13)))
@@ -8507,7 +9155,7 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
             false,
         );
         assert_eq!(output.platform_output.cursor_icon, cursor, "{index}");
-        assert_eq!(widget.clicked_link, None);
+        assert_eq!(widget.clicked_link, None, "{index}");
         tooltip |= output.shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::epaint::Shape::Text(text)
                 if text.galley.job.text == link.as_str())
@@ -8546,7 +9194,7 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
         Modifiers::COMMAND,
         false,
     );
-    assert_eq!(released.clicked_link, Some(link.clone()));
+    assert_eq!(released.clicked_link, Some(link));
     assert_eq!(editor.selection(), selection);
     assert!(context.memory(|memory| memory.has_focus(Id::unique(WIDGET_ID))));
 
@@ -8566,16 +9214,17 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
                 modifiers,
                 false,
             );
-            assert_eq!(widget.clicked_link, None);
+            assert_eq!(widget.clicked_link, None, "time={time}, pressed={pressed}");
         }
         assert_eq!(
             editor.selection(),
-            Selection::caret(Position::new(0, caret))
+            Selection::caret(Position::new(0, caret)),
+            "time={time}"
         );
     }
 
     let end = caret_point(&context, rect, &editor, Position::new(0, 17));
-    for (index, events) in [
+    let frames = [
         vec![
             Event::PointerMoved(on_link),
             primary(on_link, true, Modifiers::COMMAND),
@@ -8583,10 +9232,8 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
         vec![Event::PointerMoved(on_link + Vec2::new(12.0, 0.0))],
         vec![Event::PointerMoved(end)],
         vec![primary(end, false, Modifiers::COMMAND)],
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    for (index, events) in frames.into_iter().enumerate() {
         let (_, widget) = link_frame(
             &context,
             &mut editor,
@@ -8595,7 +9242,7 @@ fn ctrl_clicks_report_links_without_moving_the_caret_and_plain_clicks_edit() {
             Modifiers::COMMAND,
             false,
         );
-        assert_eq!(widget.clicked_link, None);
+        assert_eq!(widget.clicked_link, None, "frame {index}");
     }
     assert_eq!(
         editor.selection(),
@@ -8696,7 +9343,10 @@ fn link_drags_discard_presses_when_ime_changes_the_document_in_the_drag_frame() 
                 Modifiers::COMMAND,
                 false,
             );
-            assert!(widget_cache(&context).interaction.link_press.is_some());
+            assert!(
+                widget_cache(&context).interaction.link_press.is_some(),
+                "{text} queued={queued}"
+            );
             let mut events = Vec::new();
             if queued {
                 events.push(Event::Ime(ImeEvent::Commit(text.into())));
@@ -8712,7 +9362,7 @@ fn link_drags_discard_presses_when_ime_changes_the_document_in_the_drag_frame() 
                     Modifiers::COMMAND,
                     false,
                 );
-                assert!(editor.composition().is_some());
+                assert!(editor.composition().is_some(), "{text} queued={queued}");
             }
             events.push(Event::PointerMoved(point + Vec2::new(200.0, 0.0)));
             link_frame(
@@ -8725,7 +9375,8 @@ fn link_drags_discard_presses_when_ime_changes_the_document_in_the_drag_frame() 
             );
             assert_eq!(
                 editor.document().plain_text(),
-                format!("{text}Visit example now")
+                format!("{text}Visit example now"),
+                "{text} queued={queued}"
             );
             assert_eq!(
                 editor.selection().anchor,
@@ -8808,10 +9459,21 @@ fn read_only_clicks_and_accessibility_clicks_follow_links() {
             Modifiers::NONE,
             read_only,
         );
-        assert_eq!(widget.clicked_link, Some(link.clone()));
-        assert_eq!(editor.document().revision(), revision);
-        assert_eq!(editor.selection(), selection);
-        assert!(context.input(|input| input.events.is_empty()));
+        assert_eq!(
+            widget.clicked_link,
+            Some(link.clone()),
+            "read_only={read_only}"
+        );
+        assert_eq!(
+            editor.document().revision(),
+            revision,
+            "read_only={read_only}"
+        );
+        assert_eq!(editor.selection(), selection, "read_only={read_only}");
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "read_only={read_only}"
+        );
     }
 }
 
@@ -8844,12 +9506,16 @@ fn stale_accessibility_link_clicks_are_rejected() {
             data: None,
         }));
         let (_, widget) = link_frame(&context, &mut editor, events, 1.0, Modifiers::NONE, false);
-        assert_eq!(widget.clicked_link, None);
+        assert_eq!(widget.clicked_link, None, "edit_in_batch={edit_in_batch}");
         assert_eq!(
             widget.accessibility_errors,
-            [AccessibilityError::StaleDocument]
+            [AccessibilityError::StaleDocument],
+            "edit_in_batch={edit_in_batch}"
         );
-        assert!(context.input(|input| input.events.is_empty()));
+        assert!(
+            context.input(|input| input.events.is_empty()),
+            "edit_in_batch={edit_in_batch}"
+        );
     }
 }
 
@@ -8957,7 +9623,10 @@ fn quote_bars_paint_beside_quotes_whose_indent_pointer_and_caret_follow() {
     assert_eq!(bars[0].bottom(), rect(2).bottom());
     assert_eq!(bars[1].y_range(), rect(4).y_range());
     for bar in &bars {
-        assert!(bar.left() > origin.x && bar.right() < rect(1).left());
+        assert!(
+            bar.left() > origin.x && bar.right() < rect(1).left(),
+            "{bar:?}"
+        );
     }
     assert!(rect(1).left() > rect(0).left());
     assert_eq!(rect(3).left(), rect(0).left());

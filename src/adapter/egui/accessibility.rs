@@ -1,35 +1,47 @@
-use super::{
-    ParagraphLayouts,
-    layout::{LayoutIdentity, is_layout_text},
-};
-use crate::{
-    Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span,
-    accessibility::node_semantics::{apply_text_style, set_paragraph_semantics},
-    document::{LINE_SEPARATOR, SpanCursor, same_numbering_effect},
-};
-use egui::{Galley, Id, Pos2, Rect, Ui, accesskit, epaint::text::PlacedRow, text::CharIndex};
-use std::{
-    collections::HashMap,
-    fmt,
-    ops::Range,
-    sync::{Arc, OnceLock},
-};
-use unicode_segmentation::UnicodeSegmentation;
+use super::layout::{self, LayoutIdentity, ParagraphLayouts};
+use super::navigation::CaretPlacement;
+use crate::accessibility::node_semantics;
+use crate::model::{self, LINE_SEPARATOR, SpanCursor};
+use crate::{Color, Editor, InlineStyle, Link, Paragraph, ParagraphKind, Position, Span};
+use egui::epaint::text::PlacedRow;
+use egui::text::CharIndex;
+use egui::{Galley, Id, Pos2, Rect, Ui, accesskit};
+use std::collections::HashMap;
+use std::error;
+use std::fmt::{self, Display, Formatter};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 const MAX_RUN_CHARACTERS: usize = 255;
 const MAX_CHARACTER_BYTES: usize = 255;
 
+/// A problem that kept [`RichTextEditor`](super::RichTextEditor) from
+/// publishing its accessibility tree or from applying an AccessKit action.
+///
+/// The widget reports these in
+/// [`RichTextEditorOutput::accessibility_errors`](super::RichTextEditorOutput::accessibility_errors);
+/// none of them changes the editor.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessibilityError {
+    /// The widget's text layout did not match the document, so this frame
+    /// publishes the widget without its text.
     InvalidLayout,
+    /// An action referred to text positions or links of an older document
+    /// than the editor's current one, for example after an earlier event in
+    /// the same frame edited it, or arrived while no tree was published, and
+    /// was ignored.
     StaleDocument,
+    /// A text selection action named a position that does not exist in the
+    /// published tree, and was ignored.
     InvalidTextPosition,
+    /// An action lacked the data its kind requires, such as a selection
+    /// request without a text selection, and was ignored.
     InvalidActionData,
 }
 
-impl fmt::Display for AccessibilityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for AccessibilityError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLayout => f.write_str("accessibility layout does not match the document"),
             Self::StaleDocument => f.write_str("accessibility action refers to an older document"),
@@ -40,7 +52,7 @@ impl fmt::Display for AccessibilityError {
         }
     }
 }
-impl std::error::Error for AccessibilityError {}
+impl error::Error for AccessibilityError {}
 
 #[derive(Debug)]
 struct Run {
@@ -91,15 +103,30 @@ struct ParagraphSnapshot {
     links: Arc<[LinkNode]>,
 }
 
-type RunsKey = (*const str, *const [Span], *const Galley, bool);
+// Identifies the inputs a paragraph's runs are built from, by address, so that
+// a moved or repeated paragraph can reuse them.
+#[derive(PartialEq, Eq, Hash)]
+struct RunsKey {
+    text: *const str,
+    spans: *const [Span],
+    galley: *const Galley,
+    line_break: bool,
+}
 
 fn runs_key(source: &Paragraph, galley: &Arc<Galley>, line_break: bool) -> RunsKey {
-    (
-        source.text(),
-        source.spans(),
-        Arc::as_ptr(galley),
+    RunsKey {
+        text: source.text(),
+        spans: source.spans(),
+        galley: Arc::as_ptr(galley),
         line_break,
-    )
+    }
+}
+
+// Where a published text run lives in a `Snapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunLocation {
+    paragraph: usize,
+    run: usize,
 }
 
 #[derive(Debug)]
@@ -109,7 +136,7 @@ pub(super) struct Snapshot {
     layout_identity: LayoutIdentity,
     environment_identity: Arc<()>,
     widget_id: Id,
-    run_locations: OnceLock<HashMap<accesskit::NodeId, (usize, usize)>>,
+    run_locations: OnceLock<HashMap<accesskit::NodeId, RunLocation>>,
     next_serial: u64,
 }
 
@@ -185,7 +212,7 @@ fn changes_since(
             next_serial,
         );
     }
-    let galleys: Vec<_> = layouts
+    let galleys: Vec<&Arc<Galley>> = layouts
         .views_range(0..layouts.len())
         .map(|layout| layout.galley)
         .collect();
@@ -231,19 +258,20 @@ fn rebuild_window(
         cached.entry(key).or_default().push(index);
     }
     let mut claimed = vec![false; replaced.len()];
-    let reused: Vec<_> = window
-        .clone()
-        .map(|index| {
-            let key = runs_key(
-                &sources[index],
-                galleys[index - prefix],
-                index + 1 < sources.len(),
-            );
-            let reused = cached.get_mut(&key)?.pop()?;
-            claimed[reused - prefix] = true;
-            Some(reused)
-        })
-        .collect();
+    // For each paragraph in the window, the old paragraph whose runs it reuses.
+    let mut reused: Vec<Option<usize>> = Vec::with_capacity(window.len());
+    for index in window.clone() {
+        let key = runs_key(
+            &sources[index],
+            galleys[index - prefix],
+            index + 1 < sources.len(),
+        );
+        let old_index = cached.get_mut(&key).and_then(Vec::pop);
+        if let Some(old_index) = old_index {
+            claimed[old_index - prefix] = true;
+        }
+        reused.push(old_index);
+    }
     let mut paragraphs = Vec::with_capacity(window.len());
     for (index, reused) in window.zip(reused) {
         if let Some(reused) = reused {
@@ -291,9 +319,11 @@ fn build_paragraph_snapshot(
     widget_id: Id,
     line_break: bool,
 ) -> Result<Arc<ParagraphSnapshot>, AccessibilityError> {
+    use unicode_segmentation::UnicodeSegmentation as _;
+
     let id = paragraph_id(widget_id, serial);
     let text = source.text();
-    if !is_layout_text(&galley.job.text, text) || galley.rows.is_empty() {
+    if !layout::is_layout_text(&galley.job.text, text) || galley.rows.is_empty() {
         return Err(AccessibilityError::InvalidLayout);
     }
     let rows = Rows::new(galley);
@@ -484,47 +514,73 @@ impl Run {
     }
 }
 
-fn list_positions(kinds: impl Iterator<Item = ParagraphKind>) -> Vec<Option<(usize, usize)>> {
-    let mut open: Vec<(bool, u8, usize)> = Vec::new();
+// A list item's place in its AccessKit set, both counted from one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListPosition {
+    position_in_set: usize,
+    size_of_set: usize,
+}
+
+fn list_positions(kinds: impl Iterator<Item = ParagraphKind>) -> Vec<Option<ListPosition>> {
+    // A set that later items at its level and kind may still join.
+    struct OpenSet {
+        ordered: bool,
+        indent: u8,
+        set: usize,
+    }
+    let mut open: Vec<OpenSet> = Vec::new();
     let mut sizes: Vec<usize> = Vec::new();
-    let members: Vec<_> = kinds
-        .map(|kind| {
-            let (ordered, indent, restart) = match kind {
-                ParagraphKind::Bullet { indent } => (false, indent, false),
-                ParagraphKind::Ordered { indent, start } => (true, indent, start.is_some()),
-                ParagraphKind::Heading { .. } => {
-                    open.clear();
-                    return None;
+    // Each list item's set and its position in it.
+    let mut members: Vec<Option<(usize, usize)>> = Vec::new();
+    for kind in kinds {
+        let (ordered, indent, restart) = match kind {
+            ParagraphKind::Bullet { indent } => (false, indent, false),
+            ParagraphKind::Ordered { indent, start } => (true, indent, start.is_some()),
+            ParagraphKind::Heading { .. } => {
+                open.clear();
+                members.push(None);
+                continue;
+            }
+            _ => {
+                members.push(None);
+                continue;
+            }
+        };
+        open.retain(|candidate| candidate.indent <= indent);
+        let existing = open
+            .iter()
+            .position(|candidate| candidate.indent == indent && candidate.ordered == ordered);
+        let set = match existing {
+            Some(index) if !restart => open[index].set,
+            _ => {
+                if let Some(index) = existing {
+                    open.remove(index);
                 }
-                _ => return None,
-            };
-            open.retain(|&(_, level, _)| level <= indent);
-            let existing = open
-                .iter()
-                .position(|&(kind, level, _)| level == indent && kind == ordered);
-            let set = match existing {
-                Some(index) if !restart => open[index].2,
-                _ => {
-                    if let Some(index) = existing {
-                        open.remove(index);
-                    }
-                    sizes.push(0);
-                    open.push((ordered, indent, sizes.len() - 1));
-                    sizes.len() - 1
-                }
-            };
-            sizes[set] += 1;
-            Some((set, sizes[set]))
-        })
-        .collect();
+                sizes.push(0);
+                open.push(OpenSet {
+                    ordered,
+                    indent,
+                    set: sizes.len() - 1,
+                });
+                sizes.len() - 1
+            }
+        };
+        sizes[set] += 1;
+        members.push(Some((set, sizes[set])));
+    }
     members
         .into_iter()
-        .map(|member| member.map(|(set, position)| (position, sizes[set])))
+        .map(|member| {
+            member.map(|(set, position)| ListPosition {
+                position_in_set: position,
+                size_of_set: sizes[set],
+            })
+        })
         .collect()
 }
 
 impl Snapshot {
-    fn run_locations(&self) -> &HashMap<accesskit::NodeId, (usize, usize)> {
+    fn run_locations(&self) -> &HashMap<accesskit::NodeId, RunLocation> {
         self.run_locations.get_or_init(|| {
             self.paragraphs
                 .iter()
@@ -535,7 +591,11 @@ impl Snapshot {
                         .iter()
                         .enumerate()
                         .map(move |(run_index, run)| {
-                            (run.id.accesskit_id(), (paragraph_index, run_index))
+                            let location = RunLocation {
+                                paragraph: paragraph_index,
+                                run: run_index,
+                            };
+                            (run.id.accesskit_id(), location)
                         })
                 })
                 .collect()
@@ -552,7 +612,7 @@ impl Snapshot {
         let after = editor.document().paragraphs().get(index)?.kind();
         (self.paragraphs.len() == layouts.len()
             && Arc::ptr_eq(&self.environment_identity, &layouts.environment_identity())
-            && same_numbering_effect(before, after))
+            && model::same_numbering_effect(before, after))
         .then_some(index)
     }
 
@@ -568,7 +628,11 @@ impl Snapshot {
             }
             for (index, paragraph) in replaced.clone().zip(&splice.paragraphs) {
                 for (run_index, run) in paragraph.runs.iter().enumerate() {
-                    locations.insert(run.id.accesskit_id(), (index, run_index));
+                    let location = RunLocation {
+                        paragraph: index,
+                        run: run_index,
+                    };
+                    locations.insert(run.id.accesskit_id(), location);
                 }
             }
         }
@@ -632,27 +696,27 @@ impl Snapshot {
     }
 
     pub(super) fn decode(&self, position: accesskit::TextPosition) -> Option<Position> {
-        let &(index, run_index) = self.run_locations().get(&position.node)?;
-        let run = &self.paragraphs[index].runs[run_index];
+        let location = *self.run_locations().get(&position.node)?;
+        let run = &self.paragraphs[location.paragraph].runs[location.run];
         if let Some(byte) = run.offsets.get(position.character_index) {
-            return Some(Position::new(index, *byte));
+            return Some(Position::new(location.paragraph, *byte));
         }
         if run.line_break && position.character_index == run.offsets.len() {
-            return Some(Position::new(index + 1, 0));
+            return Some(Position::new(location.paragraph + 1, 0));
         }
         None
     }
 
-    pub(super) fn decode_focus(
-        &self,
-        position: accesskit::TextPosition,
-    ) -> Option<(Position, bool)> {
+    pub(super) fn decode_focus(&self, position: accesskit::TextPosition) -> Option<CaretPlacement> {
         let decoded = self.decode(position)?;
         // Equivalent run boundaries use the usual downstream caret, except
         // when the request explicitly names the end of a soft-wrapped row.
         let prefer_next_row = self.position(decoded) == Some(position)
             || self.focus_position(decoded, false) != Some(position);
-        Some((decoded, prefer_next_row))
+        Some(CaretPlacement {
+            position: decoded,
+            prefer_next_row,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -707,13 +771,13 @@ impl Snapshot {
         let is_quote =
             |paragraph: &Arc<ParagraphSnapshot>| paragraph.source.kind() == ParagraphKind::Quote;
         let mut quote = None;
-        for (index, ((paragraph, layout), list_item)) in self
+        let paragraphs = self
             .paragraphs
             .iter()
             .zip(layouts.views_range(0..layouts.len()))
             .zip(list_items)
-            .enumerate()
-        {
+            .enumerate();
+        for (index, ((paragraph, layout), list_item)) in paragraphs {
             let kind = paragraph.source.kind();
             if kind != ParagraphKind::Quote {
                 quote = None;
@@ -757,12 +821,12 @@ impl Snapshot {
                     .max_rect(paragraph_rect),
             );
             ui.ctx().accesskit_node_builder(paragraph.id, |node| {
-                set_paragraph_semantics(node, kind);
+                node_semantics::set_paragraph_semantics(node, kind);
                 node.set_is_line_breaking_object();
                 node.set_bounds(accesskit_rect(to_global * paragraph_rect));
-                if let Some((position, size)) = list_item {
-                    node.set_position_in_set(position);
-                    node.set_size_of_set(size);
+                if let Some(list_item) = list_item {
+                    node.set_position_in_set(list_item.position_in_set);
+                    node.set_size_of_set(list_item.size_of_set);
                 }
             });
             let from_galley = to_global
@@ -833,14 +897,14 @@ struct Geometry {
     widths: Option<Vec<f32>>,
 }
 
-struct Rows<'a> {
-    galley: &'a Galley,
+struct Rows<'galley> {
+    galley: &'galley Galley,
     ends: Vec<usize>,
     text_ends: Vec<usize>,
 }
 
-impl<'a> Rows<'a> {
-    fn new(galley: &'a Galley) -> Self {
+impl<'galley> Rows<'galley> {
+    fn new(galley: &'galley Galley) -> Self {
         let mut ends = Vec::with_capacity(galley.rows.len());
         let mut text_ends = Vec::with_capacity(galley.rows.len());
         let mut start = 0;
@@ -1004,11 +1068,11 @@ fn publish_style(
     let rgba = format.map_or([0, 0, 0, 255], |format| {
         format.color.to_srgba_unmultiplied()
     });
-    apply_text_style(
+    node_semantics::apply_text_style(
         node,
         InlineStyle {
             underline: style.underline || linked,
-            foreground: Some(crate::Color(rgba)),
+            foreground: Some(Color(rgba)),
             ..style
         },
     );
@@ -1019,10 +1083,14 @@ fn publish_style(
 
 #[cfg(test)]
 mod tests {
-    use super::super::layout::ParagraphLayout;
+    use super::super::layout::{Appearance, ParagraphLayout};
+    use super::super::{Cache, PADDING, RichTextEditor};
     use super::*;
     use crate::accessibility::random_edits;
+    use crate::model::SparseCoverage;
+    use crate::{Document, Fragment, Selection, StylePatch};
     use std::collections::HashSet;
+    use unicode_segmentation::UnicodeSegmentation;
 
     fn make_snapshot(text: &str, width: f32) -> (Editor, Snapshot) {
         let editor = Editor::from_text(text);
@@ -1034,7 +1102,7 @@ mod tests {
 
     fn layout_frame(context: &egui::Context, editor: &Editor, width: f32) -> ParagraphLayouts {
         let mut layouts = Vec::new();
-        let appearance = super::super::Appearance {
+        let appearance = Appearance {
             font: egui::FontId::proportional(16.0),
             bold_family: None,
             color: egui::Color32::WHITE,
@@ -1050,7 +1118,7 @@ mod tests {
                     .paragraphs()
                     .iter()
                     .map(|paragraph| {
-                        let job = super::super::paragraph_job(paragraph, &appearance, width);
+                        let job = layout::paragraph_job(paragraph, &appearance, width);
                         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                         let rect = Rect::from_min_size(Pos2::ZERO, galley.size());
                         ParagraphLayout {
@@ -1069,11 +1137,11 @@ mod tests {
 
     fn cached_layout_frame(
         context: &egui::Context,
-        cache: &mut super::super::Cache,
+        cache: &mut Cache,
         editor: &Editor,
         width: f32,
     ) -> ParagraphLayouts {
-        let appearance = super::super::Appearance {
+        let appearance = Appearance {
             font: egui::FontId::proportional(16.0),
             bold_family: None,
             color: egui::Color32::WHITE,
@@ -1103,13 +1171,11 @@ mod tests {
                 .unwrap()
         };
         let mut node = run.node.clone();
-        let links = (
-            node.previous_on_line().map(index),
-            node.next_on_line().map(index),
-        );
+        let previous = node.previous_on_line().map(index);
+        let next = node.next_on_line().map(index);
         node.clear_previous_on_line();
         node.clear_next_on_line();
-        (node, links.0, links.1)
+        (node, previous, next)
     }
 
     fn assert_matches_fresh(
@@ -1123,52 +1189,92 @@ mod tests {
         assert_eq!(snapshot.run_locations().len(), fresh.run_locations().len());
         assert_eq!(snapshot.paragraphs.len(), fresh.paragraphs.len());
         let mut serials = HashSet::new();
-        for (index, (actual, expected)) in snapshot
+        let paragraphs = snapshot
             .paragraphs
             .iter()
             .zip(&fresh.paragraphs)
-            .enumerate()
-        {
-            assert!(serials.insert(actual.serial));
-            assert!(actual.serial < snapshot.next_serial);
-            assert_eq!(actual.id, paragraph_id(widget_id, actual.serial));
-            assert!(Arc::ptr_eq(&actual.source, &expected.source));
-            assert!(Arc::ptr_eq(&actual.galley, &expected.galley));
-            assert_eq!(actual.line_break, expected.line_break);
-            assert_eq!(actual.runs.len(), expected.runs.len());
-            for (run_index, (actual_run, expected_run)) in
-                actual.runs.iter().zip(expected.runs.iter()).enumerate()
-            {
-                assert_eq!(actual_run.id, actual.id.with(("grapheme_run", run_index)));
+            .enumerate();
+        for (index, (actual, expected)) in paragraphs {
+            assert!(
+                serials.insert(actual.serial),
+                "paragraph {index} reuses serial {}",
+                actual.serial
+            );
+            assert!(
+                actual.serial < snapshot.next_serial,
+                "paragraph {index} has a serial at or beyond the next one"
+            );
+            assert_eq!(
+                actual.id,
+                paragraph_id(widget_id, actual.serial),
+                "paragraph {index}"
+            );
+            assert!(
+                Arc::ptr_eq(&actual.source, &expected.source),
+                "paragraph {index}"
+            );
+            assert!(
+                Arc::ptr_eq(&actual.galley, &expected.galley),
+                "paragraph {index}"
+            );
+            assert_eq!(actual.line_break, expected.line_break, "paragraph {index}");
+            assert_eq!(actual.runs.len(), expected.runs.len(), "paragraph {index}");
+            let runs = actual.runs.iter().zip(expected.runs.iter()).enumerate();
+            for (run_index, (actual_run, expected_run)) in runs {
+                let case = format!("paragraph {index}, run {run_index}");
+                assert_eq!(
+                    actual_run.id,
+                    actual.id.with(("grapheme_run", run_index)),
+                    "{case}"
+                );
                 assert_eq!(
                     snapshot.run_locations()[&actual_run.id.accesskit_id()],
-                    (index, run_index)
+                    RunLocation {
+                        paragraph: index,
+                        run: run_index
+                    },
+                    "{case}"
                 );
                 assert_eq!(
                     normalized_node(actual, actual_run),
-                    normalized_node(expected, expected_run)
+                    normalized_node(expected, expected_run),
+                    "{case}"
                 );
-                assert_eq!(actual_run.range, expected_run.range);
-                assert_eq!(actual_run.line_break, expected_run.line_break);
-                assert_eq!(actual_run.offsets, expected_run.offsets);
-                assert_eq!(actual_run.row, expected_run.row);
-                assert_eq!(actual_run.soft_break, expected_run.soft_break);
-                assert_eq!(actual_run.geometry.bounds, expected_run.geometry.bounds);
+                assert_eq!(actual_run.range, expected_run.range, "{case}");
+                assert_eq!(actual_run.line_break, expected_run.line_break, "{case}");
+                assert_eq!(actual_run.offsets, expected_run.offsets, "{case}");
+                assert_eq!(actual_run.row, expected_run.row, "{case}");
+                assert_eq!(actual_run.soft_break, expected_run.soft_break, "{case}");
                 assert_eq!(
-                    actual_run.geometry.positions,
-                    expected_run.geometry.positions
+                    actual_run.geometry.bounds, expected_run.geometry.bounds,
+                    "{case}"
                 );
-                assert_eq!(actual_run.geometry.widths, expected_run.geometry.widths);
+                assert_eq!(
+                    actual_run.geometry.positions, expected_run.geometry.positions,
+                    "{case}"
+                );
+                assert_eq!(
+                    actual_run.geometry.widths, expected_run.geometry.widths,
+                    "{case}"
+                );
             }
-            assert_eq!(actual.links.len(), expected.links.len());
-            for (link_index, (actual_link, expected_link)) in
-                actual.links.iter().zip(expected.links.iter()).enumerate()
-            {
-                assert_eq!(actual_link.id, actual.id.with(("link", link_index)));
-                assert_eq!(actual_link.link, expected_link.link);
-                assert_eq!(actual_link.runs, expected_link.runs);
-                assert_eq!(actual_link.bounds, expected_link.bounds);
-                assert_eq!(actual_link.label, expected_link.label);
+            assert_eq!(
+                actual.links.len(),
+                expected.links.len(),
+                "paragraph {index}"
+            );
+            let links = actual.links.iter().zip(expected.links.iter()).enumerate();
+            for (link_index, (actual_link, expected_link)) in links {
+                let case = format!("paragraph {index}, link {link_index}");
+                assert_eq!(
+                    actual_link.id,
+                    actual.id.with(("link", link_index)),
+                    "{case}"
+                );
+                assert_eq!(actual_link.link, expected_link.link, "{case}");
+                assert_eq!(actual_link.runs, expected_link.runs, "{case}");
+                assert_eq!(actual_link.bounds, expected_link.bounds, "{case}");
+                assert_eq!(actual_link.label, expected_link.label, "{case}");
             }
         }
         for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
@@ -1186,8 +1292,8 @@ mod tests {
     #[test]
     fn incremental_updates_match_fresh_snapshots_and_preserve_retained_values() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
-        let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
+        let mut cache = Cache::default();
+        let mut editor = Editor::from_text("first\naé👩\u{200d}💻 second\nlast");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
@@ -1196,7 +1302,7 @@ mod tests {
         let storage = snapshot.as_ref().unwrap().paragraphs.as_ptr();
         let unchanged = Arc::clone(&snapshot.as_ref().unwrap().paragraphs[0]);
         editor
-            .set_selection(crate::Selection::caret(Position::new(1, 0)))
+            .set_selection(Selection::caret(Position::new(1, 0)))
             .unwrap();
         editor.insert_text("changed ").unwrap();
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
@@ -1223,16 +1329,16 @@ mod tests {
     #[test]
     fn missed_updates_and_simultaneous_width_changes_match_fresh_snapshots() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let mut editor =
-            Editor::from_text("first second third fourth\naé👩‍💻 second\nlast words here");
+            Editor::from_text("first second third fourth\naé👩\u{200d}💻 second\nlast words here");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let mut snapshot = None;
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
         for paragraph in [0, 2] {
             editor
-                .set_selection(crate::Selection::caret(Position::new(paragraph, 0)))
+                .set_selection(Selection::caret(Position::new(paragraph, 0)))
                 .unwrap();
             editor.insert_text("changed ").unwrap();
         }
@@ -1253,7 +1359,7 @@ mod tests {
     #[test]
     fn failed_incremental_updates_keep_the_published_snapshot_intact() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let mut editor = Editor::from_text("first\nvalid\nlast");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
@@ -1263,7 +1369,7 @@ mod tests {
         let published_editor = Editor::new(editor.document().clone());
         let published_layouts = layouts.clone();
         editor
-            .set_selection(crate::Selection::caret(Position::new(1, 0)))
+            .set_selection(Selection::caret(Position::new(1, 0)))
             .unwrap();
         editor.insert_text("changed ").unwrap();
         assert_eq!(
@@ -1282,7 +1388,7 @@ mod tests {
     #[test]
     fn local_edits_reuse_unchanged_paragraph_runs_and_geometry() {
         let context = egui::Context::default();
-        let mut editor = Editor::from_text("first\naé👩‍💻 second\nlast");
+        let mut editor = Editor::from_text("first\naé👩\u{200d}💻 second\nlast");
         let widget_id = Id::unique("editor");
         let layouts = layout_frame(&context, &editor, 500.0);
         let first = build(&editor, &layouts, widget_id).unwrap();
@@ -1296,7 +1402,7 @@ mod tests {
         );
 
         editor
-            .set_selection(crate::Selection::caret(Position::new(1, 0)))
+            .set_selection(Selection::caret(Position::new(1, 0)))
             .unwrap();
         editor.insert_text("changed ").unwrap();
         let layouts = layout_frame(&context, &editor, 500.0);
@@ -1334,12 +1440,10 @@ mod tests {
         let layouts = layout_frame(&context, &editor, 500.0);
         let first = build(&editor, &layouts, widget_id).unwrap();
         let mut paragraphs = editor.document().paragraphs().to_vec();
-        paragraphs.push(Arc::clone(
-            &crate::Document::from_text("new").paragraphs()[0],
-        ));
-        let appended = Editor::new(crate::Document::from_fragment(
-            &crate::Fragment::from_paragraphs(paragraphs),
-        ));
+        paragraphs.push(Arc::clone(&Document::from_text("new").paragraphs()[0]));
+        let appended = Editor::new(Document::from_fragment(&Fragment::from_paragraphs(
+            paragraphs,
+        )));
         let layouts = layout_frame(&context, &appended, 500.0);
         let extended = build_cached(&appended, &layouts, widget_id, Some(&first)).unwrap();
         assert!(Arc::ptr_eq(&first.paragraphs[0], &extended.paragraphs[0]));
@@ -1414,7 +1518,7 @@ mod tests {
         let references = Arc::strong_count(&snapshot.paragraphs[0]);
         let mut changed = Editor::new(editor.document().clone());
         changed
-            .set_selection(crate::Selection::caret(Position::new(1, 0)))
+            .set_selection(Selection::caret(Position::new(1, 0)))
             .unwrap();
         changed.insert_text("changed ").unwrap();
         let layouts = layout_frame(&context, &changed, 500.0);
@@ -1436,7 +1540,7 @@ mod tests {
 
     #[test]
     fn emoji_and_combining_marks_expose_only_real_caret_stops() {
-        let (_, snapshot) = make_snapshot("a👩🏽‍💻e\u{301}", 500.0);
+        let (_, snapshot) = make_snapshot("a👩🏽\u{200d}💻e\u{301}", 500.0);
         let runs = &snapshot.paragraphs[0].runs;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].node.character_lengths(), [1, 15, 3]);
@@ -1456,12 +1560,16 @@ mod tests {
         for index in 0..2 {
             let paragraph = &snapshot.paragraphs[index];
             let last = paragraph.runs.last().unwrap();
-            assert!(last.node.value().unwrap().ends_with('\n'));
+            assert!(
+                last.node.value().unwrap().ends_with('\n'),
+                "paragraph {index}"
+            );
             let end = Position::new(index, paragraph.source.text().len());
             let before_break = snapshot.position(end).unwrap();
             assert_eq!(
                 before_break.character_index,
-                last.node.character_lengths().len() - 1
+                last.node.character_lengths().len() - 1,
+                "paragraph {index}"
             );
             assert_eq!(snapshot.decode(before_break), Some(end));
             assert_eq!(
@@ -1499,7 +1607,9 @@ mod tests {
         for run in wrapped.paragraphs[0].runs.iter() {
             assert_eq!(
                 run.geometry.positions.as_ref().unwrap().len(),
-                run.node.character_lengths().len()
+                run.node.character_lengths().len(),
+                "run {:?}",
+                run.range
             );
         }
     }
@@ -1525,9 +1635,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = context.run_ui(input, |ui| {
-            super::super::RichTextEditor::new(&mut editor)
-                .id(id)
-                .show(ui);
+            RichTextEditor::new(&mut editor).id(id).show(ui);
         });
         let update = output.platform_output.accesskit_update.take().unwrap();
         output.drop_without_applying_deltas();
@@ -1555,7 +1663,7 @@ mod tests {
 
     #[test]
     fn snapshots_validate_cloned_content_and_decode_wrapped_paragraphs() {
-        let (editor, snapshot) = make_snapshot("first\naé👩‍💻 second third\n", 65.0);
+        let (editor, snapshot) = make_snapshot("first\naé👩\u{200d}💻 second third\n", 65.0);
         let cloned = Editor::new(editor.document().clone());
         assert!(snapshot.matches_document(&cloned));
         assert!(!snapshot.matches_document(&Editor::from_text("different\ntext\n")));
@@ -1589,7 +1697,7 @@ mod tests {
 
     #[test]
     fn cached_geometry_follows_the_widget_origin_when_published() {
-        let (editor, snapshot) = make_snapshot("a👩🏽‍💻e\u{301}", 500.0);
+        let (editor, snapshot) = make_snapshot("a👩🏽\u{200d}💻e\u{301}", 500.0);
         let context = egui::Context::default();
         context.enable_accesskit();
         let paragraph = &snapshot.paragraphs[0];
@@ -1634,6 +1742,15 @@ mod tests {
         assert_eq!(moved.y1 - first.y1, 200.0);
     }
 
+    // How `registration_frame` registers the snapshot's nodes.
+    #[derive(Clone, Copy)]
+    enum Registration {
+        // Builds each node by hand, as a reference.
+        Legacy,
+        // Calls `Snapshot::publish`.
+        Published,
+    }
+
     fn registration_frame(
         editor: &Editor,
         snapshot: &Snapshot,
@@ -1641,7 +1758,7 @@ mod tests {
         placement: (Pos2, egui::emath::TSTransform),
         enabled: bool,
         read_only: bool,
-        legacy: bool,
+        registration: Registration,
     ) -> (accesskit::TreeUpdate, Vec<egui::Response>) {
         let (origin, transform) = placement;
         let context = egui::Context::default();
@@ -1659,7 +1776,7 @@ mod tests {
                 widget_id,
                 egui::Sense::click_and_drag(),
             );
-            if legacy {
+            if let Registration::Legacy = registration {
                 for (paragraph, layout) in snapshot.paragraphs.iter().zip(layouts.iter()) {
                     let paragraph_rect = layout.rect.translate(origin.to_vec2());
                     let _paragraph_ui = Ui::new(
@@ -1786,22 +1903,20 @@ mod tests {
     #[test]
     fn run_registration_preserves_tree_geometry_and_hover_behavior() {
         let context = egui::Context::default();
-        let mut editor = Editor::from_text("first café e\u{301} 👩‍💻 second third fourth\n\nlast 🇺🇸");
+        let mut editor =
+            Editor::from_text("first café e\u{301} 👩\u{200d}💻 second third fourth\n\nlast 🇺🇸");
         editor
-            .set_selection(crate::Selection::new(
-                Position::new(0, 0),
-                Position::new(0, 2),
-            ))
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 2)))
             .unwrap();
         editor
-            .apply_style(crate::StylePatch {
+            .apply_style(StylePatch {
                 bold: Some(true),
                 italic: Some(true),
                 underline: Some(true),
                 strikethrough: Some(true),
                 code: Some(true),
-                foreground: Some(Some(crate::Color([42, 100, 200, 255]))),
-                background: Some(Some(crate::Color::YELLOW)),
+                foreground: Some(Some(Color([42, 100, 200, 255]))),
+                background: Some(Some(Color::YELLOW)),
             })
             .unwrap();
         let layouts = layout_frame(&context, &editor, 65.0);
@@ -1828,6 +1943,7 @@ mod tests {
             scaling: 2.0,
         };
         for (enabled, read_only) in [(true, false), (true, true), (false, false), (false, true)] {
+            let case = format!("enabled={enabled}, read_only={read_only}");
             let (reference, old_responses) = registration_frame(
                 &editor,
                 &snapshot,
@@ -1835,7 +1951,7 @@ mod tests {
                 (origin, transform),
                 enabled,
                 read_only,
-                true,
+                Registration::Legacy,
             );
             let (published, responses) = registration_frame(
                 &editor,
@@ -1844,9 +1960,9 @@ mod tests {
                 (origin, transform),
                 enabled,
                 read_only,
-                false,
+                Registration::Published,
             );
-            assert_eq!(published.focus, reference.focus);
+            assert_eq!(published.focus, reference.focus, "{case}");
             let old_nodes: HashMap<_, _> = reference.nodes.into_iter().collect();
             let nodes: HashMap<_, _> = published.nodes.into_iter().collect();
             let widget = &nodes[&Id::unique("editor").accesskit_id()];
@@ -1855,23 +1971,27 @@ mod tests {
                 .iter()
                 .map(|paragraph| paragraph.id.accesskit_id())
                 .collect();
-            assert_eq!(widget.children(), children);
+            assert_eq!(widget.children(), children, "{case}");
             assert_eq!(
                 widget.children(),
-                old_nodes[&Id::unique("editor").accesskit_id()].children()
+                old_nodes[&Id::unique("editor").accesskit_id()].children(),
+                "{case}"
             );
             assert_eq!(
                 widget.supports_action(accesskit::Action::SetTextSelection),
-                enabled
+                enabled,
+                "{case}"
             );
-            assert_eq!(widget.is_read_only(), read_only);
+            assert_eq!(widget.is_read_only(), read_only, "{case}");
             assert_eq!(
                 widget.supports_action(accesskit::Action::SetValue),
-                enabled && !read_only
+                enabled && !read_only,
+                "{case}"
             );
             assert_eq!(
                 widget.supports_action(accesskit::Action::ReplaceSelectedText),
-                enabled && !read_only
+                enabled && !read_only,
+                "{case}"
             );
             for (paragraph, layout) in snapshot.paragraphs.iter().zip(layouts.iter()) {
                 let id = paragraph.id.accesskit_id();
@@ -1880,9 +2000,9 @@ mod tests {
                     .iter()
                     .map(|run| run.id.accesskit_id())
                     .collect();
-                assert_eq!(nodes[&id].children(), children);
-                assert_eq!(nodes[&id].children(), old_nodes[&id].children());
-                assert_eq!(nodes[&id].bounds(), old_nodes[&id].bounds());
+                assert_eq!(nodes[&id].children(), children, "{case}");
+                assert_eq!(nodes[&id].children(), old_nodes[&id].children(), "{case}");
+                assert_eq!(nodes[&id].bounds(), old_nodes[&id].bounds(), "{case}");
                 let from_galley = transform
                     * egui::emath::TSTransform::from_translation(
                         layout.rect.min.to_vec2() + origin.to_vec2(),
@@ -1891,14 +2011,15 @@ mod tests {
                     let geometry = &run.geometry;
                     let id = run.id.accesskit_id();
                     let node = &nodes[&id];
-                    assert_eq!(node.role(), accesskit::Role::TextRun);
-                    assert_eq!(node, &old_nodes[&id]);
-                    assert_eq!(node.bounds(), old_nodes[&id].bounds());
+                    assert_eq!(node.role(), accesskit::Role::TextRun, "{case}");
+                    assert_eq!(node, &old_nodes[&id], "{case}");
+                    assert_eq!(node.bounds(), old_nodes[&id].bounds(), "{case}");
                     assert_eq!(
                         node.bounds(),
-                        Some(accesskit_rect(from_galley * geometry.bounds))
+                        Some(accesskit_rect(from_galley * geometry.bounds)),
+                        "{case}"
                     );
-                    assert!(!node.supports_action(accesskit::Action::Focus));
+                    assert!(!node.supports_action(accesskit::Action::Focus), "{case}");
                     if let (Some(positions), Some(widths)) = (&geometry.positions, &geometry.widths)
                     {
                         assert_eq!(
@@ -1906,25 +2027,27 @@ mod tests {
                             positions
                                 .iter()
                                 .map(|position| position * 2.0)
-                                .collect::<Vec<_>>()
+                                .collect::<Vec<_>>(),
+                            "{case}"
                         );
                         assert_eq!(
                             node.character_widths().unwrap(),
-                            widths.iter().map(|width| width * 2.0).collect::<Vec<_>>()
+                            widths.iter().map(|width| width * 2.0).collect::<Vec<_>>(),
+                            "{case}"
                         );
                     }
                 }
             }
             for (response, old_response) in responses.iter().zip(&old_responses) {
-                assert_eq!(response.id, old_response.id);
-                assert_eq!(response.rect, old_response.rect);
-                assert_eq!(response.interact_rect, old_response.interact_rect);
-                assert_eq!(response.layer_id, old_response.layer_id);
-                assert_eq!(response.sense, egui::Sense::hover());
-                assert_eq!(response.sense, old_response.sense);
-                assert_eq!(response.enabled(), old_response.enabled());
-                assert!(!response.has_focus());
-                assert!(!old_response.has_focus());
+                assert_eq!(response.id, old_response.id, "{case}");
+                assert_eq!(response.rect, old_response.rect, "{case}");
+                assert_eq!(response.interact_rect, old_response.interact_rect, "{case}");
+                assert_eq!(response.layer_id, old_response.layer_id, "{case}");
+                assert_eq!(response.sense, egui::Sense::hover(), "{case}");
+                assert_eq!(response.sense, old_response.sense, "{case}");
+                assert_eq!(response.enabled(), old_response.enabled(), "{case}");
+                assert!(!response.has_focus(), "{case}");
+                assert!(!old_response.has_focus(), "{case}");
             }
         }
     }
@@ -1968,7 +2091,7 @@ mod tests {
 
     fn select(editor: &mut Editor, start: (usize, usize), end: (usize, usize)) {
         editor
-            .set_selection(crate::Selection::new(
+            .set_selection(Selection::new(
                 Position::new(start.0, start.1),
                 Position::new(end.0, end.1),
             ))
@@ -1978,7 +2101,7 @@ mod tests {
     #[test]
     fn structural_edits_reuse_shifted_paragraphs_and_their_node_ids() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let mut editor = Editor::from_text("zero zero\none\ntwo\nthree\nfour");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
@@ -1998,7 +2121,11 @@ mod tests {
         assert_eq!(split.paragraphs[0].id, before[0].id);
         assert!(before.iter().all(|old| old.id != split.paragraphs[1].id));
         for (old, new) in before[1..].iter().zip(&split.paragraphs[2..]) {
-            assert!(Arc::ptr_eq(old, new));
+            assert!(
+                Arc::ptr_eq(old, new),
+                "paragraph serial {} after the split is reused",
+                old.serial
+            );
         }
         assert_eq!(split.decode(in_two), Some(Position::new(3, 1)));
         assert_matches_fresh(&split, &editor, &layouts, widget_id);
@@ -2016,10 +2143,10 @@ mod tests {
         assert_eq!(joined.paragraphs[2].id, split.paragraphs[2].id);
         assert_eq!(joined.decode(in_removed), None);
         for index in 3..5 {
-            assert!(Arc::ptr_eq(
-                &split.paragraphs[index + 1],
-                &joined.paragraphs[index]
-            ));
+            assert!(
+                Arc::ptr_eq(&split.paragraphs[index + 1], &joined.paragraphs[index]),
+                "paragraph {index} after the join is reused"
+            );
         }
         assert_matches_fresh(joined, &editor, &layouts, widget_id);
     }
@@ -2027,7 +2154,7 @@ mod tests {
     #[test]
     fn several_changes_before_a_frame_rebuild_only_the_changed_window() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let mut editor = Editor::from_text("zero\none\ntwo\nthree\nfour\nfive\nsix");
         let widget_id = Id::unique("editor");
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
@@ -2049,17 +2176,17 @@ mod tests {
         let after = snapshot.as_ref().unwrap();
         assert!(!Arc::ptr_eq(&before, after));
         for index in 0..2 {
-            assert!(Arc::ptr_eq(
-                &before.paragraphs[index],
-                &after.paragraphs[index]
-            ));
+            assert!(
+                Arc::ptr_eq(&before.paragraphs[index], &after.paragraphs[index]),
+                "paragraph {index} before the changes is reused"
+            );
         }
         assert!(Arc::ptr_eq(&before.paragraphs[2], &after.paragraphs[3]));
         for index in 4..7 {
-            assert!(Arc::ptr_eq(
-                &before.paragraphs[index],
-                &after.paragraphs[index + 1]
-            ));
+            assert!(
+                Arc::ptr_eq(&before.paragraphs[index], &after.paragraphs[index + 1]),
+                "paragraph {index} after the changes is reused"
+            );
         }
         assert_eq!(after.decode(in_five), Some(Position::new(6, 2)));
         assert_matches_fresh(after, &editor, &layouts, widget_id);
@@ -2091,7 +2218,7 @@ mod tests {
 
     #[test]
     fn sparse_edit_frames_match_fresh_snapshots_and_layouts() {
-        crate::document::take_sparse_coverage();
+        model::take_sparse_coverage();
         random_frames_match_fresh_snapshots(
             random_edits::seeded(0x5851_f42d_4c95_7f2d),
             3,
@@ -2099,7 +2226,11 @@ mod tests {
             random_edits::sparse_editor,
             random_edits::apply_sparse,
         );
-        random_edits::assert_sparse_coverage([20, 10, 10]);
+        random_edits::assert_sparse_coverage(SparseCoverage {
+            recorded: 20,
+            replayed: 10,
+            shifted_tail: 10,
+        });
     }
 
     fn random_frames_match_fresh_snapshots<R: FnMut(usize) -> usize>(
@@ -2112,7 +2243,7 @@ mod tests {
         let context = egui::Context::default();
         let widget_id = Id::unique("editor");
         for _ in 0..editors {
-            let mut cache = super::super::Cache::default();
+            let mut cache = Cache::default();
             let mut editor = editor();
             let mut width = 400.0;
             let mut snapshot = None;
@@ -2140,22 +2271,31 @@ mod tests {
         layouts: &ParagraphLayouts,
         width: f32,
     ) {
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let fresh = cached_layout_frame(context, &mut cache, editor, width);
         assert_eq!(layouts.len(), fresh.len());
         assert_eq!(layouts.content_height(), fresh.content_height());
         let marker =
             |layout: &ParagraphLayout| layout.marker.as_ref().map(|marker| marker.job.text.clone());
-        for (index, (actual, expected)) in layouts.iter().zip(fresh.iter()).enumerate() {
-            assert_eq!(actual.galley.job, expected.galley.job);
-            assert_eq!(actual.rect, expected.rect);
-            assert_eq!(marker(&actual), marker(&expected));
-            assert_eq!(actual.marker_position, expected.marker_position);
-            assert_eq!(actual.quote_bar, expected.quote_bar);
-            assert_eq!(layouts.char_offset(index), fresh.char_offset(index));
+        let paragraphs = layouts.iter().zip(fresh.iter()).enumerate();
+        for (index, (actual, expected)) in paragraphs {
+            assert_eq!(actual.galley.job, expected.galley.job, "paragraph {index}");
+            assert_eq!(actual.rect, expected.rect, "paragraph {index}");
+            assert_eq!(marker(&actual), marker(&expected), "paragraph {index}");
+            assert_eq!(
+                actual.marker_position, expected.marker_position,
+                "paragraph {index}"
+            );
+            assert_eq!(actual.quote_bar, expected.quote_bar, "paragraph {index}");
+            assert_eq!(
+                layouts.char_offset(index),
+                fresh.char_offset(index),
+                "paragraph {index}"
+            );
             assert_eq!(
                 layouts.contains_list(index..layouts.len()),
-                fresh.contains_list(index..fresh.len())
+                fresh.contains_list(index..fresh.len()),
+                "paragraphs from {index}"
             );
         }
     }
@@ -2163,7 +2303,7 @@ mod tests {
     #[test]
     fn unshared_snapshots_splice_structural_edits_in_place() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let long = "zero ".repeat(30);
         let mut editor = Editor::from_text(&format!("{long}\none\ntwo\nthree\nfour"));
         let widget_id = Id::unique("editor");
@@ -2225,28 +2365,36 @@ mod tests {
 
     #[test]
     fn repeated_paragraphs_keep_distinct_node_ids() {
-        let paragraph = Arc::clone(&crate::Document::from_text("same").paragraphs()[0]);
-        let editor = Editor::new(crate::Document::from_fragment(
-            &crate::Fragment::from_paragraphs(vec![Arc::clone(&paragraph); 3]),
-        ));
+        let paragraph = Arc::clone(&Document::from_text("same").paragraphs()[0]);
+        let editor = Editor::new(Document::from_fragment(&Fragment::from_paragraphs(
+            vec![Arc::clone(&paragraph); 3],
+        )));
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let layouts = cached_layout_frame(&context, &mut cache, &editor, 500.0);
         let widget_id = Id::unique("editor");
         let first = build(&editor, &layouts, widget_id).unwrap();
         assert_matches_fresh(&first, &editor, &layouts, widget_id);
         let rebuilt = build_cached(&editor, &layouts, widget_id, Some(&first)).unwrap();
         for (before, after) in first.paragraphs.iter().zip(&rebuilt.paragraphs) {
-            assert!(Arc::ptr_eq(before, after));
+            assert!(
+                Arc::ptr_eq(before, after),
+                "an unchanged document reuses paragraph serial {}",
+                before.serial
+            );
         }
-        let ids: HashSet<_> = rebuilt.paragraphs.iter().map(|p| p.id).collect();
+        let ids: HashSet<_> = rebuilt
+            .paragraphs
+            .iter()
+            .map(|paragraph| paragraph.id)
+            .collect();
         assert_eq!(ids.len(), 3);
     }
 
     #[test]
     fn renumbered_list_items_keep_their_runs_and_node_ids() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let mut editor = Editor::from_text("one\ntwo\nthree\nfour");
         editor.select_all();
         editor
@@ -2266,7 +2414,11 @@ mod tests {
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
         let after = Arc::clone(snapshot.as_ref().unwrap());
         for (old, new) in before.paragraphs[1..].iter().zip(&after.paragraphs[2..]) {
-            assert!(Arc::ptr_eq(old, new));
+            assert!(
+                Arc::ptr_eq(old, new),
+                "renumbered paragraph serial {} is reused",
+                old.serial
+            );
         }
         assert_matches_fresh(&after, &editor, &layouts, widget_id);
 
@@ -2276,10 +2428,10 @@ mod tests {
         update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
         let converted = snapshot.as_ref().unwrap();
         for index in [0, 1, 3, 4] {
-            assert!(Arc::ptr_eq(
-                &after.paragraphs[index],
-                &converted.paragraphs[index]
-            ));
+            assert!(
+                Arc::ptr_eq(&after.paragraphs[index], &converted.paragraphs[index]),
+                "paragraph {index} keeps its runs"
+            );
         }
         assert_eq!(editor.document().list_number(3), Some(3));
         assert_matches_fresh(converted, &editor, &layouts, widget_id);
@@ -2288,7 +2440,7 @@ mod tests {
     #[test]
     fn renumbered_list_items_follow_rewraps_from_wider_markers() {
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi \
                     omicron pi rho sigma tau upsilon phi chi psi omega alpha beta gamma delta";
         let mut editor = Editor::from_text(&format!("a\n{long}"));
@@ -2332,7 +2484,7 @@ mod tests {
     fn single_paragraph_edits_skip_the_scan_unless_other_paragraphs_can_rewrap() {
         type Edit = fn(&mut Editor);
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let mut editor = Editor::from_text("title\none\ntwo\nquoted\nlast words");
         select(&mut editor, (0, 0), (0, 0));
         editor
@@ -2425,19 +2577,28 @@ mod tests {
                 None,
             ),
         ];
-        for (edit, width, expected) in edits {
+        for (step, (edit, width, expected)) in edits.into_iter().enumerate() {
             let before = snapshot.as_ref().unwrap().paragraphs.clone();
             edit(&mut editor);
             let layouts = cached_layout_frame(&context, &mut cache, &editor, width);
             let previous = snapshot.as_ref().unwrap();
-            assert_eq!(previous.edited_paragraph(&editor, &layouts), expected);
+            assert_eq!(
+                previous.edited_paragraph(&editor, &layouts),
+                expected,
+                "edit {step}"
+            );
             update_cached(&editor, &layouts, widget_id, &mut snapshot).unwrap();
             let after = snapshot.as_ref().unwrap();
-            assert_eq!(identity, Arc::as_ptr(after));
+            assert_eq!(identity, Arc::as_ptr(after), "edit {step}");
             if let Some(index) = expected {
-                assert_eq!(after.paragraphs[index].id, before[index].id);
-                for (other, (old, new)) in before.iter().zip(&after.paragraphs).enumerate() {
-                    assert_eq!(Arc::ptr_eq(old, new), other != index);
+                assert_eq!(after.paragraphs[index].id, before[index].id, "edit {step}");
+                let paragraphs = before.iter().zip(&after.paragraphs).enumerate();
+                for (other, (old, new)) in paragraphs {
+                    assert_eq!(
+                        Arc::ptr_eq(old, new),
+                        other != index,
+                        "edit {step}: only paragraph {index} is rebuilt, checking {other}"
+                    );
                 }
             }
             assert_matches_fresh(after, &editor, &layouts, widget_id);
@@ -2450,7 +2611,7 @@ mod tests {
             String::new(),
             "first second third fourth fifth".to_owned(),
             "e\u{301}".repeat(40),
-            "a 👨‍👩‍👧‍👦 b 🇺🇸🇺🇸 c 👩🏽‍💻".to_owned(),
+            "a 👨\u{200d}👩\u{200d}👧\u{200d}👦 b 🇺🇸🇺🇸 c 👩🏽\u{200d}💻".to_owned(),
             "line\nbreaks\n\nend\n".to_owned(),
             "w".repeat(30),
         ];
@@ -2510,11 +2671,15 @@ mod tests {
                 node,
                 character_index,
             };
-            assert_eq!(snapshot.decode(position), Some(Position::new(0, byte)));
+            assert_eq!(
+                snapshot.decode(position),
+                Some(Position::new(0, byte)),
+                "character {character_index}"
+            );
         }
         for (byte, character_index) in [(3, 3), (end, 5)] {
             let position = snapshot.position(Position::new(0, byte)).unwrap();
-            assert_eq!(position.character_index, character_index);
+            assert_eq!(position.character_index, character_index, "byte {byte}");
         }
         assert!(snapshot.position(Position::new(0, 4)).is_none());
 
@@ -2557,13 +2722,13 @@ mod tests {
             };
             context
                 .run_ui(input, |ui| {
-                    errors = super::super::RichTextEditor::new(editor)
+                    errors = RichTextEditor::new(editor)
                         .id(id)
                         .show(ui)
                         .accessibility_errors;
                 })
                 .drop_without_applying_deltas();
-            let cache = context.data(|data| data.get_temp::<super::super::Cache>(id));
+            let cache = context.data(|data| data.get_temp::<Cache>(id));
             (errors, cache.unwrap().accessibility.unwrap())
         };
         let (errors, first) = frame(&mut editor, vec![]);
@@ -2613,9 +2778,9 @@ mod tests {
         let mut editor = Editor::from_text("word play");
         select(&mut editor, (0, 0), (0, 2));
         editor
-            .apply_style(crate::StylePatch {
+            .apply_style(StylePatch {
                 bold: Some(true),
-                ..crate::StylePatch::default()
+                ..StylePatch::default()
             })
             .unwrap();
         let (_, snapshot) = snapshot_for(&editor, 500.0);
@@ -2644,12 +2809,12 @@ mod tests {
     #[test]
     fn soft_line_breaks_end_rows_and_publish_newlines() {
         let mut editor = Editor::from_text("a\u{2028}bc\u{2028}d\u{2028}\nnext");
-        let red = crate::Color([255, 0, 0, 255]);
+        let red = Color([255, 0, 0, 255]);
         select(&mut editor, (0, 4), (0, 5));
         editor
-            .apply_style(crate::StylePatch {
+            .apply_style(StylePatch {
                 foreground: Some(Some(red)),
-                ..crate::StylePatch::default()
+                ..StylePatch::default()
             })
             .unwrap();
         let (layouts, snapshot) = snapshot_for(&editor, 500.0);
@@ -2717,12 +2882,16 @@ mod tests {
                 node: runs[0].id.accesskit_id(),
                 character_index: 2,
             }),
-            Some((after, true))
+            Some(CaretPlacement {
+                position: after,
+                prefer_next_row: true,
+            })
         );
         for prefer_next_row in [false, true] {
             assert_eq!(
                 snapshot.focus_position(after, prefer_next_row),
-                snapshot.position(after)
+                snapshot.position(after),
+                "prefer_next_row={prefer_next_row}"
             );
         }
         let geometry = &runs[0].geometry;
@@ -2740,7 +2909,7 @@ mod tests {
         assert_matches_fresh(&snapshot, &editor, &layouts, Id::unique("editor"));
 
         let context = egui::Context::default();
-        let mut cache = super::super::Cache::default();
+        let mut cache = Cache::default();
         let widget_id = Id::unique("editor");
         let mut published = None;
         for edit in 0..3 {
@@ -2770,9 +2939,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = context.run_ui(input, |ui| {
-            super::super::RichTextEditor::new(&mut editor)
-                .id(id)
-                .show(ui);
+            RichTextEditor::new(&mut editor).id(id).show(ui);
         });
         let update = output.platform_output.accesskit_update.take().unwrap();
         output.drop_without_applying_deltas();
@@ -2808,16 +2975,12 @@ mod tests {
             ..Default::default()
         };
         let mut output = context.run_ui(input, |ui| {
-            super::super::RichTextEditor::new(&mut editor)
-                .id(id)
-                .show(ui);
+            RichTextEditor::new(&mut editor).id(id).show(ui);
         });
         let update = output.platform_output.accesskit_update.take().unwrap();
         output.drop_without_applying_deltas();
         let nodes: HashMap<_, _> = update.nodes.iter().cloned().collect();
-        let cache = context
-            .data(|data| data.get_temp::<super::super::Cache>(id))
-            .unwrap();
+        let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
         let snapshot = cache.accessibility.unwrap();
         let paragraph = |index: usize| snapshot.paragraphs[index].id.accesskit_id();
         let children = nodes[&id.accesskit_id()].children();
@@ -2830,11 +2993,17 @@ mod tests {
             assert_eq!(node.children(), members);
             let bounds = node.bounds().unwrap();
             for member in members {
-                let member = &nodes[&member];
-                assert_eq!(member.role(), accesskit::Role::Paragraph);
-                let inner = member.bounds().unwrap();
-                assert!(bounds.x0 < inner.x0 && bounds.y0 <= inner.y0);
-                assert!(bounds.x1 >= inner.x1 && bounds.y1 >= inner.y1);
+                let member_node = &nodes[&member];
+                assert_eq!(member_node.role(), accesskit::Role::Paragraph, "{member:?}");
+                let inner = member_node.bounds().unwrap();
+                assert!(
+                    bounds.x0 < inner.x0 && bounds.y0 <= inner.y0,
+                    "the quote's bar extends {member:?} to the left"
+                );
+                assert!(
+                    bounds.x1 >= inner.x1 && bounds.y1 >= inner.y1,
+                    "the quote contains {member:?}"
+                );
             }
         }
 
@@ -2880,27 +3049,33 @@ mod tests {
         assert_eq!(snapshot.focus_position(seam, true), Some(lower));
         assert_eq!(snapshot.focus_position(seam, false), Some(upper));
         assert_eq!(snapshot.decode(upper), Some(seam));
-        assert_eq!(snapshot.decode_focus(upper), Some((seam, false)));
-        assert_eq!(snapshot.decode_focus(lower), Some((seam, true)));
+        let placement = |prefer_next_row| CaretPlacement {
+            position: seam,
+            prefer_next_row,
+        };
+        assert_eq!(snapshot.decode_focus(upper), Some(placement(false)));
+        assert_eq!(snapshot.decode_focus(lower), Some(placement(true)));
         for position in [Position::new(0, 1), Position::new(0, text.len())] {
             assert_eq!(
                 snapshot.focus_position(position, false),
-                snapshot.position(position)
+                snapshot.position(position),
+                "{position:?} is not at a seam"
             );
         }
 
         editor
-            .set_selection(crate::Selection::new(Position::default(), seam))
+            .set_selection(Selection::new(Position::default(), seam))
             .unwrap();
         for (prefer_next_row, focus) in [(true, lower), (false, upper)] {
             let nodes = published_nodes(&editor, &snapshot, &layouts, prefer_next_row);
             let selection = nodes[&Id::unique("editor").accesskit_id()]
                 .text_selection()
                 .unwrap();
-            assert_eq!(selection.focus, focus);
+            assert_eq!(selection.focus, focus, "prefer_next_row={prefer_next_row}");
             assert_eq!(
                 selection.anchor,
-                snapshot.position(Position::default()).unwrap()
+                snapshot.position(Position::default()).unwrap(),
+                "prefer_next_row={prefer_next_row}"
             );
         }
     }
@@ -2912,14 +3087,18 @@ mod tests {
         let runs = &snapshot.paragraphs[0].runs;
         assert_ne!(runs[0].row, runs[1].row);
         let seam = Position::new(0, runs[1].range.start);
-        editor.set_selection(crate::Selection::caret(seam)).unwrap();
+        editor.set_selection(Selection::caret(seam)).unwrap();
         for prefer_next_row in [true, false] {
             let nodes = published_nodes(&editor, &snapshot, &layouts, prefer_next_row);
             let selection = nodes[&Id::unique("editor").accesskit_id()]
                 .text_selection()
                 .unwrap();
             let caret = snapshot.focus_position(seam, prefer_next_row).unwrap();
-            assert_eq!((selection.anchor, selection.focus), (caret, caret));
+            assert_eq!(
+                (selection.anchor, selection.focus),
+                (caret, caret),
+                "prefer_next_row={prefer_next_row}"
+            );
         }
     }
 
@@ -2937,7 +3116,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = context.run_ui(input, |ui| {
-                let output = super::super::RichTextEditor::new(&mut editor)
+                let output = RichTextEditor::new(&mut editor)
                     .id(id)
                     .desired_width(120.0)
                     .min_rows(1)
@@ -2951,11 +3130,11 @@ mod tests {
             (rect, update)
         };
         let (rect, _) = run_frame(vec![]);
-        let cache = context.data(|data| data.get_temp::<super::super::Cache>(id));
+        let cache = context.data(|data| data.get_temp::<Cache>(id));
         let layout = cache.unwrap().layout.layouts.get(0).unwrap();
         let row = &layout.galley.rows[0];
         let pointer = rect.min
-            + egui::Vec2::splat(super::super::PADDING)
+            + egui::Vec2::splat(PADDING)
             + layout.rect.min.to_vec2()
             + egui::vec2(row.rect().right() + 1.0, row.rect().center().y);
         let click = |pressed| egui::Event::PointerButton {
@@ -2968,7 +3147,7 @@ mod tests {
         let (_, update) = run_frame(vec![click(false)]);
         let nodes: HashMap<_, _> = update.unwrap().nodes.into_iter().collect();
         let focus = nodes[&id.accesskit_id()].text_selection().unwrap().focus;
-        let cache = context.data(|data| data.get_temp::<super::super::Cache>(id));
+        let cache = context.data(|data| data.get_temp::<Cache>(id));
         let snapshot = cache.unwrap().accessibility.unwrap();
         let first_row = &snapshot.paragraphs[0].runs[0];
         assert_eq!(focus.node, first_row.id.accesskit_id());
@@ -3035,7 +3214,13 @@ mod tests {
             start: None,
         };
         let bullet = |indent| ParagraphKind::Bullet { indent };
-        let positions = |kinds: &[ParagraphKind]| list_positions(kinds.iter().copied());
+        // Each item's position in its set and the set's size.
+        let positions = |kinds: &[ParagraphKind]| -> Vec<Option<(usize, usize)>> {
+            let items = list_positions(kinds.iter().copied()).into_iter();
+            items
+                .map(|item| item.map(|item| (item.position_in_set, item.size_of_set)))
+                .collect()
+        };
         assert_eq!(
             positions(&[ordered(0), ordered(1), ordered(0)]),
             [Some((1, 2)), Some((1, 1)), Some((2, 2))]
@@ -3127,15 +3312,15 @@ mod tests {
         let mut editor = Editor::from_text("no fill yellow code");
         select(&mut editor, (0, 8), (0, 19));
         editor
-            .apply_style(crate::StylePatch {
-                background: Some(Some(crate::Color::YELLOW)),
+            .apply_style(StylePatch {
+                background: Some(Some(Color::YELLOW)),
                 ..Default::default()
             })
             .unwrap();
-        let fill = crate::Color([0, 112, 192, 128]);
+        let fill = Color([0, 112, 192, 128]);
         select(&mut editor, (0, 15), (0, 19));
         editor
-            .apply_style(crate::StylePatch {
+            .apply_style(StylePatch {
                 code: Some(true),
                 background: Some(Some(fill)),
                 ..Default::default()
@@ -3151,7 +3336,7 @@ mod tests {
                 (run.range.clone(), node.background_color())
             })
             .collect();
-        let color = |crate::Color([red, green, blue, alpha])| accesskit::Color {
+        let color = |Color([red, green, blue, alpha])| accesskit::Color {
             red,
             green,
             blue,
@@ -3161,7 +3346,7 @@ mod tests {
             runs,
             [
                 (0..8, None),
-                (8..15, Some(color(crate::Color::YELLOW))),
+                (8..15, Some(color(Color::YELLOW))),
                 (15..19, Some(color(fill))),
             ]
         );
@@ -3170,9 +3355,9 @@ mod tests {
     #[test]
     fn formatted_runs_keep_their_colors_and_fonts_across_wraps_and_soft_breaks() {
         let colors = [
-            Some(crate::Color([255, 0, 0, 255])),
+            Some(Color([255, 0, 0, 255])),
             None,
-            Some(crate::Color([0, 0, 255, 255])),
+            Some(Color([0, 0, 255, 255])),
         ];
         let text = "e\u{301}猫\u{2028}".repeat(64);
         let spans = text
@@ -3188,12 +3373,16 @@ mod tests {
                 link: None,
             })
             .collect();
-        let paragraph = Paragraph::new(&text, spans, ParagraphKind::Heading { level: 2 }).unwrap();
-        let editor = Editor::new(crate::Document::from_paragraphs([paragraph]));
+        let paragraph =
+            Paragraph::try_new(&text, spans, ParagraphKind::Heading { level: 2 }).unwrap();
+        let editor = Editor::new(Document::from_paragraphs([paragraph]));
         for width in [8.0, 500.0] {
             let (_, snapshot) = snapshot_for(&editor, width);
             let paragraph = &snapshot.paragraphs[0];
-            assert!(paragraph.runs.last().unwrap().range.is_empty());
+            assert!(
+                paragraph.runs.last().unwrap().range.is_empty(),
+                "width {width}"
+            );
             for run in paragraph.runs.iter() {
                 let style = paragraph
                     .source
@@ -3202,8 +3391,7 @@ mod tests {
                     .find(|span| span.range.contains(&run.range.start))
                     .unwrap_or_else(|| paragraph.source.spans().last().unwrap())
                     .style;
-                let crate::Color([red, green, blue, alpha]) =
-                    style.foreground.unwrap_or(crate::Color([255; 4]));
+                let Color([red, green, blue, alpha]) = style.foreground.unwrap_or(Color([255; 4]));
                 assert_eq!(
                     run.node.foreground_color(),
                     Some(accesskit::Color {
@@ -3215,28 +3403,38 @@ mod tests {
                     "width {width}, range {:?}",
                     run.range,
                 );
-                assert_eq!(run.node.font_size(), Some(24.0));
-                assert_eq!(run.node.font_family(), style.code.then_some("monospace"));
+                assert_eq!(
+                    run.node.font_size(),
+                    Some(24.0),
+                    "width {width}, range {:?}",
+                    run.range
+                );
+                assert_eq!(
+                    run.node.font_family(),
+                    style.code.then_some("monospace"),
+                    "width {width}, range {:?}",
+                    run.range
+                );
             }
         }
     }
 
     #[test]
     fn links_publish_link_nodes_around_their_runs_for_platform_adapters() {
-        let docs = Link::new("https://example.com/docs").unwrap();
+        let docs = Link::try_new("https://example.com/docs").unwrap();
         let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line");
         select(&mut editor, (0, 5), (0, 19));
         editor.set_link(Some(docs.clone())).unwrap();
         select(&mut editor, (0, 9), (0, 13));
         editor
-            .apply_style(crate::StylePatch {
+            .apply_style(StylePatch {
                 bold: Some(true),
                 ..Default::default()
             })
             .unwrap();
         select(&mut editor, (1, 5), (1, 9));
         editor
-            .set_link(Some(Link::new("https://b.example").unwrap()))
+            .set_link(Some(Link::try_new("https://b.example").unwrap()))
             .unwrap();
         select(&mut editor, (0, 11), (0, 11));
         let (layouts, snapshot) = snapshot_for(&editor, 500.0);
@@ -3264,9 +3462,17 @@ mod tests {
         );
         let bounds = node.bounds().unwrap();
         for run in &paragraph.runs[link.runs.clone()] {
-            let run = nodes[&run.id.accesskit_id()].bounds().unwrap();
-            assert!(bounds.x0 <= run.x0 && run.x1 <= bounds.x1);
-            assert!(bounds.y0 <= run.y0 && run.y1 <= bounds.y1);
+            let run_bounds = nodes[&run.id.accesskit_id()].bounds().unwrap();
+            assert!(
+                bounds.x0 <= run_bounds.x0 && run_bounds.x1 <= bounds.x1,
+                "the link contains run {:?}",
+                run.range
+            );
+            assert!(
+                bounds.y0 <= run_bounds.y0 && run_bounds.y1 <= bounds.y1,
+                "the link contains run {:?}",
+                run.range
+            );
         }
         assert_eq!(
             nodes[&paragraph.id.accesskit_id()].children(),
@@ -3299,9 +3505,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                super::super::RichTextEditor::new(&mut editor)
-                    .id(id)
-                    .show(ui);
+                RichTextEditor::new(&mut editor).id(id).show(ui);
             },
         );
         let update = output.platform_output.accesskit_update.take().unwrap();

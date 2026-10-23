@@ -1,3 +1,8 @@
+//! Tests the AccessKit tree that `AccessKitAdapter` publishes by reading it
+//! back through `accesskit_consumer`: text, lines, word and paragraph
+//! navigation, formatting runs, links, blockquotes, selection actions, and
+//! incremental updates that stay consistent with the editor.
+
 #![cfg(feature = "accesskit")]
 
 use std::ops::Range;
@@ -7,13 +12,12 @@ use accesskit::{
     TreeInfo as TreeData, TreeUpdate, Uuid,
 };
 use accesskit_consumer::{
-    FilterResult, NodeRef as Node, TextRangePropertyValue, Tree, TreeChangeHandler, common_filter,
+    FilterResult, NodeRef as Node, TextRangePropertyValue, Tree, TreeChangeHandler,
 };
-use textloom::{
-    Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch,
-    accessibility::AccessKitAdapter,
-};
+use textloom::accessibility::{AccessKitAdapter, AccessKitError, Focus};
+use textloom::{Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch};
 
+/// A tree change handler for updates whose individual changes the tests don't inspect.
 struct Ignore;
 
 impl TreeChangeHandler for Ignore {
@@ -32,15 +36,17 @@ fn text_input<'a>(tree: &'a Tree, adapter: &AccessKitAdapter) -> Node<'a> {
 fn bold(editor: &mut Editor, range: Range<Position>) {
     editor
         .set_selection(Selection::new(range.start, range.end))
-        .unwrap();
+        .expect("callers pass a range between grapheme boundaries of the document");
     editor
         .apply_style(StylePatch {
             bold: Some(true),
             ..StylePatch::default()
         })
-        .unwrap();
+        .expect("no IME composition is active");
 }
 
+/// Returns the offset of `position` in the document's plain text, in Unicode
+/// scalar values, which is how AccessKit addresses text.
 fn scalar_index(editor: &Editor, position: Position) -> usize {
     let paragraphs = editor.document().paragraphs();
     paragraphs[..position.paragraph]
@@ -69,7 +75,10 @@ fn styled_runs_share_their_paragraph_line() {
         .set_selection(Selection::caret(Position::new(0, 6)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(adapter.text_runs(0).count(), 3);
     let node = text_input(&tree, &adapter);
     assert_eq!(
@@ -98,7 +107,10 @@ fn fills_are_formatting_boundaries_that_ranges_report() {
         })
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     let yellow = accesskit::Color {
         red: 255,
@@ -131,7 +143,10 @@ fn fills_are_formatting_boundaries_that_ranges_report() {
             ..StylePatch::default()
         })
         .unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter)
             .document_range()
@@ -144,7 +159,10 @@ fn fills_are_formatting_boundaries_that_ranges_report() {
 fn word_navigation_follows_editor_words() {
     let editor = Editor::from_text("Hello world again\nsecond");
     let mut adapter = AccessKitAdapter::default();
-    let tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     let mut position = node.document_start();
     let mut ends = Vec::new();
@@ -160,13 +178,16 @@ fn word_navigation_follows_editor_words() {
 #[test]
 fn word_starts_match_editor_words_across_long_runs() {
     let mut editor = Editor::from_text(&format!(
-        "{}\n  h\u{e9}llo, w\u{f6}rld 👩‍💻 x\n{} tail\n",
+        "{}\n  h\u{e9}llo, w\u{f6}rld 👩\u{200d}💻 x\n{} tail\n",
         "ab, cd ".repeat(100),
         "\u{e9}".repeat(300)
     ));
     bold(&mut editor, Position::new(0, 8)..Position::new(0, 400));
     let mut adapter = AccessKitAdapter::default();
-    let tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(node.document_range().text(), editor.document().plain_text());
     let document_end = node.document_range().text().chars().count();
@@ -215,35 +236,47 @@ fn word_starts_match_editor_words_across_long_runs() {
 fn invalidated_adapters_reinitialize_platform_trees() {
     let mut editor = Editor::from_text("Hello\nworld");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
-    let incremental = adapter.update(&editor, "Notes", true).unwrap();
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
+    let incremental = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
     assert!(incremental.tree.is_none() && incremental.nodes.is_empty());
 
     adapter.invalidate();
-    let restarted = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let restarted = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(
         text_input(&restarted, &adapter).document_range().text(),
         "Hello\nworld"
     );
     assert!(
         adapter
-            .update(&editor, "Notes", true)
+            .update(&editor, "Notes", Focus::Focused)
             .unwrap()
             .nodes
             .is_empty()
     );
 
     editor.insert_text("> ").unwrap();
-    let _discarded = adapter.update(&editor, "Notes", true).unwrap();
+    let _discarded = adapter.update(&editor, "Notes", Focus::Focused).unwrap();
     editor.insert_paragraph().unwrap();
     adapter.invalidate();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter).document_range().text(),
         editor.document().plain_text()
     );
     editor.insert_text("more").unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter).document_range().text(),
         editor.document().plain_text()
@@ -254,14 +287,20 @@ fn invalidated_adapters_reinitialize_platform_trees() {
 fn oversized_graphemes_keep_the_tree_accessible() {
     let mut editor = Editor::from_text("first\nmiddle\nlast");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     editor
         .set_selection(Selection::caret(Position::new(1, 3)))
         .unwrap();
     editor
         .insert_text(&format!("x{}", "\u{301}".repeat(200)))
         .unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(node.document_range().text(), editor.document().plain_text());
     assert_eq!(
@@ -286,7 +325,10 @@ fn oversized_graphemes_keep_the_tree_accessible() {
             .changed
     );
     assert_eq!(editor.selection(), Selection::caret(Position::new(1, 3)));
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         text_input(&tree, &adapter)
             .text_selection_focus()
@@ -314,7 +356,10 @@ fn grafted_subtrees_are_transparent_in_the_host_tree() {
     );
     let editor = Editor::from_text("grafted");
     let mut adapter = AccessKitAdapter::default().with_tree_id(subtree);
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     let state = tree.state();
     let input = state
         .node_by_tree_local_id(adapter.editor_node(), subtree)
@@ -326,7 +371,7 @@ fn grafted_subtrees_are_transparent_in_the_host_tree() {
             if node.role() == Role::Window && node.id() != state.root_id() {
                 FilterResult::Include
             } else {
-                common_filter(node)
+                accesskit_consumer::common_filter(node)
             }
         })
         .map(|node| node.role())
@@ -338,7 +383,10 @@ fn grafted_subtrees_are_transparent_in_the_host_tree() {
 fn consumer_tracks_the_editor_through_incremental_updates() {
     let mut editor = Editor::from_text("alpha beta\ngamma\n\ndelta");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let mut seed = 0x1234_5678_9abc_def0_u64;
     let mut random = |limit: usize| {
         seed ^= seed << 13;
@@ -362,7 +410,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
             2 => editor.insert_paragraph(),
             3 => editor.delete_backward(),
             4 => editor.delete_forward(),
-            5 => editor.insert_text("é👩‍💻 q\nr\u{2028}\n"),
+            5 => editor.insert_text("é👩\u{200d}💻 q\nr\u{2028}\n"),
             11 => editor.insert_line_break(),
             6 => {
                 editor.undo();
@@ -394,7 +442,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
                 let end = Position::new(index, end);
                 let _ = editor.set_selection(Selection::new(caret.min(end), caret.max(end)));
                 let link = ["https://a.example", "https://b.example"][random(2)];
-                editor.set_link((random(3) != 0).then(|| Link::new(link).unwrap()))
+                editor.set_link((random(3) != 0).then(|| Link::try_new(link).unwrap()))
             }
             _ => editor.delete_word_backward(),
         };
@@ -405,7 +453,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
             adapter.invalidate();
         }
         tree.update_and_process_changes(
-            adapter.update(&editor, "Notes", true).unwrap(),
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
             &mut Ignore,
         );
         let node = text_input(&tree, &adapter);
@@ -453,7 +501,7 @@ fn consumer_tracks_the_editor_through_incremental_updates() {
             let focus = editor.selection().focus;
             assert!(scalar_index(&editor, focus) <= expected, "step {step}");
             assert_eq!(
-                adapter.to_text_position(&editor, focus).map(|_| ()),
+                adapter.text_position(&editor, focus).map(|_| ()),
                 Ok(()),
                 "step {step}"
             );
@@ -469,7 +517,10 @@ fn soft_line_breaks_are_lines_within_one_paragraph() {
         .set_selection(Selection::caret(Position::new(0, 8)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(node.document_range().text(), "Hello\n  world\n\nnext");
     assert_eq!(node.document_range().text(), editor.document().plain_text());
@@ -496,12 +547,16 @@ fn soft_line_breaks_are_lines_within_one_paragraph() {
         let position = Position::new(0, paragraph.byte_from_grapheme(grapheme).unwrap());
         editor.set_selection(Selection::caret(position)).unwrap();
         tree.update_and_process_changes(
-            adapter.update(&editor, "Notes", true).unwrap(),
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
             &mut Ignore,
         );
         let node = text_input(&tree, &adapter);
         let focus = node.text_selection_focus().unwrap();
-        assert_eq!(focus.to_global_usv_index(), scalar_index(&editor, position));
+        assert_eq!(
+            focus.to_global_usv_index(),
+            scalar_index(&editor, position),
+            "grapheme {grapheme}"
+        );
         let raw = node
             .text_position_from_global_usv_index(scalar_index(&editor, position))
             .unwrap()
@@ -521,7 +576,7 @@ fn soft_line_breaks_are_lines_within_one_paragraph() {
                 &mut editor,
             )
             .unwrap();
-        assert_eq!(editor.selection().focus, position, "{grapheme}");
+        assert_eq!(editor.selection().focus, position, "grapheme {grapheme}");
     }
 
     let node = text_input(&tree, &adapter);
@@ -531,22 +586,44 @@ fn soft_line_breaks_are_lines_within_one_paragraph() {
     assert_eq!(world.backward_to_word_start().to_global_usv_index(), 6);
 }
 
-fn link_nodes(node: Node<'_>) -> Vec<(String, String, String)> {
+/// A published link node, as read back from the AccessKit tree.
+#[derive(Debug, PartialEq)]
+struct LinkNode {
+    url: String,
+    label: String,
+    /// The concatenated values of the link's text runs.
+    text: String,
+}
+
+/// Returns the link nodes below `node`, in tree order.
+fn link_nodes(node: Node<'_>) -> Vec<LinkNode> {
     let mut links = Vec::new();
     for child in node.children() {
         if child.role() == Role::Link {
             let text = child
                 .children()
                 .map(|run| {
-                    assert_eq!(run.role(), Role::TextRun);
-                    run.data().value().unwrap().to_owned()
+                    assert_eq!(
+                        run.role(),
+                        Role::TextRun,
+                        "link children should be text runs"
+                    );
+                    run.data()
+                        .value()
+                        .expect("the adapter gives every text run a value")
+                        .to_owned()
                 })
                 .collect();
-            links.push((
-                child.url().unwrap().to_owned(),
-                child.label().unwrap(),
+            links.push(LinkNode {
+                url: child
+                    .url()
+                    .expect("the adapter gives every link node a URL")
+                    .to_owned(),
+                label: child
+                    .label()
+                    .expect("the adapter labels every link node with its text"),
                 text,
-            ));
+            });
         } else {
             links.extend(link_nodes(child));
         }
@@ -556,7 +633,7 @@ fn link_nodes(node: Node<'_>) -> Vec<(String, String, String)> {
 
 #[test]
 fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
-    let docs = Link::new("https://example.com/docs").unwrap();
+    let docs = Link::try_new("https://example.com/docs").unwrap();
     let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line");
     editor
         .set_selection(Selection::new(Position::new(0, 5), Position::new(0, 19)))
@@ -567,27 +644,30 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .set_selection(Selection::new(Position::new(1, 5), Position::new(1, 9)))
         .unwrap();
     editor
-        .set_link(Some(Link::new("https://b.example").unwrap()))
+        .set_link(Some(Link::try_new("https://b.example").unwrap()))
         .unwrap();
     editor
         .set_selection(Selection::caret(Position::new(0, 11)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(
         link_nodes(node),
         [
-            (
-                docs.to_string(),
-                "the docs now".to_owned(),
-                "the docs\nnow".to_owned()
-            ),
-            (
-                "https://b.example".to_owned(),
-                "line".to_owned(),
-                "line".to_owned()
-            ),
+            LinkNode {
+                url: docs.to_string(),
+                label: "the docs now".to_owned(),
+                text: "the docs\nnow".to_owned(),
+            },
+            LinkNode {
+                url: "https://b.example".to_owned(),
+                label: "line".to_owned(),
+                text: "line".to_owned(),
+            },
         ]
     );
     let link = node
@@ -595,8 +675,11 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .flat_map(|paragraph| paragraph.children())
         .find(|child| child.role() == Role::Link)
         .unwrap();
-    assert!(link.is_clickable(&common_filter));
-    assert_eq!(common_filter(&link), FilterResult::Include);
+    assert!(link.is_clickable(&accesskit_consumer::common_filter));
+    assert_eq!(
+        accesskit_consumer::common_filter(&link),
+        FilterResult::Include
+    );
 
     assert_eq!(node.document_range().text(), editor.document().plain_text());
     let lines: Vec<_> = (0..3)
@@ -639,7 +722,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
             .unwrap();
         assert_eq!(editor.selection().focus, Position::new(0, byte), "{byte}");
     }
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
 
     let (link_id, _) = text_input(&tree, &adapter)
         .children()
@@ -647,7 +733,10 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
         .find(|child| child.role() == Role::Link)
         .unwrap()
         .locate();
-    assert_eq!(adapter.locate_link(link_id), Some((0, 5..19)));
+    assert_eq!(
+        adapter.locate_link(link_id),
+        Some(Position::new(0, 5)..Position::new(0, 19))
+    );
     assert_eq!(adapter.locate_link(adapter.editor_node()), None);
     let click = ActionRequest {
         action: Action::Click,
@@ -660,9 +749,13 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
     for read_only in [false, true] {
         adapter.set_read_only(read_only, &mut editor);
         let outcome = adapter.handle_action(&click, &mut editor).unwrap();
-        assert!(outcome.handled);
-        assert!(!outcome.changed);
-        assert_eq!(outcome.activated_link, Some(docs.clone()));
+        assert!(outcome.handled, "read_only {read_only}");
+        assert!(!outcome.changed, "read_only {read_only}");
+        assert_eq!(
+            outcome.activated_link,
+            Some(docs.clone()),
+            "read_only {read_only}"
+        );
     }
     assert_eq!(editor.document().revision(), revision);
     assert_eq!(editor.selection(), selection);
@@ -682,9 +775,12 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
     editor.set_link(None).unwrap();
     assert!(matches!(
         adapter.handle_action(&click, &mut editor),
-        Err(textloom::accessibility::AccessKitError::StaleDocument)
+        Err(AccessKitError::StaleDocument)
     ));
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     let node = text_input(&tree, &adapter);
     assert_eq!(link_nodes(node).len(), 1);
     assert_eq!(node.document_range().text(), editor.document().plain_text());
@@ -694,7 +790,18 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
     assert!(!outcome.handled);
 }
 
-fn blocks(tree: &Tree, adapter: &AccessKitAdapter, editor: &Editor) -> Vec<(bool, Vec<usize>)> {
+/// A child of the text input node: a paragraph, or a blockquote around
+/// consecutive quote paragraphs.
+#[derive(Debug, PartialEq)]
+enum Block {
+    /// The index of a paragraph outside any quote.
+    Paragraph(usize),
+    /// The indices of the paragraphs inside one blockquote.
+    Quote(Vec<usize>),
+}
+
+/// Returns the blocks published under the text input node, in tree order.
+fn blocks(tree: &Tree, adapter: &AccessKitAdapter, editor: &Editor) -> Vec<Block> {
     let paragraphs = editor.document().paragraphs().len();
     let index = |id: NodeId| {
         (0..paragraphs)
@@ -707,48 +814,75 @@ fn blocks(tree: &Tree, adapter: &AccessKitAdapter, editor: &Editor) -> Vec<(bool
         .children()
         .iter()
         .map(|&id| {
-            let node = state.node_by_tree_local_id(id, TreeId::ROOT).unwrap();
+            let node = state
+                .node_by_tree_local_id(id, TreeId::ROOT)
+                .expect("every child of the text input is in the tree");
             if node.role() != Role::Blockquote {
-                return (false, vec![index(id)]);
+                return Block::Paragraph(index(id));
             }
             let children = node.data().children();
-            assert!(!children.is_empty());
+            assert!(
+                !children.is_empty(),
+                "a blockquote should contain at least one paragraph"
+            );
             let members = children
                 .iter()
                 .map(|&child| {
-                    let paragraph = state.node_by_tree_local_id(child, TreeId::ROOT).unwrap();
-                    assert_eq!(paragraph.role(), Role::Paragraph);
-                    assert_eq!(paragraph.parent_id(), Some(node.id()));
+                    let paragraph = state
+                        .node_by_tree_local_id(child, TreeId::ROOT)
+                        .expect("every child of a blockquote is in the tree");
+                    assert_eq!(
+                        paragraph.role(),
+                        Role::Paragraph,
+                        "blockquotes should contain only paragraphs"
+                    );
+                    assert_eq!(
+                        paragraph.parent_id(),
+                        Some(node.id()),
+                        "a quoted paragraph's parent should be its blockquote"
+                    );
                     index(child)
                 })
                 .collect();
-            (true, members)
+            Block::Quote(members)
         })
         .collect()
 }
 
-fn expected_blocks(editor: &Editor) -> Vec<(bool, Vec<usize>)> {
-    let mut blocks: Vec<(bool, Vec<usize>)> = Vec::new();
-    let mut quoting = false;
+/// Returns the blocks that the paragraph kinds of `editor`'s document call for.
+fn expected_blocks(editor: &Editor) -> Vec<Block> {
+    let mut blocks = Vec::new();
     for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
-        let quote = paragraph.kind() == ParagraphKind::Quote;
-        if quote && quoting {
-            blocks.last_mut().unwrap().1.push(index);
+        if paragraph.kind() != ParagraphKind::Quote {
+            blocks.push(Block::Paragraph(index));
+        } else if let Some(Block::Quote(members)) = blocks.last_mut() {
+            members.push(index);
         } else {
-            blocks.push((quote, vec![index]));
+            blocks.push(Block::Quote(vec![index]));
         }
-        quoting = quote;
     }
     blocks
 }
 
+/// Returns the ID of the blockquote that holds paragraph `index`.
 fn container(tree: &Tree, adapter: &AccessKitAdapter, index: usize) -> NodeId {
     let paragraph = tree
         .state()
-        .node_by_tree_local_id(adapter.paragraph_node(index).unwrap(), TreeId::ROOT)
-        .unwrap();
-    let parent = paragraph.parent().unwrap();
-    assert_eq!(parent.role(), Role::Blockquote);
+        .node_by_tree_local_id(
+            adapter
+                .paragraph_node(index)
+                .expect("callers pass the index of a published paragraph"),
+            TreeId::ROOT,
+        )
+        .expect("published paragraphs are in the tree");
+    let parent = paragraph
+        .parent()
+        .expect("every paragraph is inside the text input or a blockquote");
+    assert_eq!(
+        parent.role(),
+        Role::Blockquote,
+        "paragraph {index} should be quoted"
+    );
     *text_input(tree, adapter)
         .data()
         .children()
@@ -756,11 +890,11 @@ fn container(tree: &Tree, adapter: &AccessKitAdapter, index: usize) -> NodeId {
         .find(|&&id| {
             tree.state()
                 .node_by_tree_local_id(id, TreeId::ROOT)
-                .unwrap()
+                .expect("every child of the text input is in the tree")
                 .id()
                 == parent.id()
         })
-        .unwrap()
+        .expect("a blockquote is a child of the text input")
 }
 
 #[test]
@@ -785,14 +919,17 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(1, 4)))
         .unwrap();
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(
         blocks(&tree, &adapter, &editor),
         [
-            (false, vec![0]),
-            (true, vec![1, 2]),
-            (false, vec![3]),
-            (true, vec![4])
+            Block::Paragraph(0),
+            Block::Quote(vec![1, 2]),
+            Block::Paragraph(3),
+            Block::Quote(vec![4])
         ]
     );
     let node = text_input(&tree, &adapter);
@@ -840,7 +977,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(1, 0)))
         .unwrap();
     editor.insert_text("x").unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(container(&tree, &adapter, 1), first);
     assert_eq!(container(&tree, &adapter, 2), first);
     let last = container(&tree, &adapter, 4);
@@ -850,10 +990,13 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(3, 0)))
         .unwrap();
     editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         blocks(&tree, &adapter, &editor),
-        [(false, vec![0]), (true, vec![1, 2, 3, 4])]
+        [Block::Paragraph(0), Block::Quote(vec![1, 2, 3, 4])]
     );
     assert_eq!(container(&tree, &adapter, 4), first);
     assert!(
@@ -870,24 +1013,33 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
         .set_selection(Selection::caret(Position::new(2, 0)))
         .unwrap();
     editor.delete_backward().unwrap();
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(
         blocks(&tree, &adapter, &editor),
         [
-            (false, vec![0]),
-            (true, vec![1]),
-            (false, vec![2]),
-            (true, vec![3, 4])
+            Block::Paragraph(0),
+            Block::Quote(vec![1]),
+            Block::Paragraph(2),
+            Block::Quote(vec![3, 4])
         ]
     );
     assert_eq!(container(&tree, &adapter, 1), first);
     assert!(editor.undo());
-    tree.update_and_process_changes(adapter.update(&editor, "Notes", true).unwrap(), &mut Ignore);
+    tree.update_and_process_changes(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        &mut Ignore,
+    );
     assert_eq!(blocks(&tree, &adapter, &editor), expected_blocks(&editor));
     assert_eq!(container(&tree, &adapter, 4), first);
 
     adapter.invalidate();
-    let restarted = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let restarted = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     assert_eq!(
         blocks(&restarted, &adapter, &editor),
         expected_blocks(&editor)
@@ -902,7 +1054,10 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
 fn consumer_tracks_blockquote_containers_through_incremental_updates() {
     let mut editor = Editor::from_text("alpha\nbeta\ngamma\ndelta\nepsilon");
     let mut adapter = AccessKitAdapter::default();
-    let mut tree = Tree::new(adapter.update(&editor, "Notes", true).unwrap(), true);
+    let mut tree = Tree::new(
+        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        true,
+    );
     let mut seed = 0x0dd5_eed5_ba5e_ba11_u64;
     let mut random = |limit: usize| {
         seed ^= seed << 13;
@@ -955,7 +1110,7 @@ fn consumer_tracks_blockquote_containers_through_incremental_updates() {
             adapter.invalidate();
         }
         tree.update_and_process_changes(
-            adapter.update(&editor, "Notes", true).unwrap(),
+            adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
             &mut Ignore,
         );
         assert_eq!(

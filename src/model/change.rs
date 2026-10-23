@@ -1,11 +1,13 @@
-use std::{
-    cell::OnceCell,
-    collections::{HashMap, HashSet},
-    ops::Range,
-    sync::{Arc, OnceLock},
-};
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+use std::cell::Cell;
+use std::cell::OnceCell;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
+use std::{iter, mem};
 
 use super::{Document, Paragraph};
+use crate::Link;
 
 #[cfg(any(feature = "egui", feature = "accesskit"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,20 +23,30 @@ pub(super) struct LastChange {
     paragraphs: ParagraphChange,
 }
 
+/// Which way [`Document::replay`] applies a [`Delta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// Restores the paragraphs the delta replaced.
+    Undo,
+    /// Reapplies the delta's replacement paragraphs.
+    Redo,
+}
+
 impl Document {
-    pub(crate) fn replay(&mut self, delta: &Delta, forward: bool) {
+    pub(crate) fn replay(&mut self, delta: &Delta, step: Replay) {
+        let forward = step == Replay::Redo;
         if delta.is_empty() {
             return;
         }
         if !delta.rest.is_empty() {
-            count_sparse(1);
+            count_sparse(SparsePath::Replayed);
         }
-        let (old_len, new_len) = delta.extent();
+        let extent = delta.extent();
         self.apply(delta, forward);
         if forward {
-            self.record_change(delta.start, old_len, new_len);
+            self.record_change(delta.start, extent.before, extent.after);
         } else {
-            self.record_change(delta.start, new_len, old_len);
+            self.record_change(delta.start, extent.after, extent.before);
         }
     }
 
@@ -45,7 +57,7 @@ impl Document {
                 .all(|splice| splice.before.len() == splice.after.len())
         {
             for splice in delta.splices() {
-                let (remove, insert) = splice.sides(forward);
+                let Sides { remove, insert } = splice.sides(forward);
                 debug_assert_eq!(
                     self.paragraphs
                         .get(splice.start..splice.start + remove.len()),
@@ -60,12 +72,12 @@ impl Document {
             }
             return;
         }
-        count_sparse(2);
+        count_sparse(SparsePath::ShiftedTail);
         // Splicing each run in place would shift the tail once per run.
         let mut tail = self.paragraphs.split_off(delta.start).into_iter();
         let mut end = delta.start;
         for splice in delta.splices() {
-            let (remove, insert) = splice.sides(forward);
+            let Sides { remove, insert } = splice.sides(forward);
             self.paragraphs
                 .extend(tail.by_ref().take(splice.start - end));
             for expected in remove {
@@ -106,14 +118,14 @@ impl Document {
         let new_len = after.len();
         let runs = changed_runs(&self.paragraphs[start..end], &after);
         let delta = if runs.len() > 1 {
-            count_sparse(0);
-            let mut splices = runs.into_iter().map(|(old, new)| Delta {
-                start: start + new.start,
-                before: self.paragraphs[start + old.start..start + old.end].to_vec(),
-                after: after[new].to_vec(),
+            count_sparse(SparsePath::Recorded);
+            let mut splices = runs.into_iter().map(|run| Delta {
+                start: start + run.after.start,
+                before: self.paragraphs[start + run.before.start..start + run.before.end].to_vec(),
+                after: after[run.after].to_vec(),
                 rest: Vec::new(),
             });
-            let mut delta = splices.next().expect("several runs");
+            let mut delta = splices.next().expect("this branch has several runs");
             delta.rest = splices.collect();
             delta
         } else {
@@ -125,7 +137,7 @@ impl Document {
             }
         };
         if !delta.is_empty() {
-            self.apply(&delta, true);
+            self.apply(&delta, /* forward */ true);
             self.record_change(start, end - start, new_len);
         }
         delta
@@ -146,7 +158,7 @@ impl Document {
         self.revision = self.revision.saturating_add(1);
         #[cfg(any(feature = "egui", feature = "accesskit"))]
         {
-            let previous_identity = std::mem::replace(&mut self.identity, Arc::new(()));
+            let previous_identity = mem::replace(&mut self.identity, Arc::new(()));
             self.last_change = Some(LastChange {
                 previous_identity,
                 paragraphs: ParagraphChange {
@@ -178,38 +190,70 @@ impl Document {
 
 const SHARED_GAP: usize = 8;
 
-#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-thread_local! {
-    static SPARSE_COVERAGE: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+// A code path for deltas that keep only the changed runs of paragraphs, counted in
+// tests so that randomized tests can check that they exercised each one.
+#[derive(Clone, Copy)]
+enum SparsePath {
+    Recorded,
+    Replayed,
+    ShiftedTail,
 }
 
-// Sparse deltas recorded, sparse deltas replayed, and sparse applies that shift the tail.
+// How many times each sparse delta path ran on this thread.
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-pub(crate) fn take_sparse_coverage() -> [usize; 3] {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SparseCoverage {
+    pub(crate) recorded: usize,
+    pub(crate) replayed: usize,
+    // Sparse applies that shift the paragraphs after the change.
+    pub(crate) shifted_tail: usize,
+}
+
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+thread_local! {
+    static SPARSE_COVERAGE: Cell<SparseCoverage> = const {
+        Cell::new(SparseCoverage {
+            recorded: 0,
+            replayed: 0,
+            shifted_tail: 0,
+        })
+    };
+}
+
+// Returns the counts since the last call and resets them.
+#[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
+pub(crate) fn take_sparse_coverage() -> SparseCoverage {
     SPARSE_COVERAGE.take()
 }
 
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
-fn count_sparse(kind: usize) {
+fn count_sparse(path: SparsePath) {
     SPARSE_COVERAGE.with(|coverage| {
         let mut counts = coverage.get();
-        counts[kind] += 1;
+        match path {
+            SparsePath::Recorded => counts.recorded += 1,
+            SparsePath::Replayed => counts.replayed += 1,
+            SparsePath::ShiftedTail => counts.shifted_tail += 1,
+        }
         coverage.set(counts);
     });
 }
 
 #[cfg(not(all(test, any(feature = "egui", feature = "accesskit"))))]
-fn count_sparse(_: usize) {}
+fn count_sparse(_: SparsePath) {}
+
+// A changed run of paragraphs in the old list and the run that replaces it in the new list.
+struct ChangedRun {
+    before: Range<usize>,
+    after: Range<usize>,
+}
 
 // Pairs each changed run of `before` with the run of `after` replacing it. Paragraphs kept by
 // pointer separate the runs once more than SHARED_GAP of them sit together. A kept paragraph
 // stays aligned unless an earlier run changed the paragraph count; then it is found by
 // pointer. A kept paragraph is also owned by `before`, so one with a single owner is new.
-fn changed_runs(
-    before: &[Arc<Paragraph>],
-    after: &[Arc<Paragraph>],
-) -> Vec<(Range<usize>, Range<usize>)> {
-    let mut runs: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+fn changed_runs(before: &[Arc<Paragraph>], after: &[Arc<Paragraph>]) -> Vec<ChangedRun> {
+    let mut runs: Vec<ChangedRun> = Vec::new();
     if before.len().min(after.len()) <= SHARED_GAP {
         return runs;
     }
@@ -225,33 +269,41 @@ fn changed_runs(
             new += 1;
             continue;
         }
-        let (next_old, next_new) = (new..after.len())
-            .find_map(|index| {
-                let aligned = old + index - new;
-                let paragraph = &after[index];
-                if index > new
-                    && before
-                        .get(aligned)
-                        .is_some_and(|kept| Arc::ptr_eq(kept, paragraph))
-                {
-                    return Some((aligned, index));
-                }
-                if Arc::strong_count(paragraph) < 2 {
-                    return None;
-                }
-                positions
-                    .get_or_insert_with(|| positions_by_pointer(before))
-                    .get(&Arc::as_ptr(paragraph).addr())
-                    .filter(|kept| **kept >= old)
-                    .map(|kept| (*kept, index))
-            })
-            .unwrap_or((before.len(), after.len()));
-        match runs.last_mut() {
-            Some((before_run, after_run)) if old - before_run.end <= SHARED_GAP => {
-                before_run.end = next_old;
-                after_run.end = next_new;
+        // The next kept paragraph, by its indexes in `before` and `after`.
+        let mut next = (before.len(), after.len());
+        let candidates = after.iter().enumerate().skip(new);
+        for (index, paragraph) in candidates {
+            let aligned = old + index - new;
+            if index > new
+                && before
+                    .get(aligned)
+                    .is_some_and(|kept| Arc::ptr_eq(kept, paragraph))
+            {
+                next = (aligned, index);
+                break;
             }
-            _ => runs.push((old..next_old, new..next_new)),
+            if Arc::strong_count(paragraph) < 2 {
+                continue;
+            }
+            if let Some(kept) = positions
+                .get_or_insert_with(|| positions_by_pointer(before))
+                .get(&Arc::as_ptr(paragraph).addr())
+                .filter(|kept| **kept >= old)
+            {
+                next = (*kept, index);
+                break;
+            }
+        }
+        let (next_old, next_new) = next;
+        match runs.last_mut() {
+            Some(run) if old - run.before.end <= SHARED_GAP => {
+                run.before.end = next_old;
+                run.after.end = next_new;
+            }
+            _ => runs.push(ChangedRun {
+                before: old..next_old,
+                after: new..next_new,
+            }),
         }
         (old, new) = (next_old, next_new);
     }
@@ -292,11 +344,11 @@ impl Delta {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        let runs = self.rest.len().saturating_mul(std::mem::size_of::<Delta>());
+        let runs = self.rest.len().saturating_mul(mem::size_of::<Delta>());
         self.splices()
             .map(|splice| {
                 let pointers = (splice.before.len() + splice.after.len())
-                    .saturating_mul(std::mem::size_of::<Arc<Paragraph>>());
+                    .saturating_mul(mem::size_of::<Arc<Paragraph>>());
                 side_bytes(&splice.before, &splice.after)
                     .max(side_bytes(&splice.after, &splice.before))
                     .saturating_add(pointers)
@@ -305,25 +357,47 @@ impl Delta {
     }
 
     fn splices(&self) -> impl Iterator<Item = &Delta> {
-        std::iter::once(self).chain(&self.rest)
+        iter::once(self).chain(&self.rest)
     }
 
-    fn sides(&self, forward: bool) -> (&[Arc<Paragraph>], &[Arc<Paragraph>]) {
+    fn sides(&self, forward: bool) -> Sides<'_> {
         if forward {
-            (&self.before, &self.after)
+            Sides {
+                remove: &self.before,
+                insert: &self.after,
+            }
         } else {
-            (&self.after, &self.before)
+            Sides {
+                remove: &self.after,
+                insert: &self.before,
+            }
         }
     }
 
-    fn extent(&self) -> (usize, usize) {
+    // Counts the paragraphs from `start` through the last splice, before and after applying.
+    fn extent(&self) -> Extent {
         let last = self.rest.last().unwrap_or(self);
         let end = last.start + last.after.len();
         let (removed, inserted) = self.splices().fold((0, 0), |(removed, inserted), splice| {
             (removed + splice.before.len(), inserted + splice.after.len())
         });
-        (end + removed - inserted - self.start, end - self.start)
+        Extent {
+            before: end + removed - inserted - self.start,
+            after: end - self.start,
+        }
     }
+}
+
+// The paragraphs one splice removes and inserts when replayed in a given direction.
+struct Sides<'delta> {
+    remove: &'delta [Arc<Paragraph>],
+    insert: &'delta [Arc<Paragraph>],
+}
+
+// The number of paragraphs a delta's covered range spans before and after it applies.
+struct Extent {
+    before: usize,
+    after: usize,
 }
 
 fn side_bytes(paragraphs: &[Arc<Paragraph>], other: &[Arc<Paragraph>]) -> usize {
@@ -331,25 +405,23 @@ fn side_bytes(paragraphs: &[Arc<Paragraph>], other: &[Arc<Paragraph>]) -> usize 
     let runs = Allocations::new(other, |paragraph| paragraph.spans.as_ptr().addr());
     let shift = other.len().wrapping_sub(paragraphs.len());
     let mut charged = HashSet::new();
-    paragraphs
-        .iter()
-        .enumerate()
-        .map(|(index, paragraph)| {
-            let near = [index, index.wrapping_add(shift)];
-            let mut bytes = std::mem::size_of::<Paragraph>();
-            if !paragraph.text.is_empty() && !texts.contains(paragraph, near) {
-                bytes = bytes.saturating_add(paragraph.text.len());
+    let mut total: usize = 0;
+    for (index, paragraph) in paragraphs.iter().enumerate() {
+        let near = [index, index.wrapping_add(shift)];
+        let mut bytes = mem::size_of::<Paragraph>();
+        if !paragraph.text.is_empty() && !texts.contains(paragraph, near) {
+            bytes = bytes.saturating_add(paragraph.text.len());
+        }
+        if !paragraph.spans.is_empty() && !runs.contains(paragraph, near) {
+            bytes = bytes.saturating_add(mem::size_of_val(paragraph.spans()));
+            if paragraph.linked {
+                let near = near.map(|index| other.get(index).map(Arc::as_ref));
+                bytes = bytes.saturating_add(link_bytes(paragraph, near, &mut charged));
             }
-            if !paragraph.spans.is_empty() && !runs.contains(paragraph, near) {
-                bytes = bytes.saturating_add(std::mem::size_of_val(paragraph.spans()));
-                if paragraph.linked {
-                    let near = near.map(|index| other.get(index).map(Arc::as_ref));
-                    bytes = bytes.saturating_add(link_bytes(paragraph, near, &mut charged));
-                }
-            }
-            bytes
-        })
-        .fold(0, usize::saturating_add)
+        }
+        total = total.saturating_add(bytes);
+    }
+    total
 }
 
 fn link_bytes(
@@ -357,12 +429,12 @@ fn link_bytes(
     near: [Option<&Paragraph>; 2],
     charged: &mut HashSet<usize>,
 ) -> usize {
-    let links = |paragraph: &Paragraph| {
+    let links = |paragraph: &Paragraph| -> Vec<usize> {
         paragraph
             .spans
             .iter()
-            .filter_map(|span| span.link.as_ref().map(crate::Link::address))
-            .collect::<Vec<_>>()
+            .filter_map(|span| span.link.as_ref().map(Link::address))
+            .collect()
     };
     let own = links(paragraph);
     let near: Vec<Vec<usize>> = near
@@ -373,12 +445,17 @@ fn link_bytes(
         .collect();
     let (mut prefix, mut suffix) = (0, 0);
     for other in &near {
-        prefix = prefix.max(own.iter().zip(other).take_while(|(a, b)| a == b).count());
+        prefix = prefix.max(
+            own.iter()
+                .zip(other)
+                .take_while(|(left, right)| left == right)
+                .count(),
+        );
         suffix = suffix.max(
             own.iter()
                 .rev()
                 .zip(other.iter().rev())
-                .take_while(|(a, b)| a == b)
+                .take_while(|(left, right)| left == right)
                 .count(),
         );
     }
@@ -394,20 +471,23 @@ fn link_bytes(
         .filter_map(|span| span.link.as_ref())
         .skip(start)
         .take(middle.len());
-    targets
-        .filter(|link| !shared.contains(&link.address()) && charged.insert(link.address()))
-        .map(|link| link.as_str().len())
-        .fold(0, usize::saturating_add)
+    let mut bytes: usize = 0;
+    for link in targets {
+        if !shared.contains(&link.address()) && charged.insert(link.address()) {
+            bytes = bytes.saturating_add(link.as_str().len());
+        }
+    }
+    bytes
 }
 
-struct Allocations<'a> {
-    paragraphs: &'a [Arc<Paragraph>],
+struct Allocations<'paragraphs> {
+    paragraphs: &'paragraphs [Arc<Paragraph>],
     address: fn(&Paragraph) -> usize,
     set: OnceCell<HashSet<usize>>,
 }
 
-impl<'a> Allocations<'a> {
-    fn new(paragraphs: &'a [Arc<Paragraph>], address: fn(&Paragraph) -> usize) -> Self {
+impl<'paragraphs> Allocations<'paragraphs> {
+    fn new(paragraphs: &'paragraphs [Arc<Paragraph>], address: fn(&Paragraph) -> usize) -> Self {
         Self {
             paragraphs,
             address,
@@ -441,6 +521,7 @@ impl<'a> Allocations<'a> {
 #[cfg(all(test, any(feature = "egui", feature = "accesskit")))]
 mod tests {
     use super::*;
+    use crate::model::{Indent, Replacement};
     use crate::{InlineStyle, ParagraphKind, Position, StylePatch};
 
     fn assert_change(document: &Document, identity: &Arc<()>, range: Range<usize>, new_len: usize) {
@@ -455,7 +536,7 @@ mod tests {
         let mut document = Document::from_text("zero\none\ntwo");
         let original = document.content_identity();
         assert_change(&document, &original, 0..0, 0);
-        let (delta, _) = document
+        let Replacement { delta, .. } = document
             .replace(
                 Position::new(1, 0)..Position::new(1, 3),
                 "ONE",
@@ -464,7 +545,7 @@ mod tests {
             .unwrap();
         assert_change(&document, &original, 1..2, 1);
         let changed = document.content_identity();
-        let (empty, _) = document
+        let Replacement { delta: empty, .. } = document
             .replace(
                 Position::new(1, 0)..Position::new(1, 3),
                 "ONE",
@@ -472,7 +553,7 @@ mod tests {
             )
             .unwrap();
         assert!(empty.is_empty());
-        document.replay(&empty, true);
+        document.replay(&empty, Replay::Redo);
         assert!(
             document
                 .replace(
@@ -484,7 +565,7 @@ mod tests {
         );
         assert_change(&document, &original, 1..2, 1);
         assert_change(&document, &changed, 0..0, 0);
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_change(&document, &changed, 1..2, 1);
     }
 
@@ -492,7 +573,7 @@ mod tests {
     fn structural_edits_and_history_notify_in_their_own_paragraph_coordinates() {
         let mut document = Document::from_text("zero\none\ntwo");
         let original = document.content_identity();
-        let (delta, _) = document
+        let Replacement { delta, .. } = document
             .replace(
                 Position::new(1, 0)..Position::new(1, 3),
                 "first\nmiddle\nlast",
@@ -501,10 +582,10 @@ mod tests {
             .unwrap();
         assert_change(&document, &original, 1..2, 3);
         let inserted = document.content_identity();
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_change(&document, &inserted, 1..4, 1);
         let undone = document.content_identity();
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert_change(&document, &undone, 1..2, 3);
         assert!(document.change_since(&original).is_none());
         assert_eq!(document.plain_text(), "zero\nfirst\nmiddle\nlast\ntwo");
@@ -521,10 +602,10 @@ mod tests {
         assert_eq!(delta.rest.len(), 1);
         assert_change(&document, &original, 2..26, 24);
         let changed = document.content_identity();
-        document.replay(&delta, false);
+        document.replay(&delta, Replay::Undo);
         assert_change(&document, &changed, 2..26, 24);
         let undone = document.content_identity();
-        document.replay(&delta, true);
+        document.replay(&delta, Replay::Redo);
         assert_change(&document, &undone, 2..26, 24);
     }
 
@@ -548,10 +629,14 @@ mod tests {
             .unwrap();
         assert_change(&document, &formatted, 1..2, 1);
         let listed = document.content_identity();
-        document.change_list_indent(0..3, true);
+        document.change_list_indent(0..3, Indent::Increase);
         assert_change(&document, &listed, 1..2, 1);
         let indented = document.content_identity();
-        assert!(document.change_list_indent(0..1, true).is_empty());
+        assert!(
+            document
+                .change_list_indent(0..1, Indent::Increase)
+                .is_empty()
+        );
         assert_change(&document, &listed, 1..2, 1);
         assert_change(&document, &indented, 0..0, 0);
     }

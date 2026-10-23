@@ -1,10 +1,19 @@
+//! The Linux clipboard backend, for Wayland and X11.
+//!
+//! On Wayland, the copy helper serves the clipboard with `wl-clipboard-rs`.
+//! On X11, it owns the `CLIPBOARD` selection with a hidden window and answers
+//! selection requests, using INCR transfers for large representations. When
+//! Wayland is selected but the compositor lacks a protocol that
+//! `wl-clipboard-rs` needs, both helpers fall back to X11 if `DISPLAY` is set.
+//! Every transfer has a deadline and a byte limit.
+
 use std::collections::HashMap;
+use std::env;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::OFlags;
 use wl_clipboard_rs::{copy, paste, watch};
 use x11rb::connection::{Connection, RequestConnection};
@@ -20,11 +29,20 @@ use x11rb::wrapper::ConnectionExt as _;
 use super::{MAX_NATIVE_BYTES, MIME, NativeItem};
 
 const HTML_MIME: &str = "text/html";
+/// The plain text types read from Wayland offers, in order of preference.
 const PLAIN_MIMES: [&str; 3] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
+/// The deadline for reading a clipboard item, for getting an X server
+/// timestamp, and for each INCR transfer the copy helper serves.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
+/// How many INCR transfers the X11 copy helper serves at once.
 const MAX_INCR_TRANSFERS: usize = 16;
+/// The largest property chunk the X11 copy helper writes at once, in bytes,
+/// unless the server's request limit is smaller.
 const CHUNK_BYTES: usize = 64 * 1024;
 
+/// Publishes `item` and serves it until another client takes over the
+/// clipboard. Writes the helper's ready acknowledgement just before serving.
+/// The window owner is only used on Windows.
 pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
     validate_item(item)?;
     if use_wayland() {
@@ -58,6 +76,8 @@ pub(super) fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
     publish_x11(item)
 }
 
+/// Reads the clipboard's rich item, or `None` if it holds no rich
+/// representation.
 pub(super) fn read() -> Result<Option<NativeItem>, String> {
     if use_wayland() {
         match watch::Watcher::new(watch::ClipboardType::Regular, paste::Seat::Unspecified) {
@@ -79,7 +99,7 @@ pub(super) fn read() -> Result<Option<NativeItem>, String> {
                         let html = read_wayland_type(&mut offer, &mime_types, HTML_MIME, deadline)?;
                         let plain_type = PLAIN_MIMES
                             .iter()
-                            .find(|mime| mime_types.iter().any(|s| s == **mime));
+                            .find(|mime| mime_types.iter().any(|offered| offered == **mime));
                         let plain = match plain_type {
                             Some(mime) => {
                                 read_wayland_type(&mut offer, &mime_types, mime, deadline)?
@@ -98,14 +118,24 @@ pub(super) fn read() -> Result<Option<NativeItem>, String> {
     read_x11()
 }
 
+/// The environment variable through which the host passes its process ID to
+/// helpers.
 pub(super) const PARENT_VARIABLE: &str = "TEXTLOOM_CLIPBOARD_PARENT";
 
+/// Makes the helper receive SIGTERM when its parent exits, then checks that
+/// its parent is still the host named by [`PARENT_VARIABLE`], so the helper
+/// never outlives the host, even one that was killed.
+///
+/// # Errors
+///
+/// Fails if the death signal cannot be set, if the variable is missing or
+/// invalid, or if the host has already exited or is not this process's parent.
 pub(super) fn exit_with_parent() -> Result<(), String> {
     use rustix::process::{Pid, Signal, getppid, set_parent_process_death_signal};
 
     set_parent_process_death_signal(Some(Signal::TERM))
         .map_err(|_| "Clipboard helper could not follow its host")?;
-    let host = std::env::var(PARENT_VARIABLE)
+    let host = env::var(PARENT_VARIABLE)
         .ok()
         .and_then(|pid| pid.parse().ok())
         .and_then(Pid::from_raw);
@@ -115,18 +145,22 @@ pub(super) fn exit_with_parent() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether to use Wayland: the host window's backend if the host passed one,
+/// otherwise whether `WAYLAND_DISPLAY` is set.
 fn use_wayland() -> bool {
-    match std::env::var("TEXTLOOM_CLIPBOARD_BACKEND").as_deref() {
+    match env::var("TEXTLOOM_CLIPBOARD_BACKEND").as_deref() {
         Ok("x11") => false,
         Ok("wayland") => true,
-        _ => std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        _ => env::var_os("WAYLAND_DISPLAY").is_some(),
     }
 }
 
+/// Whether an X11 display is available as a fallback.
 fn has_x11() -> bool {
-    std::env::var_os("DISPLAY").is_some()
+    env::var_os("DISPLAY").is_some()
 }
 
+/// Writes the copy helper's ready acknowledgement to stdout.
 fn ready() -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     stdout
@@ -135,6 +169,7 @@ fn ready() -> Result<(), String> {
         .map_err(|_| "Clipboard readiness response failed".into())
 }
 
+/// Rejects an item with a representation over [`MAX_NATIVE_BYTES`].
 fn validate_item(item: &NativeItem) -> Result<(), String> {
     if [item.plain.len(), item.html.len(), item.rich.len()]
         .into_iter()
@@ -145,6 +180,8 @@ fn validate_item(item: &NativeItem) -> Result<(), String> {
     Ok(())
 }
 
+/// Builds an item from representations read from the clipboard. The error
+/// names the invalid representation but never includes its contents.
 fn make_item(plain: Vec<u8>, html: Vec<u8>, rich: Vec<u8>) -> Result<NativeItem, String> {
     Ok(NativeItem {
         plain: String::from_utf8(plain).map_err(|_| "Clipboard plain text is not UTF-8")?,
@@ -153,6 +190,8 @@ fn make_item(plain: Vec<u8>, html: Vec<u8>, rich: Vec<u8>) -> Result<NativeItem,
     })
 }
 
+/// Reads the `mime` representation of `offer` by `deadline`, or returns an
+/// empty one if `types`, the offered types, lack it.
 fn read_wayland_type(
     offer: &mut watch::Offer<'_>,
     types: &[String],
@@ -168,6 +207,7 @@ fn read_wayland_type(
     read_pipe(pipe, MAX_NATIVE_BYTES, deadline)
 }
 
+/// Waits until `fd` is readable, failing at `deadline`.
 fn wait_fd(fd: &impl AsFd, deadline: Instant) -> Result<(), String> {
     loop {
         let remaining = deadline
@@ -175,7 +215,7 @@ fn wait_fd(fd: &impl AsFd, deadline: Instant) -> Result<(), String> {
             .ok_or("Clipboard transfer timed out")?;
         let timeout = Timespec::try_from(remaining).map_err(|_| "Clipboard deadline invalid")?;
         let mut fds = [PollFd::new(fd, PollFlags::IN)];
-        match poll(&mut fds, Some(&timeout)) {
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
             Ok(0) => return Err("Clipboard transfer timed out".into()),
             Ok(_) if fds[0].revents().contains(PollFlags::NVAL) => {
                 return Err("Clipboard transfer descriptor unavailable".into());
@@ -187,6 +227,12 @@ fn wait_fd(fd: &impl AsFd, deadline: Instant) -> Result<(), String> {
     }
 }
 
+/// Reads `pipe` to its end without blocking past `deadline`.
+///
+/// # Errors
+///
+/// Fails if the pipe has more than `limit` bytes, misses `deadline`, or cannot
+/// be read.
 fn read_pipe(
     mut pipe: impl Read + AsFd,
     limit: usize,
@@ -219,19 +265,24 @@ fn read_pipe(
     }
 }
 
+/// The X11 atoms of the selection protocol and the representations.
 struct Atoms {
     clipboard: Atom,
     targets: Atom,
     timestamp: Atom,
     incr: Atom,
+    /// The property on the helper's own window that receives conversions and
+    /// timestamp probes.
     property: Atom,
     rich: Atom,
     html: Atom,
+    /// The plain text targets, in order of preference.
     plain: [Atom; 3],
 }
 
 impl Atoms {
-    fn new(connection: &RustConnection) -> Result<Self, String> {
+    /// Interns the atoms on `connection`.
+    fn try_new(connection: &RustConnection) -> Result<Self, String> {
         let atom = |name: &str| -> Result<Atom, String> {
             connection
                 .intern_atom(false, name.as_bytes())
@@ -257,7 +308,16 @@ impl Atoms {
     }
 }
 
-fn x11_context() -> Result<(RustConnection, Window, Atoms), String> {
+/// An X11 connection with the helper's hidden window, which owns or receives
+/// the selection.
+struct X11Context {
+    connection: RustConnection,
+    window: Window,
+    atoms: Atoms,
+}
+
+/// Connects to the X11 display and creates the hidden window.
+fn x11_context() -> Result<X11Context, String> {
     let (connection, screen) =
         x11rb::connect(None).map_err(|_| "X11 clipboard connection failed")?;
     let window = connection
@@ -280,10 +340,15 @@ fn x11_context() -> Result<(RustConnection, Window, Atoms), String> {
         .map_err(|_| "X11 clipboard window creation failed")?
         .check()
         .map_err(|_| "X11 clipboard window creation failed")?;
-    let atoms = Atoms::new(&connection)?;
-    Ok((connection, window, atoms))
+    let atoms = Atoms::try_new(&connection)?;
+    Ok(X11Context {
+        connection,
+        window,
+        atoms,
+    })
 }
 
+/// Waits for the next X11 event, failing at `deadline`.
 fn next_x11_event(connection: &RustConnection, deadline: Instant) -> Result<Event, String> {
     loop {
         if Instant::now() >= deadline {
@@ -299,6 +364,7 @@ fn next_x11_event(connection: &RustConnection, deadline: Instant) -> Result<Even
     }
 }
 
+/// The window that owns the `CLIPBOARD` selection, or `x11rb::NONE`.
 fn selection_owner(connection: &RustConnection, atoms: &Atoms) -> Result<Window, String> {
     connection
         .get_selection_owner(atoms.clipboard)
@@ -308,6 +374,8 @@ fn selection_owner(connection: &RustConnection, atoms: &Atoms) -> Result<Window,
         .map_err(|_| "X11 selection owner unavailable".into())
 }
 
+/// Gets a current X server timestamp, for acquiring the selection, from the
+/// notification of a property change on `window`.
 fn server_time(connection: &RustConnection, window: Window, atoms: &Atoms) -> Result<u32, String> {
     connection
         .change_property8(
@@ -335,17 +403,29 @@ fn server_time(connection: &RustConnection, window: Window, atoms: &Atoms) -> Re
     }
 }
 
-struct Outgoing {
+/// An INCR transfer in progress: a representation too large for one property,
+/// sent in chunks as the requestor deletes each one.
+struct Outgoing<'item> {
+    /// The requestor's window.
     window: Window,
+    /// The requestor's property that receives the chunks.
     property: Atom,
     target: Atom,
-    bytes: Arc<[u8]>,
+    bytes: &'item [u8],
+    /// How many bytes were sent already.
     offset: usize,
+    /// When the transfer is abandoned.
     deadline: Instant,
 }
 
+/// Owns the `CLIPBOARD` selection with `item` and serves requests for it until
+/// another client takes the selection over.
 fn publish_x11(item: &NativeItem) -> Result<(), String> {
-    let (connection, window, atoms) = x11_context()?;
+    let X11Context {
+        connection,
+        window,
+        atoms,
+    } = x11_context()?;
     let timestamp = server_time(&connection, window, &atoms)?;
     connection
         .set_selection_owner(window, atoms.clipboard, timestamp)
@@ -355,13 +435,12 @@ fn publish_x11(item: &NativeItem) -> Result<(), String> {
     if selection_owner(&connection, &atoms)? != window {
         return Err("X11 clipboard ownership unavailable".into());
     }
-    let plain: Arc<[u8]> = Arc::from(item.plain.as_bytes());
-    let mut data = HashMap::from([
-        (atoms.rich, Arc::from(item.rich.as_slice())),
-        (atoms.html, Arc::from(item.html.as_bytes())),
+    let mut data: HashMap<Atom, &[u8]> = HashMap::from([
+        (atoms.rich, item.rich.as_slice()),
+        (atoms.html, item.html.as_bytes()),
     ]);
     for target in atoms.plain {
-        data.insert(target, Arc::clone(&plain));
+        data.insert(target, item.plain.as_bytes());
     }
     let mut targets: Vec<Atom> = data.keys().copied().collect();
     targets.extend([atoms.targets, atoms.timestamp]);
@@ -420,16 +499,21 @@ fn publish_x11(item: &NativeItem) -> Result<(), String> {
     }
 }
 
+/// Answers one selection request: writes the requested representation, the
+/// target list, or the acquisition `timestamp` to the requestor's property,
+/// or starts an INCR transfer in `outgoing`, then notifies the requestor.
+/// Refuses unknown targets, a property that already has a transfer, and INCR
+/// transfers beyond [`MAX_INCR_TRANSFERS`].
 #[allow(clippy::too_many_arguments)]
-fn serve_request(
+fn serve_request<'item>(
     connection: &RustConnection,
     atoms: &Atoms,
     event: &SelectionRequestEvent,
     timestamp: u32,
     targets: &[Atom],
-    data: &HashMap<Atom, Arc<[u8]>>,
+    data: &HashMap<Atom, &'item [u8]>,
     chunk_size: usize,
-    outgoing: &mut Vec<Outgoing>,
+    outgoing: &mut Vec<Outgoing<'item>>,
 ) {
     let property = if event.property == x11rb::NONE {
         event.target
@@ -494,7 +578,7 @@ fn serve_request(
                     window: event.requestor,
                     property,
                     target: event.target,
-                    bytes: Arc::clone(bytes),
+                    bytes,
                     offset: 0,
                     deadline: Instant::now() + TRANSFER_TIMEOUT,
                 });
@@ -520,6 +604,8 @@ fn serve_request(
     }
 }
 
+/// Reads and deletes `property` of `window`, failing if it holds more than
+/// `limit` bytes.
 fn bounded_property(
     connection: &RustConnection,
     window: Window,
@@ -538,6 +624,8 @@ fn bounded_property(
     Ok(reply)
 }
 
+/// Converts the selection to `target` and reads the result, assembling an
+/// INCR transfer. Returns `None` if the owner refuses the conversion.
 fn read_target(
     connection: &RustConnection,
     window: Window,
@@ -637,6 +725,7 @@ fn read_target(
     }
 }
 
+/// Reads the selection owner's acquisition timestamp, if it reports one.
 fn read_timestamp(
     connection: &RustConnection,
     window: Window,
@@ -654,16 +743,24 @@ fn read_timestamp(
     )
 }
 
+/// Reads the rich item from the X11 selection, or `None` if there is no owner
+/// or no rich representation. Fails if the owner or its acquisition timestamp
+/// changes during the read.
 fn read_x11() -> Result<Option<NativeItem>, String> {
-    let (connection, window, atoms) = x11_context()?;
+    let X11Context {
+        connection,
+        window,
+        atoms,
+    } = x11_context()?;
     let deadline = Instant::now() + TRANSFER_TIMEOUT;
     let owner = selection_owner(&connection, &atoms)?;
     if owner == x11rb::NONE {
         return Ok(None);
     }
     let timestamp = read_timestamp(&connection, window, &atoms, deadline)?;
-    let targets = read_target(&connection, window, &atoms, atoms.targets, deadline)?
-        .and_then(|reply| reply.value32().map(|values| values.collect::<Vec<_>>()));
+    let targets: Option<Vec<Atom>> =
+        read_target(&connection, window, &atoms, atoms.targets, deadline)?
+            .and_then(|reply| reply.value32().map(|values| values.collect()));
     let get = |target| -> Result<Vec<u8>, String> {
         if targets
             .as_ref()
@@ -728,7 +825,8 @@ mod tests {
             drop(writer);
             assert_eq!(
                 read_pipe(reader, limit, Instant::now() + TRANSFER_TIMEOUT).unwrap_err(),
-                "Clipboard representation exceeds the byte limit"
+                "Clipboard representation exceeds the byte limit",
+                "limit {limit}"
             );
         }
     }
