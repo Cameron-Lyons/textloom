@@ -76,6 +76,13 @@ text and selection. Repeat deletion in read-only mode to confirm it is blocked.
 | Reader selection and replacement | Select text through the reader's supported navigation, type over it, undo, redo, and undo again. | Selection is exposed and announced appropriately; replacement and history restore exact content and selection. Record whether replacement used native typing or a direct accessibility operation. |
 | Display scale | Repeat caret placement, selection, candidate placement, and scrolling at the intended high-DPI scale. If supported, move between displays with different scales. | Text, pointer hit testing, caret, popup, and scroll position agree throughout scale changes. |
 
+The hosted check on 2026-10-23 confirmed that TextEdit 1.20 (415) on macOS
+26.6.2 (25G83) displays the native two-paragraph HTML quote like ordinary body
+text. Window captures and character positions were compared with plain HTML
+and a known indented RTF control before copy/save. The quote-presentation check
+therefore remains failed on that configuration; successful transport and other
+formatting checks do not satisfy it. See [current release evidence](../../RELEASING.md#automated-evidence-refreshed-2026-10-23).
+
 ## Winit adapter
 
 The egui host does not exercise `textloom::adapter::winit`. Use the repository's

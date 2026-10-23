@@ -28,10 +28,11 @@ The production fixes are at clean commit `3908e3c208a58863246173720f6d5d9ff22ab4
 The full `scripts/check-release.sh` passed: all eight feature combinations,
 release tests, native host tests, strict Clippy, rustdoc, quick benchmarks,
 package inventory, and extracted-package consumer validation. The publication
-dry run passed without uploading. All nine CI jobs passed at `3469352` in
-[run 39970290841](https://github.com/Cameron-Lyons/textloom/actions/runs/39970290841);
-that excludes the separate native interaction workflow. Subsequent commits extend repository-only
-QA and documentation; they do not change the published library implementation.
+dry run passed without uploading. All nine CI jobs passed at `b923934` in
+[run 39974423410](https://github.com/Cameron-Lyons/textloom/actions/runs/39974423410);
+that excludes the separate native interaction workflow. Subsequent commits
+extend repository-only QA and documentation; they do not change the published
+library implementation.
 
 The isolated Linux run used a copied executable with that revision and recorded
 SHA-256. All 27 interaction checks passed, along with rich-source plain paste
@@ -79,8 +80,8 @@ Word/Outlook interoperability and physical hardware remain unverified.
 
 The new macOS winit probe passed all nine observations on macOS 26.6.2 arm64,
 most recently in
-[run 39970290852](https://github.com/Cameron-Lyons/textloom/actions/runs/39970290852),
-PR head `3469352` / tested merge `e8b07f97b57c4487c470560c24d5deee8cd5d606`.
+[run 39974423408](https://github.com/Cameron-Lyons/textloom/actions/runs/39974423408),
+PR head `b923934` / tested merge `d131ca007e2e8c997c8090724643163330aae2c3`.
 It verified natural startup focus before the first native key, exact Unicode
 copy/paste, document and selection restoration through undo/redo, and owned
 process cleanup. It did not test an IME or VoiceOver. The separate TextEdit
@@ -89,19 +90,31 @@ controls with undo/redo, external TextEdit color/link import, a soft break
 within one numbered item, quote continuation/exit and Backspace behavior,
 numbering controls and external partial-list numbers, forced-wrap deletion,
 and read-only/disabled guards. All nine Swift accessibility retry self-tests
-and ten feature/capture self-tests passed. All three native sessions closed
+and nineteen feature/capture self-tests passed. All three native sessions closed
 gracefully with zero reported errors, and owned processes were cleaned up.
 
-The overall interaction result remains failed: TextEdit's copied RTF retained
+The overall interaction result remains failed. TextEdit's copied RTF retained
 the exact quote text but no paragraph indentation from the native
 `<blockquote>` offer, in both reused and fresh neutral documents. Controlled
 HTML and AppKit parser comparisons reproduced the result. A margin on child
 paragraphs produced a positive subsequent-line indent but left the first-line
 indent at zero. AppKit retained a block-quote presentation intent; the copied
-RTF did not. The source offers and destination artifacts are retained separately
-under `macos-run6-39970290852/` in the local evidence archive. This establishes
-the RTF formatting failure; visible TextEdit quote presentation still requires
-direct observation. The probe's successful checks do not erase that distinction.
+RTF did not. These five failed observations concern the same quote-import issue,
+not five independent defects.
+
+The pre-copy visual comparison confirms a quote-presentation interoperability
+failure with TextEdit 1.20 (415) on macOS 26.6.2 (25G83). The native quote and
+matching plain-paragraph HTML looked identical, with no visible quote treatment;
+both paragraph starts were 5 points from the text-area edge. A known indented
+RTF control placed both starts at 41 points, demonstrating the intended
+36-point difference. All three used the same window/text-area dimensions and
+fresh neutral documents. Identity, exact text, and clipboard generation were
+verified before and after each window-only screenshot, before any copy or save.
+The observation covers two short paragraph starts, not wrapped lines or other
+TextEdit/macOS versions. Native source offers, returned RTF, screenshots, and
+geometry are retained under `macos-run7-39974423408/` in the local evidence
+archive; prior failed runs remain preserved. This failure remains a stable
+release blocker under the current external quote-presentation requirement.
 
 ## Earlier validation evidence
 

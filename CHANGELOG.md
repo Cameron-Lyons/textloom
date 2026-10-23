@@ -18,7 +18,8 @@
 - Native QA expands the macOS TextEdit and Windows VM feature and clipboard
   checks, including native paste-as-plain-text shortcuts. Automated evidence
   remains separate from the physical-device and screen-reader signoffs
-  required for 1.0.
+  required for 1.0. The checks retain a confirmed TextEdit 1.20 quote-import
+  presentation failure; see the current evidence in `RELEASING.md`.
 
 ## 1.0.0-rc.2
 

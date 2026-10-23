@@ -254,6 +254,9 @@ HTML, and plain read-back plus widget rich insertion and undo/redo. Isolated
 fixtures passed on Linux X11/Wayland, macOS, and Windows; evidence is recorded in
 `RELEASING.md`. External-application interoperability, IME, dead keys/AltGr, and
 screen-reader behavior still need native platform signoff.
+TextEdit 1.20 (415) on macOS 26.6.2 displayed the tested two-paragraph native HTML
+quote as ordinary body text; this confirmed interoperability failure remains open in
+[the release evidence](RELEASING.md#automated-evidence-refreshed-2026-10-23).
 
 `--qa-report PATH` creates a new report file at startup, exiting with status 2
 if it exists or cannot be created, and writes a JSON report on graceful exit.
