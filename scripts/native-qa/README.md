@@ -62,11 +62,20 @@ captures the most recent TextEdit import for diagnosing failures. Rust tests
 check orchestration and oracles without a desktop; they do not establish that
 AppKit, System Events, or TextEdit passed on macOS.
 
-Native winit-adapter startup, IMEs, VoiceOver, link activation/hover, selection
-and search painting over fills, quote painting in both themes, and complete
-manual feature signoff remain separate. The existing winit harness needs macOS
-host/clipboard integration before it can honestly cover the adapter startup
-row; this probe continues to exercise the egui host.
+The separate `macos_winit.py` probe runs the minimal winit harness before the
+egui interaction session. It observes natural foreground activation, without
+raising, clicking, or switching applications to repair focus, then sends the
+first native key and Command selection, paste, copy, undo, and redo shortcuts.
+Exact Unicode, source revision, executable SHA-256, native key events, and
+document/selection states are recorded in `macos-winit.json` and its event log.
+The clipboard roundtrip must replace a distinct sentinel. This probe has a
+90-second internal deadline and reaps only its owned process group. It refuses
+to run outside a disposable GitHub-hosted macOS runner.
+
+IMEs, VoiceOver, link activation/hover, selection and search painting over
+fills, quote painting in both themes, and complete manual feature signoff
+remain separate. The winit probe tests startup and plain clipboard behavior;
+the TextEdit probe exercises the egui host and rich interchange.
 
 The Windows probe creates a fresh portable copy and private profile of pinned
 NVDA 2026.2 after checking the official installer digest and signature. Native

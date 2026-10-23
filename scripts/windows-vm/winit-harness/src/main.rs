@@ -1,5 +1,5 @@
 //! A minimal winit host for checking textloom's winit adapter on Linux (Wayland,
-//! X11) and Windows. `cargo winvm-checks` drives it in the Windows VM.
+//! X11), macOS, and Windows. `cargo winvm-checks` drives it in the Windows VM.
 //!
 //! One window, one `Editor`, one `WinitAdapter`, a fake monospace layout
 //! (cells of 10x24 logical px from origin 20,20) painted with softbuffer.
@@ -268,6 +268,8 @@ impl App {
                     "Set-Clipboard -Value $env:TLQA_CLIPBOARD",
                 ],
             )
+        } else if cfg!(target_os = "macos") {
+            ("/usr/bin/pbcopy", &[])
         } else if self.wayland {
             ("wl-copy", &[])
         } else {
@@ -276,7 +278,10 @@ impl App {
                 &["-selection", "clipboard", "-i", "-t", "UTF8_STRING"],
             )
         };
-        let spawned = Command::new(program)
+        let mut command = Command::new(program);
+        #[cfg(target_os = "macos")]
+        command.env("LC_ALL", "en_US.UTF-8");
+        let spawned = command
             .args(args)
             .env("TLQA_CLIPBOARD", text)
             .stdin(Stdio::piped())
@@ -304,6 +309,8 @@ impl App {
                 "-Command",
                 "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Out.Write((Get-Clipboard -Raw))",
             ]
+        } else if cfg!(target_os = "macos") {
+            &["/usr/bin/pbpaste", "-Prefer", "txt"]
         } else if self.wayland {
             &["timeout", "5", "wl-paste", "--no-newline"]
         } else {
@@ -318,10 +325,10 @@ impl App {
                 "UTF8_STRING",
             ]
         };
-        let output = Command::new(command[0])
-            .args(&command[1..])
-            .stdin(Stdio::null())
-            .output();
+        let mut process = Command::new(command[0]);
+        #[cfg(target_os = "macos")]
+        process.env("LC_ALL", "en_US.UTF-8");
+        let output = process.args(&command[1..]).stdin(Stdio::null()).output();
         let text = output
             .ok()
             .filter(|output| output.status.success())
@@ -473,8 +480,9 @@ impl ApplicationHandler for App {
             _ => None,
         };
         let value = json!({
-            "event": "ready", "backend": if cfg!(windows) { "windows" } else if self.wayland { "wayland" } else { "x11" },
+            "event": "ready", "backend": if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else if self.wayland { "wayland" } else { "x11" },
             "pid": std::process::id(), "x11_window": x11_window, "scale": window.scale_factor(),
+            "revision": option_env!("TEXTLOOM_QA_REVISION"), "window_has_focus": window.has_focus(),
             "set_focused": outcome_json(&focus), "state": state(&self.editor),
         });
         self.window = Some(window.clone());
