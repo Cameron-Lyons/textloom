@@ -2,6 +2,18 @@
 
 ## 1.0 validation status
 
+Version 1.0.0-rc.2 was prepared on 2026-10-22, after the rc.1 and Windows VM
+work recorded below, as a second release candidate: `main` at
+`91abb32939638a1243282bb444ed73858f32bbe6` plus the version change and
+documentation fixes. Since rc.1, `main` has applied the
+Google Rust Style Guide, which renames or retypes some public API (see
+`CHANGELOG.md`), and the native host's Ctrl+Alt+Q fix described below. On
+`91abb32`, `scripts/check-release.sh` and `scripts/format.sh --check` passed, as
+did all nine CI jobs; both hosted interaction jobs passed on PR #14's head
+`8f8cbdea032a284ec874dcdf95e5ccd516a65b6b`. The isolated Linux sessions and
+Windows VM checks below were not repeated after the style changes. The open
+Windows, macOS, and physical-device checks still block 1.0.0.
+
 On 2026-10-22, version 1.0.0-rc.1 was prepared as a release candidate, because
 no Windows desktop is available for the hands-on checks below. Its commit
 `d7f2feec05ec599af280f64645c95fdd1b44c86e` is `main` at
@@ -404,13 +416,16 @@ upgrade that breaks those exposed types requires a Textloom major release.
 Error enums (`Error`, `FragmentError`, `AccessKitError`, egui
 `AccessibilityError`), `ParagraphKind`, `Movement`, `InlineAttribute`,
 `AccessibleAction`, and winit `ClipboardEvent` are non-exhaustive: callers must
-retain a fallback match arm. `Composition`, `DecodeLimits`, `AccessibleParagraph`,
-`AccessibilityOutcome`, `RichTextEditorOutput`, and winit `InputOutcome` are
-non-exhaustive structs that may gain fields. `InlineStyle`,
-`StylePatch`, `SelectionStyle`, `SearchOptions`, `HistoryLimits`, `Position`,
-`Selection`, `Color`, and `Span` stay exhaustive; adding a field to them requires
-a major release. `Editor`, `Document`, `Paragraph`, and `Fragment` must remain
-`Send + Sync`, which `src/lib.rs` checks at compile time.
+retain a fallback match arm. `Composition`, `DecodeLimits`, `Span`,
+`NamedColor`, `AccessibleParagraph`, `AccessibilityOutcome`,
+`RichTextEditorOutput`, and winit `InputOutcome` are non-exhaustive structs that
+may gain fields. `InlineStyle`, `StylePatch`, `SelectionStyle`, `SearchOptions`,
+`HistoryLimits`, `Position`, `Selection`, `Color`, `AccessiblePosition`, and
+`AccessibleSelection` stay exhaustive, as do the two-way enums `SelectionMode`,
+`SearchWrap`, `accessibility::Focus`, and winit `CommandModifier`; adding a
+field or variant to them requires a major release. `Editor`, `Document`,
+`Paragraph`, and `Fragment` must remain `Send + Sync`, which `src/lib.rs` checks
+at compile time.
 Exact error messages, private implementation details, cache layouts, and benchmark
 timings are not API guarantees. Release candidates, such as 1.0.0-rc.1, precede
 this contract: their API may still change before 1.0.0.
@@ -570,12 +585,12 @@ For a release candidate, substitute its tag in these steps and in
 `check-release.sh --tag`, and mark its GitHub release as a pre-release:
 
 ```sh
-git tag -a v1.0.0-rc.1 -m 'Textloom 1.0.0-rc.1'
-git push origin v1.0.0-rc.1
+git tag -a v1.0.0-rc.2 -m 'Textloom 1.0.0-rc.2'
+git push origin v1.0.0-rc.2
 ```
 
 Cargo selects a release candidate only for requirements that name one, such as
-`textloom = "1.0.0-rc.1"`.
+`textloom = "1.0.0-rc.2"`.
 
 Crates.io versions cannot be overwritten. Fix a published defect in a new patch
 release; consider yanking a defective version where appropriate. Do not move an
