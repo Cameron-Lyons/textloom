@@ -110,6 +110,266 @@ fn raw(events: Vec<Event>) -> RawInput {
     }
 }
 
+fn plain_paste_key() -> Event {
+    Event::Key {
+        key: egui::Key::V,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    }
+}
+
+#[test]
+fn plain_paste_reply_keeps_its_owner_through_queued_focus_passes() {
+    for max_passes in [1, 2, 8] {
+        let ctx = context(max_passes);
+        let mut fields = Fields::new(FieldKind::Rich, FieldKind::Rich);
+        fields.warm(&ctx);
+        fields
+            .frame(&ctx, vec![plain_paste_key()])
+            .drop_without_applying_deltas();
+        // First host batch: eframe has not drained the newly queued action yet.
+        fields.frame(&ctx, vec![]).drop_without_applying_deltas();
+        let mut seen = Vec::new();
+        let mut events = vec![
+            focus("first"),
+            Event::Paste("plain".into()),
+            focus("second"),
+            Event::Paste("rich".into()),
+        ];
+        for _ in 0..8 {
+            ctx.run_ui(raw(std::mem::take(&mut events)), |ui| {
+                for (index, text) in ui
+                    .input(|input| input.events.clone())
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Paste(text) => Some(text),
+                        _ => None,
+                    })
+                    .enumerate()
+                {
+                    seen.push((text.clone(), super::paste_reply(ui.ctx(), index)));
+                }
+                fields.show(ui);
+            })
+            .drop_without_applying_deltas();
+            if ctx.plugin::<InputRouting>().lock().pending.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "plain".into(),
+                    super::PasteReply::Plain(Id::unique("first"))
+                ),
+                ("rich".into(), super::PasteReply::Ordinary),
+            ],
+            "max_passes={max_passes}"
+        );
+        assert_eq!(
+            fields.fields.each_ref().map(Field::text),
+            ["plaina", "richb"]
+        );
+    }
+}
+
+#[test]
+fn plain_paste_survives_layout_passes_and_manual_hosts_expire_after_two_batches() {
+    for manual in [false, true] {
+        let ctx = context(8);
+        let mut fields = Fields::new(FieldKind::Rich, FieldKind::Rich);
+        fields.warm(&ctx);
+        let frame = |fields: &mut Fields, events| {
+            if manual {
+                ctx.begin_pass(raw(events));
+                ctx.root_ui(|ui| fields.show(ui));
+                ctx.end_pass()
+            } else {
+                ctx.run_ui(raw(events), |ui| {
+                    fields.show(ui);
+                    if ui.ctx().current_pass_index() < 3 {
+                        ui.ctx().request_discard("extra layout pass");
+                    }
+                })
+            }
+        };
+        frame(&mut fields, vec![plain_paste_key()]).drop_without_applying_deltas();
+        for remaining in [1, 0] {
+            let output = frame(&mut fields, vec![]);
+            let routing = ctx.plugin::<InputRouting>();
+            let routing = routing.lock();
+            assert_eq!(
+                routing.paste_requests.contains_key(&ViewportId::ROOT),
+                remaining > 0
+            );
+            if remaining > 0 {
+                assert_eq!(
+                    output.viewport_output[&ViewportId::ROOT].repaint_delay,
+                    Duration::ZERO
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
+        frame(&mut fields, vec![Event::Paste("ordinary".into())]).drop_without_applying_deltas();
+        assert_eq!(fields.fields[0].text(), "ordinarya");
+        frame(&mut fields, vec![plain_paste_key()]).drop_without_applying_deltas();
+        frame(&mut fields, vec![]).drop_without_applying_deltas();
+        frame(&mut fields, vec![Event::Paste("reply".into())]).drop_without_applying_deltas();
+        assert_eq!(fields.fields[0].text(), "ordinaryreplya");
+        assert!(
+            ctx.plugin::<InputRouting>()
+                .lock()
+                .paste_requests
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn stale_plain_replies_do_not_replace_rich_or_native_focus_destinations() {
+    for second in [FieldKind::Rich, FieldKind::Native] {
+        for reversed in [false, true] {
+            for max_passes in [1, 2, 8] {
+                for focus_in_reply_batch in [false, true] {
+                    let ctx = context(max_passes);
+                    let mut fields = Fields::new(FieldKind::Rich, second);
+                    fields.reversed = reversed;
+                    fields.warm(&ctx);
+                    fields
+                        .frame(&ctx, vec![plain_paste_key()])
+                        .drop_without_applying_deltas();
+                    fields
+                        .frame(
+                            &ctx,
+                            if focus_in_reply_batch {
+                                vec![]
+                            } else {
+                                vec![focus("second")]
+                            },
+                        )
+                        .drop_without_applying_deltas();
+                    let mut events = if focus_in_reply_batch {
+                        vec![focus("second")]
+                    } else {
+                        vec![]
+                    };
+                    events.push(Event::Paste("stale".into()));
+                    fields.frame(&ctx, events).drop_without_applying_deltas();
+                    fields.flush(&ctx);
+                    assert_eq!(
+                        fields.fields.each_ref().map(Field::text),
+                        ["a", "b"],
+                        "{second:?}, reversed={reversed}, max_passes={max_passes}, focus_in_reply_batch={focus_in_reply_batch}"
+                    );
+                    fields
+                        .frame(&ctx, vec![Event::Paste("ordinary".into())])
+                        .drop_without_applying_deltas();
+                    assert_eq!(
+                        fields.fields.each_ref().map(Field::text),
+                        ["a", "ordinaryb"]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn returning_focus_does_not_revive_a_canceled_paste() {
+    let ctx = context(8);
+    let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+    fields.warm(&ctx);
+    fields
+        .frame(&ctx, vec![plain_paste_key()])
+        .drop_without_applying_deltas();
+    fields
+        .frame(&ctx, vec![focus("second"), focus("first")])
+        .drop_without_applying_deltas();
+    fields
+        .frame(&ctx, vec![Event::Paste("stale".into())])
+        .drop_without_applying_deltas();
+    assert_eq!(fields.fields.each_ref().map(Field::text), ["a", "b"]);
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(Id::unique("first"))
+    );
+}
+
+#[test]
+fn an_unfocused_editors_accessibility_action_does_not_consume_another_editors_reply() {
+    for reversed in [false, true] {
+        let ctx = context(2);
+        let mut fields = Fields::new(FieldKind::Rich, FieldKind::Rich);
+        fields.reversed = reversed;
+        fields.warm(&ctx);
+        fields
+            .frame(&ctx, vec![plain_paste_key()])
+            .drop_without_applying_deltas();
+        fields.frame(&ctx, vec![]).drop_without_applying_deltas();
+        let action = Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::ScrollIntoView,
+            target_node: Id::unique("second").accesskit_id(),
+            target_tree: egui::accesskit::TreeId::ROOT,
+            data: None,
+        });
+        fields
+            .frame(&ctx, vec![action, Event::Paste("reply".into())])
+            .drop_without_applying_deltas();
+        assert_eq!(fields.fields.each_ref().map(Field::text), ["replya", "b"]);
+    }
+}
+
+#[test]
+fn pointer_and_keyboard_focus_changes_discard_pending_replies_before_native_widgets() {
+    for reversed in [false, true] {
+        for change in 0..4 {
+            let ctx = context(2);
+            let mut fields = Fields::new(FieldKind::Rich, FieldKind::Native);
+            fields.reversed = reversed;
+            fields.warm(&ctx);
+            fields
+                .frame(&ctx, vec![plain_paste_key()])
+                .drop_without_applying_deltas();
+            fields.frame(&ctx, vec![]).drop_without_applying_deltas();
+            let event = match change {
+                0 => {
+                    ctx.memory_mut(|memory| memory.request_focus(Id::unique("second")));
+                    Event::ModifiersChanged(egui::Modifiers::NONE)
+                }
+                1 => Event::PointerButton {
+                    pos: ctx
+                        .read_response(Id::unique("second"))
+                        .unwrap()
+                        .rect
+                        .center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                2 => Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                _ => Event::WindowFocused(false),
+            };
+            fields
+                .frame(&ctx, vec![event, Event::Paste("stale".into())])
+                .drop_without_applying_deltas();
+            assert_eq!(
+                fields.fields.each_ref().map(Field::text),
+                ["a", "b"],
+                "reversed={reversed}, change={change}"
+            );
+        }
+    }
+}
+
 fn focus(name: &str) -> Event {
     Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
         action: egui::accesskit::Action::Focus,
@@ -593,6 +853,68 @@ fn nested_viewports_keep_their_own_queued_events_and_repaint_requests() {
     let routing = routing.lock();
     assert!(routing.pending.is_empty());
     assert!(routing.passes.is_empty());
+}
+
+#[test]
+fn manual_nested_viewports_keep_paste_ownership_and_batch_age_separate() {
+    for cancel_child in [false, true] {
+        let ctx = context(1);
+        ctx.set_embed_viewports(false);
+        let mut parent = Fields::new(FieldKind::Rich, FieldKind::Native);
+        let mut child = Fields::new(FieldKind::Rich, FieldKind::Native);
+        child.names = ["child first", "child second"];
+        let child_id = ViewportId::from_hash_of("paste child viewport");
+        for batch in 0..5 {
+            let mut parent_input = raw(match batch {
+                2 => vec![plain_paste_key()],
+                4 => vec![Event::Paste("parent".into())],
+                _ => vec![],
+            });
+            parent_input.viewports.insert(
+                child_id,
+                egui::ViewportInfo {
+                    parent: Some(ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            ctx.begin_pass(parent_input.clone());
+            if batch == 0 {
+                ctx.memory_mut(|memory| memory.request_focus(Id::unique("first")));
+            }
+            ctx.root_ui(|ui| parent.show(ui));
+            ctx.show_viewport_deferred(child_id, egui::ViewportBuilder::default(), |_, _| {});
+            let mut child_input = parent_input;
+            child_input.viewport_id = child_id;
+            child_input.events = match batch {
+                2 => vec![plain_paste_key()],
+                3 if cancel_child => vec![focus("child second")],
+                4 => vec![Event::Paste("child".into())],
+                _ => vec![],
+            };
+            ctx.begin_pass(child_input);
+            if batch == 0 {
+                ctx.memory_mut(|memory| memory.request_focus(Id::unique("child first")));
+            }
+            ctx.root_ui(|ui| child.show(ui));
+            ctx.end_pass().drop_without_applying_deltas();
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+        assert_eq!(parent.fields.each_ref().map(Field::text), ["parenta", "b"]);
+        assert_eq!(
+            child.fields.each_ref().map(Field::text),
+            if cancel_child {
+                ["a", "b"]
+            } else {
+                ["childa", "b"]
+            }
+        );
+        assert!(
+            ctx.plugin::<InputRouting>()
+                .lock()
+                .paste_requests
+                .is_empty()
+        );
+    }
 }
 
 #[test]

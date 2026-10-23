@@ -1289,8 +1289,12 @@ impl NativeEditor {
         });
         if let Some(clipboard) = &mut self.clipboard {
             clipboard.clear_staged_paste();
-            if let Some(error) = clipboard.take_error() {
-                self.status = format!("{error}; copied plain text instead");
+            while let Some(error) = clipboard.take_error() {
+                self.status = error;
+                self.smoke_error = true;
+                if let Some(qa) = &mut self.qa {
+                    qa.host_command_error();
+                }
             }
         }
         if self.smoke_frames.is_some() && self.smoke_error {
@@ -2757,6 +2761,27 @@ mod tests {
                 .link_at(Position::new(paragraph, byte))
                 .map(ToString::to_string)
         }
+    }
+
+    #[test]
+    fn clipboard_failures_are_counted_once_even_when_plain_fallback_is_available() {
+        use textloom::adapter::egui::RichClipboard as _;
+
+        let mut harness = Harness::new("clipboard-errors");
+        let mut clipboard = NativeClipboard::default();
+        // A transport rejection exercises the same error reporting path as
+        // a helper timeout without reading/writing the test machine's clipboard.
+        let fragment = textloom::Fragment::from_text("before\0after");
+        assert!(!clipboard.copy(&fragment));
+        assert!(!clipboard.copy(&fragment));
+        harness.app.clipboard = Some(clipboard);
+        harness.app.smoke_frames = Some(0);
+        harness.step(Vec::new());
+        assert_eq!(harness.app.qa.as_ref().unwrap().host_command_errors(), 2);
+        assert!(harness.app.status.ends_with("; copied plain text instead"));
+        assert!(harness.app.failed.load(Ordering::Relaxed));
+        harness.step(Vec::new());
+        assert_eq!(harness.app.qa.as_ref().unwrap().host_command_errors(), 2);
     }
 
     #[test]

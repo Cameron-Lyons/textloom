@@ -38,6 +38,12 @@ pub(super) struct InputOptions {
     pub(super) heading_shortcuts: bool,
 }
 
+pub(super) fn is_plain_paste_shortcut(event: &Event) -> bool {
+    matches!(event, Event::Key { key: Key::V, pressed: true, modifiers, .. }
+        if modifiers.command && modifiers.shift && !modifiers.alt
+            && !(modifiers.mac_cmd && modifiers.ctrl))
+}
+
 pub(super) fn reads_layout(os: OperatingSystem, event: &Event, options: &InputOptions) -> bool {
     match event {
         Event::Key {

@@ -61,6 +61,24 @@ screenshots per check; `TLQA_WINDOWS_OUT` names another results directory. By
 default guest audio is recorded to `audio.wav` in the VM directory;
 `nvda-audible-speech` saves the speech it measured for listening.
 
+Use a new `TLQA_WINDOWS_OUT` directory for each evidence run to retain previous
+screenshots and native reports; `--runs N` keeps artifacts in separate `run-N`
+subdirectories. Failed checks are recorded and the remaining
+checks still run; the command exits unsuccessfully if any selected check fails.
+Every result records `manual_signoff: "not_recorded"`.
+
+`build` records `target/windows-vm-build.json`: the source HEAD, dirty status,
+a SHA-256 inventory of tracked and nonignored untracked files, and hashes of
+all three executables. A dirty build embeds a revision such as
+`<HEAD>-dirty-<source hash prefix>` in the native reports. The build refuses
+to record provenance if source files change while compilation runs; rerun it
+after those edits settle. `deploy` verifies the executable hashes and adds
+the deployed guest helper's hash. Checks verify these hashes inside the VM
+and validate reports against the **deployed build's** revision. Results also
+record the test runner's current source inventory separately. A later checkout
+or helper edit therefore cannot relabel an older executable as the current
+clean commit. Rebuild and redeploy for final clean-commit evidence.
+
 The checks cover the egui native host (dead keys and AltGr, Windows
 clipboard keys, AZERTY digit-row shortcuts, Japanese and Chinese IME
 composition, candidate placement, and commits on focus changes, IME in a long
@@ -70,6 +88,46 @@ logs every event and its editor state as JSON lines. IME candidate lists are
 neither windows nor UI Automation elements, so they are located by comparing
 screenshots. Touch input, precision touchpads, and physical keyboards still
 need real hardware.
+
+`german-dead-keys-and-altgr` separately records the first acute-dead-key attempt
+immediately after switching layouts, without a preparatory key, in
+`german/first-dead-key-diagnostic.json` and its screenshot. Its own `passed`
+field can be false even when the warmed-up dead-key/AltGr check passes: winit
+0.30.13 consumes the first pending dead key while preparing the new layout
+([upstream #4582](https://github.com/rust-windowing/winit/pull/4582)). Keep that
+diagnostic result separate when reporting the suite; it is not a waived pass.
+
+The feature checks also cover:
+
+- `rich-colors`: native fill/font palettes, exact UIA foreground/background
+  RGB, CF_HTML colors, independent clearing, and lossless TLFR undo/redo.
+- `soft-breaks`: Shift+Enter within a paragraph/list item, Enter continuing a
+  list, `<br>` export, plain newlines, and native rich paste with undo/redo.
+- `links`: Ctrl+K, escaping the HTML target, UIA hyperlink exposure, removal,
+  and undo/redo. No navigation to the link is requested.
+- `block-quotes`: adjacent quotes, UIA grouping, HTML structure, undo/redo,
+  and a pixel-contrast assertion for the quote rule in light and dark themes.
+- `numbering`: computed item numbers, restart/continue, and indent/outdent.
+- `plain-paste-shortcut`: actual Ctrl+Shift+V on a selected word, exact plain
+  replacement with rich source formatting removed, and one-step undo/redo.
+- `external-rich-clipboard`: QEMU Ctrl+V into a separate, independently
+  rendering Windows HTML editing control, with DOM observations of Unicode,
+  emphasis, font/fill colors, soft breaks, links, quotes, and lists. Its native
+  Ctrl+C offers external HTML/Unicode without TLFR; Textloom must use exact
+  plain fallback, with one-step undo/redo. Arbitrary HTML import is not supported
+  by the example host.
+
+The independent clipboard consumer uses the installed Windows
+[MSHTML-backed Windows Forms WebBrowser control](https://learn.microsoft.com/en-us/dotnet/desktop/winforms/controls/webbrowser-control-overview)
+in a separate STA PowerShell process. It displays an offline editable document,
+blocks navigation, and requires no Office license or downloaded application.
+The harness only initializes its own external fixture and observes its DOM;
+clipboard paste/copy use native keyboard input. This establishes interoperability
+with that recorded engine version, not with Word, Outlook, or every Windows
+application. Screenshots are retained as rendering evidence, not human visual
+signoff. Each new feature session also closes gracefully and saves a validated,
+content-free `native-report.json`; bounded public fixture clipboard/DOM captures
+are separate from those reports. The peer is stopped during session cleanup.
 
 ## How it works
 

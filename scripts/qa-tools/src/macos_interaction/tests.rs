@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::iter;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +46,8 @@ struct Editor {
     focus: usize,
     history: Vec<Snapshot>,
     undo_count: usize,
+    /// Test-only visual wrapping in grapheme cells; native widths are observed.
+    wrap_width: Option<usize>,
 }
 
 /// The oracle's document and selection before an edit, for undo.
@@ -85,12 +86,21 @@ impl Editor {
 
     /// The paragraphs, or with `soft` the visual lines, of the document.
     fn boundaries(&self, soft: bool) -> Lines {
-        let mut ends: Vec<usize> = (0..self.text.len())
-            .filter(|&index| self.text[index] == "\n" || (soft && self.text[index] == "\u{2028}"))
-            .collect();
-        let starts: Vec<usize> = iter::once(0)
-            .chain(ends.iter().map(|end| end + 1))
-            .collect();
+        let mut ends = Vec::new();
+        let mut starts = vec![0];
+        for (index, token) in self.text.iter().enumerate() {
+            if token == "\n" || (soft && token == "\u{2028}") {
+                ends.push(index);
+                starts.push(index + 1);
+            } else if soft
+                && self
+                    .wrap_width
+                    .is_some_and(|width| index - starts.last().unwrap() == width)
+            {
+                ends.push(index);
+                starts.push(index);
+            }
+        }
         let current = starts
             .iter()
             .rposition(|&start| start <= self.focus)
@@ -157,6 +167,10 @@ impl Editor {
                 "51" => {
                     let lines = self.boundaries(true);
                     self.replace(lines.starts[lines.current], self.focus, "")?;
+                }
+                "123" => {
+                    let lines = self.boundaries(true);
+                    target = Some(lines.starts[lines.current]);
                 }
                 "124" => {
                     let lines = self.boundaries(true);
@@ -253,6 +267,7 @@ struct Fake {
     waits: HashMap<u32, VecDeque<Option<i32>>>,
     wait_calls: Vec<(u32, f64)>,
     signals: Vec<(u32, Signal, Recipient)>,
+    control_results: VecDeque<Result<Ran, String>>,
 }
 
 fn ran(code: i32, stdout: impl Into<Vec<u8>>, stderr: &str) -> Ran {
@@ -300,6 +315,7 @@ impl Fake {
         }
         let editor = &mut self.editor;
         let result = match (command, value) {
+            ("focus", _) => Ok(()),
             ("chord", "a") => {
                 (editor.anchor, editor.focus) = (0, editor.text.len());
                 Ok(())
@@ -365,6 +381,15 @@ impl System for Fake {
             arguments: arguments.to_vec(),
             input: input.map(str::to_owned),
         });
+        if arguments[0].ends_with("/macos-clipboard") && arguments[1] == "ax-press" {
+            let observation = json!({"backend": "application-services", "nodes": [{"role": "AXGroup"}], "pressed": false});
+            fs::write(&arguments[8], observation.to_string())?;
+            return self
+                .control_results
+                .pop_front()
+                .unwrap_or_else(|| Ok(ran(0, r#"{"pressed":true}"#, "")))
+                .map_err(Into::into);
+        }
         Ok(match arguments[0].as_str() {
             "/usr/bin/osascript" => self.osascript(&arguments[2..]),
             "/usr/bin/env" if arguments[2] == "/usr/bin/pbcopy" => {
@@ -734,6 +759,38 @@ fn authored_sequences_select_exact_fixtures_and_undo_all_deletions() {
 }
 
 #[test]
+fn forced_wrap_deletion_uses_the_observed_suffix_at_multiple_visual_widths() {
+    for width in [37, 81, 119] {
+        let mut replay = Replay::new(Fake::default());
+        replay.probe.system.editor.wrap_width = Some(width);
+        replay.probe.forced_wrap(101).unwrap();
+        assert_eq!(replay.fake().editor.undo_count, 1);
+        assert_eq!(replay.fake().editor.text.len(), 1600);
+        assert_eq!(replay.notes().len(), 2);
+        assert!(replay.fake().actions.len() <= 20);
+    }
+}
+
+#[test]
+fn forced_wrap_cannot_pass_without_a_wrap_selection_or_deletion() {
+    for missing in ["wrapping", "selection", "deletion"] {
+        let mut replay = Replay::new(Fake::default());
+        if missing != "wrapping" {
+            replay.probe.system.editor.wrap_width = Some(81);
+            replay.probe.system.ignored = Some(Box::new(move |command, value| {
+                if missing == "selection" {
+                    command == "command-shift-keycode" && value == "123"
+                } else {
+                    command == "command-keycode" && value == "51"
+                }
+            }));
+        }
+        assert!(replay.probe.forced_wrap(101).is_err(), "missing {missing}");
+        assert!(replay.notes().is_empty());
+    }
+}
+
+#[test]
 fn exact_fixture_oracle_rejects_each_missing_native_shortcut() {
     let mut missing: Vec<(String, Ignored)> = Vec::new();
     for letter in ["a", "e", "b", "f", "p", "n", "h", "d"] {
@@ -828,6 +885,138 @@ fn document_urls_match_textedit_documents() {
             && document.absolute.ends_with("/textloom-html-import.rtf")
     );
     assert!(document.resolved.ends_with("/textloom-html-import.rtf"));
+}
+
+#[test]
+fn controls_use_pid_checked_focus_then_one_direct_ax_request() {
+    for command in ["press-button", "press-popup"] {
+        let mut replay = Replay::new(Fake::default());
+        replay
+            .probe
+            .action(101, TITLE, command, "Exact label")
+            .unwrap();
+        let calls = &replay.probe.system.commands;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            &calls[0].arguments[2..6],
+            ["focus", "101", TITLE, "Exact label"]
+        );
+        assert_eq!(
+            &calls[1].arguments[1..8],
+            ["ax-press", "101", TITLE, command, "Exact label", "", ""]
+        );
+        assert_eq!(
+            replay.probe.observations["last_native_action"]["command"],
+            command
+        );
+        assert_eq!(
+            replay.probe.observations["last_ax_control"]["nodes"][0]["role"],
+            "AXGroup"
+        );
+    }
+    let mut replay = Replay::new(Fake::default());
+    assert!(
+        replay
+            .probe
+            .action(101, "wrong window", "press-button", "Exact label")
+            .is_err()
+    );
+    assert_eq!(
+        replay.probe.system.commands.len(),
+        1,
+        "failed focus must not start AX helper"
+    );
+}
+
+#[test]
+fn uncertain_ax_failures_are_never_retried_and_inventory_survives() {
+    for result in [
+        Ok(ran(1, "", "AXPress: AX error -25202 (invalidUIElement)")),
+        Ok(ran(1, "", "AXPress: AX error -25204 (cannotComplete)")),
+        Ok(ran(
+            1,
+            "",
+            "AXRole: AX error -25202 after 30 pre-action attempts",
+        )),
+        Ok(ran(1, "", "Target control count 0")),
+        Ok(ran(0, r#"{"pressed":false}"#, "")),
+        Ok(ran(77, "{}", "unrecognized helper failure")),
+        Err("helper timed out".to_owned()),
+    ] {
+        let mut replay = Replay::new(Fake {
+            control_results: [result].into(),
+            ..Fake::default()
+        });
+        assert!(
+            replay
+                .probe
+                .action(101, TITLE, "press-button", "Clear formatting")
+                .is_err()
+        );
+        assert_eq!(
+            replay.probe.system.commands.len(),
+            2,
+            "must not retry or fall back after uncertain AX delivery"
+        );
+        assert_eq!(
+            replay.probe.observations["last_ax_control"]["nodes"][0]["role"],
+            "AXGroup"
+        );
+    }
+}
+
+#[test]
+fn only_explicit_untrusted_helper_uses_system_events_fallback_once() {
+    for succeeds in [true, false] {
+        let mut replay = Replay::new(Fake {
+            control_results: [Ok(ran(
+                77,
+                r#"{"pressed":false,"trusted":false,"fallback":"system-events"}"#,
+                "",
+            ))]
+            .into(),
+            ignored: succeeds
+                .then(|| Box::new(|command: &str, _: &str| command == "press-button") as Ignored),
+            ..Fake::default()
+        });
+        let result = replay
+            .probe
+            .action(101, TITLE, "press-button", "Clear formatting");
+        assert_eq!(result.is_ok(), succeeds);
+        let calls = &replay.probe.system.commands;
+        assert_eq!(
+            calls.len(),
+            3,
+            "fallback must not retry an uncertain result"
+        );
+        assert_eq!(
+            &calls[2].arguments[2..6],
+            ["press-button", "101", TITLE, "Clear formatting"]
+        );
+        let observation = &replay.probe.observations["last_ax_control"];
+        assert_eq!(observation["backend"], "system-events");
+        assert_eq!(observation["direct_ax_trusted"], false);
+        assert_eq!(observation["pressed"], succeeds);
+        let artifact: Value = serde_json::from_slice(
+            &fs::read(replay.probe.output.join("macos-ax-control.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&artifact, observation);
+    }
+}
+
+#[test]
+fn subprocess_timeout_keeps_partial_ax_diagnostics() {
+    let mut machine = Machine::new(Arc::default());
+    let error = machine.run(&[
+        "/bin/sh".to_owned(), "-c".to_owned(),
+        "printf 'AX partial inventory: AXGroup AXButton Clear formatting\\n' >&2; exec sleep 5".to_owned(),
+    ], None, 0.2).unwrap_err().to_string();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        error.contains("AX partial inventory: AXGroup AXButton Clear formatting"),
+        "{error}"
+    );
 }
 
 #[test]
