@@ -1,16 +1,23 @@
 # Changelog
 
-## 1.0.0
+## 1.0.0-rc.2
 
-Unreleased. The code follows the
+2026-10-22. Second release candidate for 1.0.0. The code follows the
 [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html),
-which changes some public API names and types from 1.0.0-rc.1. Every public
-item is documented.
+which changes some public API names and types from 1.0.0-rc.1; see the
+migration notes below. Every public item is documented. The API may still
+change before 1.0.0. Hands-on Windows checks and several macOS and
+physical-device checks are still pending; see `RELEASING.md`.
 
 - `Error`, `FragmentError`, `AccessKitError`, and the egui
   `AccessibilityError` implement `Copy`. `AccessibilitySnapshot` implements
   `Clone` and `Copy`; `AccessKitAdapter`, `WinitAdapter`, and
   `RichTextEditorOutput` implement `Clone`; `Movement` implements `Hash`.
+- Native host: Ctrl+Alt+Q, which Windows accepts in place of AltGr+Q to type
+  `@` on a German layout, no longer closes the host. egui's default quit
+  shortcut matched Ctrl+Q and ignored Alt; the host now handles
+  Ctrl/Command+Q itself and leaves Alt chords alone, as it does for
+  Ctrl/Command+K.
 
 ### Migration from 1.0.0-rc.1
 
