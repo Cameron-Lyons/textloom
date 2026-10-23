@@ -326,6 +326,9 @@ struct ImportDesktop {
     open: bool,
     prepared: bool,
     fault: &'static str,
+    destination_text: String,
+    destination_copied: bool,
+    destination_saved: bool,
 }
 
 impl ImportDesktop {
@@ -338,6 +341,9 @@ impl ImportDesktop {
             open: true,
             prepared: false,
             fault: "",
+            destination_text: "paste target".into(),
+            destination_copied: false,
+            destination_saved: false,
         }
     }
 }
@@ -349,6 +355,18 @@ impl System for ImportDesktop {
             let value = arguments[5].as_str();
             let owner = if arguments[3] == "101" { "native:" } else { "" };
             self.actions.push(format!("{owner}{command}:{value}"));
+            if owner.is_empty() {
+                match (command, value) {
+                    ("chord", "v") => {
+                        self.destination_text = format!("{}\n", super::QUOTE.text);
+                        self.destination_copied = false;
+                        self.destination_saved = false;
+                    }
+                    ("chord", "c") => self.destination_copied = true,
+                    ("chord", "s") => self.destination_saved = true,
+                    _ => {}
+                }
+            }
             if self.fault == "paste" && command == "chord" && value == "v" {
                 return Ok(response(1, String::new(), "native paste delivery failed"));
             }
@@ -416,7 +434,43 @@ impl System for ImportDesktop {
             "prepare-import" => {
                 assert!(!self.open, "must not replace an open document on disk");
                 self.prepared = true;
+                self.destination_text = "paste target".into();
+                self.destination_copied = false;
+                self.destination_saved = false;
                 json!({"neutral_import_prepared":true})
+            }
+            "offer-visible-control" | "offer-html" => {
+                self.generation += 1;
+                json!({"source":"diagnostic-control"})
+            }
+            "textedit-visible" => {
+                let expected: Value = serde_json::from_str(&arguments[2])?;
+                if self.destination_copied
+                    || self.destination_saved
+                    || expected["generation"] != self.generation
+                {
+                    return Err(
+                        "Visible capture happened after copy/save or source replacement".into(),
+                    );
+                }
+                self.actions.push(format!(
+                    "visible:{}:{}",
+                    expected["label"].as_str().unwrap(),
+                    expected["stage"].as_str().unwrap()
+                ));
+                let mut observed = json!({"visible_capture_verified":true, "pid":expected["pid"],
+                    "window":expected["window"], "document":expected["document"],
+                    "label":expected["label"], "stage":expected["stage"], "text":self.destination_text,
+                    "character_bounds":[{"available":false,"error":"fixture geometry unavailable"}]});
+                match self.fault {
+                    "visible-pid" => observed["pid"] = json!(999),
+                    "visible-window" => observed["window"] = json!("unrelated"),
+                    "visible-document" => observed["document"] = json!("file:///unrelated.rtf"),
+                    "visible-text" => observed["text"] = json!("wrong fixture"),
+                    "visible-generation" => self.generation += 1,
+                    _ => {}
+                }
+                observed
             }
             "textedit-features" if self.fault == "helper" => {
                 return Err("helper transport failed".into());
@@ -676,5 +730,123 @@ fn unstable_native_source_capture_is_fatal_before_any_destination_action() {
             1
         );
         assert_eq!(probe.observations["checks"], json!([]));
+    }
+}
+
+#[test]
+fn visible_comparison_captures_three_fresh_cases_before_copy_or_save_without_control_passes() {
+    let work = TempDir::try_new("macos-visible-order-").unwrap();
+    let mut probe = Probe::try_new(
+        ImportDesktop::new(json!({"textedit_rtf_features_exact":true})),
+        PathBuf::from("unused"),
+        work.path().to_path_buf(),
+        work.path(),
+        "candidate",
+    )
+    .unwrap();
+    probe.textedit_pid = Some(202);
+    probe.quote_import_diagnostics(101).unwrap();
+    let actions = &probe.system.actions;
+    for label in [
+        "quote-native-fresh",
+        "quote-visible-plain",
+        "quote-visible-indented",
+    ] {
+        let neutral = actions
+            .iter()
+            .position(|action| action == &format!("visible:{label}:neutral"))
+            .unwrap();
+        let pasted = actions
+            .iter()
+            .position(|action| action == &format!("visible:{label}:pasted"))
+            .unwrap();
+        assert!(neutral < pasted);
+        assert!(
+            actions[neutral..pasted]
+                .iter()
+                .any(|action| action == "chord:v")
+        );
+        assert!(
+            !actions[neutral..pasted]
+                .iter()
+                .any(|action| action == "chord:c" || action == "chord:s")
+        );
+        assert!(
+            actions[..neutral]
+                .iter()
+                .rposition(|action| action == "prepare-import")
+                .is_some()
+        );
+        assert!(actions[pasted..].iter().any(|action| action == "chord:c"));
+    }
+    assert_eq!(
+        probe.observations["quote_visible_captures"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        probe.observations["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|check| check["name"].as_str().unwrap().contains("visible control"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn visible_capture_rejects_wrong_identity_text_generation_and_post_copy_or_save() {
+    for fault in [
+        "visible-pid",
+        "visible-window",
+        "visible-document",
+        "visible-text",
+        "visible-generation",
+    ] {
+        let work = TempDir::try_new("macos-visible-invalid-").unwrap();
+        let mut system = ImportDesktop::new(json!({"textedit_rtf_features_exact":true}));
+        system.fault = fault;
+        let mut probe = Probe::try_new(
+            system,
+            PathBuf::from("unused"),
+            work.path().to_path_buf(),
+            work.path(),
+            "candidate",
+        )
+        .unwrap();
+        probe.textedit_pid = Some(202);
+        assert!(probe.native_quote_import(101, true).is_err(), "{fault}");
+        assert!(
+            !probe
+                .system
+                .actions
+                .iter()
+                .any(|action| action == "chord:v")
+        );
+        assert!(!probe.observations.contains_key("quote_visible_captures"));
+    }
+    for save in [false, true] {
+        let work = TempDir::try_new("macos-visible-late-").unwrap();
+        let mut system = ImportDesktop::new(json!({}));
+        system.destination_copied = !save;
+        system.destination_saved = save;
+        let mut probe = Probe::try_new(
+            system,
+            PathBuf::from("unused"),
+            work.path().to_path_buf(),
+            work.path(),
+            "candidate",
+        )
+        .unwrap();
+        probe.textedit_pid = Some(202);
+        assert!(
+            probe
+                .visible_quote("quote-native-fresh", "pasted", 1)
+                .is_err()
+        );
+        assert!(!probe.observations.contains_key("quote_visible_captures"));
     }
 }

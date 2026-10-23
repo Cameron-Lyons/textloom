@@ -28,8 +28,8 @@ The production fixes are at clean commit `3908e3c208a58863246173720f6d5d9ff22ab4
 The full `scripts/check-release.sh` passed: all eight feature combinations,
 release tests, native host tests, strict Clippy, rustdoc, quick benchmarks,
 package inventory, and extracted-package consumer validation. The publication
-dry run passed without uploading. All nine CI jobs passed at `db1fd58` in
-[run 39966191435](https://github.com/Cameron-Lyons/textloom/actions/runs/39966191435);
+dry run passed without uploading. All nine CI jobs passed at `3469352` in
+[run 39970290841](https://github.com/Cameron-Lyons/textloom/actions/runs/39970290841);
 that excludes the separate native interaction workflow. Subsequent commits extend repository-only
 QA and documentation; they do not change the published library implementation.
 
@@ -79,19 +79,29 @@ Word/Outlook interoperability and physical hardware remain unverified.
 
 The new macOS winit probe passed all nine observations on macOS 26.6.2 arm64,
 most recently in
-[run 39966191421](https://github.com/Cameron-Lyons/textloom/actions/runs/39966191421),
-PR head `db1fd58` / tested merge `7f188df15b36319a5dacf77d911c5860c9802a93`.
+[run 39970290852](https://github.com/Cameron-Lyons/textloom/actions/runs/39970290852),
+PR head `3469352` / tested merge `e8b07f97b57c4487c470560c24d5deee8cd5d606`.
 It verified natural startup focus before the first native key, exact Unicode
 copy/paste, document and selection restoration through undo/redo, and owned
 process cleanup. It did not test an IME or VoiceOver. The separate TextEdit
 probe passed native Command+Shift+V from a rich source, fill/font color and link
-controls with undo/redo, external TextEdit color/link import, and a soft break
-within one numbered item. Bounded accessibility rediscovery and all nine Swift
-retry self-tests also passed. The probe then failed because TextEdit returned
-the correct quote text without paragraph indentation from the native
-`<blockquote>` offer. This is a retained interoperability failure under
-investigation, not a full macOS pass; later numbering, forced-wrap, and guarded
-mode checks were not reached in this run.
+controls with undo/redo, external TextEdit color/link import, a soft break
+within one numbered item, quote continuation/exit and Backspace behavior,
+numbering controls and external partial-list numbers, forced-wrap deletion,
+and read-only/disabled guards. All nine Swift accessibility retry self-tests
+and ten feature/capture self-tests passed. All three native sessions closed
+gracefully with zero reported errors, and owned processes were cleaned up.
+
+The overall interaction result remains failed: TextEdit's copied RTF retained
+the exact quote text but no paragraph indentation from the native
+`<blockquote>` offer, in both reused and fresh neutral documents. Controlled
+HTML and AppKit parser comparisons reproduced the result. A margin on child
+paragraphs produced a positive subsequent-line indent but left the first-line
+indent at zero. AppKit retained a block-quote presentation intent; the copied
+RTF did not. The source offers and destination artifacts are retained separately
+under `macos-run6-39970290852/` in the local evidence archive. This establishes
+the RTF formatting failure; visible TextEdit quote presentation still requires
+direct observation. The probe's successful checks do not erase that distinction.
 
 ## Earlier validation evidence
 

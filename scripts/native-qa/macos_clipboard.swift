@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Foundation
+import Darwin
 
 let fixture = "café 日本語👩🏽‍💻\nsecond"
 let external = "external café 日本語👩🏽‍💻\nsecond"
@@ -512,6 +513,234 @@ func prepareImport(_ arguments: [String]) throws {
     try emit(["neutral_import_prepared": true])
 }
 
+func visibleIdentity(_ expected: [String: Any], _ observed: [String: Any]) throws {
+    try require(observed["pid"] as? Int == expected["pid"] as? Int, "Visible capture wrong PID")
+    try require(observed["bundle"] as? String == "com.apple.TextEdit", "Visible capture is not TextEdit")
+    guard let window = expected["window"] as? String, let title = observed["window"] as? String,
+          let document = observed["document"] as? String, !document.isEmpty else {
+        throw ProbeError.failed("Visible capture missing window/document identity")
+    }
+    try require(title == window || title == window + ".rtf", "Visible capture wrong window")
+    try require(document == expected["document"] as? String || document == expected["resolved_document"] as? String,
+                "Visible capture wrong document")
+    try require(observed["foreground_verified"] as? Bool == true && observed["text_area_in_window"] as? Bool == true,
+                "Visible capture lost focused text area/window")
+    guard let text = expected["text"] as? String, let actual = observed["text"] as? String else {
+        throw ProbeError.failed("Visible capture missing exact text")
+    }
+    // HTML import may append one paragraph terminator, as in the RTF checks.
+    try require(Data(actual.utf8) == Data(text.utf8) || Data(actual.utf8) == Data((text + "\n").utf8),
+                "Visible capture changed fixture text")
+    try require(observed["change_count"] as? Int == expected["generation"] as? Int,
+                "Visible capture happened after copy or source replacement")
+}
+
+func visibleRect(_ lookup: ControlLookup, _ element: AXUIElement) throws -> CGRect {
+    guard let position = try lookup.read(element, "AXPosition", optional: false),
+          let size = try lookup.read(element, "AXSize", optional: false),
+          CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else {
+        throw ProbeError.failed("Visible capture missing AX bounds")
+    }
+    var point = CGPoint.zero
+    var dimensions = CGSize.zero
+    try require(AXValueGetValue(position as! AXValue, .cgPoint, &point)
+                && AXValueGetValue(size as! AXValue, .cgSize, &dimensions), "Invalid AX bounds type")
+    try require(point.x.isFinite && point.y.isFinite && dimensions.width.isFinite && dimensions.height.isFinite
+                && dimensions.width > 0 && dimensions.height > 0, "Invalid AX bounds")
+    return CGRect(origin: point, size: dimensions)
+}
+
+func rectFields(_ rect: CGRect) -> [String: Double] {
+    ["x": Double(rect.minX), "y": Double(rect.minY), "width": Double(rect.width), "height": Double(rect.height)]
+}
+
+// Only the already-focused owned document is read. No activation, traversal,
+// desktop capture, or focus fallback is performed by this helper.
+func textEditVisible(_ arguments: [String]) throws {
+    let environment = ProcessInfo.processInfo.environment
+    try require(environment["GITHUB_ACTIONS"] == "true" && environment["RUNNER_OS"] == "macOS",
+                "Visible comparison requires an isolated hosted macOS Actions runner")
+    try require(arguments.count == 1 && arguments[0].utf8.count <= 16384, "Visible comparison requires bounded JSON")
+    guard let expected = try JSONSerialization.jsonObject(with: Data(arguments[0].utf8)) as? [String: Any],
+          let pid = expected["pid"] as? Int, pid > 0 && pid <= Int(Int32.max),
+          let label = expected["label"] as? String,
+          ["quote-native-fresh", "quote-visible-plain", "quote-visible-indented"].contains(label),
+          let stage = expected["stage"] as? String, ["neutral", "pasted"].contains(stage),
+          let directory = expected["directory"] as? String,
+          let neutralFile = expected["neutral_file"] as? String,
+          let expectedText = expected["text"] as? String, expectedText.utf8.count <= 128 else {
+        throw ProbeError.failed("Invalid visible comparison specification")
+    }
+    try require(AXIsProcessTrusted(), "Visible comparison AX helper is untrusted")
+    let prefix = URL(fileURLWithPath: directory, isDirectory: true).appendingPathComponent("macos-fixture-\(label)")
+    let artifact = prefix.appendingPathExtension("visible-\(stage).json")
+    let lookup = ControlLookup(artifact: artifact.path, observation: [:])
+    _ = try lookup.checked(AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25), "set visible AX timeout")
+    let app = AXUIElementCreateApplication(pid_t(pid))
+    let window = try lookup.element(lookup.read(app, "AXFocusedWindow", optional: false))
+    let textArea = try lookup.element(lookup.read(app, "AXFocusedUIElement", optional: false))
+    func identity() throws -> [String: Any] {
+        try lookup.foreground(app, window: window, pid: pid_t(pid))
+        for element in [app, window, textArea] {
+            var owner: pid_t = 0
+            _ = try lookup.checked(AXUIElementGetPid(element, &owner), "visible element PID")
+            try require(owner == pid_t(pid), "Visible AX element belongs to wrong PID")
+        }
+        let focused = try lookup.element(lookup.read(app, "AXFocusedUIElement", optional: false))
+        let ownerWindow = try lookup.element(lookup.read(textArea, "AXWindow", optional: false))
+        try require(CFEqual(focused, textArea) && CFEqual(ownerWindow, window), "Visible text area/window changed")
+        try require(try lookup.string(textArea, "AXRole", optional: false) == "AXTextArea", "Visible focus is not a text area")
+        let observed: [String: Any] = [
+            "pid": pid, "bundle": NSRunningApplication(processIdentifier: pid_t(pid))?.bundleIdentifier ?? "",
+            "window": try lookup.string(window, "AXTitle", optional: false) ?? "",
+            "document": try lookup.string(window, "AXDocument", optional: false) ?? "",
+            "text": try lookup.string(textArea, "AXValue", optional: false) ?? "",
+            "foreground_verified": true, "text_area_in_window": true,
+            "change_count": NSPasteboard.general.changeCount
+        ]
+        try visibleIdentity(expected, observed)
+        return observed
+    }
+    var observation = try identity()
+    let windowRect = try visibleRect(lookup, window)
+    let areaRect: CGRect?
+    do {
+        areaRect = try visibleRect(lookup, textArea)
+        observation["text_area_bounds_available"] = true
+    } catch {
+        if let failure = error as? ControlAXError,
+           failure.code == .invalidUIElement || failure.code == .cannotComplete { throw error }
+        areaRect = nil
+        observation["text_area_bounds_available"] = false
+        observation["text_area_bounds_error"] = String(describing: error)
+    }
+    observation["window_bounds"] = rectFields(windowRect)
+    if let areaRect = areaRect { observation["text_area_bounds"] = rectFields(areaRect) }
+    observation["label"] = label
+    observation["stage"] = stage
+    observation["source_manifest"] = label == "quote-native-fresh"
+        ? "macos-fixture-quote-native-fresh-source.json" : "macos-fixture-\(label).source.json"
+    observation["neutral_fixture"] = prefix.appendingPathExtension("neutral.rtf").lastPathComponent
+    observation["timestamp_utc"] = ISO8601DateFormatter().string(from: Date())
+    observation["macos"] = ProcessInfo.processInfo.operatingSystemVersionString
+    let bundle = NSRunningApplication(processIdentifier: pid_t(pid))?.bundleURL.flatMap { Bundle(url: $0) }
+    observation["textedit_version"] = bundle?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unavailable"
+    observation["textedit_build"] = bundle?.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unavailable"
+    observation["scope"] = "two observed paragraph starts; no witnessed wrapping or automatic visual pass"
+    var geometry: [[String: Any]] = []
+    for offset in stage == "neutral" ? [0] : [0, 6] {
+        try lookup.checkTime()
+        var range = CFRange(location: offset, length: 1)
+        guard let parameter = AXValueCreate(.cfRange, &range) else { throw ProbeError.failed("Could not create visible range") }
+        var result: CFTypeRef?
+        let error = AXUIElementCopyParameterizedAttributeValue(textArea, "AXBoundsForRange" as CFString, parameter, &result)
+        var item: [String: Any] = ["utf16_location": offset, "utf16_length": 1]
+        if error == .success, let result = result, CFGetTypeID(result) == AXValueGetTypeID() {
+            var bounds = CGRect.zero
+            if AXValueGetValue(result as! AXValue, .cgRect, &bounds), !bounds.isEmpty, !bounds.isInfinite, !bounds.isNull {
+                item["screen_bounds"] = rectFields(bounds)
+                if let areaRect = areaRect {
+                    item["available"] = true
+                    item["text_area_relative_bounds"] = rectFields(bounds.offsetBy(dx: -areaRect.minX, dy: -areaRect.minY))
+                } else { item["available"] = false; item["error"] = "text-area origin unavailable for normalization" }
+            } else { item["available"] = false; item["error"] = "invalid or empty range bounds" }
+        } else {
+            if error == .invalidUIElement || error == .cannotComplete { throw ControlAXError(code: error, operation: "visible range bounds") }
+            item["available"] = false
+            item["error"] = "AXBoundsForRange: \(error.rawValue)"
+        }
+        geometry.append(item)
+    }
+    observation["character_bounds"] = geometry
+    if stage == "neutral" {
+        let url = URL(fileURLWithPath: neutralFile)
+        let data = try Data(contentsOf: url)
+        try require(data.count <= 65536, "Neutral fixture exceeds cap")
+        let value = try NSAttributedString(data: data, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil)
+        try require(value.string == "paste target", "Wrong neutral fixture payload")
+        var offset = 0
+        while offset < value.length {
+            var range = NSRange(location: 0, length: 0)
+            let attributes = value.attributes(at: offset, effectiveRange: &range)
+            guard let style = attributes[.paragraphStyle] as? NSParagraphStyle else { throw ProbeError.failed("Neutral fixture lacks paragraph style") }
+            try require(style.headIndent == 0 && style.firstLineHeadIndent == 0 && style.tailIndent == 0 && style.textBlocks.isEmpty && style.textLists.isEmpty,
+                        "Neutral destination retained paragraph formatting")
+            try require(NSMaxRange(range) > offset, "Invalid neutral attributes")
+            offset = NSMaxRange(range)
+        }
+        observation["neutral_attribute_runs"] = try featureAttributes(value)
+        try data.write(to: prefix.appendingPathExtension("neutral.rtf"), options: .withoutOverwriting)
+    } else {
+        // AX and CG use screen coordinates. Require a unique same-PID, normal
+        // window with the verified AX frame; never capture a display rectangle.
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]], windows.count <= 512 else {
+            throw ProbeError.failed("Visible window inventory unavailable or exceeds cap")
+        }
+        let matches = windows.filter { entry in
+            guard entry[kCGWindowOwnerPID as String] as? Int == pid,
+                  entry[kCGWindowLayer as String] as? Int == 0,
+                  let fields = entry[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: fields as CFDictionary) else { return false }
+            return abs(bounds.minX - windowRect.minX) < 1 && abs(bounds.minY - windowRect.minY) < 1
+                && abs(bounds.width - windowRect.width) < 1 && abs(bounds.height - windowRect.height) < 1
+        }
+        try require(matches.count == 1, "Visible screenshot window identity is ambiguous")
+        guard let windowID = matches[0][kCGWindowNumber as String] as? UInt32 else { throw ProbeError.failed("Visible window has no ID") }
+        try require(windowRect.width <= 4096 && windowRect.height <= 4096, "Visible window exceeds screenshot cap")
+        observation["cg_window_id"] = windowID
+        _ = try identity()
+        let temporary = prefix.appendingPathExtension(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let stderrURL = prefix.appendingPathExtension("screenshot.stderr.log")
+        try Data().write(to: stderrURL, options: .withoutOverwriting)
+        let stderr = try FileHandle(forWritingTo: stderrURL)
+        defer { try? stderr.close() }
+        let capture = Process()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-o", "-l", String(windowID), "-t", "png", temporary.path]
+        capture.standardError = stderr
+        capture.standardOutput = FileHandle.nullDevice
+        try capture.run()
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while capture.isRunning && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        if capture.isRunning {
+            capture.terminate()
+            let stop = ProcessInfo.processInfo.systemUptime + 0.25
+            while capture.isRunning && ProcessInfo.processInfo.systemUptime < stop { Thread.sleep(forTimeInterval: 0.01) }
+            if capture.isRunning { _ = Darwin.kill(capture.processIdentifier, SIGKILL) }
+            throw ProbeError.failed("Owned-window screenshot timed out")
+        }
+        try require(capture.terminationStatus == 0, "Owned-window screenshot failed; see scoped stderr")
+        let attributes = try FileManager.default.attributesOfItem(atPath: temporary.path)
+        try require(((attributes[.size] as? NSNumber)?.intValue ?? Int.max) <= 8 * 1024 * 1024, "Screenshot exceeds byte cap")
+        let png = try Data(contentsOf: temporary)
+        guard let bitmap = NSBitmapImageRep(data: png), bitmap.pixelsWide > 0 && bitmap.pixelsHigh > 0,
+              bitmap.pixelsWide <= 8192 && bitmap.pixelsHigh <= 8192 else { throw ProbeError.failed("Invalid owned-window screenshot") }
+        observation["screenshot"] = prefix.appendingPathExtension("visible.png").lastPathComponent
+        observation["screenshot_pixels"] = [bitmap.pixelsWide, bitmap.pixelsHigh]
+        // Recheck exact identity, clipboard and viewport after capture before
+        // publishing any image as fixture evidence.
+        _ = try identity()
+        try require(try visibleRect(lookup, window) == windowRect, "Visible window moved during capture")
+        if let areaRect = areaRect {
+            try require(try visibleRect(lookup, textArea) == areaRect, "Visible text area moved during capture")
+        }
+        guard let current = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
+              current.count == 1,
+              current[0][kCGWindowOwnerPID as String] as? Int == pid,
+              current[0][kCGWindowNumber as String] as? UInt32 == windowID else {
+            throw ProbeError.failed("Screenshot window identity changed during capture")
+        }
+        try png.write(to: prefix.appendingPathExtension("visible.png"), options: .withoutOverwriting)
+    }
+    _ = try identity()
+    observation["completed_utc"] = ISO8601DateFormatter().string(from: Date())
+    observation["visible_capture_verified"] = true
+    let result = try JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys])
+    try result.write(to: artifact, options: .withoutOverwriting)
+    print(String(decoding: result, as: UTF8.self))
+}
+
 func nativeFixture() throws {
     try require(try plain() == fixture, "Native fixture plain text differs")
     guard let htmlData = try boundedData(.html), let html = String(data: htmlData, encoding: .utf8) else {
@@ -822,6 +1051,23 @@ func featureSelfTest() throws {
         try require(accepted == expected, "Native source self-test failed: \(name)")
         checks.append(name)
     }
+    let visibleExpected: [String: Any] = ["pid": 42, "window": "fixture", "document": "file:///fixture.rtf",
+        "resolved_document": "file:///private/fixture.rtf", "generation": 7, "text": "quote\ncontinued"]
+    let visibleObserved: [String: Any] = ["pid": 42, "bundle": "com.apple.TextEdit", "window": "fixture.rtf",
+        "document": "file:///fixture.rtf", "change_count": 7, "text": "quote\ncontinued\n",
+        "foreground_verified": true, "text_area_in_window": true]
+    try visibleIdentity(visibleExpected, visibleObserved)
+    checks.append("visible identity and terminal paragraph LF accepted")
+    for (key, value) in [("pid", 99 as Any), ("window", "other"), ("document", "file:///other.rtf"),
+                          ("text", "wrong"), ("change_count", 8), ("foreground_verified", false),
+                          ("text_area_in_window", false), ("bundle", "other.application")] {
+        var altered = visibleObserved
+        altered[key] = value
+        var accepted = false
+        do { try visibleIdentity(visibleExpected, altered); accepted = true } catch {}
+        try require(!accepted, "Visible self-test accepted changed \(key)")
+        checks.append("visible capture rejects changed \(key)")
+    }
     try emit(["feature_self_test": true, "checks": checks])
 }
 
@@ -872,6 +1118,52 @@ func offerHTML(_ arguments: [String]) throws {
     try emit(["controlled_html_offer": true, "types": types()])
 }
 
+func offerVisibleControl(_ arguments: [String]) throws {
+    let environment = ProcessInfo.processInfo.environment
+    try require(environment["GITHUB_ACTIONS"] == "true" && environment["RUNNER_OS"] == "macOS",
+                "Visible controls require an isolated hosted macOS Actions runner")
+    try require(arguments.count == 2, "Visible control requires directory and label")
+    let label = arguments[1]
+    try require(["quote-visible-plain", "quote-visible-indented"].contains(label), "Unknown visible control")
+    let text = "quote\ncontinued"
+    let prefix = URL(fileURLWithPath: arguments[0], isDirectory: true).appendingPathComponent("macos-fixture-\(label)")
+    let type: NSPasteboard.PasteboardType
+    let data: Data
+    var observation: [String: Any] = ["label": label, "source": "diagnostic-control", "plain_utf8_exact": true]
+    if label == "quote-visible-plain" {
+        type = .html
+        data = Data("<!doctype html><html><head><meta charset=\"utf-8\"></head><body><div style=\"white-space:pre-wrap\"><p>quote</p><p>continued</p></div></body></html>".utf8)
+    } else {
+        type = .rtf
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.headIndent = 36
+        paragraph.firstLineHeadIndent = 36
+        paragraph.paragraphSpacing = 12
+        guard let font = NSFont(name: "Times-Roman", size: 12) else { throw ProbeError.failed("Positive control font unavailable") }
+        let value = NSAttributedString(string: text, attributes: [.font: font, .paragraphStyle: paragraph])
+        data = try value.data(from: NSRange(location: 0, length: value.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+        observation["source_attribute_runs"] = try featureAttributes(value)
+    }
+    let name = type == .html ? "html" : "rtf"
+    try require(data.count <= 65536, "Visible control representation exceeds cap")
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    try require(pasteboard.setData(data, forType: type) && pasteboard.setData(Data(text.utf8), forType: .string), "Visible control publication failed")
+    let generation = pasteboard.changeCount
+    let offeredTypes = types()
+    try require(try boundedData(type) == data && boundedData(.string) == Data(text.utf8)
+                && boundedData(customType) == nil, "Visible control offer readback differs")
+    try require(pasteboard.changeCount == generation, "Visible control changed during source capture")
+    observation["change_count"] = generation
+    observation["types"] = offeredTypes
+    observation["representation_bytes"] = [name: data.count, "plain": text.utf8.count]
+    try data.write(to: prefix.appendingPathExtension("source.\(name)"), options: .withoutOverwriting)
+    try Data(text.utf8).write(to: prefix.appendingPathExtension("source.plain"), options: .withoutOverwriting)
+    let manifest = try JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys])
+    try manifest.write(to: prefix.appendingPathExtension("source.json"), options: .withoutOverwriting)
+    print(String(decoding: manifest, as: UTF8.self))
+}
+
 func expectPlain(_ arguments: [String], fallback: Bool) throws {
     try require(arguments.count == 1, "plain assertion requires one expected value")
     try require(try plain() == arguments[0], "Native clipboard differs from the expected document state")
@@ -890,7 +1182,7 @@ func diagnose(_ arguments: [String]) throws {
     try require(arguments.count == 2, "diagnose requires an artifact directory and fixture label")
     let labels = ["native-offer", "textedit-before-paste", "textedit-after-paste", "textedit-after-copy", "feature-import", "failure",
                   "feature-colors", "feature-soft-break", "feature-numbering", "quote-native-reused", "quote-native-fresh",
-                  "quote-bare", "quote-block-margin", "quote-paragraph-margin"]
+                  "quote-bare", "quote-block-margin", "quote-paragraph-margin", "quote-visible-plain", "quote-visible-indented"]
     try require(labels.contains(arguments[1]), "Unexpected fixture diagnostic label")
     let directory = URL(fileURLWithPath: arguments[0], isDirectory: true)
     let label = arguments[1]
@@ -947,6 +1239,8 @@ do {
     case "feature-self-test": try featureSelfTest()
     case "inspect-html": try inspectHTML(Array(arguments.dropFirst()))
     case "offer-html": try offerHTML(Array(arguments.dropFirst()))
+    case "offer-visible-control": try offerVisibleControl(Array(arguments.dropFirst()))
+    case "textedit-visible": try textEditVisible(Array(arguments.dropFirst()))
     case "textedit-import": try textEditImport()
     case "external-fixture": try externalFixture()
     case "state": try emit(["types": types()])

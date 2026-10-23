@@ -160,12 +160,16 @@ impl<S: System> Probe<S> {
         &mut self,
         label: &str,
         specification: &Value,
+        visible_generation: Option<i64>,
     ) -> Result<Map<String, Value>> {
         // The last rich assertion left the native offer on the clipboard.
         let pid = self.textedit_pid.ok_or("TextEdit is not running")?;
         let window = stem(&self.import_file);
         self.action(pid, &window, "chord", "a")?;
         self.action(pid, &window, "chord", "v")?;
+        if let Some(generation) = visible_generation {
+            self.visible_quote(label, "pasted", generation)?;
+        }
         let generation = change_count(&self.clipboard("state", &[], None)?)?;
         self.action(pid, &window, "chord", "a")?;
         self.action(pid, &window, "chord", "c")?;
@@ -205,8 +209,62 @@ impl<S: System> Probe<S> {
     }
 
     fn feature_import(&mut self, name: &str, label: &str, specification: Value) -> Result<()> {
-        let imported = self.import_features(label, &specification)?;
+        let imported = self.import_features(label, &specification, None)?;
         self.record_feature_import(name, imported)
+    }
+
+    fn visible_quote(&mut self, label: &str, stage: &str, generation: i64) -> Result<()> {
+        let pid = self.textedit_pid.ok_or("TextEdit is not running")?;
+        let window = stem(&self.import_file);
+        let document = self.documents(&window);
+        let expected = json!({
+            "pid":pid, "window":window, "document":document.absolute,
+            "resolved_document":document.resolved, "label":label, "stage":stage,
+            "generation":generation, "text":if stage == "neutral" { "paste target" } else { QUOTE.text },
+            "directory":self.output, "neutral_file":self.import_file,
+        });
+        // Do not focus, copy, save, or retry here: the observed display must be
+        // the original paste with its source clipboard generation still intact.
+        let result = self.run(
+            &[
+                self.helper.display().to_string(),
+                "textedit-visible".to_owned(),
+                expected.to_string(),
+            ],
+            None,
+            10.0,
+            Exit::MustSucceed,
+        )?;
+        let observed: Map<String, Value> = serde_json::from_slice(&result.stdout)?;
+        let text = observed
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or("Visible capture has no text")?;
+        let expected_text = expected["text"]
+            .as_str()
+            .ok_or("Missing visible fixture text")?;
+        if observed.get("visible_capture_verified") != Some(&Value::Bool(true))
+            || observed.get("pid") != expected.get("pid")
+            || observed.get("label") != expected.get("label")
+            || observed.get("stage") != expected.get("stage")
+            || observed.get("document") != expected.get("document")
+                && observed.get("document") != expected.get("resolved_document")
+            || observed
+                .get("window")
+                .and_then(Value::as_str)
+                .is_none_or(|title| title != window && title != format!("{window}.rtf"))
+            || change_count(&observed)? != generation
+            || text != expected_text && text != format!("{expected_text}\n")
+        {
+            return Err("Visible capture identity, text, or pre-copy generation differs".into());
+        }
+        self.observations
+            .entry("quote_visible_captures")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or("Malformed visible capture collection")?
+            .push(Value::Object(observed));
+        self.save()
     }
 
     pub(super) fn require_feature_success(&self) -> Result<()> {
@@ -299,17 +357,49 @@ impl<S: System> Probe<S> {
             if change_count(&self.clipboard("state", &[], None)?)? != generation {
                 return Err("Preparing the neutral destination changed the native offer".into());
             }
+            self.visible_quote(label, "neutral", generation)?;
         }
         let name = if fresh {
             "features: TextEdit quote import into a fresh neutral document"
         } else {
             "features: Enter continues quotes; TextEdit preserves quoted indentation"
         };
-        self.feature_import(name, label, quote_specification())
+        let imported =
+            self.import_features(label, &quote_specification(), fresh.then_some(generation))?;
+        self.record_feature_import(name, imported)
     }
 
     fn quote_import_diagnostics(&mut self, pid: u32) -> Result<()> {
         self.native_quote_import(pid, true)?;
+        for label in ["quote-visible-plain", "quote-visible-indented"] {
+            self.fresh_feature_destination()?;
+            let offered = self.run(
+                &[
+                    self.helper.display().to_string(),
+                    "offer-visible-control".to_owned(),
+                    self.output.display().to_string(),
+                    label.to_owned(),
+                ],
+                None,
+                10.0,
+                Exit::MustSucceed,
+            )?;
+            let offered: Map<String, Value> = serde_json::from_slice(&offered.stdout)?;
+            let generation = change_count(&offered)?;
+            self.visible_quote(label, "neutral", generation)?;
+            let specification = if label == "quote-visible-indented" {
+                quote_specification()
+            } else {
+                json!({"paragraphs":[{"text":"quote"},{"text":"continued"}]})
+            };
+            let imported = self.import_features(label, &specification, Some(generation))?;
+            if !import_passed(&imported)? {
+                self.record_feature_import(
+                    &format!("diagnostic: TextEdit visible control {label}"),
+                    imported,
+                )?;
+            }
+        }
         let mut comparisons = Vec::new();
         for (label, _) in QUOTE_CONTROLS {
             self.fresh_feature_destination()?;
@@ -321,7 +411,7 @@ impl<S: System> Probe<S> {
                 &[&path.display().to_string(), QUOTE.text],
                 None,
             )?;
-            let imported = self.import_features(label, &quote_specification())?;
+            let imported = self.import_features(label, &quote_specification(), None)?;
             // A controlled offer cannot certify the exporter, but an observed
             // native semantic failure must still keep this diagnostic run red.
             if !import_passed(&imported)? {

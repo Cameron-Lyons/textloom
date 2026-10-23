@@ -65,6 +65,17 @@ Before either native quote import, immutable
 rich envelope, plain bytes, advertised types, and clipboard generation. A
 generation change during capture fails before any destination action.
 
+The fresh native quote also has a visible comparison against ordinary-paragraph
+HTML and an RTF control with both indents set to 36 points. Each uses a reopened
+neutral document. Before copy or save, the helper captures only the verified
+TextEdit window and records available character bounds relative to its text
+area, along with the app version, timestamps, source manifest, and clipboard
+generation. Files ending in `.visible-neutral.json`, `.neutral.rtf`,
+`.visible-pasted.json`, and `.visible.png` retain these observations. Capture
+identity is checked before and after the screenshot; there is no desktop-image
+fallback. This comparison covers two paragraph starts, not wrapped lines, and
+does not automatically turn a failed RTF assertion into a visual pass.
+
 Every import has distinct `macos-fixture-<case>.*` RTF, plain-text, accessibility,
 and feature observations; paragraph diagnostics retain indents, text blocks,
 lists, and attribute descriptions. Semantic import failures remain in
