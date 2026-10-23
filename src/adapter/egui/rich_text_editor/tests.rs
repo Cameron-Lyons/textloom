@@ -480,6 +480,67 @@ fn shifted_paste_does_not_duplicate_an_inline_paste_or_request_with_extra_modifi
 }
 
 #[test]
+fn shifted_paste_with_an_older_reply_still_delivers_both_shortcuts() {
+    for inline in [false, true] {
+        for command in [Modifiers::CTRL, Modifiers::MAC_CMD] {
+            let context = egui::Context::default();
+            input_routing::install_input_routing(&context);
+            let mut editor = Editor::from_text("original");
+            editor.select_all();
+            let modifiers = command | Modifiers::COMMAND | Modifiers::SHIFT;
+            let mut clipboard = TestClipboard {
+                fragment: Some(styled_clipboard_editor().selected_fragment()),
+                ..Default::default()
+            };
+            let output = frame(&context, &mut editor, vec![key(Key::V, modifiers)], true);
+            assert_eq!(paste_requests(&output), 1);
+            output.drop_without_applying_deltas();
+            let mut events = vec![
+                key(Key::V, modifiers),
+                Event::ModifiersChanged(Modifiers::NONE),
+                Event::Paste("first".into()),
+            ];
+            if inline {
+                events.push(Event::Paste("second".into()));
+            }
+            let output = clipboard_frame(
+                &context,
+                &mut editor,
+                events,
+                true,
+                false,
+                true,
+                Some(&mut clipboard),
+            );
+            assert_eq!(paste_requests(&output), usize::from(!inline));
+            output.drop_without_applying_deltas();
+            if !inline {
+                clipboard_frame(
+                    &context,
+                    &mut editor,
+                    vec![Event::Paste("second".into())],
+                    true,
+                    false,
+                    true,
+                    Some(&mut clipboard),
+                )
+                .drop_without_applying_deltas();
+            }
+            assert_eq!(
+                Fragment::from_document(editor.document()),
+                Fragment::from_text("firstsecond")
+            );
+            assert!(clipboard.calls.is_empty());
+            assert_eq!(editor.undo_len(), 2);
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "first");
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), "original");
+        }
+    }
+}
+
+#[test]
 fn empty_shifted_paste_reply_does_not_change_the_next_rich_paste() {
     let context = egui::Context::default();
     input_routing::install_input_routing(&context);

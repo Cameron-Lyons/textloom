@@ -659,11 +659,15 @@ impl<'editor> RichTextEditor<'editor> {
             let mut layout_stale = false;
             let mut traversed = false;
             let mut paste_index = 0;
-            let mut inline_plain_paste = false;
+            let mut inline_plain_paste = None;
             let mut event_modifiers = input_routing::modifiers_at_pass_start(ui.ctx());
             for (index, event) in events.iter().enumerate() {
                 let plain_paste = if matches!(event, Event::Paste(_)) {
                     let reply = input_routing::paste_reply(ui.ctx(), paste_index);
+                    let inline = inline_plain_paste == Some(paste_index);
+                    if inline {
+                        inline_plain_paste = None;
+                    }
                     paste_index += 1;
                     // Recheck ownership after widget construction, which can
                     // change focus after the plugin's raw-input hook.
@@ -673,10 +677,7 @@ impl<'editor> RichTextEditor<'editor> {
                         consumed.push(index);
                         continue;
                     }
-                    let plain =
-                        matches!(reply, input_routing::PasteReply::Plain(_)) || inline_plain_paste;
-                    inline_plain_paste = false;
-                    plain
+                    matches!(reply, input_routing::PasteReply::Plain(_)) || inline
                 } else {
                     false
                 };
@@ -735,13 +736,21 @@ impl<'editor> RichTextEditor<'editor> {
                             .is_none_or(|composition| composition.text.is_empty())
                     {
                         // Some integrations already send both Key and Paste.
-                        // Do not ask them to paste a second copy.
+                        // An older request's reply is not this shortcut's
+                        // inline delivery. Keep the exact paste index when an
+                        // older reply precedes the inline event.
                         let delivered = events[index + 1..]
                             .iter()
                             .take_while(|event| !matches!(event, Event::Key { pressed: true, .. }))
-                            .any(|event| matches!(event, Event::Paste(_)));
-                        if delivered {
-                            inline_plain_paste = true;
+                            .filter(|event| matches!(event, Event::Paste(_)))
+                            .enumerate()
+                            .map(|(offset, _)| paste_index + offset)
+                            .find(|&index| {
+                                input_routing::paste_reply(ui.ctx(), index)
+                                    == input_routing::PasteReply::Ordinary
+                            });
+                        if let Some(index) = delivered {
+                            inline_plain_paste = Some(index);
                         } else {
                             input_routing::request_plain_paste(ui.ctx(), id);
                         }
