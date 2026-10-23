@@ -25,6 +25,46 @@ func emit(_ observation: [String: Any]) throws {
     print(String(decoding: data, as: UTF8.self))
 }
 
+struct ControlAXError: Error, CustomStringConvertible {
+    let code: AXError
+    let operation: String
+    var description: String { "\(operation): AX error \(code.rawValue) (\(code))" }
+}
+
+// The catch covers discovery ONLY. Even invalidUIElement/cannotComplete from
+// AXPress is unreplayable: a failed acknowledgement need not mean no action.
+// Injecting discovery, time, and press also lets the hosted helper test this
+// exact retry boundary without touching a desktop or sleeping.
+func discoverAndPress<T>(deadline: TimeInterval, now: () -> TimeInterval,
+                         pause: (TimeInterval) -> Void, begin: (Int) throws -> Void,
+                         failed: (Error?) throws -> Void, discover: () throws -> T?,
+                         press: (T) throws -> Void) throws {
+    var lastError: Error = ProbeError.failed("Target control count 0 after 30 attempts")
+    for attempt in 1...30 {
+        try require(now() < deadline, "AX lookup exceeded six-second deadline")
+        try begin(attempt)
+        let candidate: T?
+        do {
+            candidate = try discover()
+        } catch {
+            try failed(error)
+            guard let failure = error as? ControlAXError, failure.code == .invalidUIElement else { throw error }
+            lastError = error
+            if attempt < 30 { pause(min(0.1, max(0, deadline - now()))) }
+            continue
+        }
+        if let candidate = candidate {
+            try require(now() < deadline, "AX lookup exceeded six-second deadline")
+            try press(candidate)
+            return
+        }
+        lastError = ProbeError.failed("Target control count 0 after 30 attempts")
+        try failed(nil)
+        if attempt < 30 { pause(min(0.1, max(0, deadline - now()))) }
+    }
+    throw lastError
+}
+
 // A direct, PID-scoped AX client avoids System Events' expensive `entire
 // contents` materialization. The caller raises its owned window first; this
 // helper independently checks its identity and foreground status before press.
@@ -35,18 +75,46 @@ final class ControlLookup {
     var observation: [String: Any]
     var nodes: [[String: Any]] = []
     var errors: [[String: Any]] = []
+    var attempts: [[String: Any]] = []
 
     init(artifact: String, observation: [String: Any]) {
         self.artifact = URL(fileURLWithPath: artifact)
         self.observation = observation
     }
 
+    func snapshot() -> [String: Any] {
+        var result = observation
+        result["nodes"] = nodes
+        result["attribute_errors"] = errors
+        result["elapsed_seconds"] = 6 - (deadline - ProcessInfo.processInfo.systemUptime)
+        return result
+    }
+
     func save() throws {
-        observation["nodes"] = nodes
-        observation["attribute_errors"] = errors
-        observation["elapsed_seconds"] = 6 - (deadline - ProcessInfo.processInfo.systemUptime)
-        let data = try JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys, .prettyPrinted])
+        var result = snapshot()
+        result["failed_attempts"] = attempts
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted])
         try data.write(to: artifact, options: .atomic)
+    }
+
+    func beginAttempt(_ attempt: Int) throws {
+        nodes = []
+        errors = []
+        for key in ["error", "windows", "window_count", "match_count", "current_node", "retryable"] {
+            observation.removeValue(forKey: key)
+        }
+        observation["attempt"] = attempt
+        observation["status"] = "discovering"
+        observation["complete"] = false
+        try save()
+    }
+
+    func failedAttempt(_ error: Error?) throws {
+        observation["status"] = error == nil ? "not-found" : "discovery-failed"
+        if let error = error { observation["error"] = String(describing: error) }
+        observation["retryable"] = error == nil || (error as? ControlAXError)?.code == .invalidUIElement
+        attempts.append(snapshot())
+        try save()
     }
 
     func checkTime() throws {
@@ -56,11 +124,11 @@ final class ControlLookup {
     func checked(_ error: AXError, _ operation: String, optional: Bool = false) throws -> Bool {
         if error == .success { return true }
         if errors.count < 128 {
-            errors.append(["operation": operation, "code": error.rawValue,
+            errors.append(["operation": operation, "code": Int(error.rawValue),
                            "error": String(describing: error)])
         }
         if optional && (error == .attributeUnsupported || error == .noValue) { return false }
-        throw ProbeError.failed("\(operation): AX error \(error.rawValue) (\(error))")
+        throw ControlAXError(code: error, operation: operation)
     }
 
     func read(_ element: AXUIElement, _ attribute: String, optional: Bool = true) throws -> CFTypeRef? {
@@ -122,24 +190,28 @@ final class ControlLookup {
 
     func press(pid: pid_t, windowName: String, command: String, label: String,
                document: String, resolvedDocument: String) throws {
-        let app = AXUIElementCreateApplication(pid)
         // The system-wide element applies the timeout to ALL queried elements,
         // unlike setting it on just the app. A single stalled IPC cannot consume
         // the driver's ten-second subprocess budget.
         _ = try checked(AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25), "set AX timeout")
-        for attempt in 1...30 {
-            try checkTime()
-            nodes = []
-            errors = []
-            observation["attempt"] = attempt
-            observation["status"] = "discovering"
-            observation["complete"] = false
+        try discoverAndPress(
+            deadline: deadline, now: { ProcessInfo.processInfo.systemUptime },
+            pause: { Thread.sleep(forTimeInterval: $0) }, begin: beginAttempt, failed: failedAttempt,
+            discover: { () throws -> AXUIElement? in
+            // Activation can replace AccessKit's placeholder context. Discard
+            // the ENTIRE failed scan and reacquire application/windows/children.
+            let app = AXUIElementCreateApplication(pid)
             var windows: [AXUIElement] = []
             var windowInventory: [[String: Any]] = []
             for window in try children(app, attribute: "AXWindows") {
+                windowInventory.append(["index": windowInventory.count])
+                observation["windows"] = windowInventory
                 let title = try string(window, "AXTitle") ?? ""
+                windowInventory[windowInventory.count - 1]["title"] = String(title.prefix(200))
+                observation["windows"] = windowInventory
                 let uri = try string(window, "AXDocument") ?? ""
-                windowInventory.append(["title": String(title.prefix(200)), "document": String(uri.prefix(512))])
+                windowInventory[windowInventory.count - 1]["document"] = String(uri.prefix(512))
+                observation["windows"] = windowInventory
                 if document.isEmpty ? title.contains(windowName) : (uri == document || uri == resolvedDocument) {
                     windows.append(window)
                 }
@@ -160,6 +232,7 @@ final class ControlLookup {
                     index += 1
                     if visited.contains(where: { CFEqual($0, node) }) { continue }
                     visited.append(node)
+                    observation["current_node"] = ["index": current, "parent": parent, "depth": depth]
                     try require(depth <= 32, "AX tree exceeds depth cap 32")
                     var nodePID: pid_t = 0
                     _ = try checked(AXUIElementGetPid(node, &nodePID), "AX element PID")
@@ -197,24 +270,21 @@ final class ControlLookup {
                     try require((actions as? [String])?.contains("AXPress") == true, "Control does not support AXPress: \(label)")
                     try foreground(app, window: window, pid: pid)
                     try checkTime()
-                    observation["status"] = "pressing"
-                    try save()
-                    // Never retry an action: even cannotComplete can mean the
-                    // target performed it but failed to acknowledge in time.
-                    _ = try checked(AXUIElementPerformAction(control, "AXPress" as CFString), "AXPress")
-                    observation["pressed"] = true
-                    observation["status"] = "pressed"
-                    try save()
-                    try emit(["pressed": true, "backend": "application-services"])
-                    return
+                    return control
                 }
             }
+            return nil
+        }, press: { control in
+            observation["status"] = "pressing"
+            observation["press_attempted"] = true
             try save()
-            // A first children query activates AccessKit asynchronously. Start
-            // again at AXWindows, discarding any placeholder/old descendants.
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        throw ProbeError.failed("Target control count 0 for \(command) named \(label)")
+            try checkTime()
+            _ = try checked(AXUIElementPerformAction(control, "AXPress" as CFString), "AXPress")
+            observation["pressed"] = true
+            observation["status"] = "pressed"
+            try save()
+            try emit(["pressed": true, "backend": "application-services"])
+        })
     }
 }
 
@@ -229,7 +299,8 @@ func pressControl(_ arguments: [String]) throws {
     let trusted = AXIsProcessTrusted() // Never request a permission prompt on CI.
     let lookup = ControlLookup(artifact: arguments[6], observation: [
         "pid": pid, "window": arguments[1], "command": arguments[2], "label": arguments[3],
-        "backend": "application-services", "trusted": trusted, "pressed": false, "status": "starting"
+        "backend": "application-services", "trusted": trusted, "pressed": false,
+        "press_attempted": false, "status": "starting"
     ])
     try lookup.save()
     if !trusted {
@@ -247,6 +318,100 @@ func pressControl(_ arguments: [String]) throws {
         try lookup.save()
         throw error
     }
+}
+
+// Runs the production retry controller with fake candidate IDs and a virtual
+// clock. This touches neither AX nor the pasteboard and takes no real sleeps.
+// A partial scan contains a matching candidate BEFORE its later stale node;
+// the only permissible action uses the candidate from a subsequent full scan.
+func controlRetrySelfTest() throws {
+    var passed: [String] = []
+    func scenario(_ name: String, stale: Int = 0, empty: Int = 0,
+                  discoveryError: AXError? = nil, semanticError: Bool = false,
+                  actionError: AXError? = nil, afterActionError: Bool = false,
+                  duration: TimeInterval = 0, expectedAttempts: Int,
+                  expectedPresses: Int, expectError: Bool) throws {
+        let artifact = FileManager.default.temporaryDirectory.appendingPathComponent("textloom-ax-retry-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: artifact) }
+        let lookup = ControlLookup(artifact: artifact.path, observation: ["pressed": false])
+        var time: TimeInterval = 0
+        var discoveries = 0
+        var presses: [Int] = []
+        var failure: Error?
+        do {
+            try discoverAndPress(deadline: 6, now: { time }, pause: { time += $0 }, begin: {
+                discoveries = $0
+                try lookup.beginAttempt($0)
+            }, failed: lookup.failedAttempt, discover: { () throws -> Int? in
+                time += duration
+                if discoveries <= empty {
+                    lookup.observation["match_count"] = 0
+                    lookup.observation["complete"] = true
+                    return nil
+                }
+                lookup.nodes = [["role": "AXButton", "title": "Clear formatting", "candidate": discoveries]]
+                lookup.observation["match_count"] = 1
+                lookup.observation["current_node"] = ["index": 2, "parent": 0, "depth": 1]
+                if let code = discoveryError { _ = try lookup.checked(code, "AXRole") }
+                if semanticError { throw ProbeError.failed("Ambiguous target AX controls") }
+                if discoveries <= stale + empty { _ = try lookup.checked(.invalidUIElement, "AXRole") }
+                lookup.observation["complete"] = true
+                return discoveries
+            }, press: { candidate in
+                presses.append(candidate)
+                if let code = actionError { _ = try lookup.checked(code, "AXPress") }
+                lookup.observation["pressed"] = true
+                try lookup.save()
+                if afterActionError { throw ProbeError.failed("Recording the successful action failed") }
+            })
+        } catch {
+            failure = error
+        }
+        try require(discoveries == expectedAttempts, "\(name): wrong discovery count \(discoveries)")
+        try require(presses.count == expectedPresses, "\(name): wrong press count \(presses.count)")
+        try require((failure != nil) == expectError, "\(name): wrong success/failure outcome")
+        if expectedPresses == 1 {
+            try require(presses == [expectedAttempts], "\(name): pressed the stale partial match")
+        }
+        if let expectedCode = actionError ?? discoveryError {
+            try require((failure as? ControlAXError)?.code == expectedCode, "\(name): lost the terminal AX error")
+        }
+        try require(lookup.attempts.count == expectedAttempts - expectedPresses,
+                    "\(name): failed discovery history was lost")
+        for (index, attempt) in lookup.attempts.enumerated() {
+            try require(attempt["attempt"] as? Int == index + 1, "\(name): wrong attempt identity")
+            let nodes = attempt["nodes"] as? [[String: Any]]
+            if index >= empty {
+                try require(nodes?.first?["candidate"] as? Int == index + 1, "\(name): prior inventory overwritten")
+            }
+            try require(attempt["complete"] as? Bool == (index < empty), "\(name): wrong scan completion status")
+            if index >= empty && (stale > 0 || discoveryError != nil) {
+                let errors = attempt["attribute_errors"] as? [[String: Any]]
+                try require(errors?.last?["code"] as? Int == Int((discoveryError ?? .invalidUIElement).rawValue),
+                            "\(name): failed AX code was lost")
+            }
+        }
+        // Exercise the actual diagnostic serializer, including independent
+        // snapshots (without recursively embedding all preceding attempts).
+        try lookup.save()
+        let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: artifact)) as? [String: Any]
+        let history = saved?["failed_attempts"] as? [[String: Any]]
+        try require(history?.count == lookup.attempts.count, "\(name): failed attempts not persisted")
+        try require(history?.allSatisfy { $0["failed_attempts"] == nil } == true, "\(name): recursive attempt history")
+        passed.append(name)
+    }
+    try scenario("stale partial match is discarded", stale: 1, expectedAttempts: 2, expectedPresses: 1, expectError: false)
+    try scenario("empty and stale scans recover", stale: 1, empty: 1, expectedAttempts: 3, expectedPresses: 1, expectError: false)
+    try scenario("permanent stale tree stops at 30", stale: 100, expectedAttempts: 30, expectedPresses: 0, expectError: true)
+    try scenario("fixed deadline bounds stale retries", stale: 100, duration: 2.1, expectedAttempts: 3, expectedPresses: 0, expectError: true)
+    try scenario("messaging failure is terminal", discoveryError: .cannotComplete, expectedAttempts: 1, expectedPresses: 0, expectError: true)
+    try scenario("ambiguous match is terminal", semanticError: true, expectedAttempts: 1, expectedPresses: 0, expectError: true)
+    try scenario("invalid-element press is not replayed", actionError: .invalidUIElement, expectedAttempts: 1, expectedPresses: 1, expectError: true)
+    try scenario("uncertain press is not replayed", actionError: .cannotComplete, expectedAttempts: 1, expectedPresses: 1, expectError: true)
+    try scenario("post-press failure is not replayed", afterActionError: true, expectedAttempts: 1, expectedPresses: 1, expectError: true)
+    let observation: [String: Any] = ["ax_retry_self_test": true, "checks": passed]
+    let data = try JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys])
+    print(String(decoding: data, as: UTF8.self))
 }
 
 func boundedData(_ type: NSPasteboard.PasteboardType) throws -> Data? {
@@ -534,6 +699,7 @@ do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     try require(!arguments.isEmpty, "Missing inspector command")
     switch arguments[0] {
+    case "ax-retry-self-test": try controlRetrySelfTest()
     case "ax-press": try pressControl(Array(arguments.dropFirst()))
     case "prepare": try prepare(Array(arguments.dropFirst()))
     case "native-fixture": try nativeFixture()

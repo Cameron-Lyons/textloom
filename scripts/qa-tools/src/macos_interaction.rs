@@ -1682,6 +1682,18 @@ impl<S: System> Probe<S> {
         let result = self.run(&build, None, 60.0, Exit::MustSucceed)?;
         let log = self.output.join("macos-helper-build.log");
         fs::write(&log, result.stdout() + &result.stderr()).context(log.display())?;
+        let self_test = self.run(
+            &strings(&[&self.helper.display().to_string(), "ax-retry-self-test"]),
+            None,
+            10.0,
+            Exit::MustSucceed,
+        )?;
+        let self_test: Value = serde_json::from_slice(&self_test.stdout)?;
+        if self_test.get("ax_retry_self_test") != Some(&Value::Bool(true)) {
+            return Err("AX retry controller self-test did not confirm success".into());
+        }
+        self.observe("ax_retry_self_test", self_test);
+        self.save()?;
         let (import_file, external_file) = (
             self.import_file.display().to_string(),
             self.external_file.display().to_string(),

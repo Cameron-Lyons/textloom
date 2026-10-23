@@ -12,7 +12,7 @@ to leave every QA error counter at zero. The Windows example uses
 
 Stable 1.0 still requires final platform signoff. In particular, physical
 keyboards, touch screens/touchpads, audible reader usability, display-scale
-transitions, macOS IMEs/VoiceOver and native winit input, and untested reader
+transitions, macOS IMEs/VoiceOver, and untested reader
 or visual feature behavior remain open. Automated clipboard transport and
 external-renderer assertions do not establish these observations. Record
 unavailable checks explicitly rather than treating them as passes.
@@ -21,6 +21,69 @@ The [native dependency limitations](#native-dependency-limitations) distinguish
 known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
+
+### Automated evidence refreshed 2026-10-23
+
+The production fixes are at clean commit `3908e3c208a58863246173720f6d5d9ff22ab4a7`.
+The full `scripts/check-release.sh` passed: all eight feature combinations,
+release tests, native host tests, strict Clippy, rustdoc, quick benchmarks,
+package inventory, and extracted-package consumer validation. The publication
+dry run passed without uploading. All nine CI jobs passed at `39719e3` in
+[run 39963810757](https://github.com/Cameron-Lyons/textloom/actions/runs/39963810757);
+that excludes the separate native interaction workflow. Subsequent commits extend repository-only
+QA and documentation; they do not change the published library implementation.
+
+The isolated Linux run used a copied executable with that revision and recorded
+SHA-256. All 27 interaction checks passed, along with rich-source plain paste
+and single undo on X11 and Wayland, and quote-rule geometry/contrast in both
+themes. Seven X11 IME assertion groups passed, while their observations still
+showed the Find round-trip keyboard stall and a 9-pixel candidate overlap.
+Those failures remain open. Two repeat runs loading upstream xcb-imdkit commit
+`621048bd50e8f3cbf52335f824f7b4d708a21b14` in Fcitx restored keyboard input and
+new composition; each recorded the library actually loaded by Fcitx.
+
+These Linux sessions used private HOME/runtime directories and display servers:
+Sway 1.12, Xvfb 21.1.25, Fcitx 5.1.23, Mozc 3.35.6354.2, Pinyin 5.1.15,
+xcb-imdkit 1.0.9, libX11 1.8.14, Orca 51.1, and AT-SPI 2.62.1. Sway required
+running under GDB because direct launches exited with status 137; the editor
+ran without instrumentation. Virtual input, static 200% scaling, and captured
+reader output do not establish physical-device or audible-reader signoff.
+The recorded Orca link/quote announcement gaps remain open. Local evidence,
+harness snapshots, executable hashes, logs, and upstream research are retained
+under `target/native-qa-1.0-20261023/`; the clean Linux run is `linux-3908e3c/`.
+
+The Windows 11 VM completed all 21 aggregate checks on the same clean
+`3908e3c` production revision, with source inventory and deployed executable
+SHA-256 verification. The new groups cover seven consecutive rich copies,
+colors, soft breaks, links, quotes in both themes, numbering (including a
+partial list starting at 3), native Ctrl+Shift+V, and external MSHTML 11.00.26100.1
+interoperability. MSHTML independently retained Unicode, emphasis, fill/font
+colors, links, soft breaks, quotes, and ordered lists; its copy back exercised
+plain fallback without Textloom data. Hosted NVDA assertions passed 15/15;
+a sound-card capture recorded about 1.98 seconds above its silence threshold,
+which does not establish audible usability. The no-warmup dead-key diagnostic
+still failed: the first acute-plus-e after switching to German inserted `e`
+instead of `é`. A separate native Ctrl+Alt+Q diagnostic left the document
+unchanged instead of inserting `@`; the window remained open. Both diagnostics
+explicitly record `passed: false`. Aggregate passes do not close these failures.
+
+Supplemental Windows checks passed immediate modifier release (all six
+Ctrl+Shift+V press/release events in one QMP packet) and the ignored repeated-copy
+helper regression with a blocked host window. Fourteen native reports recorded
+graceful shutdown, zero errors, and equal TLFR round trips. The VM, job server,
+owned guest processes, and temporary NVDA copy were cleaned up. Evidence is in
+`/home/cam/.local/share/textloom-winvm/results-3908e3c-final/summary.json` and its
+per-check directories; the native executable SHA-256 is
+`ef592901c717525257125483b7eb011bef799444e6de06b69d0025dd61ca8d41`.
+Word/Outlook interoperability and physical hardware remain unverified.
+
+The new macOS winit probe passed all nine observations on macOS 26.6.2 arm64 in
+[run 39962542906](https://github.com/Cameron-Lyons/textloom/actions/runs/39962542906),
+PR head `8322c23` / tested merge `bcc6a11e0dd8fac0c744a23f808bb331b85ac60a`.
+It verified natural startup focus before the first native key, exact Unicode
+copy/paste, document and selection restoration through undo/redo, and owned
+process cleanup. It did not test an IME or VoiceOver. That run's separate
+TextEdit probe failed at its new control lookup; it is not a full macOS pass.
 
 ## Earlier validation evidence
 
@@ -383,12 +446,13 @@ builds with local changes accordingly. The native example guide describes
 platform commands. Attach exact steps, IME/screen-reader versions, OS/backend,
 and outcomes separately for final-commit signoff.
 
-Partial QA record for 2026-10-09: clean implementation candidate `5f8ccfb`;
+Historical QA record, starting 2026-10-09: clean implementation candidate `5f8ccfb`;
 earlier desktop observations used an uncommitted candidate on Omarchy
 4.0.0.r6815.g50d687a (Arch-based Linux), kernel 7.2.8-5-omarchy-bore,
 Hyprland/Wayland, 200% display scale. The isolated Linux sessions above add IME,
 reader, and external clipboard evidence. Final commit and complete platform
-signoff remain pending.
+signoff remain pending. The tables below retain their original observations;
+the current evidence at the top supersedes their older pending statuses.
 
 | Check | Result |
 | --- | --- |
@@ -408,9 +472,10 @@ signoff remain pending.
 
 The later improvement and feature passes added the checks below. Their Linux
 results come from the isolated sessions of 2026-10-21 and 2026-10-22 described
-at the top; macOS, Windows, and physical-keyboard results are still pending. No
-windowed host in this repository uses the winit adapter, so its Linux results
-come from a scratch winit host that follows the README: it calls `set_focused`
+at the top; macOS, Windows, and physical-keyboard results were pending then.
+Those Linux winit results came from a scratch host; the repository now includes
+the [windowed winit harness](https://github.com/Cameron-Lyons/textloom/tree/main/scripts/windows-vm/winit-harness).
+Both follow the README: the host calls `set_focused`
 at startup, routes every window event through `handle_window_event`, and calls
 `sync_ime` each frame with its painted caret. The `NATIVE_QA.md` protocol gives
 steps for the feature rows.
@@ -616,8 +681,9 @@ malformed-input regression tests when changing the codec.
    services. Record the host/platform results in the release notes. Any failed
    host behavior claimed by this release is a release blocker. Use the native
    signoff protocol in `examples/native-editor/NATIVE_QA.md` and record unavailable
-   checks explicitly. No Windows desktop is available, so these human gates
-   remain open. A release candidate may be published with them open if its
+   checks explicitly. Windows VM and hosted automation are available; physical
+   device checks and audible reader signoff remain open. A release candidate
+   may be published with them open if its
    GitHub release lists them; 1.0.0 may not.
 
 Re-apply `.github/branch-protection.json` to `main` whenever its required checks

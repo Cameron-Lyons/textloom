@@ -931,7 +931,13 @@ fn controls_use_pid_checked_focus_then_one_direct_ax_request() {
 #[test]
 fn uncertain_ax_failures_are_never_retried_and_inventory_survives() {
     for result in [
+        Ok(ran(1, "", "AXPress: AX error -25202 (invalidUIElement)")),
         Ok(ran(1, "", "AXPress: AX error -25204 (cannotComplete)")),
+        Ok(ran(
+            1,
+            "",
+            "AXRole: AX error -25202 after 30 pre-action attempts",
+        )),
         Ok(ran(1, "", "Target control count 0")),
         Ok(ran(0, r#"{"pressed":false}"#, "")),
         Ok(ran(77, "{}", "unrecognized helper failure")),

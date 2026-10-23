@@ -49,7 +49,7 @@ text and selection. Repeat deletion in read-only mode to confirm it is blocked.
 
 | Check | Steps | Required observation |
 | --- | --- | --- |
-| Selection, typing, and history | Focus Document, select all, type a short word, undo, redo, then undo again. Repeat ordinary adjacent typing at a caret. | Exact original rich content and selection return after undo; redo restores the edit. Caret typing groups correctly. Replacing a selection and subsequent caret typing may be separate history entries. |
+| Selection, typing, and history | Focus Document, select all, type a short word, undo, redo, then undo again. Repeat ordinary adjacent typing at a caret. | One undo restores the exact original rich content and selection after uninterrupted typing without paragraph breaks, including replacement followed by adjacent typing. Redo restores the complete edit. Separate history entries require a documented grouping boundary, such as navigation, a style change, or focus loss. |
 | Platform navigation | Move by character/word and line/document boundaries; extend selections with Shift; use platform paragraph-start deletion. | Caret and selection land at the expected grapheme boundaries, including combining marks and emoji. Undo restores deletion and selection. |
 | Formatting | Select mixed bold/plain text, toggle bold, then italic/underline. Undo and redo. | The whole selection toggles uniformly; rendered text and toolbar agree after history changes. |
 | Unicode plain paste | Paste the fixture above, copy it to a plain text editor, undo, and redo. | Exact Unicode text and paragraph breaks survive. Paste is one undo step. |
