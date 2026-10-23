@@ -56,6 +56,10 @@ const EXTERNAL_FILE: &str = "textloom-external-source.rtf";
 /// document URI that TextEdit should show, as given and with symlinks resolved;
 /// `preflight` and `textedit-pid` take only the command.
 pub const APPLESCRIPT: &str = r#"
+on checkControlDeadline(deadline, inventory)
+    if (current date) is greater than or equal to deadline then error "AX child traversal deadline; available:" & inventory
+end checkControlDeadline
+
 on run argv
     set commandName to item 1 of argv
     tell application "System Events"
@@ -156,36 +160,95 @@ on run argv
             else if commandName is "type" then
                 keystroke (item 4 of argv)
             else if commandName is "press-button" or commandName is "press-popup" then
-                set wantedRole to "AXButton"
-                if commandName is "press-popup" then set wantedRole to "AXPopUpButton"
+                -- Only used if the direct AX helper reports it is untrusted.
+                -- Query immediate children explicitly; never ask System Events
+                -- to materialize `entire contents` before we can inspect it.
                 set wantedLabel to item 4 of argv
-                set controls to {}
+                set deadline to (current date) + 5
                 set inventory to ""
-                -- The first AXChildren query can activate AccessKit's tree;
-                -- wait for its asynchronous update and for newly opened menus.
+                set controls to {}
                 repeat 30 times
                     set controls to {}
                     set inventory to ""
-                    repeat with candidateControl in (entire contents of targetWindow)
+                    set queue to {targetWindow}
+                    set depths to {0}
+                    set cursor to 1
+                    repeat while cursor is less than or equal to (count of queue)
+                        my checkControlDeadline(deadline, inventory)
+                        if cursor > 512 then error "AX node cap; available:" & inventory
+                        set candidateControl to item cursor of queue
+                        set candidateDepth to item cursor of depths
+                        if candidateDepth > 32 then error "AX depth cap; available:" & inventory
+                        set entry to "node=" & cursor & " depth=" & candidateDepth
                         try
-                            set elementRole to (role of candidateControl) as text
-                            if (elementRole is wantedRole) or (commandName is "press-button" and elementRole is "AXCheckBox") then
-                                set elementLabel to (value of attribute "AXTitle" of candidateControl) as text
-                                if wantedRole is "AXPopUpButton" then set elementLabel to (value of attribute "AXValue" of candidateControl) as text
-                                set inventory to inventory & " [" & elementRole & ":" & elementLabel & "]"
-                                if elementLabel is wantedLabel then set end of controls to contents of candidateControl
+                            with timeout of 1 seconds
+                                set elementRole to (role of candidateControl) as text
+                            end timeout
+                            set entry to entry & " role=" & elementRole
+                            set isButton to elementRole is "AXButton" or elementRole is "AXCheckBox"
+                            set isPopup to elementRole is "AXPopUpButton"
+                            if isButton or isPopup then
+                                my checkControlDeadline(deadline, inventory)
+                                with timeout of 1 seconds
+                                    set elementLabel to ""
+                                    if isPopup then
+                                        if exists attribute "AXValue" of candidateControl then
+                                            set rawLabel to value of attribute "AXValue" of candidateControl
+                                            if rawLabel is not missing value then set elementLabel to rawLabel as text
+                                        end if
+                                    else
+                                        if exists attribute "AXTitle" of candidateControl then
+                                            set rawLabel to value of attribute "AXTitle" of candidateControl
+                                            if rawLabel is not missing value then set elementLabel to rawLabel as text
+                                        end if
+                                    end if
+                                end timeout
+                                set entry to entry & " label=" & elementLabel
+                                set wantedRole to (commandName is "press-button" and isButton) or (commandName is "press-popup" and isPopup)
+                                if wantedRole and elementLabel is wantedLabel then set end of controls to contents of candidateControl
                             end if
+                            set inventory to inventory & " [" & entry & "]"
+                            log entry
+                            my checkControlDeadline(deadline, inventory)
+                            with timeout of 1 seconds
+                                set descendants to UI elements of candidateControl
+                            end timeout
+                            if (count of queue) + (count of descendants) > 512 then error "AX queue cap"
+                            repeat with descendant in descendants
+                                set end of queue to contents of descendant
+                                set end of depths to candidateDepth + 1
+                            end repeat
                         on error descriptionText number errorNumber
-                            set inventory to inventory & " [AX error " & errorNumber & "]"
+                            error "AX traversal at " & entry & ": " & descriptionText & " (" & errorNumber & "); available:" & inventory
                         end try
+                        set cursor to cursor + 1
                     end repeat
                     if (count of controls) is not 0 then exit repeat
+                    my checkControlDeadline(deadline, inventory)
                     delay 0.1
                 end repeat
-                if (count of controls) is not 1 then error "Target control count " & (count of controls) & " for " & wantedRole & " named " & wantedLabel & "; available:" & inventory
+                if (count of controls) is not 1 then error "Target control count " & (count of controls) & " for " & wantedLabel & "; available:" & inventory
                 set matchedControl to item 1 of controls
-                if not (enabled of matchedControl) then error "Disabled control: " & wantedLabel
-                perform action "AXPress" of matchedControl
+                my checkControlDeadline(deadline, inventory)
+                with timeout of 1 seconds
+                    if not (enabled of matchedControl) then error "Disabled control: " & wantedLabel
+                end timeout
+                my checkControlDeadline(deadline, inventory)
+                with timeout of 1 seconds
+                    tell application "System Events" to set foregroundPID to unix id of first application process whose frontmost is true
+                    if foregroundPID is not targetPID then error "Target PID lost foreground"
+                    if expectedDocument is not "" then
+                        set foregroundDocument to (value of attribute "AXDocument" of window 1) as text
+                        if foregroundDocument is not expectedDocument and foregroundDocument is not resolvedDocument then error "Target document lost foreground"
+                    else if not ((name of window 1) contains windowName) then
+                        error "Target window lost foreground"
+                    end if
+                end timeout
+                my checkControlDeadline(deadline, inventory)
+                -- No retries after this point, including an uncertain reply.
+                with timeout of 1 seconds
+                    perform action "AXPress" of matchedControl
+                end timeout
             else if commandName is "close" then
                 perform action "AXPress" of (first button of targetWindow whose subrole is "AXCloseButton")
             else
@@ -367,7 +430,20 @@ impl System for Machine {
             if let Some(message) = stop {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(message.into());
+                // Preserve the bounded AX fallback's streamed inventory even
+                // when an Apple Event ignores its timeout and we kill osascript.
+                let stdout = stdout
+                    .recv_timeout(Duration::from_millis(100))
+                    .unwrap_or_default();
+                let stderr = stderr
+                    .recv_timeout(Duration::from_millis(100))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{message}: {}{}",
+                    crate::tail(&String::from_utf8_lossy(&stderr), 4000),
+                    crate::tail(&String::from_utf8_lossy(&stdout), 1000),
+                )
+                .into());
             }
             thread::sleep(Duration::from_millis(5));
         };
@@ -710,11 +786,12 @@ impl<S: System> Probe<S> {
         );
         self.save()?;
         let document = self.documents(window);
+        let control = matches!(command, "press-button" | "press-popup");
         let deadline = self.system.monotonic() + 5.0;
         loop {
             let result = self.apple(
                 &[
-                    command,
+                    if control { "focus" } else { command },
                     &pid.to_string(),
                     window,
                     value,
@@ -724,13 +801,15 @@ impl<S: System> Probe<S> {
                 Exit::MayFail,
             )?;
             if result.code == 0 {
+                if control {
+                    return self.press_control(pid, window, command, value, &document);
+                }
                 return Ok(());
             }
             let stderr = result.stderr();
             // AX tree activation can take a frame after the first query. Only
             // retry failures that happened before any action was delivered.
-            let target_pending = stderr.contains("Target window count 0")
-                || stderr.contains("Target control count 0");
+            let target_pending = stderr.contains("Target window count 0");
             if !target_pending || self.system.monotonic() >= deadline {
                 return Err(format!(
                     "Native {command} on PID {pid} / {window}: {}",
@@ -740,6 +819,115 @@ impl<S: System> Probe<S> {
             }
             self.system.sleep(0.2)?;
         }
+    }
+
+    /// System Events has already raised and checked the owned window. Use the
+    /// direct AX client for a bounded tree walk; `entire contents` in System
+    /// Events can stall before returning even the first inventory entry.
+    fn press_control(
+        &mut self,
+        pid: u32,
+        window: &str,
+        command: &str,
+        label: &str,
+        document: &DocumentUrls,
+    ) -> Result<()> {
+        let artifact = self.output.join("macos-ax-control.json");
+        let pending = json!({
+            "pid": pid, "window": window, "command": command, "label": label,
+            "status": "starting", "pressed": false,
+        });
+        fs::write(&artifact, serde_json::to_vec_pretty(&pending)?).context(artifact.display())?;
+        self.observe("last_ax_control", pending);
+        self.save()?;
+        let arguments = vec![
+            self.helper.display().to_string(),
+            "ax-press".to_owned(),
+            pid.to_string(),
+            window.to_owned(),
+            command.to_owned(),
+            label.to_owned(),
+            document.absolute.clone(),
+            document.resolved.clone(),
+            artifact.display().to_string(),
+        ];
+        // The helper has a six-second total deadline and a per-AX-message
+        // timeout. Never retry AXPress: a failed reply can follow delivery.
+        let result = self.run(&arguments, None, 10.0, Exit::MayFail);
+        if let Ok(bytes) = fs::read(&artifact)
+            && let Ok(observation) = serde_json::from_slice::<Value>(&bytes)
+        {
+            self.observe("last_ax_control", observation);
+            self.save()?;
+        }
+        let result = result.map_err(|error| {
+            format!(
+                "Native {command} / {label}: {error}; AX inventory: {}",
+                artifact.display()
+            )
+        })?;
+        if result.code == 77
+            && serde_json::from_slice::<Value>(&result.stdout).is_ok_and(|value| {
+                value.get("trusted") == Some(&Value::Bool(false))
+                    && value.get("pressed") == Some(&Value::Bool(false))
+                    && value.get("fallback").and_then(Value::as_str) == Some("system-events")
+            })
+        {
+            // System Events and this separately compiled helper can have
+            // different TCC trust. Only an explicit pre-action trust rejection
+            // permits fallback; AXPress errors must never deliver a second press.
+            let fallback = self.apple(
+                &[
+                    command,
+                    &pid.to_string(),
+                    window,
+                    label,
+                    &document.absolute,
+                    &document.resolved,
+                ],
+                Exit::MayFail,
+            );
+            let observation = match &fallback {
+                Ok(result) => json!({
+                    "pid": pid, "window": window, "command": command, "label": label,
+                    "backend": "system-events", "direct_ax_trusted": false,
+                    "pressed": result.code == 0, "exit_code": result.code,
+                    "stdout": result.stdout(), "inventory_and_errors": result.stderr(),
+                }),
+                Err(error) => json!({
+                    "pid": pid, "window": window, "command": command, "label": label,
+                    "backend": "system-events", "direct_ax_trusted": false,
+                    "pressed": false, "error": error.to_string(),
+                }),
+            };
+            fs::write(&artifact, serde_json::to_vec_pretty(&observation)?)
+                .context(artifact.display())?;
+            self.observe("last_ax_control", observation);
+            self.save()?;
+            let result = fallback?;
+            if result.code != 0 {
+                return Err(format!(
+                    "System Events {command} / {label}: {}; AX inventory: {}",
+                    crate::tail(&result.stderr(), 4000),
+                    artifact.display(),
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        if result.code != 0 {
+            return Err(format!(
+                "Native {command} on PID {pid} / {window} / {label}: {}; AX inventory: {}",
+                crate::tail(&result.stderr(), 4000),
+                artifact.display(),
+            )
+            .into());
+        }
+        let observation: Value = serde_json::from_slice(&result.stdout)?;
+        if observation.get("pressed") != Some(&Value::Bool(true)) {
+            return Err("AX helper did not confirm control delivery".into());
+        }
+        self.system.sleep(0.2)
     }
 
     fn focus(&mut self, pid: u32, window: &str, owner: Owner) -> Result<()> {

@@ -160,7 +160,9 @@ fn response(code: i32, stdout: String, stderr: &str) -> Ran {
 impl System for Desktop {
     fn run(&mut self, arguments: &[String], _input: Option<&str>, _timeout: f64) -> Result<Ran> {
         if arguments[0] == "/usr/bin/osascript" {
-            self.native(&arguments[2], &arguments[5])?;
+            if arguments[2] != "focus" {
+                self.native(&arguments[2], &arguments[5])?;
+            }
             return Ok(response(0, "native-action-delivered".into(), ""));
         }
         if arguments[0] == "/usr/bin/env" {
@@ -172,6 +174,10 @@ impl System for Desktop {
         }
         assert!(arguments[0].ends_with("macos-clipboard"));
         let value = match arguments[1].as_str() {
+            "ax-press" => {
+                self.native(&arguments[4], &arguments[5])?;
+                json!({"pressed": true})
+            }
             "state" => json!({"change_count":self.generation}),
             "native-html" => json!({"change_count":self.generation,"html":self.clipboard.html()}),
             "plain" if arguments[2] == self.clipboard.text => {

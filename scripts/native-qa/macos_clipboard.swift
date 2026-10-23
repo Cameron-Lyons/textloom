@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Foundation
 
 let fixture = "café 日本語👩🏽‍💻\nsecond"
@@ -22,6 +23,230 @@ func emit(_ observation: [String: Any]) throws {
     result["change_count"] = NSPasteboard.general.changeCount
     let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
     print(String(decoding: data, as: UTF8.self))
+}
+
+// A direct, PID-scoped AX client avoids System Events' expensive `entire
+// contents` materialization. The caller raises its owned window first; this
+// helper independently checks its identity and foreground status before press.
+final class ControlLookup {
+    let deadline = ProcessInfo.processInfo.systemUptime + 6
+    let maxNodes = 512
+    let artifact: URL
+    var observation: [String: Any]
+    var nodes: [[String: Any]] = []
+    var errors: [[String: Any]] = []
+
+    init(artifact: String, observation: [String: Any]) {
+        self.artifact = URL(fileURLWithPath: artifact)
+        self.observation = observation
+    }
+
+    func save() throws {
+        observation["nodes"] = nodes
+        observation["attribute_errors"] = errors
+        observation["elapsed_seconds"] = 6 - (deadline - ProcessInfo.processInfo.systemUptime)
+        let data = try JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys, .prettyPrinted])
+        try data.write(to: artifact, options: .atomic)
+    }
+
+    func checkTime() throws {
+        try require(ProcessInfo.processInfo.systemUptime < deadline, "AX lookup exceeded six-second deadline")
+    }
+
+    func checked(_ error: AXError, _ operation: String, optional: Bool = false) throws -> Bool {
+        if error == .success { return true }
+        if errors.count < 128 {
+            errors.append(["operation": operation, "code": error.rawValue,
+                           "error": String(describing: error)])
+        }
+        if optional && (error == .attributeUnsupported || error == .noValue) { return false }
+        throw ProbeError.failed("\(operation): AX error \(error.rawValue) (\(error))")
+    }
+
+    func read(_ element: AXUIElement, _ attribute: String, optional: Bool = true) throws -> CFTypeRef? {
+        try checkTime()
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        _ = try checked(error, attribute, optional: optional)
+        return value
+    }
+
+    func string(_ element: AXUIElement, _ attribute: String, optional: Bool = true) throws -> String? {
+        guard let value = try read(element, attribute, optional: optional) else { return nil }
+        try require(CFGetTypeID(value) == CFStringGetTypeID(), "\(attribute) is not a string")
+        return value as? String
+    }
+
+    func boolean(_ element: AXUIElement, _ attribute: String) throws -> Bool {
+        guard let value = try read(element, attribute, optional: false),
+              CFGetTypeID(value) == CFBooleanGetTypeID(), let result = value as? Bool else {
+            throw ProbeError.failed("\(attribute) is not a Boolean")
+        }
+        return result
+    }
+
+    func element(_ value: CFTypeRef?) throws -> AXUIElement {
+        guard let value = value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            throw ProbeError.failed("AX attribute is not an element")
+        }
+        return value as! AXUIElement
+    }
+
+    func children(_ element: AXUIElement, attribute: String = "AXChildren") throws -> [AXUIElement] {
+        try checkTime()
+        var values: CFArray?
+        // Do not pre-query the count: AccessKit can publish a larger populated
+        // tree before the copy. Request one beyond the cap so
+        // an oversized result cannot masquerade as a complete unique scan.
+        let error = AXUIElementCopyAttributeValues(element, attribute as CFString, 0, maxNodes + 1, &values)
+        if error == .illegalArgument {
+            // Some providers reject index zero for an empty array. Confirm the
+            // empty leaf explicitly; all other illegal-argument errors fail.
+            try checkTime()
+            var count: CFIndex = 0
+            _ = try checked(AXUIElementGetAttributeValueCount(element, attribute as CFString, &count), attribute + ".count")
+            if count == 0 { return [] }
+        }
+        if !(try checked(error, attribute, optional: attribute == "AXChildren")) { return [] }
+        guard let entries = values as? [AnyObject] else { throw ProbeError.failed("\(attribute) is not an array") }
+        try require(entries.count <= maxNodes, "\(attribute) exceeds \(maxNodes)-child cap")
+        return try entries.map { try self.element($0) }
+    }
+
+    func foreground(_ app: AXUIElement, window: AXUIElement, pid: pid_t) throws {
+        try require(NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                    "Target PID is not foreground")
+        let focused = try element(read(app, "AXFocusedWindow", optional: false))
+        try require(CFEqual(focused, window), "Wrong foreground AX window")
+    }
+
+    func press(pid: pid_t, windowName: String, command: String, label: String,
+               document: String, resolvedDocument: String) throws {
+        let app = AXUIElementCreateApplication(pid)
+        // The system-wide element applies the timeout to ALL queried elements,
+        // unlike setting it on just the app. A single stalled IPC cannot consume
+        // the driver's ten-second subprocess budget.
+        _ = try checked(AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25), "set AX timeout")
+        for attempt in 1...30 {
+            try checkTime()
+            nodes = []
+            errors = []
+            observation["attempt"] = attempt
+            observation["status"] = "discovering"
+            observation["complete"] = false
+            var windows: [AXUIElement] = []
+            var windowInventory: [[String: Any]] = []
+            for window in try children(app, attribute: "AXWindows") {
+                let title = try string(window, "AXTitle") ?? ""
+                let uri = try string(window, "AXDocument") ?? ""
+                windowInventory.append(["title": String(title.prefix(200)), "document": String(uri.prefix(512))])
+                if document.isEmpty ? title.contains(windowName) : (uri == document || uri == resolvedDocument) {
+                    windows.append(window)
+                }
+            }
+            observation["windows"] = windowInventory
+            observation["window_count"] = windows.count
+            try require(windows.count <= 1, "Ambiguous target AX windows: \(windows.count)")
+            if let window = windows.first {
+                try foreground(app, window: window, pid: pid)
+                var queue: [(AXUIElement, Int, Int)] = [(window, 0, -1)]
+                var visited: [AXUIElement] = []
+                var matches: [AXUIElement] = []
+                var index = 0
+                while index < queue.count {
+                    try checkTime()
+                    let (node, depth, parent) = queue[index]
+                    let current = index
+                    index += 1
+                    if visited.contains(where: { CFEqual($0, node) }) { continue }
+                    visited.append(node)
+                    try require(depth <= 32, "AX tree exceeds depth cap 32")
+                    var nodePID: pid_t = 0
+                    _ = try checked(AXUIElementGetPid(node, &nodePID), "AX element PID")
+                    try require(nodePID == pid, "AX child belongs to a different PID")
+                    let role = try string(node, "AXRole", optional: false) ?? ""
+                    var entry: [String: Any] = ["index": current, "parent": parent, "depth": depth, "role": role]
+                    nodes.append(entry)
+                    let title = try string(node, "AXTitle")
+                    entry["title"] = title.map { String($0.prefix(160)) } ?? ""
+                    let wantedRole = command == "press-popup" ? role == "AXPopUpButton" : (role == "AXButton" || role == "AXCheckBox")
+                    if role == "AXButton" || role == "AXCheckBox" || role == "AXPopUpButton" {
+                        let value = try read(node, "AXValue")
+                        entry["value"] = value.map { String(String(describing: $0).prefix(160)) } ?? ""
+                        entry["enabled"] = try boolean(node, "AXEnabled")
+                        let actualLabel = command == "press-popup" ? (value as? String) : title
+                        if wantedRole && actualLabel == label { matches.append(node) }
+                    }
+                    nodes[nodes.count - 1] = entry
+                    let descendants = try children(node)
+                    try require(queue.count + descendants.count <= maxNodes, "AX tree exceeds \(maxNodes)-node/queue cap")
+                    queue.append(contentsOf: descendants.map { ($0, depth + 1, current) })
+                    // Preserve partial discovery even if the process subsequently
+                    // stalls. The normal error path saves every collected node.
+                    if nodes.count % 16 == 0 { try save() }
+                }
+                observation["complete"] = true
+                observation["match_count"] = matches.count
+                try save()
+                try require(matches.count <= 1, "Ambiguous target AX controls: \(matches.count) for \(label)")
+                if let control = matches.first {
+                    try require(try boolean(control, "AXEnabled"), "Disabled control: \(label)")
+                    try checkTime()
+                    var actions: CFArray?
+                    _ = try checked(AXUIElementCopyActionNames(control, &actions), "AX action names")
+                    try require((actions as? [String])?.contains("AXPress") == true, "Control does not support AXPress: \(label)")
+                    try foreground(app, window: window, pid: pid)
+                    try checkTime()
+                    observation["status"] = "pressing"
+                    try save()
+                    // Never retry an action: even cannotComplete can mean the
+                    // target performed it but failed to acknowledge in time.
+                    _ = try checked(AXUIElementPerformAction(control, "AXPress" as CFString), "AXPress")
+                    observation["pressed"] = true
+                    observation["status"] = "pressed"
+                    try save()
+                    try emit(["pressed": true, "backend": "application-services"])
+                    return
+                }
+            }
+            try save()
+            // A first children query activates AccessKit asynchronously. Start
+            // again at AXWindows, discarding any placeholder/old descendants.
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        throw ProbeError.failed("Target control count 0 for \(command) named \(label)")
+    }
+}
+
+func pressControl(_ arguments: [String]) throws {
+    try require(arguments.count == 7, "ax-press requires PID, window, command, label, document URIs, and artifact")
+    let environment = ProcessInfo.processInfo.environment
+    try require(environment["GITHUB_ACTIONS"] == "true" && environment["RUNNER_OS"] == "macOS",
+                "AX control probe requires an isolated hosted macOS Actions runner")
+    guard let pid = pid_t(arguments[0]), pid > 0 else { throw ProbeError.failed("Invalid target PID") }
+    try require(!arguments[1].isEmpty && !arguments[3].isEmpty, "Empty window or control label")
+    try require(["press-button", "press-popup"].contains(arguments[2]), "Unknown AX control command")
+    let trusted = AXIsProcessTrusted() // Never request a permission prompt on CI.
+    let lookup = ControlLookup(artifact: arguments[6], observation: [
+        "pid": pid, "window": arguments[1], "command": arguments[2], "label": arguments[3],
+        "backend": "application-services", "trusted": trusted, "pressed": false, "status": "starting"
+    ])
+    try lookup.save()
+    if !trusted {
+        lookup.observation["status"] = "untrusted"
+        try lookup.save()
+        try emit(["pressed": false, "trusted": false, "fallback": "system-events"])
+        exit(77) // The driver may use its already-authorized System Events path.
+    }
+    do {
+        try lookup.press(pid: pid, windowName: arguments[1], command: arguments[2], label: arguments[3],
+                         document: arguments[4], resolvedDocument: arguments[5])
+    } catch {
+        lookup.observation["status"] = "failed"
+        lookup.observation["error"] = String(describing: error)
+        try lookup.save()
+        throw error
+    }
 }
 
 func boundedData(_ type: NSPasteboard.PasteboardType) throws -> Data? {
@@ -309,6 +534,7 @@ do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     try require(!arguments.isEmpty, "Missing inspector command")
     switch arguments[0] {
+    case "ax-press": try pressControl(Array(arguments.dropFirst()))
     case "prepare": try prepare(Array(arguments.dropFirst()))
     case "native-fixture": try nativeFixture()
     case "native-html": try nativeHTML()

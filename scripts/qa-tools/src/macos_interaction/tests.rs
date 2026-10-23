@@ -267,6 +267,7 @@ struct Fake {
     waits: HashMap<u32, VecDeque<Option<i32>>>,
     wait_calls: Vec<(u32, f64)>,
     signals: Vec<(u32, Signal, Recipient)>,
+    control_results: VecDeque<Result<Ran, String>>,
 }
 
 fn ran(code: i32, stdout: impl Into<Vec<u8>>, stderr: &str) -> Ran {
@@ -314,6 +315,7 @@ impl Fake {
         }
         let editor = &mut self.editor;
         let result = match (command, value) {
+            ("focus", _) => Ok(()),
             ("chord", "a") => {
                 (editor.anchor, editor.focus) = (0, editor.text.len());
                 Ok(())
@@ -379,6 +381,15 @@ impl System for Fake {
             arguments: arguments.to_vec(),
             input: input.map(str::to_owned),
         });
+        if arguments[0].ends_with("/macos-clipboard") && arguments[1] == "ax-press" {
+            let observation = json!({"backend": "application-services", "nodes": [{"role": "AXGroup"}], "pressed": false});
+            fs::write(&arguments[8], observation.to_string())?;
+            return self
+                .control_results
+                .pop_front()
+                .unwrap_or_else(|| Ok(ran(0, r#"{"pressed":true}"#, "")))
+                .map_err(Into::into);
+        }
         Ok(match arguments[0].as_str() {
             "/usr/bin/osascript" => self.osascript(&arguments[2..]),
             "/usr/bin/env" if arguments[2] == "/usr/bin/pbcopy" => {
@@ -874,6 +885,132 @@ fn document_urls_match_textedit_documents() {
             && document.absolute.ends_with("/textloom-html-import.rtf")
     );
     assert!(document.resolved.ends_with("/textloom-html-import.rtf"));
+}
+
+#[test]
+fn controls_use_pid_checked_focus_then_one_direct_ax_request() {
+    for command in ["press-button", "press-popup"] {
+        let mut replay = Replay::new(Fake::default());
+        replay
+            .probe
+            .action(101, TITLE, command, "Exact label")
+            .unwrap();
+        let calls = &replay.probe.system.commands;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            &calls[0].arguments[2..6],
+            ["focus", "101", TITLE, "Exact label"]
+        );
+        assert_eq!(
+            &calls[1].arguments[1..8],
+            ["ax-press", "101", TITLE, command, "Exact label", "", ""]
+        );
+        assert_eq!(
+            replay.probe.observations["last_native_action"]["command"],
+            command
+        );
+        assert_eq!(
+            replay.probe.observations["last_ax_control"]["nodes"][0]["role"],
+            "AXGroup"
+        );
+    }
+    let mut replay = Replay::new(Fake::default());
+    assert!(
+        replay
+            .probe
+            .action(101, "wrong window", "press-button", "Exact label")
+            .is_err()
+    );
+    assert_eq!(
+        replay.probe.system.commands.len(),
+        1,
+        "failed focus must not start AX helper"
+    );
+}
+
+#[test]
+fn uncertain_ax_failures_are_never_retried_and_inventory_survives() {
+    for result in [
+        Ok(ran(1, "", "AXPress: AX error -25204 (cannotComplete)")),
+        Ok(ran(1, "", "Target control count 0")),
+        Ok(ran(0, r#"{"pressed":false}"#, "")),
+        Ok(ran(77, "{}", "unrecognized helper failure")),
+        Err("helper timed out".to_owned()),
+    ] {
+        let mut replay = Replay::new(Fake {
+            control_results: [result].into(),
+            ..Fake::default()
+        });
+        assert!(
+            replay
+                .probe
+                .action(101, TITLE, "press-button", "Clear formatting")
+                .is_err()
+        );
+        assert_eq!(
+            replay.probe.system.commands.len(),
+            2,
+            "must not retry or fall back after uncertain AX delivery"
+        );
+        assert_eq!(
+            replay.probe.observations["last_ax_control"]["nodes"][0]["role"],
+            "AXGroup"
+        );
+    }
+}
+
+#[test]
+fn only_explicit_untrusted_helper_uses_system_events_fallback_once() {
+    for succeeds in [true, false] {
+        let mut replay = Replay::new(Fake {
+            control_results: [Ok(ran(
+                77,
+                r#"{"pressed":false,"trusted":false,"fallback":"system-events"}"#,
+                "",
+            ))]
+            .into(),
+            ignored: succeeds
+                .then(|| Box::new(|command: &str, _: &str| command == "press-button") as Ignored),
+            ..Fake::default()
+        });
+        let result = replay
+            .probe
+            .action(101, TITLE, "press-button", "Clear formatting");
+        assert_eq!(result.is_ok(), succeeds);
+        let calls = &replay.probe.system.commands;
+        assert_eq!(
+            calls.len(),
+            3,
+            "fallback must not retry an uncertain result"
+        );
+        assert_eq!(
+            &calls[2].arguments[2..6],
+            ["press-button", "101", TITLE, "Clear formatting"]
+        );
+        let observation = &replay.probe.observations["last_ax_control"];
+        assert_eq!(observation["backend"], "system-events");
+        assert_eq!(observation["direct_ax_trusted"], false);
+        assert_eq!(observation["pressed"], succeeds);
+        let artifact: Value = serde_json::from_slice(
+            &fs::read(replay.probe.output.join("macos-ax-control.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&artifact, observation);
+    }
+}
+
+#[test]
+fn subprocess_timeout_keeps_partial_ax_diagnostics() {
+    let mut machine = Machine::new(Arc::default());
+    let error = machine.run(&[
+        "/bin/sh".to_owned(), "-c".to_owned(),
+        "printf 'AX partial inventory: AXGroup AXButton Clear formatting\\n' >&2; exec sleep 5".to_owned(),
+    ], None, 0.2).unwrap_err().to_string();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        error.contains("AX partial inventory: AXGroup AXButton Clear formatting"),
+        "{error}"
+    );
 }
 
 #[test]
