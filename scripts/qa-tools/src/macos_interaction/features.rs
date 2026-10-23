@@ -2,7 +2,9 @@
 //! clipboard HTML/RTF. Exact HTML comparisons catch lost styles and unwanted
 //! extra paragraphs; they are not screenshot or screen-reader signoff.
 
-use serde_json::{Value, json};
+use std::fs;
+
+use serde_json::{Map, Value, json};
 
 use super::{
     ClipboardCheck, CopyScope, END, Exit, Key, PASTE, Probe, START, System, TITLE, change_count,
@@ -34,6 +36,45 @@ const FONT_ONLY: Rich<'_> = Rich {
     body: "<p><span style=\"color:#ff0000\">café link</span></p><p><span style=\"color:#ff0000\">second</span></p>",
 };
 const URL: &str = "https://example.invalid/textloom";
+const QUOTE: Rich<'_> = Rich {
+    text: "quote\ncontinued",
+    body: "<blockquote><p>quote</p><p>continued</p></blockquote>",
+};
+// Keep the production skeleton and vary only placement of a physical margin.
+// These controlled offers never count as native exporter checks.
+const QUOTE_CONTROLS: [(&str, &str); 3] = [
+    ("quote-bare", QUOTE.body),
+    (
+        "quote-block-margin",
+        "<blockquote style=\"margin-left:36px\"><p>quote</p><p>continued</p></blockquote>",
+    ),
+    (
+        "quote-paragraph-margin",
+        "<blockquote><p style=\"margin-left:36px\">quote</p><p style=\"margin-left:36px\">continued</p></blockquote>",
+    ),
+];
+
+fn quote_specification() -> Value {
+    json!({"paragraphs":[{"text":"quote", "quote":true},{"text":"continued", "quote":true}]})
+}
+
+fn import_passed(observation: &Map<String, Value>) -> Result<bool> {
+    match observation
+        .get("textedit_rtf_features_exact")
+        .and_then(Value::as_bool)
+    {
+        Some(true) if !observation.contains_key("error") => Ok(true),
+        Some(false)
+            if observation
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| !error.is_empty()) =>
+        {
+            Ok(false)
+        }
+        _ => Err("TextEdit feature observation has no unambiguous semantic result".into()),
+    }
+}
 
 fn html_document(body: &str) -> String {
     format!(
@@ -115,7 +156,11 @@ impl<S: System> Probe<S> {
         )
     }
 
-    fn feature_import(&mut self, name: &str, specification: Value) -> Result<()> {
+    fn import_features(
+        &mut self,
+        label: &str,
+        specification: &Value,
+    ) -> Result<Map<String, Value>> {
         // The last rich assertion left the native offer on the clipboard.
         let pid = self.textedit_pid.ok_or("TextEdit is not running")?;
         let window = stem(&self.import_file);
@@ -124,14 +169,175 @@ impl<S: System> Probe<S> {
         let generation = change_count(&self.clipboard("state", &[], None)?)?;
         self.action(pid, &window, "chord", "a")?;
         self.action(pid, &window, "chord", "c")?;
-        self.diagnostic("feature-import")?;
+        // Confirm copy completion separately from semantic validation: a false
+        // observation is final evidence, not a reason to repeat a five-second poll.
+        self.clipboard("state", &[], Some(generation))?;
+        self.diagnostic(label)?;
         let imported = self.clipboard(
             "textedit-features",
             &[&specification.to_string()],
             Some(generation),
         )?;
-        self.note(name, Value::Object(imported))?;
-        self.action(pid, &window, "chord", "s")
+        import_passed(&imported)?;
+        fs::write(
+            self.output
+                .join(format!("macos-fixture-{label}.features.json")),
+            serde_json::to_vec_pretty(&imported)?,
+        )?;
+        // Save even a semantically failed import so closing the private fixture
+        // cannot leave a dialog that contaminates subsequent native actions.
+        self.action(pid, &window, "chord", "s")?;
+        Ok(imported)
+    }
+
+    fn record_feature_import(&mut self, name: &str, imported: Map<String, Value>) -> Result<()> {
+        if import_passed(&imported)? {
+            return self.note(name, Value::Object(imported));
+        }
+        eprintln!("{name}: {}", imported["error"]);
+        self.observations
+            .entry("feature_failures")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or("Malformed feature failure collection")?
+            .push(json!({"name":name, "observation":imported}));
+        self.save()
+    }
+
+    fn feature_import(&mut self, name: &str, label: &str, specification: Value) -> Result<()> {
+        let imported = self.import_features(label, &specification)?;
+        self.record_feature_import(name, imported)
+    }
+
+    pub(super) fn require_feature_success(&self) -> Result<()> {
+        if let Some(failures) = self
+            .observations
+            .get("feature_failures")
+            .and_then(Value::as_array)
+            && !failures.is_empty()
+        {
+            let names: Vec<_> = failures
+                .iter()
+                .filter_map(|failure| failure["name"].as_str())
+                .collect();
+            return Err(format!(
+                "{} native feature import(s) failed: {}",
+                failures.len(),
+                names.join("; ")
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Close the saved document before recreating it, so TextEdit cannot retain
+    /// the previous list/quote paragraph or its insertion-point attributes.
+    fn fresh_feature_destination(&mut self) -> Result<()> {
+        let pid = self.textedit_pid.ok_or("TextEdit is not running")?;
+        let path = self.import_file.clone();
+        self.action(pid, &stem(&path), "close", "")?;
+        self.clipboard("prepare-import", &[&path.display().to_string()], None)?;
+        self.open_textedit(&path)
+    }
+
+    pub(super) fn quote_parser_diagnostics(&mut self) -> Result<()> {
+        for (label, body) in QUOTE_CONTROLS {
+            let path = self
+                .output
+                .join(format!("macos-fixture-{label}.source.html"));
+            fs::write(&path, html_document(body))?;
+            let parsed = self.clipboard(
+                "inspect-html",
+                &[
+                    &path.display().to_string(),
+                    &quote_specification().to_string(),
+                ],
+                None,
+            )?;
+            fs::write(
+                path.with_extension("appkit.json"),
+                serde_json::to_vec_pretty(&parsed)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn native_quote_import(&mut self, pid: u32, fresh: bool) -> Result<()> {
+        self.rich(pid, QUOTE)?;
+        let generation = self.observations["last_feature_html"]["observed"]["change_count"]
+            .as_i64()
+            .ok_or("Native quote HTML has no clipboard generation")?;
+        let label = if fresh {
+            "quote-native-fresh"
+        } else {
+            "quote-native-reused"
+        };
+        let source_label = format!("{label}-source");
+        // Capture the actual offer before ANY destination action (including
+        // closing/raising its window). Immutable writes must never be retried.
+        let captured = self.run(
+            &[
+                self.helper.display().to_string(),
+                "capture-native-offer".to_owned(),
+                self.output.display().to_string(),
+                source_label.clone(),
+                generation.to_string(),
+            ],
+            None,
+            10.0,
+            Exit::MustSucceed,
+        )?;
+        let captured: Map<String, Value> = serde_json::from_slice(&captured.stdout)?;
+        if captured.get("native_source_snapshot") != Some(&Value::Bool(true))
+            || captured.get("label").and_then(Value::as_str) != Some(&source_label)
+            || change_count(&captured)? != generation
+        {
+            return Err("Native source capture did not confirm the copied offer".into());
+        }
+        if fresh {
+            self.fresh_feature_destination()?;
+            if change_count(&self.clipboard("state", &[], None)?)? != generation {
+                return Err("Preparing the neutral destination changed the native offer".into());
+            }
+        }
+        let name = if fresh {
+            "features: TextEdit quote import into a fresh neutral document"
+        } else {
+            "features: Enter continues quotes; TextEdit preserves quoted indentation"
+        };
+        self.feature_import(name, label, quote_specification())
+    }
+
+    fn quote_import_diagnostics(&mut self, pid: u32) -> Result<()> {
+        self.native_quote_import(pid, true)?;
+        let mut comparisons = Vec::new();
+        for (label, _) in QUOTE_CONTROLS {
+            self.fresh_feature_destination()?;
+            let path = self
+                .output
+                .join(format!("macos-fixture-{label}.source.html"));
+            self.clipboard(
+                "offer-html",
+                &[&path.display().to_string(), QUOTE.text],
+                None,
+            )?;
+            let imported = self.import_features(label, &quote_specification())?;
+            // A controlled offer cannot certify the exporter, but an observed
+            // native semantic failure must still keep this diagnostic run red.
+            if !import_passed(&imported)? {
+                self.record_feature_import(
+                    &format!("diagnostic: TextEdit controlled HTML {label}"),
+                    imported.clone(),
+                )?;
+            }
+            comparisons
+                .push(json!({"label":label, "source":"controlled-html", "observation":imported}));
+            self.observe("quote_comparisons", json!(comparisons));
+            self.save()?;
+        }
+        // The native quote editor state was untouched; next UI checks continue
+        // its exit/backspace/undo behavior regardless of import semantics.
+        Ok(())
     }
 
     pub(super) fn features(&mut self, pid: u32) -> Result<()> {
@@ -188,6 +394,7 @@ impl<S: System> Probe<S> {
         self.rich(pid, linked)?;
         self.feature_import(
             "features: TextEdit preserves fill, font color, and hyperlink",
+            "feature-colors",
             json!({
                 "paragraphs": [{"text": "café link"}, {"text": "second"}],
                 "foreground": [255,0,0,255], "background": [255,255,0,255], "link": URL
@@ -294,6 +501,7 @@ impl<S: System> Probe<S> {
         )?;
         self.feature_import(
             "features: TextEdit keeps a soft break within one numbered item",
+            "feature-soft-break",
             json!({"paragraphs":[{"text":"first\u{2028}second", "list_start":1, "number":1}]}),
         )?;
         self.feature_fixture(pid, base)?;
@@ -337,12 +545,8 @@ impl<S: System> Probe<S> {
                 Key::new("type", "continued"),
             ],
         )?;
-        let quote = Rich {
-            text: "quote\ncontinued",
-            body: "<blockquote><p>quote</p><p>continued</p></blockquote>",
-        };
-        self.rich(pid, quote)?;
-        self.feature_import("features: Enter continues quotes; TextEdit preserves quoted indentation", json!({"paragraphs":[{"text":"quote", "quote":true},{"text":"continued", "quote":true}]}))?;
+        self.native_quote_import(pid, false)?;
+        self.quote_import_diagnostics(pid)?;
         self.keys(pid, &[END, Key::new("keycode", "36")])?;
         self.rich_change(
             pid,
@@ -425,7 +629,7 @@ impl<S: System> Probe<S> {
             offer.get("html").ok_or("Native list offer has no HTML")?,
             "<ol start=\"2\"><li>two</li><li>three</li></ol>",
         )?;
-        self.feature_import("features: TextEdit keeps copied item numbers 2 and 3", json!({"paragraphs":[{"text":"two","list_start":2,"number":2},{"text":"three","list_start":2,"number":3}]}))?;
+        self.feature_import("features: TextEdit keeps copied item numbers 2 and 3", "feature-numbering", json!({"paragraphs":[{"text":"two","list_start":2,"number":2},{"text":"three","list_start":2,"number":3}]}))?;
         self.rich_change(pid, "features: numbering continues across body text", continuous,
             Rich { text, body: "<ol start=\"1\"><li>one</li></ol><p>two</p><ol start=\"2\"><li>three</li></ol>" },
             &[START, Key::new("keycode", "125"), Key::new("chord", "0")])?;

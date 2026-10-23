@@ -1693,6 +1693,11 @@ impl<S: System> Probe<S> {
             return Err("AX retry controller self-test did not confirm success".into());
         }
         self.observe("ax_retry_self_test", self_test);
+        let feature_self_test = self.clipboard("feature-self-test", &[], None)?;
+        if feature_self_test.get("feature_self_test") != Some(&Value::Bool(true)) {
+            return Err("Feature inspector self-test did not confirm success".into());
+        }
+        self.observe("feature_self_test", Value::Object(feature_self_test));
         self.save()?;
         let (import_file, external_file) = (
             self.import_file.display().to_string(),
@@ -1703,9 +1708,11 @@ impl<S: System> Probe<S> {
             "preflight: isolated hosted desktop and System Events Accessibility verified",
             Value::Null,
         )?;
+        self.quote_parser_diagnostics()?;
         self.editable()?;
         self.guarded(Mode::ReadOnly)?;
         self.guarded(Mode::Disabled)?;
+        self.require_feature_success()?;
         self.observe("passed", true.into());
         Ok(())
     }

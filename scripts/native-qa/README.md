@@ -53,14 +53,32 @@ Command+Shift+Left selection first witnesses a nonempty, proper suffix of that
 paragraph; deletion must remove exactly that suffix and undo must restore every
 byte. This measures the actual visual boundary instead of assuming font metrics.
 
-The feature extension reuses the native host and TextEdit documents. Allow
-roughly 5–7 minutes for the complete interaction step (an estimate until the
-hosted run); its timeout is eight minutes, including helper compilation and
-cleanup. It adds no app launches. `last_feature_html` records the last exact
-expected/observed native representation, and `macos-fixture-feature-import.*`
-captures the most recent TextEdit import for diagnosing failures. Rust tests
-check orchestration and oracles without a desktop; they do not establish that
-AppKit, System Events, or TextEdit passed on macOS.
+The feature extension reuses the native host and TextEdit process. Quote-import
+diagnostics compare the native offer in the reused document and a fresh neutral
+document, then three controlled HTML offers: bare blockquote, a margin on the
+blockquote, and margins on its child paragraphs. The same controls are inspected
+separately through AppKit's HTML parser. Controlled offers and parser results
+cannot establish that the production exporter passed.
+
+Before either native quote import, immutable
+`macos-fixture-quote-native-{reused,fresh}-source.*` files retain the actual HTML,
+rich envelope, plain bytes, advertised types, and clipboard generation. A
+generation change during capture fails before any destination action.
+
+Every import has distinct `macos-fixture-<case>.*` RTF, plain-text, accessibility,
+and feature observations; paragraph diagnostics retain indents, text blocks,
+lists, and attribute descriptions. Semantic import failures remain in
+`feature_failures` and fail the final aggregate after subsequent checks run.
+UI, transport, stale-copy, and malformed-observation failures stop execution.
+The quote assertion still requires positive first-line and subsequent-line
+indents. `last_feature_html` records the most recent native representation.
+
+Allow roughly 6.5–7.5 minutes for the complete interaction step with these
+comparisons (an estimate until hosted execution); its timeout is eight minutes,
+including helper compilation and cleanup. Rust tests check orchestration and
+oracles without a desktop; they do not establish that AppKit, System Events,
+or TextEdit passed on macOS. Hosted Swift self-tests check the quote oracle and
+accessibility retry boundaries before native interaction.
 
 The separate `macos_winit.py` probe runs the minimal winit harness before the
 egui interaction session. It observes natural foreground activation, without

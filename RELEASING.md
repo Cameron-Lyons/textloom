@@ -28,8 +28,8 @@ The production fixes are at clean commit `3908e3c208a58863246173720f6d5d9ff22ab4
 The full `scripts/check-release.sh` passed: all eight feature combinations,
 release tests, native host tests, strict Clippy, rustdoc, quick benchmarks,
 package inventory, and extracted-package consumer validation. The publication
-dry run passed without uploading. All nine CI jobs passed at `39719e3` in
-[run 39963810757](https://github.com/Cameron-Lyons/textloom/actions/runs/39963810757);
+dry run passed without uploading. All nine CI jobs passed at `db1fd58` in
+[run 39966191435](https://github.com/Cameron-Lyons/textloom/actions/runs/39966191435);
 that excludes the separate native interaction workflow. Subsequent commits extend repository-only
 QA and documentation; they do not change the published library implementation.
 
@@ -77,13 +77,21 @@ per-check directories; the native executable SHA-256 is
 `ef592901c717525257125483b7eb011bef799444e6de06b69d0025dd61ca8d41`.
 Word/Outlook interoperability and physical hardware remain unverified.
 
-The new macOS winit probe passed all nine observations on macOS 26.6.2 arm64 in
-[run 39962542906](https://github.com/Cameron-Lyons/textloom/actions/runs/39962542906),
-PR head `8322c23` / tested merge `bcc6a11e0dd8fac0c744a23f808bb331b85ac60a`.
+The new macOS winit probe passed all nine observations on macOS 26.6.2 arm64,
+most recently in
+[run 39966191421](https://github.com/Cameron-Lyons/textloom/actions/runs/39966191421),
+PR head `db1fd58` / tested merge `7f188df15b36319a5dacf77d911c5860c9802a93`.
 It verified natural startup focus before the first native key, exact Unicode
 copy/paste, document and selection restoration through undo/redo, and owned
-process cleanup. It did not test an IME or VoiceOver. That run's separate
-TextEdit probe failed at its new control lookup; it is not a full macOS pass.
+process cleanup. It did not test an IME or VoiceOver. The separate TextEdit
+probe passed native Command+Shift+V from a rich source, fill/font color and link
+controls with undo/redo, external TextEdit color/link import, and a soft break
+within one numbered item. Bounded accessibility rediscovery and all nine Swift
+retry self-tests also passed. The probe then failed because TextEdit returned
+the correct quote text without paragraph indentation from the native
+`<blockquote>` offer. This is a retained interoperability failure under
+investigation, not a full macOS pass; later numbering, forced-wrap, and guarded
+mode checks were not reached in this run.
 
 ## Earlier validation evidence
 

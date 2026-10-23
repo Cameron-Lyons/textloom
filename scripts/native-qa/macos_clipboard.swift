@@ -432,6 +432,58 @@ func types() -> [String] {
     (NSPasteboard.general.types ?? []).map { $0.rawValue }.sorted()
 }
 
+// NSPasteboard has no read lock. Read every representation between generation
+// checks, and never publish a partial/mixed-generation snapshot as evidence.
+func nativeOfferSnapshot(_ expected: Int, generation: () -> Int,
+                         readTypes: () -> [String],
+                         readData: (NSPasteboard.PasteboardType) -> Data?) throws -> ([String: Any], [(String, Data)]) {
+    let before = generation()
+    try require(before == expected, "Native source changed before capture")
+    let advertised = readTypes()
+    try require(advertised.count <= 32 && advertised.allSatisfy { $0.utf8.count <= 256 },
+                "Native source type inventory exceeds its cap")
+    let representations: [(String, NSPasteboard.PasteboardType)] = [
+        ("html", .html), ("envelope", customType), ("plain", .string)
+    ]
+    var captured: [(String, Data)] = []
+    var sizes: [String: Int] = [:]
+    for (name, type) in representations {
+        try require(advertised.contains(type.rawValue), "Native source does not advertise \(name)")
+        guard let data = readData(type) else { throw ProbeError.failed("Native source \(name) read failed") }
+        try require(!data.isEmpty && data.count <= 64 * 1024, "Native source \(name) exceeds its capture bounds")
+        captured.append((name, data))
+        sizes[name] = data.count
+    }
+    let after = generation()
+    try require(after == before, "Native source changed during capture")
+    return (["native_source_snapshot": true, "change_count": before,
+             "types": advertised, "representation_bytes": sizes], captured)
+}
+
+func captureNativeOffer(_ arguments: [String]) throws {
+    try require(arguments.count == 3, "capture-native-offer requires artifact directory, source label, and generation")
+    let label = arguments[1]
+    try require(["quote-native-reused-source", "quote-native-fresh-source"].contains(label),
+                "Unexpected native source capture label")
+    guard let expected = Int(arguments[2]) else { throw ProbeError.failed("Invalid native source generation") }
+    let pasteboard = NSPasteboard.general
+    let (snapshot, captured) = try nativeOfferSnapshot(expected,
+        generation: { pasteboard.changeCount }, readTypes: types,
+        readData: { pasteboard.data(forType: $0) })
+    var observation = snapshot
+    observation["label"] = label
+    let prefix = URL(fileURLWithPath: arguments[0], isDirectory: true)
+        .appendingPathComponent("macos-fixture-\(label)")
+    for (name, data) in captured {
+        try data.write(to: prefix.appendingPathExtension(name), options: .withoutOverwriting)
+    }
+    // The manifest is written last and carries the captured generation. Generic
+    // emit() would replace it with an unrelated post-write pasteboard read.
+    let manifest = try JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys])
+    try manifest.write(to: prefix.appendingPathExtension("json"), options: .withoutOverwriting)
+    print(String(decoding: manifest, as: UTF8.self))
+}
+
 func writeRTF(_ value: NSAttributedString, _ path: String) throws {
     let data = try value.data(
         from: NSRange(location: 0, length: value.length),
@@ -448,6 +500,16 @@ func prepare(_ arguments: [String]) throws {
     let attributed = NSAttributedString(string: external, attributes: [.font: boldFont])
     try writeRTF(attributed, arguments[1])
     try emit(["private_rtf_fixtures_prepared": true])
+}
+
+func prepareImport(_ arguments: [String]) throws {
+    try require(arguments.count == 1, "prepare-import requires a closed private RTF path")
+    let paragraph = NSMutableParagraphStyle()
+    try writeRTF(NSAttributedString(string: "paste target", attributes: [
+        .font: NSFont.systemFont(ofSize: 14), .paragraphStyle: paragraph
+    ]), arguments[0])
+    // Do not touch the clipboard: the next paste must use the original offer.
+    try emit(["neutral_import_prepared": true])
 }
 
 func nativeFixture() throws {
@@ -559,22 +621,75 @@ func rgba(_ color: Any?) -> [Int]? {
         .map { Int(($0 * 255).rounded()) }
 }
 
-// Inspect TextEdit's actual copied RTF, never an attributed string constructed
-// directly from our HTML. List markers and one terminal paragraph LF may be
-// added by TextEdit. All payload bytes, soft separators, and attributes must
-// survive; typography and the particular installed font are not asserted.
-func textEditFeatures(_ arguments: [String]) throws {
-    try require(arguments.count == 1, "textedit-features requires a JSON specification")
-    guard let specification = try JSONSerialization.jsonObject(with: Data(arguments[0].utf8)) as? [String: Any],
+func featureSpecification(_ argument: String) throws -> ([String: Any], [[String: Any]]) {
+    guard let specification = try JSONSerialization.jsonObject(with: Data(argument.utf8)) as? [String: Any],
           let paragraphs = specification["paragraphs"] as? [[String: Any]],
-          !paragraphs.isEmpty, paragraphs.count <= 8,
-          let data = try boundedData(.rtf) else {
-        throw ProbeError.failed("Missing feature specification or TextEdit RTF")
+          !paragraphs.isEmpty, paragraphs.count <= 8 else {
+        throw ProbeError.failed("Missing feature specification")
     }
-    try require(try boundedData(customType) == nil, "TextEdit feature copy retained a stale native envelope")
-    let attributed = try NSAttributedString(
-        data: data, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil
-    )
+    try require(paragraphs.allSatisfy { ($0["text"] as? String).map { !$0.isEmpty } == true },
+                "Feature paragraphs require nonempty text")
+    return (specification, paragraphs)
+}
+
+func textBlockAttributes(_ block: NSTextBlock) -> [String: Any] {
+    var layers: [String: Any] = [:]
+    let layerKinds: [(String, NSTextBlock.Layer)] = [("margin", .margin), ("padding", .padding), ("border", .border)]
+    let edges: [(String, NSRectEdge)] = [("min_x", .minX), ("max_x", .maxX), ("min_y", .minY), ("max_y", .maxY)]
+    for (name, layer) in layerKinds {
+        var widths: [String: Any] = [:]
+        for (edgeName, edge) in edges {
+            let width: [String: Any] = ["width": block.width(for: layer, edge: edge),
+                                       "value_type": block.widthValueType(for: layer, edge: edge).rawValue]
+            widths[edgeName] = width
+        }
+        layers[name] = widths
+    }
+    return ["class": String(describing: type(of: block)), "description": String(describing: block), "layers": layers]
+}
+
+// Keep all attribute keys and text-block descriptions, including representations
+// the strict indentation oracle does not yet understand. This is evidence, not
+// an alternative path to passing a quote assertion.
+func featureAttributes(_ attributed: NSAttributedString) throws -> [[String: Any]] {
+    try require(attributed.length <= 8192, "Feature attribute diagnostic exceeds its cap")
+    var observations: [[String: Any]] = []
+    var offset = 0
+    while offset < attributed.length {
+        try require(observations.count < 64, "Too many feature attribute runs")
+        var range = NSRange(location: 0, length: 0)
+        let attributes = attributed.attributes(at: offset, effectiveRange: &range)
+        try require(NSMaxRange(range) > offset, "Invalid feature attribute range")
+        var descriptions: [String: Any] = [:]
+        for (key, value) in attributes {
+            descriptions[key.rawValue] = ["class": String(describing: type(of: value)),
+                                          "value": String(String(describing: value).prefix(2048))]
+        }
+        var observation: [String: Any] = [
+            "location": range.location, "length": range.length,
+            "text": (attributed.string as NSString).substring(with: range),
+            "attributes": descriptions
+        ]
+        if let paragraph = attributes[.paragraphStyle] as? NSParagraphStyle {
+            try require(paragraph.textBlocks.count <= 8 && paragraph.textLists.count <= 8,
+                        "Too many feature text blocks or lists")
+            let paragraphObservation: [String: Any] = [
+                "head_indent": paragraph.headIndent,
+                "first_line_head_indent": paragraph.firstLineHeadIndent,
+                "tail_indent": paragraph.tailIndent,
+                "text_lists": paragraph.textLists.map { String(describing: $0) },
+                "text_blocks": paragraph.textBlocks.map { textBlockAttributes($0) }
+            ]
+            observation["paragraph"] = paragraphObservation
+        }
+        observations.append(observation)
+        offset = NSMaxRange(range)
+    }
+    return observations
+}
+
+func validateFeatures(_ attributed: NSAttributedString, _ specification: [String: Any],
+                      _ paragraphs: [[String: Any]]) throws -> [[String: Any]] {
     var lines = attributed.string.components(separatedBy: "\n")
     if lines.last == "" { lines.removeLast() }
     try require(lines.count == paragraphs.count, "TextEdit changed feature paragraph count: \(lines.count)")
@@ -634,8 +749,127 @@ func textEditFeatures(_ arguments: [String]) throws {
         observations.append(observation)
         offset += line.length + 1
     }
-    try emit(["textedit_rtf_features_exact": true, "paragraphs": observations,
-              "checked_specification": specification, "types": types()])
+    return observations
+}
+
+// Semantic mismatches are explicit false observations so the driver can retain
+// them and collect the remaining independent checks. Transport, parsing, stale
+// envelopes, and malformed specifications still fail the command immediately.
+func textEditFeatures(_ arguments: [String]) throws {
+    try require(arguments.count == 1, "textedit-features requires a JSON specification")
+    let (specification, paragraphs) = try featureSpecification(arguments[0])
+    guard let data = try boundedData(.rtf) else { throw ProbeError.failed("Missing TextEdit RTF") }
+    try require(try boundedData(customType) == nil, "TextEdit feature copy retained a stale native envelope")
+    let attributed = try NSAttributedString(
+        data: data, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil
+    )
+    var result: [String: Any] = [
+        "checked_specification": specification, "types": types(),
+        "attribute_runs": try featureAttributes(attributed)
+    ]
+    do {
+        result["paragraphs"] = try validateFeatures(attributed, specification, paragraphs)
+        result["textedit_rtf_features_exact"] = true
+    } catch {
+        result["textedit_rtf_features_exact"] = false
+        result["error"] = String(describing: error)
+    }
+    try emit(result)
+}
+
+func featureSelfTest() throws {
+    let paragraphs: [[String: Any]] = [["text": "quote", "quote": true]]
+    let specification: [String: Any] = ["paragraphs": paragraphs]
+    var checks: [String] = []
+    for (head, first, expected) in [(36.0, 36.0, true), (0, 36, false), (36, 0, false), (0, 0, false)] {
+        let style = NSMutableParagraphStyle()
+        style.headIndent = CGFloat(head)
+        style.firstLineHeadIndent = CGFloat(first)
+        let value = NSAttributedString(string: "quote\n", attributes: [.paragraphStyle: style])
+        var matched = false
+        do { _ = try validateFeatures(value, specification, paragraphs); matched = true } catch {}
+        try require(matched == expected, "Feature self-test changed the strict quote oracle")
+        _ = try featureAttributes(value)
+        checks.append("head=\(head), first=\(first), accepted=\(expected)")
+    }
+    let style = NSMutableParagraphStyle()
+    style.textBlocks = [NSTextBlock()]
+    let value = NSAttributedString(string: "quote\n", attributes: [.paragraphStyle: style])
+    var matched = false
+    do { _ = try validateFeatures(value, specification, paragraphs); matched = true } catch {}
+    try require(!matched, "A text block alone must not bypass the quote assertion")
+    _ = try featureAttributes(value)
+    checks.append("text-block presence alone is not a pass")
+    for (name, before, after, missing, oversized, expected) in [
+        ("stable source bytes", 7, 7, false, false, true),
+        ("source changed before capture", 8, 8, false, false, false),
+        ("source changed during capture", 7, 8, false, false, false),
+        ("advertised source read failed", 7, 7, true, false, false),
+        ("oversized source rejected", 7, 7, false, true, false)
+    ] {
+        var reads = 0
+        var accepted = false
+        do {
+            let (snapshot, captured) = try nativeOfferSnapshot(7, generation: {
+                reads += 1
+                return reads == 1 ? before : after
+            }, readTypes: { [NSPasteboard.PasteboardType.html.rawValue, customType.rawValue, NSPasteboard.PasteboardType.string.rawValue] },
+            readData: { _ in missing ? nil : (oversized ? Data(repeating: 0, count: 65537) : Data([0, 255, 13, 10])) })
+            try require(snapshot["change_count"] as? Int == 7 && captured.allSatisfy { $0.1 == Data([0, 255, 13, 10]) },
+                        "Source capture altered raw bytes or generation")
+            accepted = true
+        } catch {}
+        try require(accepted == expected, "Native source self-test failed: \(name)")
+        checks.append(name)
+    }
+    try emit(["feature_self_test": true, "checks": checks])
+}
+
+// Parser-only controls are never a native interoperability pass. The same
+// bounded HTML file is also offered to TextEdit by the native comparison.
+func inspectHTML(_ arguments: [String]) throws {
+    try require(arguments.count == 2, "inspect-html requires a fixture HTML path and specification")
+    let (specification, paragraphs) = try featureSpecification(arguments[1])
+    let data = try Data(contentsOf: URL(fileURLWithPath: arguments[0]))
+    try require(data.count <= 8192, "HTML comparison fixture exceeds its cap")
+    var result: [String: Any] = ["source": "appkit-html-parser", "checked_specification": specification]
+    let attributed: NSAttributedString
+    do {
+        attributed = try NSAttributedString(data: data, options: [
+            .documentType: NSAttributedString.DocumentType.html,
+            .characterEncoding: String.Encoding.utf8.rawValue
+        ], documentAttributes: nil)
+    } catch {
+        result["appkit_html_features_exact"] = false
+        result["error"] = String(describing: error)
+        try emit(result)
+        return
+    }
+    result["attribute_runs"] = try featureAttributes(attributed)
+    result["text"] = attributed.string
+    try writeRTF(attributed, arguments[0] + ".appkit.rtf")
+    do {
+        result["paragraphs"] = try validateFeatures(attributed, specification, paragraphs)
+        result["appkit_html_features_exact"] = true
+    } catch {
+        result["appkit_html_features_exact"] = false
+        result["error"] = String(describing: error)
+    }
+    try emit(result)
+}
+
+func offerHTML(_ arguments: [String]) throws {
+    let environment = ProcessInfo.processInfo.environment
+    try require(environment["GITHUB_ACTIONS"] == "true" && environment["RUNNER_OS"] == "macOS",
+                "HTML comparison offers require an isolated hosted macOS Actions runner")
+    try require(arguments.count == 2, "offer-html requires a fixture HTML path and plain text")
+    let data = try Data(contentsOf: URL(fileURLWithPath: arguments[0]))
+    try require(data.count <= 8192 && arguments[1].utf8.count <= 8192, "HTML comparison fixture exceeds its cap")
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    try require(pasteboard.setData(data, forType: .html), "Could not offer comparison HTML")
+    try require(pasteboard.setString(arguments[1], forType: .string), "Could not offer comparison plain text")
+    try emit(["controlled_html_offer": true, "types": types()])
 }
 
 func expectPlain(_ arguments: [String], fallback: Bool) throws {
@@ -654,7 +888,9 @@ func expectPlain(_ arguments: [String], fallback: Bool) throws {
 
 func diagnose(_ arguments: [String]) throws {
     try require(arguments.count == 2, "diagnose requires an artifact directory and fixture label")
-    let labels = ["native-offer", "textedit-before-paste", "textedit-after-paste", "textedit-after-copy", "feature-import", "failure"]
+    let labels = ["native-offer", "textedit-before-paste", "textedit-after-paste", "textedit-after-copy", "feature-import", "failure",
+                  "feature-colors", "feature-soft-break", "feature-numbering", "quote-native-reused", "quote-native-fresh",
+                  "quote-bare", "quote-block-margin", "quote-paragraph-margin"]
     try require(labels.contains(arguments[1]), "Unexpected fixture diagnostic label")
     let directory = URL(fileURLWithPath: arguments[0], isDirectory: true)
     let label = arguments[1]
@@ -675,6 +911,7 @@ func diagnose(_ arguments: [String]) throws {
             )
             try require(parsed.string.utf8.count <= diagnosticLimit, "Parsed fixture RTF exceeds its diagnostic cap")
             try parsed.string.write(to: directory.appendingPathComponent("macos-fixture-\(label).rtf.txt"), atomically: true, encoding: .utf8)
+            observation["rtf_attribute_runs"] = try featureAttributes(parsed)
         }
         if type == .html && label == "native-offer" {
             for explicitUTF8 in [false, true] {
@@ -702,9 +939,14 @@ do {
     case "ax-retry-self-test": try controlRetrySelfTest()
     case "ax-press": try pressControl(Array(arguments.dropFirst()))
     case "prepare": try prepare(Array(arguments.dropFirst()))
+    case "prepare-import": try prepareImport(Array(arguments.dropFirst()))
     case "native-fixture": try nativeFixture()
     case "native-html": try nativeHTML()
+    case "capture-native-offer": try captureNativeOffer(Array(arguments.dropFirst()))
     case "textedit-features": try textEditFeatures(Array(arguments.dropFirst()))
+    case "feature-self-test": try featureSelfTest()
+    case "inspect-html": try inspectHTML(Array(arguments.dropFirst()))
+    case "offer-html": try offerHTML(Array(arguments.dropFirst()))
     case "textedit-import": try textEditImport()
     case "external-fixture": try externalFixture()
     case "state": try emit(["types": types()])
