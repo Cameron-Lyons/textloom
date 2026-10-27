@@ -6,7 +6,7 @@ has its own lockfile and workspace, like the native example.
 | Binary | Use |
 | --- | --- |
 | `check-native-report` | Validates a native host `--qa-report` file: strict, content-free fields, and the expected revision, OS, mode, and clipboard configuration. CI runs it after every renderer smoke run. It never certifies manual QA. |
-| `macos-interaction` | The hosted macOS interaction probe; see [`../native-qa`](../native-qa/README.md). It refuses to run outside a GitHub Actions macOS runner. |
+| `macos-interaction` | The hosted macOS interaction probe; see [`../native-qa`](../native-qa/README.md). It requires a disposable GitHub-hosted macOS runner and refuses self-hosted runners. |
 | `winvm` | Creates and runs the local Windows 11 VM; see [`../windows-vm`](../windows-vm/README.md). |
 | `winvm-checks` | Runs the Windows checks in that VM. |
 

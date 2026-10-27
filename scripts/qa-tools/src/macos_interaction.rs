@@ -1718,14 +1718,32 @@ impl<S: System> Probe<S> {
     }
 }
 
+/// Whether the process is running on the disposable desktop this probe needs.
+fn disposable_hosted_runner(
+    macos: bool,
+    github_actions: Option<&str>,
+    runner_os: Option<&str>,
+    runner_environment: Option<&str>,
+) -> bool {
+    macos
+        && github_actions == Some("true")
+        && runner_os == Some("macOS")
+        && runner_environment == Some("github-hosted")
+}
+
 /// The `macos-interaction` command.
 #[must_use]
 pub fn main() -> ExitCode {
-    let hosted = env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true")
-        && env::var("RUNNER_OS").is_ok_and(|value| value == "macOS");
-    if !cfg!(target_os = "macos") || !hosted {
+    // Check every marker before querying Accessibility, touching the clipboard,
+    // or launching applications. GITHUB_ACTIONS is also set on self-hosted Macs.
+    if !disposable_hosted_runner(
+        cfg!(target_os = "macos"),
+        env::var("GITHUB_ACTIONS").ok().as_deref(),
+        env::var("RUNNER_OS").ok().as_deref(),
+        env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+    ) {
         eprintln!(
-            "This clipboard/input probe runs only on an isolated hosted macOS Actions runner"
+            "This clipboard/input probe runs only on a disposable GitHub-hosted macOS runner"
         );
         return ExitCode::FAILURE;
     }

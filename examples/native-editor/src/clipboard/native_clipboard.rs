@@ -868,6 +868,20 @@ mod tests {
                 .unwrap();
             editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
         }
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+            .unwrap();
+        editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                foreground: Some(Some(Color::RED)),
+                background: Some(Some(Color::YELLOW)),
+                ..Default::default()
+            })
+            .unwrap();
+        editor
+            .set_link(Some(Link::try_new("https://example.com/quote").unwrap()))
+            .unwrap();
         let fragment = Fragment::from_document(editor.document());
         let item = NativeItem::from_fragment(&fragment).unwrap();
         assert_eq!(item.fragment().unwrap(), fragment);
@@ -881,19 +895,40 @@ let data = FileHandle.standardInput.readDataToEndOfFile()
 let value = try NSAttributedString(data: data,
     options: [.documentType: NSAttributedString.DocumentType.html], documentAttributes: nil)
 let expected = ["café quote\u{2028}wrapped", "continued", "body", "日本語 quote", "last"]
-precondition(value.string == expected.joined(separator: "\n") + "\n", "changed quote payload")
-var offset = 0
-for (index, text) in expected.enumerated() {
-    guard let paragraph = value.attribute(.paragraphStyle, at: offset, effectiveRange: nil) as? NSParagraphStyle else {
-        fatalError("missing paragraph style")
+// TextEdit copies rich content as RTF. Check the receiving framework's export
+// and reimport too, since accepting HTML alone does not prove the copied
+// paragraph formatting survives.
+let rtf = try value.data(from: NSRange(location: 0, length: value.length),
+    documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+let roundtrip = try NSAttributedString(data: rtf,
+    options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil)
+for imported in [value, roundtrip] {
+    precondition(imported.string == expected.joined(separator: "\n") + "\n", "changed quote payload")
+    var offset = 0
+    for (index, text) in expected.enumerated() {
+        guard let paragraph = imported.attribute(.paragraphStyle, at: offset, effectiveRange: nil) as? NSParagraphStyle else {
+            fatalError("missing paragraph style")
+        }
+        if [0, 1, 3].contains(index) {
+            precondition(abs(paragraph.headIndent - 36) < 0.02, "lost wrapped-line quote indent")
+            precondition(abs(paragraph.firstLineHeadIndent - 36) < 0.02, "lost first-line quote indent")
+        } else {
+            precondition(paragraph.headIndent == 0 && paragraph.firstLineHeadIndent == 0, "indented body text")
+        }
+        offset += (text as NSString).length + 1
     }
-    if [0, 1, 3].contains(index) {
-        precondition(abs(paragraph.headIndent - 36) < 0.02, "lost wrapped-line quote indent")
-        precondition(abs(paragraph.firstLineHeadIndent - 36) < 0.02, "lost first-line quote indent")
-    } else {
-        precondition(paragraph.headIndent == 0 && paragraph.firstLineHeadIndent == 0, "indented body text")
+    let attributes = imported.attributes(at: 0, effectiveRange: nil)
+    precondition((attributes[.link] as? URL)?.absoluteString == "https://example.com/quote", "lost quote link")
+    guard let font = attributes[.font] as? NSFont,
+          let foreground = (attributes[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB),
+          let background = (attributes[.backgroundColor] as? NSColor)?.usingColorSpace(.sRGB) else {
+        fatalError("lost quote style attributes")
     }
-    offset += (text as NSString).length + 1
+    precondition(NSFontManager.shared.traits(of: font).contains(.boldFontMask), "lost quote emphasis")
+    precondition(abs(foreground.redComponent - 1) < 0.01 && foreground.greenComponent < 0.01 && foreground.blueComponent < 0.01,
+        "lost quote font color")
+    precondition(abs(background.redComponent - 1) < 0.01 && abs(background.greenComponent - 1) < 0.01 && background.blueComponent < 0.01,
+        "lost quote fill")
 }
 "#;
         let mut child = Command::new("/usr/bin/swift")

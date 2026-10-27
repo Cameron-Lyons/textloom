@@ -129,6 +129,7 @@ impl<'editor> AccessibilitySnapshot<'editor> {
     }
 
     /// The document's paragraphs, in order.
+    #[must_use]
     pub fn paragraphs(
         &self,
     ) -> impl ExactSizeIterator<Item = AccessibleParagraph<'editor>> + DoubleEndedIterator {

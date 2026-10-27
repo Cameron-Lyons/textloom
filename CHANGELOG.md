@@ -17,13 +17,20 @@
   patch release; the library dependency graph is unchanged.
 - Native macOS rich copy adds inline paragraph styles so AppKit indents both
   first and wrapped quote lines. A receiving-framework regression test checks
-  the generated HTML; native TextEdit imports remain required in CI. Historical
-  unstyled HTML comparisons retain their failures as diagnostic artifacts.
+  the generated HTML and RTF round trip, including Unicode, colors, links, and
+  unindented body text. Native TextEdit imports passed in hosted run 40559669028;
+  historical unstyled HTML comparisons retain their failures as diagnostic artifacts.
+- The macOS interaction probe rejects self-hosted runners before accessing
+  the clipboard, Accessibility, or applications; its fixture requires a
+  disposable GitHub-hosted Mac.
+- Mark `AccessibilitySnapshot::paragraphs` as `#[must_use]` to keep strict
+  Clippy checks passing with Rust 1.98.
 - Native QA expands the macOS TextEdit and Windows VM feature and clipboard
   checks, including native paste-as-plain-text shortcuts. Automated evidence
   remains separate from the physical-device and screen-reader signoffs
-  required for 1.0. The checks retain a confirmed TextEdit 1.20 quote-import
-  presentation failure; see the current evidence in `RELEASING.md`.
+  required for 1.0. The corrected exporter clears the recorded TextEdit 1.20
+  quote-import presentation failure on the tested configuration; see the
+  current evidence in `RELEASING.md`.
 
 ## 1.0.0-rc.2
 

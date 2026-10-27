@@ -23,6 +23,30 @@ type Ignored = Box<dyn Fn(&str, &str) -> bool>;
 
 const WOMAN_TECHNOLOGIST: &str = "\u{1f469}\u{1f3fd}\u{200d}\u{1f4bb}";
 
+#[test]
+fn clipboard_input_probe_requires_a_disposable_github_hosted_mac() {
+    assert!(super::disposable_hosted_runner(
+        true,
+        Some("true"),
+        Some("macOS"),
+        Some("github-hosted"),
+    ));
+    for (macos, actions, os, environment) in [
+        (false, Some("true"), Some("macOS"), Some("github-hosted")),
+        (true, None, Some("macOS"), Some("github-hosted")),
+        (true, Some("false"), Some("macOS"), Some("github-hosted")),
+        (true, Some("true"), None, Some("github-hosted")),
+        (true, Some("true"), Some("Linux"), Some("github-hosted")),
+        (true, Some("true"), Some("macOS"), None),
+        (true, Some("true"), Some("macOS"), Some("self-hosted")),
+    ] {
+        assert!(
+            !super::disposable_hosted_runner(macos, actions, os, environment),
+            "{macos:?}, {actions:?}, {os:?}, {environment:?}"
+        );
+    }
+}
+
 fn tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut rest = text;
