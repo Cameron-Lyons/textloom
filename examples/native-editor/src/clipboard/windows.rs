@@ -1,15 +1,17 @@
 //! The Windows clipboard backend.
 //!
 //! A publication sets the registered rich format, CF_HTML, and
-//! `CF_UNICODETEXT` while the host window owns the clipboard, then reads each
-//! one back. Every native size is checked against [`MAX_NATIVE_BYTES`] before
-//! allocating a buffer for it.
+//! `CF_UNICODETEXT` while a helper-local window owns the clipboard, then reads
+//! each one back. Every native size is checked against [`MAX_NATIVE_BYTES`]
+//! before allocating a buffer for it.
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 use std::{mem, thread};
 
 use clipboard_win::{Clipboard, formats, raw};
+use windows_win::Window;
+use windows_win::raw::window::Builder;
 
 use super::{MAX_NATIVE_BYTES, MIME, NativeItem};
 
@@ -27,12 +29,9 @@ const HTML_SUFFIX: &str = "<!--EndFragment--></body></html>";
 /// How far into CF_HTML data [`decode_html`] looks for header lines.
 const MAX_HTML_HEADER_BYTES: usize = 8192;
 
-/// Publishes `item` with `owner`, the host window's handle as an integer, as
-/// the clipboard owner, and verifies each format by reading it back.
-pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
-    if owner == 0 {
-        return Err("Windows rich clipboard copy requires a native window owner".into());
-    }
+/// Publishes `item` with a helper-local window as the clipboard owner and
+/// verifies each format by reading it back. The legacy host handle is ignored.
+pub fn publish(item: &NativeItem, _owner: usize) -> Result<(), String> {
     checked_size(item.rich.len(), "rich clipboard")?;
     if item.rich.is_empty() {
         return Err("Windows rich clipboard copy requires a framed rich payload".into());
@@ -47,7 +46,16 @@ pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
         (formats::CF_UNICODETEXT, plain.as_slice(), "Unicode text"),
     ];
 
-    with_clipboard(owner, || {
+    // EmptyClipboard sends WM_DESTROYCLIPBOARD to the previous owner. Using
+    // the host HWND deadlocks repeated copies: its UI thread is waiting for
+    // this helper, so it cannot dispatch that message. A message-only STATIC
+    // window belongs to this helper's thread and uses the system window proc.
+    // Do not use a NULL owner: EmptyClipboard would leave SetClipboardData
+    // without an owner. See Microsoft's Clipboard Operations/OpenClipboard.
+    let window = Window::from_builder(Builder::new().class_name("STATIC").parent_message())
+        .map_err(|error| format!("Windows clipboard owner window creation failed: {error}"))?;
+    let owner = window.inner() as usize;
+    let result = with_clipboard(owner, || {
         raw::empty().map_err(|error| format!("Windows clipboard clear failed: {error}"))?;
         if raw::get_owner().map(|window| window.as_ptr() as usize) != Some(owner) {
             return Err("Windows clipboard owner verification failed".into());
@@ -66,7 +74,15 @@ pub fn publish(item: &NativeItem, owner: usize) -> Result<(), String> {
             }
         }
         Ok(())
-    })
+    });
+    // set_without_clear transfers populated GMEM_MOVEABLE allocations to
+    // Windows; no format uses delayed rendering, private CF_PRIVATE* data,
+    // or CF_OWNERDISPLAY. Close the clipboard before destroying the window,
+    // and destroy it before READY so the next copy cannot wait on this helper.
+    // The system-owned data remains readable after the window/process exits.
+    // https://learn.microsoft.com/en-us/windows/win32/dataxchg/clipboard-operations
+    window.destroy();
+    result
 }
 
 /// Reads the rich item, or `None` if the clipboard has no rich format. A

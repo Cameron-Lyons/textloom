@@ -18,7 +18,8 @@ x11rb = { version = "0.13.2", default-features = false }
 rustix = { version = "1", features = ["event", "fs", "pipe", "process"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-clipboard-win = { version = "5.4.1", features = ["std"] }
+clipboard-win = { version = "5.4.3", features = ["std"] }
+windows-win = "3.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.5", default-features = false, features = ["std"] }

@@ -11,6 +11,7 @@ on:
       - 'Cargo.lock'
       - 'scripts/native-qa/**'
       - 'scripts/qa-tools/**'
+      - 'scripts/windows-vm/winit-harness/**'
       - 'examples/native-editor/**'
       - 'src/**'
 
@@ -29,7 +30,7 @@ jobs:
   macos-interaction:
     name: Native interaction (macOS TextEdit)
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -43,13 +44,20 @@ jobs:
             . -> target
             examples/native-editor -> ../../target
             scripts/qa-tools -> ../../target
+            scripts/windows-vm/winit-harness -> ../../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native host and interaction probe
+        id: native-build
         run: |
           cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
           cargo build --locked --manifest-path scripts/qa-tools/Cargo.toml --target-dir target --bin macos-interaction
+          cargo build --locked --manifest-path scripts/windows-vm/winit-harness/Cargo.toml --target-dir target
+      - name: Native winit startup and Unicode clipboard
+        timeout-minutes: 2
+        run: python3 scripts/native-qa/macos_winit.py
       - name: Native keyboard and external clipboard interaction
-        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        timeout-minutes: 8
         run: ./target/debug/macos-interaction
       - name: Native interaction observations
         if: always()

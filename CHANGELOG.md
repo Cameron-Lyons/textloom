@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Egui: Ctrl/Command+Shift+V requests a native clipboard read when the host
+  delivers only the key event, as egui-winit 0.37 does. Default and rich
+  clipboard hosts paste the text once without source formatting. Plain-text
+  intent survives modifier release and routed focus passes, and an empty
+  reply does not change the meaning of a later ordinary paste. Replies stay
+  bound to the requesting widget and are discarded if it loses focus. Custom
+  hosts must service `ViewportCommand::RequestPaste` in FIFO order within two
+  host input batches; eframe supplies this behavior.
+- Native Windows rich copy uses a helper-owned window so consecutive copies
+  cannot block on notifications to the waiting editor thread. Clipboard
+  failures increment QA error counters, and the self-test repeats publication
+  seven times. The example requires the compatible `clipboard-win` 5.4.3
+  patch release; the library dependency graph is unchanged.
+- Native macOS rich copy adds inline paragraph styles so AppKit indents both
+  first and wrapped quote lines. A receiving-framework regression test checks
+  the generated HTML; native TextEdit imports remain required in CI. Historical
+  unstyled HTML comparisons retain their failures as diagnostic artifacts.
+- Native QA expands the macOS TextEdit and Windows VM feature and clipboard
+  checks, including native paste-as-plain-text shortcuts. Automated evidence
+  remains separate from the physical-device and screen-reader signoffs
+  required for 1.0. The checks retain a confirmed TextEdit 1.20 quote-import
+  presentation failure; see the current evidence in `RELEASING.md`.
+
 ## 1.0.0-rc.2
 
 2026-10-22. Second release candidate for 1.0.0. The code follows the

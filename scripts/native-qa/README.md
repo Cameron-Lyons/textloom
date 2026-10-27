@@ -28,15 +28,96 @@ one native undo to restore its exact public fixture. Every copy requires a
 fresh clipboard generation; a separate raw UTF-8 `pbpaste` comparison also
 rejects Unicode normalization and changed line endings or trailing newlines.
 
-The companion test caps this extension at 160 native actions (currently 133).
-Short fixtures and reuse of the editable host are designed for the workflow's
-five-minute interaction budget, with no added app launches or sleeps.
-The driver avoids OS-reserved Control+arrow chords. Native line
-deletion coverage uses explicit soft breaks; it does not force font-dependent
-line wrapping. This probe does not run VoiceOver or an IME. Its Rust tests
-replay the fixture sequences against an editor oracle and check runner behavior
-without driving a desktop; they do not establish that the hosted System Events
-run passed.
+The companion test caps the shortcut extension at 160 native actions (currently
+133). The driver avoids OS-reserved Control+arrow chords.
+
+The editable session also uses PID-scoped accessibility buttons and native keys
+to exercise Fill Color, Font Color, No Fill, Automatic, link add/edit/remove,
+quote continuation/exit, and numbering restart/continuation. Every asserted
+formatting change compares exact copied HTML, with one-step undo/redo where
+specified in the observations. Shift+Enter must retain one numbered item or
+heading, while plain copy contains LF. TextEdit's actual copied RTF must retain
+the fill, foreground, hyperlink, soft separator within one numbered paragraph,
+quoted indentation, and a partial list's numbers 2 and 3. These checks avoid
+installed font names and pixel coordinates.
+
+A dedicated native Command+Shift+V check starts with a verified colored, linked
+Textloom clipboard offer, prepares a plain target without overwriting that
+offer, and verifies exact Unicode and unformatted HTML after paste. One native
+undo must restore the target and one redo must restore the plain pasted text.
+The Linux-run history oracle rejects missing paste, accidental rich paste,
+stale copies, and ineffective undo/redo.
+
+Forced-wrap Command+Backspace uses a long, single paragraph. A native
+Command+Shift+Left selection first witnesses a nonempty, proper suffix of that
+paragraph; deletion must remove exactly that suffix and undo must restore every
+byte. This measures the actual visual boundary instead of assuming font metrics.
+
+The feature extension reuses the native host and TextEdit process. Quote-import
+diagnostics compare the native offer in the reused document and a fresh neutral
+document, then three controlled HTML offers: bare blockquote, a margin on the
+blockquote, and margins on its child paragraphs. The same controls are inspected
+separately through AppKit's HTML parser. Controlled offers and parser results
+cannot establish that the production exporter passed. The three historical
+HTML controls omit the native macOS inline quote styles; their semantic
+failures remain in `quote_comparisons` and per-case artifacts as diagnostics.
+Both actual native quote imports and the positive RTF control must pass.
+
+The macOS native host styles quoted paragraphs with a 36-pixel left margin and
+a 0.01-pixel first-line indent. AppKit otherwise treats a zero first-line
+indent as absolute zero, even with a paragraph margin; it also ignores the
+equivalent stylesheet indent. The subpixel positive value keeps both first
+and wrapped lines at the quote margin. A macOS host regression test imports
+the actual generated HTML through AppKit without opening an application or
+touching the general pasteboard, and checks Unicode, soft breaks, separate
+quote groups, and unindented body text.
+
+Before either native quote import, immutable
+`macos-fixture-quote-native-{reused,fresh}-source.*` files retain the actual HTML,
+rich envelope, plain bytes, advertised types, and clipboard generation. A
+generation change during capture fails before any destination action.
+
+The fresh native quote also has a visible comparison against ordinary-paragraph
+HTML and an RTF control with both indents set to 36 points. Each uses a reopened
+neutral document. Before copy or save, the helper captures only the verified
+TextEdit window and records available character bounds relative to its text
+area, along with the app version, timestamps, source manifest, and clipboard
+generation. Files ending in `.visible-neutral.json`, `.neutral.rtf`,
+`.visible-pasted.json`, and `.visible.png` retain these observations. Capture
+identity is checked before and after the screenshot; there is no desktop-image
+fallback. This comparison covers two paragraph starts, not wrapped lines, and
+does not automatically turn a failed RTF assertion into a visual pass.
+
+Every import has distinct `macos-fixture-<case>.*` RTF, plain-text, accessibility,
+and feature observations; paragraph diagnostics retain indents, text blocks,
+lists, and attribute descriptions. Native and positive-control semantic import
+failures remain in `feature_failures` and fail the final aggregate after
+subsequent checks run.
+UI, transport, stale-copy, and malformed-observation failures stop execution.
+The quote assertion still requires positive first-line and subsequent-line
+indents. `last_feature_html` records the most recent native representation.
+
+Allow roughly 6.5–7.5 minutes for the complete interaction step with these
+comparisons (an estimate until hosted execution); its timeout is eight minutes,
+including helper compilation and cleanup. Rust tests check orchestration and
+oracles without a desktop; they do not establish that AppKit, System Events,
+or TextEdit passed on macOS. Hosted Swift self-tests check the quote oracle and
+accessibility retry boundaries before native interaction.
+
+The separate `macos_winit.py` probe runs the minimal winit harness before the
+egui interaction session. It observes natural foreground activation, without
+raising, clicking, or switching applications to repair focus, then sends the
+first native key and Command selection, paste, copy, undo, and redo shortcuts.
+Exact Unicode, source revision, executable SHA-256, native key events, and
+document/selection states are recorded in `macos-winit.json` and its event log.
+The clipboard roundtrip must replace a distinct sentinel. This probe has a
+90-second internal deadline and reaps only its owned process group. It refuses
+to run outside a disposable GitHub-hosted macOS runner.
+
+IMEs, VoiceOver, link activation/hover, selection and search painting over
+fills, quote painting in both themes, and complete manual feature signoff
+remain separate. The winit probe tests startup and plain clipboard behavior;
+the TextEdit probe exercises the egui host and rich interchange.
 
 The Windows probe creates a fresh portable copy and private profile of pinned
 NVDA 2026.2 after checking the official installer digest and signature. Native

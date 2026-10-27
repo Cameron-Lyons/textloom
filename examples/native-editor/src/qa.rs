@@ -362,7 +362,8 @@ impl Session {
         self.accessibility_errors += accessibility as u64;
     }
 
-    /// Counts a toolbar, link, or search command that failed.
+    /// Counts a failed host operation: toolbar, link, search, or native
+    /// clipboard copy/capture. An absent rich clipboard format is not a failure.
     pub fn host_command_error(&mut self) {
         self.host_command_errors += 1;
     }
