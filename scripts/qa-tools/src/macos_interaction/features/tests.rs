@@ -394,7 +394,7 @@ impl System for ImportDesktop {
         let command = arguments[1].as_str();
         self.actions.push(command.into());
         let mut result = match command {
-            "state" | "diagnose" => json!({}),
+            "state" | "diagnose" | "inspect-html" => json!({}),
             "plain" => {
                 assert_eq!(arguments[2], super::QUOTE.text);
                 json!({"plain_exact":true})
@@ -474,6 +474,22 @@ impl System for ImportDesktop {
             }
             "textedit-features" if self.fault == "helper" => {
                 return Err("helper transport failed".into());
+            }
+            "textedit-features"
+                if self.fault == "html-controls"
+                    && self
+                        .actions
+                        .iter()
+                        .rev()
+                        .find(|action| {
+                            matches!(
+                                action.as_str(),
+                                "native-html" | "offer-html" | "offer-visible-control"
+                            )
+                        })
+                        .is_some_and(|action| action == "offer-html") =>
+            {
+                json!({"textedit_rtf_features_exact":false, "error":"lost quote indentation"})
             }
             "textedit-features" => self.observation.clone(),
             other => panic!("unexpected import helper {other}"),
@@ -794,6 +810,56 @@ fn visible_comparison_captures_three_fresh_cases_before_copy_or_save_without_con
             .filter(|check| check["name"].as_str().unwrap().contains("visible control"))
             .count(),
         0
+    );
+}
+
+#[test]
+fn legacy_html_comparisons_preserve_failures_without_overriding_native_success() {
+    let work = TempDir::try_new("macos-quote-controls-").unwrap();
+    let mut desktop = ImportDesktop::new(json!({"textedit_rtf_features_exact":true}));
+    desktop.fault = "html-controls";
+    let mut probe = Probe::try_new(
+        desktop,
+        PathBuf::from("unused"),
+        work.path().to_path_buf(),
+        work.path(),
+        "candidate",
+    )
+    .unwrap();
+    probe.textedit_pid = Some(202);
+    probe.quote_parser_diagnostics().unwrap();
+    probe.quote_import_diagnostics(101).unwrap();
+    probe.require_feature_success().unwrap();
+    assert!(!probe.observations.contains_key("feature_failures"));
+    let comparisons = probe.observations["quote_comparisons"].as_array().unwrap();
+    assert_eq!(comparisons.len(), 3);
+    for comparison in comparisons {
+        assert_eq!(
+            comparison["observation"]["textedit_rtf_features_exact"],
+            false
+        );
+        assert_eq!(comparison["observation"]["error"], "lost quote indentation");
+        let label = comparison["label"].as_str().unwrap();
+        let source = std::fs::read_to_string(
+            work.path()
+                .join(format!("macos-fixture-{label}.source.html")),
+        )
+        .unwrap();
+        assert!(
+            !source.contains("text-indent:"),
+            "legacy control inherited the native fix"
+        );
+    }
+    let checks: Vec<_> = probe.observations["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|check| check["name"].as_str().unwrap().starts_with("features:"))
+        .collect();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(
+        checks[0]["name"],
+        "features: TextEdit quote import into a fresh neutral document"
     );
 }
 

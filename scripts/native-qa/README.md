@@ -58,7 +58,19 @@ diagnostics compare the native offer in the reused document and a fresh neutral
 document, then three controlled HTML offers: bare blockquote, a margin on the
 blockquote, and margins on its child paragraphs. The same controls are inspected
 separately through AppKit's HTML parser. Controlled offers and parser results
-cannot establish that the production exporter passed.
+cannot establish that the production exporter passed. The three historical
+HTML controls omit the native macOS inline quote styles; their semantic
+failures remain in `quote_comparisons` and per-case artifacts as diagnostics.
+Both actual native quote imports and the positive RTF control must pass.
+
+The macOS native host styles quoted paragraphs with a 36-pixel left margin and
+a 0.01-pixel first-line indent. AppKit otherwise treats a zero first-line
+indent as absolute zero, even with a paragraph margin; it also ignores the
+equivalent stylesheet indent. The subpixel positive value keeps both first
+and wrapped lines at the quote margin. A macOS host regression test imports
+the actual generated HTML through AppKit without opening an application or
+touching the general pasteboard, and checks Unicode, soft breaks, separate
+quote groups, and unindented body text.
 
 Before either native quote import, immutable
 `macos-fixture-quote-native-{reused,fresh}-source.*` files retain the actual HTML,
@@ -78,8 +90,9 @@ does not automatically turn a failed RTF assertion into a visual pass.
 
 Every import has distinct `macos-fixture-<case>.*` RTF, plain-text, accessibility,
 and feature observations; paragraph diagnostics retain indents, text blocks,
-lists, and attribute descriptions. Semantic import failures remain in
-`feature_failures` and fail the final aggregate after subsequent checks run.
+lists, and attribute descriptions. Native and positive-control semantic import
+failures remain in `feature_failures` and fail the final aggregate after
+subsequent checks run.
 UI, transport, stale-copy, and malformed-observation failures stop execution.
 The quote assertion still requires positive first-line and subsequent-line
 indents. `last_feature_html` records the most recent native representation.

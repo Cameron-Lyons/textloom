@@ -15,6 +15,10 @@
   failures increment QA error counters, and the self-test repeats publication
   seven times. The example requires the compatible `clipboard-win` 5.4.3
   patch release; the library dependency graph is unchanged.
+- Native macOS rich copy adds inline paragraph styles so AppKit indents both
+  first and wrapped quote lines. A receiving-framework regression test checks
+  the generated HTML; native TextEdit imports remain required in CI. Historical
+  unstyled HTML comparisons retain their failures as diagnostic artifacts.
 - Native QA expands the macOS TextEdit and Windows VM feature and clipboard
   checks, including native paste-as-plain-text shortcuts. Automated evidence
   remains separate from the physical-device and screen-reader signoffs

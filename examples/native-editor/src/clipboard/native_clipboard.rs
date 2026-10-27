@@ -196,13 +196,33 @@ impl NativeItem {
 }
 
 /// The HTML representation of `fragment`. On macOS it is a full document that
-/// declares UTF-8, so that other applications decode it correctly.
+/// declares UTF-8, so that other applications decode it correctly, and styles
+/// quote paragraphs for AppKit's HTML importer.
 fn native_html(fragment: &Fragment) -> String {
     let html = fragment.to_html();
     #[cfg(target_os = "macos")]
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{html}</body></html>"
-    );
+    let html = {
+        // This operates only on our escaped, non-nested quote export. AppKit
+        // ignores block margins and stylesheet text-indent; inline paragraph
+        // margins work, but a zero indent puts the first line at absolute zero.
+        // A positive subpixel indent makes it relative to the paragraph margin.
+        let mut styled = String::with_capacity(html.len());
+        for section in html.split_inclusive("</blockquote>") {
+            if let Some((before, quote)) = section.split_once("<blockquote>") {
+                styled.push_str(before);
+                // Avoid a second margin in other HTML consumers.
+                styled.push_str("<blockquote style=\"margin-left:0\">");
+                styled.push_str(
+                    &quote.replace("<p>", "<p style=\"margin-left:36px;text-indent:0.01px\">"),
+                );
+            } else {
+                styled.push_str(section);
+            }
+        }
+        format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{styled}</body></html>"
+        )
+    };
     html
 }
 
@@ -835,6 +855,66 @@ mod tests {
 
     fn item() -> NativeItem {
         NativeItem::from_fragment(&Fragment::from_text("café 日本語👩🏽\u{200d}💻\nsecond")).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_quote_html_imports_with_first_and_wrapped_lines_indented() {
+        let mut editor =
+            Editor::from_text("café quote\u{2028}wrapped\ncontinued\nbody\n日本語 quote\nlast");
+        for index in [0, 1, 3] {
+            editor
+                .set_selection(Selection::caret(Position::new(index, 0)))
+                .unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+        }
+        let fragment = Fragment::from_document(editor.document());
+        let item = NativeItem::from_fragment(&fragment).unwrap();
+        assert_eq!(item.fragment().unwrap(), fragment);
+        assert_eq!(item.plain, fragment.plain_text());
+
+        // Exercise the receiving framework, independently of our HTML strings,
+        // without launching TextEdit or touching the user's general clipboard.
+        let script = r#"
+import AppKit
+let data = FileHandle.standardInput.readDataToEndOfFile()
+let value = try NSAttributedString(data: data,
+    options: [.documentType: NSAttributedString.DocumentType.html], documentAttributes: nil)
+let expected = ["café quote\u{2028}wrapped", "continued", "body", "日本語 quote", "last"]
+precondition(value.string == expected.joined(separator: "\n") + "\n", "changed quote payload")
+var offset = 0
+for (index, text) in expected.enumerated() {
+    guard let paragraph = value.attribute(.paragraphStyle, at: offset, effectiveRange: nil) as? NSParagraphStyle else {
+        fatalError("missing paragraph style")
+    }
+    if [0, 1, 3].contains(index) {
+        precondition(abs(paragraph.headIndent - 36) < 0.02, "lost wrapped-line quote indent")
+        precondition(abs(paragraph.firstLineHeadIndent - 36) < 0.02, "lost first-line quote indent")
+    } else {
+        precondition(paragraph.headIndent == 0 && paragraph.firstLineHeadIndent == 0, "indented body text")
+    }
+    offset += (text as NSString).length + 1
+}
+"#;
+        let mut child = Command::new("/usr/bin/swift")
+            .args(["-e", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(item.html.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "AppKit rejected the native quote HTML: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
