@@ -22,6 +22,86 @@ known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
 
+### macOS readiness refreshed 2026-10-27
+
+The quote-export fix at `822297bbaa1ceba863c26cb46ca32c5c101809d5` passed
+[native interaction run 40559669028](https://github.com/Cameron-Lyons/textloom/actions/runs/40559669028).
+The tested pull-request merge revision was
+`b8707c83e0d477ae1b71d488150806430ab65fe7`. Its downloaded macOS artifact
+records 70 interaction checks, nine winit startup/Unicode clipboard checks,
+no aggregate feature failures, and successful owned-process cleanup. The
+three native interaction reports also pass the strict report validator with
+zero reported errors. All nine jobs in
+[CI run 40559669294](https://github.com/Cameron-Lyons/textloom/actions/runs/40559669294)
+passed, including macOS rendering in all three modes with both clipboard
+configurations.
+
+TextEdit 1.20 (415) on macOS 26.6.2 (25G83) now preserves both quote indents
+at 36 points in reused and fresh neutral documents. Before-copy captures show
+both tested paragraph starts about 41 points from the text area's edge,
+compared with 5 points for the matching plain HTML; the indented RTF control
+agrees. The current exporter therefore clears the recorded TextEdit quote
+blocker on this configuration. Historical bare-HTML and incomplete-margin
+controls still fail and remain diagnostic evidence. The visible comparison
+covers two short paragraph starts, not wrapped text or other TextEdit versions.
+
+Local verification used macOS 27.2 (26B123), Apple Silicon, Rust 1.98.1,
+and a 2x Retina display, on a working tree based on that fix. All 15 clipboard
+tests passed, including three private-pasteboard tests. The strengthened AppKit
+regression verifies HTML import and RTF export/reimport retain Unicode, soft
+breaks, both quote indents, unindented body paragraphs, bold, font/fill colors,
+and links. All 71 QA-tool tests, strict QA Clippy, nine Swift AX retry self-tests,
+and nineteen feature/capture self-tests passed. Five local 20-frame rendering
+sessions passed strict report validation: default clipboard in editable,
+read-only, and disabled modes, and rich clipboard in read-only and disabled
+modes. No local system-clipboard fixture was run. The library and native host
+also pass all-target, locked Intel (`x86_64-apple-darwin`) cross-compilation
+checks; that does not establish Intel runtime support. Local logs, reports,
+and the downloaded hosted artifact are in `target/macos-readiness-20261027/`.
+
+The complete local release-check sequence passed: all eight feature
+combinations, release-mode tests, 74 native-host unit tests and its link-opening
+integration test, strict library/host Clippy, warning-free rustdoc, quick
+benchmarks, headless examples, package inventory and tests, and a native host
+compiled against the extracted package. The first run stopped at a missing
+`#[must_use]` on `AccessibilitySnapshot::paragraphs`; after adding it, the
+remaining script steps were rerun from Clippy onward. Both logs are retained
+as `release-checks.log` and `release-checks-resumed.log`. Stable/nightly
+formatting and `actionlint` also passed. Nothing was published.
+
+The input/navigation, composition routing, and accessibility review found no
+additional production defect. The interaction probe now also requires
+`RUNNER_ENVIRONMENT=github-hosted` before touching the desktop, preventing an
+accidental run on a self-hosted developer Mac. Its hosted passes above predate
+this guard and the stronger regression, so the final clean candidate must
+repeat CI.
+
+The first [PR #17 native run](https://github.com/Cameron-Lyons/textloom/actions/runs/40562889186)
+failed in the harness: all nine winit behavior checks passed, but process-group
+cleanup returned `Operation not permitted`; TextEdit then failed to resolve a
+window during `AXRaise`, before the first paste. These failed aggregate results
+remain preserved under `target/macos-ci-failure-40562889186/`. The corresponding
+Mac and Windows lint jobs also rejected the bare `#[must_use]` with Rust 1.99;
+the annotation now has an explicit message compatible with Rust 1.98 and 1.99.
+The harness now retries only explicitly marked pre-input stale-window errors
+within its existing deadline, and continues reaping on Darwin's transient
+process-group permission error until the group actually disappears. Persistent
+groups and uncertain input failures still fail. All 75 QA-tool tests and four
+headless Python cleanup regressions pass; the Python regressions now run in
+the hosted Mac job. Strict library, native-host, and QA Clippy pass with Rust
+1.99.1, and the AppKit quote/RTF regression passes on that compiler too.
+These failures do not invalidate the earlier quote-import observations, and
+the corrected PR must pass fresh hosted checks before merging.
+
+macOS 1.0 signoff remains incomplete. Record Japanese and Chinese IME startup,
+candidate placement in scrolled text, cancellation, and focus round trips for
+both the egui and winit integrations; VoiceOver reading, selection, replacement,
+and link/quote semantics; physical keyboard/dead-key and touchpad behavior; and
+display-scale transitions using the [native protocol](examples/native-editor/NATIVE_QA.md).
+Intel runtime and older-macOS compatibility remain unverified. Keep the package
+at its release-candidate version until the required outcomes are recorded on
+the final clean revision.
+
 ### Automated evidence refreshed 2026-10-23
 
 The production fixes are at clean commit `3908e3c208a58863246173720f6d5d9ff22ab4a7`.
@@ -93,7 +173,8 @@ and read-only/disabled guards. All nine Swift accessibility retry self-tests
 and nineteen feature/capture self-tests passed. All three native sessions closed
 gracefully with zero reported errors, and owned processes were cleaned up.
 
-The overall interaction result remains failed. TextEdit's copied RTF retained
+Before the quote-export fix above, the overall interaction result failed.
+TextEdit's copied RTF retained
 the exact quote text but no paragraph indentation from the native
 `<blockquote>` offer, in both reused and fresh neutral documents. Controlled
 HTML and AppKit parser comparisons reproduced the result. A margin on child
@@ -113,8 +194,8 @@ verified before and after each window-only screenshot, before any copy or save.
 The observation covers two short paragraph starts, not wrapped lines or other
 TextEdit/macOS versions. Native source offers, returned RTF, screenshots, and
 geometry are retained under `macos-run7-39974423408/` in the local evidence
-archive; prior failed runs remain preserved. This failure remains a stable
-release blocker under the current external quote-presentation requirement.
+archive; prior failed runs remain preserved. The corrected exporter clears this
+blocker on the same TextEdit/macOS configuration in the 2026-10-27 run above.
 
 ## Earlier validation evidence
 

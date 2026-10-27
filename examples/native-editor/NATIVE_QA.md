@@ -79,9 +79,13 @@ text and selection. Repeat deletion in read-only mode to confirm it is blocked.
 The hosted check on 2026-10-23 confirmed that TextEdit 1.20 (415) on macOS
 26.6.2 (25G83) displays the native two-paragraph HTML quote like ordinary body
 text. Window captures and character positions were compared with plain HTML
-and a known indented RTF control before copy/save. The quote-presentation check
-therefore remains failed on that configuration; successful transport and other
-formatting checks do not satisfy it. See [current release evidence](../../RELEASING.md#automated-evidence-refreshed-2026-10-23).
+and a known indented RTF control before copy/save. The corrected exporter
+subsequently passed on the same configuration in hosted run 40559669028 on
+2026-10-27: both native quote paragraphs retained 36-point first-line and
+subsequent-line indents, with before-copy character positions and screenshots
+confirming the difference from plain HTML. This closes that specific failure;
+IME, VoiceOver, physical-device, and display-scale signoff still require the
+checks above. See [current macOS release evidence](../../RELEASING.md#macos-readiness-refreshed-2026-10-27).
 
 ## Winit adapter
 
