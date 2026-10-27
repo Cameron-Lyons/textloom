@@ -23,8 +23,11 @@
 - The macOS interaction probe rejects self-hosted runners before accessing
   the clipboard, Accessibility, or applications; its fixture requires a
   disposable GitHub-hosted Mac.
-- Mark `AccessibilitySnapshot::paragraphs` as `#[must_use]` to keep strict
-  Clippy checks passing with Rust 1.98.
+- Native macOS QA retries stale TextEdit window discovery only before input,
+  and winit cleanup waits for the owned process group to disappear even when
+  Darwin reports permission denied while its leader awaits reaping.
+- Mark `AccessibilitySnapshot::paragraphs` as `#[must_use]` with an explicit
+  message to keep strict Clippy checks passing with Rust 1.98 and 1.99.
 - Native QA expands the macOS TextEdit and Windows VM feature and clipboard
   checks, including native paste-as-plain-text shortcuts. Automated evidence
   remains separate from the physical-device and screen-reader signoffs

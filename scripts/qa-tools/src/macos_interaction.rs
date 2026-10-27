@@ -77,48 +77,60 @@ on run argv
         set windowName to item 3 of argv
         set expectedDocument to item 5 of argv
         set resolvedDocument to item 6 of argv
-        set targetProcess to first application process whose unix id is targetPID
-        tell targetProcess
-            set candidates to {}
-            set windowDescriptions to {}
-            repeat with candidate in windows
-                set candidateName to name of candidate
-                set candidateDocument to ""
-                try
-                    set candidateDocument to (value of attribute "AXDocument" of candidate) as text
-                end try
-                set end of windowDescriptions to candidateName & " [" & candidateDocument & "]"
-                if expectedDocument is not "" then
-                    if candidateDocument is expectedDocument or candidateDocument is resolvedDocument then
+        -- Only this pre-action section may be retried. System Events can
+        -- retain a stale window specifier during discovery/AXRaise.
+        try
+            set targetProcess to first application process whose unix id is targetPID
+            tell targetProcess
+                set candidates to {}
+                set windowDescriptions to {}
+                repeat with candidate in windows
+                    set candidateName to name of candidate
+                    set candidateDocument to ""
+                    try
+                        set candidateDocument to (value of attribute "AXDocument" of candidate) as text
+                    end try
+                    set end of windowDescriptions to candidateName & " [" & candidateDocument & "]"
+                    if expectedDocument is not "" then
+                        if candidateDocument is expectedDocument or candidateDocument is resolvedDocument then
+                            set end of candidates to contents of candidate
+                        end if
+                    else if candidateName contains windowName then
                         set end of candidates to contents of candidate
                     end if
-                else if candidateName contains windowName then
-                    set end of candidates to contents of candidate
+                end repeat
+                if (count of candidates) is not 1 then
+                    set AppleScript's text item delimiters to "; "
+                    set inventory to windowDescriptions as text
+                    set AppleScript's text item delimiters to ""
+                    error "Target window count " & (count of candidates) & " for " & commandName & " / " & windowName & ": " & inventory
                 end if
-            end repeat
-            if (count of candidates) is not 1 then
-                set AppleScript's text item delimiters to "; "
-                set inventory to windowDescriptions as text
-                set AppleScript's text item delimiters to ""
-                error "Target window count " & (count of candidates) & " for " & commandName & " / " & windowName & ": " & inventory
+                set targetWindow to item 1 of candidates
+                set frontmost to true
+                perform action "AXRaise" of targetWindow
+            end tell
+            delay 0.15
+            if (unix id of first application process whose frontmost is true) is not targetPID then
+                error "Target PID did not become foreground"
             end if
-            set targetWindow to item 1 of candidates
-            set frontmost to true
-            perform action "AXRaise" of targetWindow
-        end tell
-        delay 0.15
-        if (unix id of first application process whose frontmost is true) is not targetPID then
-            error "Target PID did not become foreground"
-        end if
+            tell targetProcess
+                if expectedDocument is not "" then
+                    set foregroundDocument to (value of attribute "AXDocument" of window 1) as text
+                    if foregroundDocument is not expectedDocument and foregroundDocument is not resolvedDocument then
+                        error "Wrong foreground document"
+                    end if
+                else if not ((name of window 1) contains windowName) then
+                    error "Wrong foreground window"
+                end if
+            end tell
+        on error descriptionText number errorNumber
+            if errorNumber is -1728 then
+                error "Pre-action target unavailable: " & descriptionText
+            end if
+            error descriptionText number errorNumber
+        end try
+        -- No input or close action is inside the retryable section.
         tell targetProcess
-            if expectedDocument is not "" then
-                set foregroundDocument to (value of attribute "AXDocument" of window 1) as text
-                if foregroundDocument is not expectedDocument and foregroundDocument is not resolvedDocument then
-                    error "Wrong foreground document"
-                end if
-            else if not ((name of window 1) contains windowName) then
-                error "Wrong foreground window"
-            end if
             if commandName is "diagnostic" then
                 set focusedRole to "unavailable"
                 set focusedDescription to "unavailable"
@@ -809,7 +821,8 @@ impl<S: System> Probe<S> {
             let stderr = result.stderr();
             // AX tree activation can take a frame after the first query. Only
             // retry failures that happened before any action was delivered.
-            let target_pending = stderr.contains("Target window count 0");
+            let target_pending = stderr.contains("Target window count 0")
+                || stderr.contains("Pre-action target unavailable:");
             if !target_pending || self.system.monotonic() >= deadline {
                 return Err(format!(
                     "Native {command} on PID {pid} / {window}: {}",

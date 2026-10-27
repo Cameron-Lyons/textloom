@@ -46,6 +46,8 @@ jobs:
             scripts/qa-tools -> ../../target
             scripts/windows-vm/winit-harness -> ../../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Winit probe regression tests
+        run: python3 -m unittest discover -s scripts/native-qa -p 'test_*.py'
       - name: Build native host and interaction probe
         id: native-build
         run: |

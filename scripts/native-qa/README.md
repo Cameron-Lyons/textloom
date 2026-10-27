@@ -104,6 +104,11 @@ oracles without a desktop; they do not establish that AppKit, System Events,
 or TextEdit passed on macOS. Hosted Swift self-tests check the quote oracle and
 accessibility retry boundaries before native interaction.
 
+Headless winit cleanup regressions run before the hosted build with
+`python3 -m unittest discover -s scripts/native-qa -p 'test_*.py'`. They cover
+Darwin's transient process-group permission error during reaping and require
+cleanup to fail when owned group members survive.
+
 The separate `macos_winit.py` probe runs the minimal winit harness before the
 egui interaction session. It observes natural foreground activation, without
 raising, clicking, or switching applications to repair focus, then sends the

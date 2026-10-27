@@ -76,6 +76,23 @@ accidental run on a self-hosted developer Mac. Its hosted passes above predate
 this guard and the stronger regression, so the final clean candidate must
 repeat CI.
 
+The first [PR #17 native run](https://github.com/Cameron-Lyons/textloom/actions/runs/40562889186)
+failed in the harness: all nine winit behavior checks passed, but process-group
+cleanup returned `Operation not permitted`; TextEdit then failed to resolve a
+window during `AXRaise`, before the first paste. These failed aggregate results
+remain preserved under `target/macos-ci-failure-40562889186/`. The corresponding
+Mac and Windows lint jobs also rejected the bare `#[must_use]` with Rust 1.99;
+the annotation now has an explicit message compatible with Rust 1.98 and 1.99.
+The harness now retries only explicitly marked pre-input stale-window errors
+within its existing deadline, and continues reaping on Darwin's transient
+process-group permission error until the group actually disappears. Persistent
+groups and uncertain input failures still fail. All 75 QA-tool tests and four
+headless Python cleanup regressions pass; the Python regressions now run in
+the hosted Mac job. Strict library, native-host, and QA Clippy pass with Rust
+1.99.1, and the AppKit quote/RTF regression passes on that compiler too.
+These failures do not invalidate the earlier quote-import observations, and
+the corrected PR must pass fresh hosted checks before merging.
+
 macOS 1.0 signoff remains incomplete. Record Japanese and Chinese IME startup,
 candidate placement in scrolled text, cancellation, and focus round trips for
 both the egui and winit integrations; VoiceOver reading, selection, replacement,

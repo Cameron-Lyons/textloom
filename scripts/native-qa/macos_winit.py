@@ -303,6 +303,13 @@ class Probe:
                     return True
                 except ProcessLookupError:
                     return False
+                except PermissionError:
+                    # Darwin can return EPERM for a terminated group whose
+                    # leader became a zombie between poll() and killpg(). The
+                    # group still exists: keep reaping and require ESRCH before
+                    # reporting success. A genuinely unsignalable live group
+                    # therefore still fails the bounded cleanup below.
+                    return True
 
             for signum in (signal.SIGTERM, signal.SIGKILL):
                 signal_group(signum)

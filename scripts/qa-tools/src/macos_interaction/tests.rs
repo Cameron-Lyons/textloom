@@ -292,6 +292,7 @@ struct Fake {
     wait_calls: Vec<(u32, f64)>,
     signals: Vec<(u32, Signal, Recipient)>,
     control_results: VecDeque<Result<Ran, String>>,
+    action_results: VecDeque<Ran>,
 }
 
 fn ran(code: i32, stdout: impl Into<Vec<u8>>, stderr: &str) -> Ran {
@@ -319,6 +320,9 @@ impl Fake {
         }
         let (window, value) = (arguments[2].as_str(), arguments[3].clone());
         self.actions.push((command.to_owned(), value.clone()));
+        if let Some(result) = self.action_results.pop_front() {
+            return result;
+        }
         if window != TITLE {
             return ran(1, "", &format!("unexpected window {window}"));
         }
@@ -909,6 +913,81 @@ fn document_urls_match_textedit_documents() {
             && document.absolute.ends_with("/textloom-html-import.rtf")
     );
     assert!(document.resolved.ends_with("/textloom-html-import.rtf"));
+}
+
+#[test]
+fn stale_window_before_input_retries_discovery_and_delivers_the_edit_once() {
+    let fake = Fake {
+        action_results: VecDeque::from([ran(
+            1,
+            "",
+            "execution error: Pre-action target unavailable: Can't get window (-1728)",
+        )]),
+        ..Fake::default()
+    };
+    let mut replay = Replay::new(fake);
+    replay.probe.action(101, TITLE, "type", "once").unwrap();
+    let fake = replay.fake();
+    assert_eq!(fake.action_names(), ["type once", "type once"]);
+    assert_eq!(fake.editor.text.concat(), "once");
+    assert_eq!(fake.editor.history.len(), 1);
+}
+
+#[test]
+fn persistent_stale_window_stops_at_the_action_deadline_without_editing() {
+    let fake = Fake {
+        action_results: (0..50)
+            .map(|_| ran(1, "", "Pre-action target unavailable: stale window"))
+            .collect(),
+        ..Fake::default()
+    };
+    let mut replay = Replay::new(fake);
+    let error = replay
+        .probe
+        .action(101, TITLE, "type", "once")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Pre-action target unavailable:"), "{error}");
+    let fake = replay.fake();
+    assert!((5.0..5.3).contains(&fake.clock), "{}", fake.clock);
+    assert!(fake.editor.history.is_empty());
+    assert!(fake.actions.len() < 50);
+}
+
+#[test]
+fn uncertain_action_errors_and_wrong_document_are_never_replayed() {
+    for message in [
+        "execution error: Can't get window (-1728)",
+        "execution error: Wrong foreground document",
+        "execution error: Target window count 2",
+    ] {
+        let fake = Fake {
+            action_results: VecDeque::from([ran(1, "", message)]),
+            ..Fake::default()
+        };
+        let mut replay = Replay::new(fake);
+        let error = replay
+            .probe
+            .action(101, TITLE, "type", "once")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(message), "{error}");
+        assert_eq!(replay.fake().action_names(), ["type once"]);
+    }
+}
+
+#[test]
+fn stale_window_retry_marker_cannot_wrap_native_input() {
+    let pre_action = APPLESCRIPT
+        .split("-- No input or close action")
+        .next()
+        .unwrap();
+    assert!(pre_action.contains("perform action \"AXRaise\" of targetWindow"));
+    assert!(pre_action.contains("if errorNumber is -1728 then"));
+    assert!(pre_action.contains("Pre-action target unavailable:"));
+    assert!(!pre_action.contains("keystroke"));
+    assert!(!pre_action.contains("key code"));
+    assert!(!pre_action.contains("AXCloseButton"));
 }
 
 #[test]
