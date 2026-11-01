@@ -25,6 +25,7 @@ if ! $allow_dirty && [[ -n "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
+bash ./scripts/test-release-version.sh
 version=$(./scripts/release-version.sh ${release_tag:+"$release_tag"})
 
 export CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-always}

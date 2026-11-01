@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Refresh the library, native host, and winit harness lockfiles to Tokio 1.53.3,
+  which fixes RUSTSEC-2026-0386. This transitive dependency is conditional on
+  Emscripten's experimental Tokio integration and is inactive in native builds.
+- Release verification rejects tags while the changelog has pending Unreleased
+  changes or the selected version lacks a valid release date. Local release
+  checks and CI exercise these gates with isolated changelog fixtures.
 - Egui: Ctrl/Command+Shift+V requests a native clipboard read when the host
   delivers only the key event, as egui-winit 0.37 does. Default and rich
   clipboard hosts paste the text once without source formatting. Plain-text
