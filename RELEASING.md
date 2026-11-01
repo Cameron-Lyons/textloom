@@ -22,6 +22,60 @@ known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
 
+### Stable release readiness refreshed 2026-10-31
+
+The target remains stable 1.0 with the existing requirements intact. The
+checkout was advanced from `f6afc23` to merged main
+`b539f9ec18870e2d7d1aef7b39d7b8d43171cb48`, including the verified macOS quote
+fix described below. The package remains `1.0.0-rc.2`; no release was published.
+
+Pending release-tool changes reject a tag when its changelog entry lacks a
+valid release date or pending changes remain under `Unreleased`. All 26 gate
+regressions pass. The library, native host, and winit harness lockfiles update
+only Tokio from 1.53.2 to 1.53.3, clearing RUSTSEC-2026-0386. Tokio is conditional
+on the experimental Emscripten integration and is absent from native builds.
+Fresh advisory and yanked-crate checks of all four lockfiles report no
+vulnerability, unsoundness, or yanked-version advisories. The native host retains
+three transitive unmaintained notices for `zbus_names`, `zvariant`, and
+`zvariant_derive`; the existing dependency policy permits those notices.
+All four packages pass cargo-deny's advisory, ban, license, and source checks
+against RustSec revision `2295466c4e9df26647fd67d8fa1c705ac2fc7f81` (2026-10-30).
+
+The complete release-check sequence passes on Rust 1.99.1: all eight feature
+combinations, release-mode tests, native-host tests, strict library/host
+Clippy, warning-free rustdoc, quick benchmarks, examples, package inventory,
+extracted-package tests and targets, and a native host compiled against that
+package. The daemon interruption stopped the first run during the sixth
+feature combination; `check-release-resumed.log` reruns that combination and
+all remaining script steps. The original `check-release.log` is retained.
+The minimum direct dependency versions also pass an all-feature/all-target
+check on Rust 1.95.0 in a disposable copy, leaving the release lockfile intact.
+Rust 1.95.0 also passes all eight feature combinations, benchmark compilation,
+and native-host tests (76 unit tests and two Linux integration tests). The
+all-feature library run passes 644 unit/integration tests and nine doctests.
+The interrupted MSRV run and its successful continuation are retained as
+`msrv.log` and `msrv-resumed.log`. A publication dry run with registry access
+passes and explicitly aborts before upload.
+
+All 75 QA-tool tests, strict QA Clippy, stable/nightly formatting, workflow
+linting, and four headless Python cleanup regressions pass. Six isolated Linux
+X11 rendering sessions cover default and rich clipboard configurations in
+editable, read-only, and disabled modes. Each reports 21 frames, graceful
+shutdown, zero errors, and an equal TLFR round trip; rich editable mode also
+passes the clipboard fixture and undo/redo. Private Xvfb displays and D-Bus
+sessions isolate these checks from the user's desktop. Reports identify
+`b539f9ec18870e2d7d1aef7b39d7b8d43171cb48-release-readiness-working-tree`;
+the executable hash and logs are retained in
+`target/release-readiness-20261031/`.
+
+Stable publication remains blocked by the observed input/accessibility
+failures in [native dependency limitations](#native-dependency-limitations)
+and the outstanding physical-keyboard, touch/touchpad, audible-reader,
+macOS IME/VoiceOver, and display-scale-transition signoffs. The TextEdit quote
+failure is resolved on the tested configuration; it is not a remaining blocker.
+Record the required native outcomes and repeat CI and native interaction on
+the final clean release revision before setting the stable version and date.
+
 ### macOS readiness refreshed 2026-10-27
 
 The quote-export fix at `822297bbaa1ceba863c26cb46ca32c5c101809d5` passed
@@ -90,8 +144,15 @@ groups and uncertain input failures still fail. All 75 QA-tool tests and four
 headless Python cleanup regressions pass; the Python regressions now run in
 the hosted Mac job. Strict library, native-host, and QA Clippy pass with Rust
 1.99.1, and the AppKit quote/RTF regression passes on that compiler too.
-These failures do not invalidate the earlier quote-import observations, and
-the corrected PR must pass fresh hosted checks before merging.
+The corrected PR head `27a930c2acd884d401807127c27069d0daf704af` subsequently
+passed [native interaction run 40564433047](https://github.com/Cameron-Lyons/textloom/actions/runs/40564433047),
+including macOS TextEdit, the winit cleanup regressions, and Windows NVDA, and
+[CI run 40564432628](https://github.com/Cameron-Lyons/textloom/actions/runs/40564432628).
+After PR #17 merged, all nine jobs in
+[CI run 40581456914](https://github.com/Cameron-Lyons/textloom/actions/runs/40581456914)
+passed on `b539f9ec18870e2d7d1aef7b39d7b8d43171cb48`. The native interaction
+workflow ran for the pull request, not that merge commit; repeat it and record
+the remaining platform signoffs on the final clean release candidate.
 
 macOS 1.0 signoff remains incomplete. Record Japanese and Chinese IME startup,
 candidate placement in scrolled text, cancellation, and focus round trips for
@@ -735,10 +796,12 @@ malformed-input regression tests when changing the codec.
 ## Prepare and verify
 
 1. Update `Cargo.toml`, dependency examples in `README.md`, and `CHANGELOG.md`.
-   Replace `Unreleased.` in the version's changelog entry with the release date;
+   Move pending `Unreleased` changes into the version's changelog entry and
+   start that entry with a valid `YYYY-MM-DD` release date;
    the entry must not mention "unreleased" anywhere else.
    `scripts/release-version.sh` enforces this for `scripts/check-release.sh --tag`
-   and the tag workflow, so both fail until the date is recorded.
+   and the tag workflow, so both fail until the changes and date are recorded.
+   An empty `Unreleased` section, including empty subsections, may remain.
    Refresh the package entry in `Cargo.lock` with `cargo check --offline`.
 2. Run `./scripts/check-release.sh --allow-dirty` while reviewing pending changes,
    adding `--tag v1.0.0` once the changelog entry is dated. This requires a
