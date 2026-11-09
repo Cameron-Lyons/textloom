@@ -28,18 +28,28 @@ fi
 bash ./scripts/test-release-version.sh
 version=$(./scripts/release-version.sh ${release_tag:+"$release_tag"})
 
+if ! command -v python3 >/dev/null 2>&1; then
+    echo 'Python 3 is required for the headless native-QA regression tests.' >&2
+    exit 1
+fi
+
 export CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-always}
 package_target_dir=${CARGO_TARGET_DIR:-target}
 native_example_manifest=examples/native-editor/Cargo.toml
+qa_tools_manifest=scripts/qa-tools/Cargo.toml
 cargo fmt --all -- --check
 cargo fmt --manifest-path "$native_example_manifest" --package textloom-native-example -- --check
+cargo fmt --manifest-path "$qa_tools_manifest" --all -- --check
+python3 -m unittest discover -s scripts/native-qa -p 'test_*.py'
 for features in '' egui winit accesskit egui,winit egui,accesskit winit,accesskit egui,winit,accesskit; do
     cargo test --locked --no-default-features --features "$features"
 done
 cargo test --release --locked --all-features --test operations --test search
 cargo test --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir"
+cargo test --locked --manifest-path "$qa_tools_manifest" --all-targets --target-dir "$package_target_dir"
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo clippy --locked --manifest-path "$native_example_manifest" --all-targets --target-dir "$package_target_dir" -- -D warnings
+cargo clippy --locked --manifest-path "$qa_tools_manifest" --all-targets --target-dir "$package_target_dir" -- -D warnings
 RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --locked --all-features --no-deps
 TEXTLOOM_BENCH_QUICK=1 cargo bench --locked --all-features --bench editing --bench rendering
 cargo run --locked --example rich_text
@@ -52,7 +62,7 @@ if $allow_dirty; then
 fi
 cargo package "${package_args[@]}" --target-dir "$package_target_dir"
 package_root="$(cd -- "$package_target_dir" && pwd)/package/textloom-$version"
-required_files=(Cargo.toml Cargo.lock README.md BENCHMARKS.md CHANGELOG.md RELEASING.md LICENSE)
+required_files=(Cargo.toml Cargo.lock README.md GUIDE.md BENCHMARKS.md CHANGELOG.md RELEASING.md LICENSE)
 check_package_file() {
     if [[ ! -f "$package_root/$1" ]]; then
         echo "Required release file is missing from the package: $1" >&2

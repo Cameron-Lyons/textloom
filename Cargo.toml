@@ -18,6 +18,7 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
+    "/GUIDE.md",
     "/BENCHMARKS.md",
     "/CHANGELOG.md",
     "/RELEASING.md",

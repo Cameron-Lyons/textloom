@@ -22,6 +22,72 @@ known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
 
+### Release hardening refreshed 2026-11-09
+
+This cleanup is based on merged main `205e2ee`, retaining its
+pending-`Unreleased` gate and 26 shell regressions. The preceding
+[CI run 41319846258](https://github.com/Cameron-Lyons/textloom/actions/runs/41319846258)
+and [native QA run 41319846228](https://github.com/Cameron-Lyons/textloom/actions/runs/41319846228)
+passed on PR #18 head `3d46bcb`; fresh checks are still required for this cleanup.
+
+The README now provides a short installation and integration overview;
+`GUIDE.md` preserves the detailed
+contracts and is included in the verified Cargo package. Tagged checks reject
+empty, undated, and invalid-date changelog entries. Local release checks now
+include the QA-tool and headless cleanup regressions previously split across CI;
+POSIX-only cleanup tests explicitly skip on hosts without process-group signals.
+These changes do not alter the library's public API or editing implementation.
+
+The library, native example, and winit harness lock Tokio to the compatible
+1.53.3 patch, clearing
+[RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+The native example also replaces yanked `async-executor` 1.14.0 with 1.14.1.
+It updates `accesskit_unix` to 0.24.1 with compatible `accesskit` 0.25.2,
+`accesskit_atspi_common` 0.21.1, and `accesskit_consumer` 0.39.2 patches.
+The Unix patch fixes AT-SPI cache signal encoding and sorted adapter lookup.
+Its locked graph shares one AccessKit version and passes the Rust 1.95
+all-target host check and dependency policy. Native Linux behavior still needs
+the hosted run; these patches do not supply the missing Hypertext interface
+or establish Orca link/quote announcements.
+
+The VM command-line tool now preserves nonzero guest exits outside the host's
+one-byte status range. The new simulated-guest regression first reproduced a
+guest exit of 256 becoming host success; it now checks ordinary, large, and
+negative codes through the real job-server protocol. All 76 QA-tool tests and
+strict QA Clippy pass.
+
+`cargo-deny` passes advisories, bans, licenses, and sources for the library,
+native example, and QA tools under the existing policy. `cargo-audit` reports
+no vulnerabilities or yanked packages in the four lockfiles. It still reports
+upstream maintenance notices for the native example's transitive `zbus_names`,
+`zvariant`, and `zvariant_derive`; these are not suppressed in the audit evidence.
+
+Local validation uses macOS 27.3 (26C5035r), Apple Silicon, Rust 1.99.1, and
+the minimum Rust 1.95.0. Before the AccessKit and VM-tool fixes, the complete
+consolidated `check-release.sh --allow-dirty` passed on a working tree based on
+`27a930c`: all eight feature combinations, release-mode editing/search tests,
+native-host and QA-tool regressions, strict Clippy, warning-free rustdoc,
+quick benchmarks, headless examples, and packaged-source tests and consumer
+compilation. Stable/nightly formatting, workflow lint, and shell lint also pass.
+All-feature tests pass on 1.95.0, as do all-target
+checks of the native host and winit harness. The README and integration-guide
+Rust examples compile and pass. Core and adapter reviews found no additional
+production defect; an expanded independent Unicode search oracle passed on
+1,024 generated documents in all four search modes. No unused direct
+dependencies were found.
+
+Five 20-frame native renderer sessions built with Rust 1.95.0 pass strict report
+validation: default clipboard in editable, read-only, and disabled modes, and
+rich clipboard in read-only and disabled modes. All record graceful shutdown,
+zero errors, and matching TLFR snapshots. The executable hash and source label
+explicitly identify a working-tree build, not clean-commit platform signoff.
+No system-clipboard fixture or native interaction probe was run locally.
+Logs and reports are in `target/release-readiness-20261109/`.
+
+The package remains at 1.0.0-rc.2. Fresh CI on the final clean revision and the
+native protocol's manual IME, reader, physical-input, and display-scale outcomes
+remain required before stable 1.0. Nothing has been published.
+
 ### Stable release readiness refreshed 2026-10-31
 
 The target remains stable 1.0 with the existing requirements intact. The
@@ -809,7 +875,9 @@ malformed-input regression tests when changing the codec.
    doctests, Clippy, documentation, benchmark smoke runs with
    `TEXTLOOM_BENCH_QUICK=1`, and headless examples. It also checks formatting
    and strict Clippy for the native host and its CLI/report/clipboard regression
-   tests without opening a window.
+   tests without opening a window. The same command checks QA-tool formatting,
+   tests, and Clippy, plus the headless macOS cleanup regressions;
+   Python 3 is required for those regression tests.
    It then runs all-feature tests and compiles
    every target from the extracted Cargo package. An explicit inventory check
    requires every packaged source, test, fixture, headless example, benchmark,
@@ -821,8 +889,9 @@ malformed-input regression tests when changing the codec.
    which needs nightly rustfmt for the Google Rust Style Guide's import and macro
    formatting options and covers every package in the repository. CI runs both.
 3. Review `cargo package --locked --list --allow-dirty`. Source, headless examples,
-   tests, fixtures, benchmark documentation, changelog, and license must be
-   included. The repository-only native host, workflows, and local build output
+   tests, fixtures, integration guide (`GUIDE.md`), benchmark documentation,
+   changelog, and license must be included. The repository-only native host,
+   workflows, and local build output
    must be absent. Include patterns are anchored to the package root so nested
    QA README/license files are excluded. The release script rejects repository-only
    directories in the extracted crate as well as requiring the intended inventory.
