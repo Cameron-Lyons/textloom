@@ -10,17 +10,52 @@ now reports clipboard operation failures instead of allowing a plain fallback
 to leave every QA error counter at zero. The Windows example uses
 `clipboard-win` 5.4.3 or later; 5.4.1 was yanked on 2026-10-23.
 
-Stable 1.0 still requires final platform signoff. In particular, physical
-keyboards, touch screens/touchpads, audible reader usability, display-scale
-transitions, macOS IMEs/VoiceOver, and untested reader
-or visual feature behavior remain open. Automated clipboard transport and
-external-renderer assertions do not establish these observations. Record
-unavailable checks explicitly rather than treating them as passes.
+Stable 1.0 still requires final platform signoff and correction of the known
+native integration failures. The scoped macOS hands-on confirmation below
+records the user's results; other platform evidence and unitemized protocol
+details remain open. Automated clipboard transport and external-renderer
+assertions do not establish physical-input or audible-reader usability.
+Record unavailable checks explicitly rather than treating them as passes.
 
 The [native dependency limitations](#native-dependency-limitations) distinguish
 known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
+
+### Verified candidate and macOS feedback, 2026-11-10
+
+Candidate `f7d3a655c6ec0bdd8e3d04aa5beff6ea109a5bcd` in
+[PR #19](https://github.com/Cameron-Lyons/textloom/pull/19) passes all nine
+[CI jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/42725926104)
+and both [native interaction jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/42725926357).
+GitHub tested PR merge `b770e5b94283e572705d737e09b97f9b41951a4e`.
+The complete release command, Rust 1.95 feature matrix, minimum dependency
+versions, dependency policies, optimized tests, quick benchmarks, and package
+checks pass. All 78 QA-tool tests pass, including the foreground regressions.
+
+Downloaded artifacts match their recorded hashes and revision metadata.
+The Mac interaction report contains 70 passing checks, including 21 feature
+checks; the separate winit probe passes nine checks. Windows NVDA passes all
+15 checks. All 12 renderer reports across macOS, Linux X11, and Windows Mesa
+pass the strict validator with the expected modes and clipboard settings,
+graceful shutdown, zero errors, and matching TLFR round trips. Native-process
+and reader cleanup checks also pass. These automated reports retain their
+explicit manual, IME, audible-reader, and scale-transition limitations.
+
+The user tested the preserved `f7d3a65` native editor on macOS 27.3
+(26C5035r), then reported "it looks good" and confirmed "all of them" when
+asked about appearance/basic editing, Japanese/Chinese IMEs, VoiceOver,
+physical keyboard/touch, and display-scale changes. Those named categories
+are recorded as user-reported passes in the
+[macOS feedback record](https://github.com/Cameron-Lyons/textloom/blob/7b3d85b949fa065b41e3edfe864a812ad936d054/examples/native-editor/signoff/macos-f7d3a65-2026-11-10.txt).
+Individual protocol steps, input-source versions, reader commands, layouts,
+and scale values were not itemized. The T3 restart canceled the session before
+its native report finalized; the empty original report is retained locally.
+The feedback does not imply Windows/Linux or separate winit manual signoff.
+
+The package remains 1.0.0-rc.2. The Windows/X11/Orca failures listed below still
+require correction; no stable release, tag, or publication is claimed by this
+record. Source changes after the tested candidate require applicable checks.
 
 ### Release hardening refreshed 2026-11-09
 
@@ -37,7 +72,7 @@ recorded as not gracefully closed. The probe now retries this specific
 pre-input condition within its existing five-second limit and records the
 observed foreground PID. Regressions cover exactly-once editing after delayed
 activation, bounded failure without editing, and nonretryable uncertain
-delivery. Fresh hosted checks are required for the correction.
+delivery. The correction passed the subsequent hosted run recorded above.
 
 The README now provides a short installation and integration overview;
 `GUIDE.md` preserves the detailed
@@ -55,9 +90,9 @@ It updates `accesskit_unix` to 0.24.1 with compatible `accesskit` 0.25.2,
 `accesskit_atspi_common` 0.21.1, and `accesskit_consumer` 0.39.2 patches.
 The Unix patch fixes AT-SPI cache signal encoding and sorted adapter lookup.
 Its locked graph shares one AccessKit version and passes the Rust 1.95
-all-target host check and dependency policy. Native Linux behavior still needs
-the hosted run; these patches do not supply the missing Hypertext interface
-or establish Orca link/quote announcements.
+all-target host check and dependency policy. Subsequent Linux X11 renderer
+checks pass; these patches do not supply the missing Hypertext interface or
+establish Orca link/quote announcements.
 
 The VM command-line tool now preserves nonzero guest exits outside the host's
 one-byte status range. The new simulated-guest regression first reproduced a
@@ -97,9 +132,9 @@ explicitly identify a working-tree build, not clean-commit platform signoff.
 No system-clipboard fixture or native interaction probe was run locally.
 Logs and reports are in `target/release-readiness-20261109/`.
 
-The package remains at 1.0.0-rc.2. Fresh CI on the final clean revision and the
-native protocol's manual IME, reader, physical-input, and display-scale outcomes
-remain required before stable 1.0. Nothing has been published.
+The package remains at 1.0.0-rc.2. Subsequent CI and the scoped macOS user
+confirmation are recorded above. Remaining platform/protocol evidence and
+the known native failures still prevent stable 1.0. Nothing has been published.
 
 ### Stable release readiness refreshed 2026-10-31
 
