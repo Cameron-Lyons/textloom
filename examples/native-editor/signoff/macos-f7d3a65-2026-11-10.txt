@@ -1,0 +1,45 @@
+Textloom macOS hands-on feedback — 2026-11-10
+
+Candidate full commit: f7d3a655c6ec0bdd8e3d04aa5beff6ea109a5bcd
+Clean checkout confirmed at build: yes
+Recorded by: release-readiness assistant, from the user's replies in this thread
+Test platform: macOS 27.3 (26C5035r), Apple Silicon
+Build compiler: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+Native host dependencies: egui/eframe 0.37.0, winit 0.30.13, AccessKit 0.25.2
+Native executable SHA-256:
+  b27b6651908933989c61e75b04b96b48455289537e167d78bb5cf6777460385f
+Launched session: editable, rich clipboard, default system-font fallback
+Session directory: target/release-readiness-20261109/manual-f7d3a65/reports/
+  editable-rich-20261110-094443-uw758M/
+
+User feedback: "it looks good"
+Follow-up asked which checks were completed: appearance/basic editing,
+Japanese/Chinese IMEs, VoiceOver, physical keyboard/touch, and display-scale
+changes, with a request to name any failures.
+User scope confirmation: "all of them"
+
+Recorded outcomes (user-reported):
+PASS — Appearance/basic editing
+PASS — Japanese IME
+PASS — Chinese IME
+PASS — VoiceOver
+PASS — Physical keyboard
+PASS — Touch input
+PASS — Display-scale changes
+No failures were reported in these replies.
+
+Scope and evidence limits:
+- Individual steps from NATIVE_QA.md were not itemized. Input-source names and
+  versions, reader commands, keyboard layouts/sequences, display-scale values,
+  and external clipboard application/version were not supplied.
+- The T3 server restart canceled the session. The process was confirmed gone,
+  and its native.json remained zero bytes. This record preserves the human
+  feedback; it does not invent a finalized native report or runtime counters.
+- The separate winit harness and other platforms were not covered by the
+  confirmation about the open macOS editor. Their evidence remains separate.
+- The known Windows/X11/Orca integration failures remain release blockers.
+
+Automated checks for this candidate passed separately on PR merge
+b770e5b94283e572705d737e09b97f9b41951a4e:
+https://github.com/Cameron-Lyons/textloom/actions/runs/42725926104
+https://github.com/Cameron-Lyons/textloom/actions/runs/42725926357
