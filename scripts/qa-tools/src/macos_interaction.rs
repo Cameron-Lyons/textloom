@@ -78,7 +78,7 @@ on run argv
         set expectedDocument to item 5 of argv
         set resolvedDocument to item 6 of argv
         -- Only this pre-action section may be retried. System Events can
-        -- retain a stale window specifier during discovery/AXRaise.
+        -- retain a stale window specifier or delay activation after AXRaise.
         try
             set targetProcess to first application process whose unix id is targetPID
             tell targetProcess
@@ -110,8 +110,9 @@ on run argv
                 perform action "AXRaise" of targetWindow
             end tell
             delay 0.15
-            if (unix id of first application process whose frontmost is true) is not targetPID then
-                error "Target PID did not become foreground"
+            set foregroundPID to unix id of first application process whose frontmost is true
+            if foregroundPID is not targetPID then
+                error "Pre-action foreground pending: expected PID " & targetPID & ", found " & foregroundPID
             end if
             tell targetProcess
                 if expectedDocument is not "" then
@@ -822,7 +823,8 @@ impl<S: System> Probe<S> {
             // AX tree activation can take a frame after the first query. Only
             // retry failures that happened before any action was delivered.
             let target_pending = stderr.contains("Target window count 0")
-                || stderr.contains("Pre-action target unavailable:");
+                || stderr.contains("Pre-action target unavailable:")
+                || stderr.contains("Pre-action foreground pending:");
             if !target_pending || self.system.monotonic() >= deadline {
                 return Err(format!(
                     "Native {command} on PID {pid} / {window}: {}",

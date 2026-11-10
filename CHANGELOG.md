@@ -14,6 +14,9 @@
 - The Windows VM CLI preserves failures whose guest exit codes do not fit
   into the host's one-byte status; codes such as 256 previously wrapped to
   success. In-range codes remain unchanged.
+- Native macOS QA retries delayed foreground activation within its existing
+  five-second limit before delivering input. Persistent activation failures,
+  wrong documents, and uncertain action delivery still fail the probe.
 - Refresh the library, native host, and winit harness lockfiles to Tokio 1.53.3,
   which fixes RUSTSEC-2026-0386. This transitive dependency is conditional on
   Emscripten's experimental Tokio integration and is inactive in native builds.

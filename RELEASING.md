@@ -28,7 +28,16 @@ This cleanup is based on merged main `205e2ee`, retaining its
 pending-`Unreleased` gate and 26 shell regressions. The preceding
 [CI run 41319846258](https://github.com/Cameron-Lyons/textloom/actions/runs/41319846258)
 and [native QA run 41319846228](https://github.com/Cameron-Lyons/textloom/actions/runs/41319846228)
-passed on PR #18 head `3d46bcb`; fresh checks are still required for this cleanup.
+passed on PR #18 head `3d46bcb`. On cleanup head `bb8ffa5`, hosted
+[native QA run 42724892228](https://github.com/Cameron-Lyons/textloom/actions/runs/42724892228)
+passed Windows NVDA checks but failed macOS foreground activation after the
+external clipboard import passed. The failure occurred before input delivery;
+both apps were removed during cleanup, with the native session correctly
+recorded as not gracefully closed. The probe now retries this specific
+pre-input condition within its existing five-second limit and records the
+observed foreground PID. Regressions cover exactly-once editing after delayed
+activation, bounded failure without editing, and nonretryable uncertain
+delivery. Fresh hosted checks are required for the correction.
 
 The README now provides a short installation and integration overview;
 `GUIDE.md` preserves the detailed
@@ -53,8 +62,9 @@ or establish Orca link/quote announcements.
 The VM command-line tool now preserves nonzero guest exits outside the host's
 one-byte status range. The new simulated-guest regression first reproduced a
 guest exit of 256 becoming host success; it now checks ordinary, large, and
-negative codes through the real job-server protocol. All 76 QA-tool tests and
-strict QA Clippy pass.
+negative codes through the real job-server protocol. With the two foreground
+regressions, all 78 QA-tool tests and strict QA Clippy pass. The embedded
+AppleScript compiles with `osacompile` without executing native actions.
 
 `cargo-deny` passes advisories, bans, licenses, and sources for the library,
 native example, and QA tools under the existing policy. `cargo-audit` reports
@@ -74,7 +84,10 @@ checks of the native host and winit harness. The README and integration-guide
 Rust examples compile and pass. Core and adapter reviews found no additional
 production defect; an expanded independent Unicode search oracle passed on
 1,024 generated documents in all four search modes. No unused direct
-dependencies were found.
+dependencies were found. After the AccessKit and VM-tool changes, the complete
+consolidated release check also passed on clean commit `bb8ffa5`, including
+the extracted package and native consumer. Its 131 tracked file hashes and
+verified package checksum are retained with the local evidence.
 
 Five 20-frame native renderer sessions built with Rust 1.95.0 pass strict report
 validation: default clipboard in editable, read-only, and disabled modes, and
