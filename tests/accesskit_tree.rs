@@ -183,9 +183,18 @@ fn word_starts_match_editor_words_across_long_runs() {
         "\u{e9}".repeat(300)
     ));
     bold(&mut editor, Position::new(0, 8)..Position::new(0, 400));
+    assert_accessible_word_navigation(&editor);
+    // The first check builds the editor's word indexes. Publishing again must
+    // preserve every word boundary when the adapter reuses those cached indexes.
+    assert_accessible_word_navigation(&editor);
+}
+
+fn assert_accessible_word_navigation(editor: &Editor) {
     let mut adapter = AccessKitAdapter::default();
     let tree = Tree::new(
-        adapter.update(&editor, "Notes", Focus::Focused).unwrap(),
+        adapter
+            .update(editor, "Notes", Focus::Focused)
+            .expect("the initial tree fits within the node ID space"),
         true,
     );
     let node = text_input(&tree, &adapter);
@@ -194,7 +203,11 @@ fn word_starts_match_editor_words_across_long_runs() {
     let mut paragraph_start = 0;
     for paragraph in editor.document().paragraphs() {
         let boundaries: Vec<_> = (0..=paragraph.grapheme_count())
-            .map(|grapheme| paragraph.byte_from_grapheme(grapheme).unwrap())
+            .map(|grapheme| {
+                paragraph
+                    .byte_from_grapheme(grapheme)
+                    .expect("the grapheme index is within the paragraph")
+            })
             .collect();
         let mut starts: Vec<_> = boundaries
             .iter()
@@ -205,7 +218,7 @@ fn word_starts_match_editor_words_across_long_runs() {
         for byte in &boundaries {
             let position = node
                 .text_position_from_global_usv_index(global(*byte))
-                .unwrap();
+                .expect("every editor boundary has an accessible text position");
             if *byte > 0 {
                 assert_eq!(
                     position.backward_to_word_start().to_global_usv_index(),

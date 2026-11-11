@@ -262,6 +262,16 @@ impl Plugin for InputRouting {
             };
         self.observe_focus(input.viewport_id, focused);
         self.memory_viewport = Some(input.viewport_id);
+        if !self.pending.contains_key(&input.viewport_id)
+            && !self.paste_requests.contains_key(&input.viewport_id)
+            && !input.events.iter().any(requests_focus)
+        {
+            // Ordinary batches need only the starting modifiers. Keep their
+            // event buffer intact instead of allocating a routing queue and
+            // then rebuilding the same events in another buffer.
+            self.passes.push(pass);
+            return;
+        }
         // Extra layout/focus passes run before the host can service output.
         // begin_pass/end_pass hosts have no frame counter, but start at pass 0.
         let first_pass = ctx.viewport_for(input.viewport_id, |viewport| {

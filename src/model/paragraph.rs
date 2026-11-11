@@ -141,7 +141,8 @@ impl Paragraph {
     /// text as described or the text contains CR, LF, or U+2029.
     pub fn try_new(text: &str, spans: Vec<Span>, kind: ParagraphKind) -> Result<Self, Error> {
         let paragraph = Self::try_from_parts(text, spans, kind)?;
-        if text.contains(['\r', '\n', '\u{2029}']) {
+        // Separate searches let str use its optimized byte scan for long paragraphs.
+        if text.contains('\r') || text.contains('\n') || text.contains('\u{2029}') {
             return Err(Error::InvalidFragment);
         }
         Ok(paragraph)
@@ -168,6 +169,11 @@ impl Paragraph {
 
     pub(crate) fn is_ascii(&self) -> bool {
         self.ascii
+    }
+
+    #[cfg(feature = "egui")]
+    pub(crate) fn has_links(&self) -> bool {
+        self.linked
     }
 
     /// Returns the number of extended grapheme clusters in the text.
@@ -447,14 +453,20 @@ impl Paragraph {
     }
 
     #[cfg(any(feature = "egui", feature = "accesskit"))]
-    pub(crate) fn word_starts(&self) -> Vec<usize> {
-        match self.indices.get().and_then(|indices| indices.words.get()) {
-            Some(words) => words.iter().map(|word| word.start).collect(),
-            None => word_stops(&self.text)
-                .into_iter()
-                .map(|word| word.start)
-                .collect(),
-        }
+    pub(crate) fn word_starts(&self) -> impl Iterator<Item = usize> + '_ {
+        // Reuse an existing word index without copying it, but do not retain a
+        // new index just to publish accessibility information.
+        let cached = self
+            .indices
+            .get()
+            .and_then(|indices| indices.words.get())
+            .map(Box::as_ref);
+        let fresh = cached.is_none().then(|| word_stops(&self.text));
+        cached
+            .into_iter()
+            .flatten()
+            .map(|word| word.start)
+            .chain(fresh.into_iter().flatten().map(|word| word.start))
     }
 
     pub(super) fn with_kind(self: &Arc<Self>, kind: ParagraphKind) -> Arc<Self> {

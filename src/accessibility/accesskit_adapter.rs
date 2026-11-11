@@ -1055,7 +1055,7 @@ fn build_paragraph(
         cached.node.set_children(ids[cached.runs.clone()].to_vec());
     }
     let text = paragraph.text();
-    let mut words = paragraph.word_starts().into_iter().peekable();
+    let mut words = paragraph.word_starts().peekable();
     let last = pieces.len() - 1;
     let mut continues_line = false;
     let mut runs = Vec::with_capacity(pieces.len());
@@ -1097,6 +1097,7 @@ fn build_paragraph(
             soft_break: piece.soft_break,
         });
     }
+    drop(words);
     node.set_children(children);
     Ok(CachedParagraph {
         paragraph,

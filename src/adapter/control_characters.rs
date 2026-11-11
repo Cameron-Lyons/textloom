@@ -21,13 +21,63 @@ pub(super) fn clean_text(text: &str, keep: ControlCharacters) -> Cow<'_, str> {
         !character.is_control()
             || keep == ControlCharacters::KeepWhitespace && matches!(character, '\n' | '\r' | '\t')
     };
-    if text.chars().all(allowed) {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(
-            text.chars()
-                .filter(|character| allowed(*character))
-                .collect(),
-        )
+    let Some((start, _)) = text
+        .char_indices()
+        .find(|(_, character)| !allowed(*character))
+    else {
+        return Cow::Borrowed(text);
+    };
+    // The prefix is already valid; copy it without decoding every character again.
+    let mut clean = String::from(&text[..start]);
+    clean.extend(
+        text[start..]
+            .chars()
+            .filter(|character| allowed(*character)),
+    );
+    Cow::Owned(clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_filtering_preserves_unicode_and_allowed_whitespace() {
+        let text = "\0café\u{85} 👩🏽‍💻\u{7f}\r\n\t日本\u{9f}\u{2028}end\u{1b}";
+        assert_eq!(
+            clean_text(text, ControlCharacters::KeepWhitespace),
+            "café 👩🏽‍💻\r\n\t日本\u{2028}end"
+        );
+        assert_eq!(
+            clean_text(text, ControlCharacters::RemoveAll),
+            "café 👩🏽‍💻日本\u{2028}end"
+        );
+        // Every control can occur after a multibyte prefix or before the first character.
+        for control in ('\0'..='\u{1f}').chain('\u{7f}'..='\u{9f}') {
+            for prefix in ["", "日本👩🏽‍💻"] {
+                let text = format!("{prefix}{control}café");
+                assert_eq!(
+                    clean_text(&text, ControlCharacters::RemoveAll),
+                    format!("{prefix}café")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clean_text_stays_borrowed_without_removing_unicode_separators() {
+        for text in ["", "typed text", "café 日本 👩🏽‍💻", "\u{a0}\u{2028}\u{2029}"] {
+            for mode in [
+                ControlCharacters::RemoveAll,
+                ControlCharacters::KeepWhitespace,
+            ] {
+                assert!(matches!(clean_text(text, mode), Cow::Borrowed(value) if value == text));
+            }
+        }
+        let whitespace = "\tfirst\r\nsecond\n";
+        assert!(matches!(
+            clean_text(whitespace, ControlCharacters::KeepWhitespace),
+            Cow::Borrowed(value) if value == whitespace
+        ));
     }
 }

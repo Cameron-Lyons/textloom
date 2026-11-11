@@ -235,9 +235,13 @@ jobs:
             scripts/qa-tools -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install virtual display and software renderer
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
+          # Avoid repeated Ubuntu archive DNS failures while retaining its signing key.
+          sudo sed -i 's|^URIs:.*|URIs: https://mirrors.edge.kernel.org/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources
+          apt_options=(-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+          sudo apt-get "${apt_options[@]}" update --error-on=any
+          sudo apt-get "${apt_options[@]}" install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
       - name: Build native renderer and report validator
         run: |
           cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target

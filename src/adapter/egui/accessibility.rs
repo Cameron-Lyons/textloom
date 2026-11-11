@@ -328,7 +328,7 @@ fn build_paragraph_snapshot(
     }
     let rows = Rows::new(galley);
     let limit = MAX_RUN_CHARACTERS - usize::from(line_break);
-    let mut words = source.word_starts().into_iter().peekable();
+    let mut words = source.word_starts().peekable();
     let mut runs: Vec<RunBuilder> = Vec::new();
     let mut spans = SpanCursor::new(source.spans());
     let mut scalar_start = 0;
@@ -1816,7 +1816,6 @@ mod tests {
                             let word_starts: Vec<_> = paragraph
                                 .source
                                 .word_starts()
-                                .into_iter()
                                 .filter(|byte| run.range.contains(byte))
                                 .map(|byte| {
                                     let graphemes = text[run.range.start..byte].graphemes(true);

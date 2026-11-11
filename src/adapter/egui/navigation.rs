@@ -88,6 +88,12 @@ pub(super) fn link_at_point(
     layouts: &ParagraphLayouts,
     point: Vec2,
 ) -> Option<Link> {
+    let paragraph = layouts.paragraph_at_y(point.y);
+    if !document.paragraph(paragraph)?.has_links() {
+        // Hover runs every frame, including over long paragraphs with no links.
+        // Their cached flag avoids walking rows, glyphs, or formatting spans.
+        return None;
+    }
     let position = grapheme_at_point(document, layouts, point)?;
     document.link_at(position).cloned()
 }

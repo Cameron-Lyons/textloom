@@ -504,8 +504,16 @@ fn never_overlaps(needle: &str) -> bool {
 }
 
 // A line of such a query must end, fill, or start the paragraph it matches.
+// Bound the number of paragraphs compared at every candidate so repetitive
+// multiline queries cannot turn this fast path into a quadratic scan. Longer
+// queries use the flattened text matcher instead.
 fn paragraph_lines(needle: &str) -> Option<Vec<&str>> {
-    (needle.contains('\n') && never_overlaps(needle)).then(|| needle.split('\n').collect())
+    const MAX_LINES: usize = 16;
+    if !needle.contains('\n') {
+        return None;
+    }
+    let lines: Vec<_> = needle.split('\n').take(MAX_LINES + 1).collect();
+    (lines.len() <= MAX_LINES && never_overlaps(needle)).then_some(lines)
 }
 
 fn lowercase_char(character: char) -> impl DoubleEndedIterator<Item = char> {

@@ -58,7 +58,8 @@ pub struct Editor {
     preferred_column: Option<usize>,
     pub(super) composition: Option<Arc<Composition>>,
     saved: SavePoint,
-    style_cache: Mutex<Option<StyleCache>>,
+    style_cache: Mutex<Option<SelectionCache<Option<SelectionStyle>>>>,
+    link_cache: Mutex<Option<SelectionCache<Option<Link>>>>,
 }
 
 impl Default for Editor {
@@ -82,16 +83,22 @@ impl Clone for Editor {
             style_cache: Mutex::new(
                 self.style_cache
                     .lock()
-                    .expect(STYLE_CACHE_LOCK_HEALTHY)
+                    .expect(SELECTION_CACHE_LOCK_HEALTHY)
+                    .clone(),
+            ),
+            link_cache: Mutex::new(
+                self.link_cache
+                    .lock()
+                    .expect(SELECTION_CACHE_LOCK_HEALTHY)
                     .clone(),
             ),
         }
     }
 }
 
-// The style cache stays locked only while a selection's spans are scanned and the result is
-// stored, which does not panic, so no thread poisons the lock.
-const STYLE_CACHE_LOCK_HEALTHY: &str = "no panic occurs while the style cache is locked";
+// Selection caches stay locked only while spans are scanned and the result is stored,
+// which does not panic, so no thread poisons the locks.
+const SELECTION_CACHE_LOCK_HEALTHY: &str = "no panic occurs while a selection cache is locked";
 
 impl Debug for Editor {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -114,7 +121,8 @@ impl Debug for Editor {
 #[derive(Clone)]
 struct SavePoint {
     revision: u64,
-    paragraphs: Vec<Arc<Paragraph>>,
+    // Saved content is immutable; editor clones can share the paragraph list too.
+    paragraphs: Arc<[Arc<Paragraph>]>,
     // Edits and history/transaction restores invalidate this content comparison.
     cached_match: OnceLock<bool>,
 }
@@ -123,7 +131,7 @@ impl SavePoint {
     fn new(document: &Document) -> Self {
         Self {
             revision: document.revision(),
-            paragraphs: document.paragraphs().to_vec(),
+            paragraphs: Arc::from(document.paragraphs()),
             cached_match: OnceLock::new(),
         }
     }
@@ -132,15 +140,15 @@ impl SavePoint {
         (self.revision == document.revision() && self.revision != u64::MAX)
             || *self
                 .cached_match
-                .get_or_init(|| self.paragraphs == document.paragraphs())
+                .get_or_init(|| self.paragraphs.as_ref() == document.paragraphs())
     }
 }
 
 #[derive(Clone)]
-struct StyleCache {
+struct SelectionCache<T> {
     identity: Arc<()>,
-    selection: Selection,
-    style: Option<SelectionStyle>,
+    range: Range<Position>,
+    value: T,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,6 +176,7 @@ impl Editor {
             preferred_column: None,
             composition: None,
             style_cache: Mutex::new(None),
+            link_cache: Mutex::new(None),
         }
     }
 
@@ -209,37 +218,39 @@ impl Editor {
     /// For a range, each attribute is uniform only if all selected text
     /// agrees on it; paragraph breaks and empty paragraphs are ignored, and a
     /// selection of only paragraph breaks also reports the typing style. The
-    /// scan of a range is cached until the document or selection changes.
+    /// scan of a range is cached until the document or covered range changes.
     #[must_use]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the expect checks an internal invariant: nothing panics while the cache is locked"
-    )]
     pub fn selection_style(&self) -> SelectionStyle {
         if self.selection.is_caret() {
             return self.typing_style.into();
         }
-        let identity = self.document.content_identity();
-        let mut cache = self.style_cache.lock().expect(STYLE_CACHE_LOCK_HEALTHY);
-        let style = match cache.as_ref() {
-            Some(cached)
-                if Arc::ptr_eq(&cached.identity, &identity)
-                    && cached.selection == self.selection =>
-            {
-                cached.style
-            }
-            _ => {
-                let style = self.scan_selection_style();
-                *cache = Some(StyleCache {
-                    identity,
-                    selection: self.selection,
-                    style,
-                });
-                style
-            }
-        };
-        style.unwrap_or_else(|| self.typing_style.into())
+        self.cached_selection(&self.style_cache, Self::scan_selection_style)
+            .unwrap_or_else(|| self.typing_style.into())
     }
+
+    fn cached_selection<T: Clone>(
+        &self,
+        cache: &Mutex<Option<SelectionCache<T>>>,
+        scan: impl FnOnce(&Self) -> T,
+    ) -> T {
+        let identity = self.document.content_identity();
+        let range = self.selection.range();
+        let mut cache = cache.lock().expect(SELECTION_CACHE_LOCK_HEALTHY);
+        if let Some(cached) = cache.as_ref()
+            && Arc::ptr_eq(&cached.identity, &identity)
+            && cached.range == range
+        {
+            return cached.value.clone();
+        }
+        let value = scan(self);
+        *cache = Some(SelectionCache {
+            identity,
+            range,
+            value: value.clone(),
+        });
+        value
+    }
+
     fn scan_selection_style(&self) -> Option<SelectionStyle> {
         let mut result: Option<SelectionStyle> = None;
         for span in self.document.spans_in(&self.selection.range()) {
@@ -260,12 +271,17 @@ impl Editor {
     /// At a caret, this is the link of the grapheme before the caret, or
     /// failing that, after it. For a range, it is the link that all selected
     /// text shares, or `None` if any selected text is unlinked or the links
-    /// differ.
+    /// differ. The range summary is cached until the document or covered
+    /// range changes.
     #[must_use]
     pub fn selected_link(&self) -> Option<Link> {
         if self.selection.is_caret() {
             return self.document.caret_link(self.selection.focus).cloned();
         }
+        self.cached_selection(&self.link_cache, Self::scan_selected_link)
+    }
+
+    fn scan_selected_link(&self) -> Option<Link> {
         let mut shared: Option<&Link> = None;
         for span in self.document.spans_in(&self.selection.range()) {
             let link = span.link.as_ref()?;
