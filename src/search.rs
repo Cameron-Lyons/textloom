@@ -3,6 +3,7 @@ use std::ops::{ControlFlow, Range};
 
 use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
+use crate::model::word_restart;
 use crate::types::Direction;
 use crate::{Document, Position, model};
 
@@ -558,26 +559,6 @@ fn lowered_suffix_start(text: &str, suffix: &str) -> Option<usize> {
 
 fn is_word_boundary(text: &str, byte: usize) -> bool {
     WordBoundaries::new(text, word_restart(text, byte)).contains(byte)
-}
-
-// A space is followed by a word boundary unless the next character is Extend,
-// Format, ZWJ, or WSegSpace (WB3d, WB4), and no later rule looks back past that
-// space, so segmentation restarted there matches segmentation from byte 0.
-fn word_restart(text: &str, byte: usize) -> usize {
-    let bytes = text.as_bytes();
-    let last = text.floor_char_boundary(byte.min(bytes.len().saturating_sub(1)));
-    text[..last]
-        .rmatch_indices(' ')
-        .map(|(space, _)| space + 1)
-        .find(|&start| {
-            if bytes[start].is_ascii() {
-                bytes[start] != b' '
-            } else {
-                let pair = &text[start - 1..text.ceil_char_boundary(start + 1)];
-                pair.split_word_bounds().next() == Some(" ")
-            }
-        })
-        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

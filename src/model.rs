@@ -7,6 +7,8 @@ mod numbering;
 mod paragraph;
 mod words;
 
+pub(crate) use words::word_restart;
+
 #[cfg(feature = "egui")]
 pub(crate) use change::ParagraphChange;
 pub(crate) use change::{Delta, Replay};

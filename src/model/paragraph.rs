@@ -104,6 +104,7 @@ pub(super) struct TextIndices {
     pub(super) graphemes: OnceLock<Box<[usize]>>,
     pub(super) scalars: OnceLock<Box<[usize]>>,
     pub(super) words: OnceLock<Box<[Range<usize>]>>,
+    word_boundaries: OnceLock<super::words::WordSelectionIndex>,
 }
 
 impl PartialEq for Paragraph {
@@ -444,6 +445,18 @@ impl Paragraph {
                 .chain([self.text.len()])
                 .collect()
         })
+    }
+
+    pub(super) fn cached_word_segment(&self, byte: usize) -> Option<Range<usize>> {
+        let boundaries = self.indices.get()?.word_boundaries.get()?;
+        Some(boundaries.segment(byte))
+    }
+
+    pub(super) fn indexed_word_segment(&self, byte: usize) -> Range<usize> {
+        self.text_indices()
+            .word_boundaries
+            .get_or_init(|| super::words::WordSelectionIndex::new(&self.text))
+            .segment(byte)
     }
 
     pub(super) fn word_ranges(&self) -> &[Range<usize>] {

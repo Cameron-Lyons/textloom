@@ -1011,3 +1011,29 @@ office files flow affix, different effort`, and a 72 KB paragraph repeated
 Dividing ligatures costs about 1.5 µs per paragraph that contains one. About
 three quarters of that copies the row's glyphs and mesh, because egui's galley
 cache shares the galley. Paragraphs without ligatures keep egui's galley.
+
+## Word selection coverage
+
+Double-click word selection shares the Unicode-safe segmentation restart used
+by whole-word search. Local queries start at a preceding safe space instead
+of segmenting every word from the paragraph start. A scan exceeding 4 KiB
+builds an index only when it traverses at least half the paragraph; this avoids
+indexing a large untouched prefix or suffix for a local selection. Selecting
+a very long word can also build the cache, even at the word's beginning.
+
+The index preserves forward Unicode segmentation and stores boundary bits in
+nonempty 64-byte blocks. On a 64-bit target each retained block uses 16 bytes;
+dense punctuation needs about one quarter of the text size, and a single long
+word needs only its endpoint blocks. The first indexed selection still scans
+the paragraph and allocates. Later queries use binary search and bit lookup.
+Formatting-only copies share the cache, text edits invalidate it, and undo
+can restore the original cached paragraph.
+
+The editing harness covers warm selection in short and long English, Cyrillic,
+space-separated Chinese, and unspaced Chinese paragraphs. Cold queries near
+the start and end of large CJK and punctuation paragraphs expose construction
+costs; an edit/select/undo workload measures rebuilding. Timings include
+Unicode position validation. Differential tests compare cached and uncached
+selections against full forward segmentation, including soft breaks, emoji,
+combining marks, and grapheme expansion. These paths do not promise constant
+time for every script or paragraph shape.
