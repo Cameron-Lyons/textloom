@@ -37,6 +37,7 @@ fn main() {
     caret_link_queries();
     empty_insertions();
     unicode_navigation();
+    word_selection();
     cold_zero_index_navigation();
     long_unicode_edits();
     contextual_unicode_search();
@@ -51,6 +52,88 @@ fn main() {
     sparse_replacement();
     #[cfg(feature = "accesskit")]
     accessibility_navigation();
+}
+
+fn word_selection() {
+    for (word, selected) in [("hello", "hello"), ("слово", "слово"), ("你好", "你")] {
+        for count in [100, 100_000] {
+            let text = format!("{word} ").repeat(count);
+            let document = Document::from_text(&text);
+            let start = text.len() - word.len() - 1;
+            let position = Position::new(0, start);
+            let expected = position..Position::new(0, start + selected.len());
+            assert_eq!(
+                document.word_range_at(position).expect(VALID_POSITION),
+                expected
+            );
+            measure(
+                &format!("{count} {word} words select last word warm"),
+                2_000,
+                || {
+                    hint::black_box(
+                        document
+                            .word_range_at(hint::black_box(position))
+                            .expect(VALID_POSITION),
+                    );
+                },
+            );
+        }
+    }
+    for (label, text, byte) in [
+        ("CJK near start", "你好".repeat(100_000), 4_098),
+        ("CJK near end", "你好".repeat(100_000), 599_997),
+        ("punctuation near start", "!?".repeat(300_000), 4_097),
+        ("punctuation near end", "!?".repeat(300_000), 599_999),
+    ] {
+        let document = Document::from_text(&text);
+        let position = Position::new(0, byte);
+        let start = Instant::now();
+        hint::black_box(document.word_range_at(position).expect(VALID_POSITION));
+        println!(
+            "{label} word selection cold: {:.2} µs / first query",
+            start.elapsed().as_secs_f64() * 1_000_000.0
+        );
+    }
+    for count in [100, 100_000] {
+        let text = "你好".repeat(count);
+        let document = Document::from_text(&text);
+        let position = Position::new(0, text.len() - "好".len());
+        assert_eq!(
+            document.word_range_at(position).expect(VALID_POSITION),
+            position..Position::new(0, text.len())
+        );
+        measure(
+            &format!("{count} unspaced CJK pairs select final character warm"),
+            200,
+            || {
+                hint::black_box(
+                    document
+                        .word_range_at(hint::black_box(position))
+                        .expect(VALID_POSITION),
+                );
+            },
+        );
+    }
+    let mut editor = Editor::from_text(&"你好".repeat(100_000));
+    editor
+        .document()
+        .word_range_at(editor.document().end())
+        .expect(VALID_POSITION);
+    measure("unspaced CJK edit + select + undo", 50, || {
+        editor
+            .insert_text(hint::black_box("你"))
+            .expect(NO_COMPOSITION);
+        hint::black_box(
+            editor
+                .document()
+                .word_range_at(editor.document().end())
+                .expect(VALID_POSITION),
+        );
+        assert!(
+            editor.undo(),
+            "selection must preserve the edit's undo entry"
+        );
+    });
 }
 
 fn transaction_edits() {
