@@ -1395,7 +1395,9 @@ fn run_command(vm: &Vm, script: &str, elevation: Elevation, timeout: u64) -> Res
     if result.timed_out {
         return Err(format!("the job timed out after {timeout} s").into());
     }
-    Ok(ExitCode::from(result.exit as u8))
+    // Windows exit codes can exceed the host's byte-sized exit status. Never
+    // truncate a guest failure such as 256 into a successful host status.
+    Ok(u8::try_from(result.exit).map_or(ExitCode::FAILURE, ExitCode::from))
 }
 
 enum Action {
@@ -1668,6 +1670,41 @@ mod tests {
             assert_eq!(result.exit, 0);
         });
         assert!(harness.vm.agent_seen(0.0));
+    }
+
+    #[test]
+    fn cli_preserves_failure_for_guest_exit_codes_outside_one_byte() {
+        let harness = harness();
+        for (exit, expected) in [
+            (0, 0),
+            (1, 1),
+            (42, 42),
+            (255, 255),
+            (256, 1),
+            (512, 1),
+            (-256, 1),
+            (-1, 1),
+            (i64::MIN, 1),
+            (i64::MAX, 1),
+        ] {
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    let reply = harness.guest("GET", "/next", b"", "secret");
+                    assert_eq!(reply.status, 200);
+                    let job: Value = serde_json::from_slice(&reply.body).unwrap();
+                    let result = json!({"exit": exit, "timed_out": false, "output": ""});
+                    let path = format!("/result/{}", job["id"].as_str().unwrap());
+                    assert_eq!(
+                        harness
+                            .guest("POST", &path, result.to_string().as_bytes(), "secret")
+                            .status,
+                        204
+                    );
+                });
+                let code = run_command(&harness.vm, "exit", Elevation::Standard, 30).unwrap();
+                assert_eq!(code, ExitCode::from(expected), "guest exit code {exit}");
+            });
+        }
     }
 
     #[test]

@@ -8,6 +8,10 @@ from unittest.mock import Mock, patch
 import macos_winit
 
 
+@unittest.skipUnless(
+    hasattr(macos_winit.os, "killpg") and hasattr(signal, "SIGKILL"),
+    "requires POSIX process-group signals",
+)
 class CleanupTests(unittest.TestCase):
     def probe(self):
         # Avoid constructing executable/report paths or starting a real child.

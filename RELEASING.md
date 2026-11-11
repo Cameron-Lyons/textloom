@@ -10,17 +10,131 @@ now reports clipboard operation failures instead of allowing a plain fallback
 to leave every QA error counter at zero. The Windows example uses
 `clipboard-win` 5.4.3 or later; 5.4.1 was yanked on 2026-10-23.
 
-Stable 1.0 still requires final platform signoff. In particular, physical
-keyboards, touch screens/touchpads, audible reader usability, display-scale
-transitions, macOS IMEs/VoiceOver, and untested reader
-or visual feature behavior remain open. Automated clipboard transport and
-external-renderer assertions do not establish these observations. Record
-unavailable checks explicitly rather than treating them as passes.
+Stable 1.0 still requires final platform signoff and correction of the known
+native integration failures. The scoped macOS hands-on confirmation below
+records the user's results; other platform evidence and unitemized protocol
+details remain open. Automated clipboard transport and external-renderer
+assertions do not establish physical-input or audible-reader usability.
+Record unavailable checks explicitly rather than treating them as passes.
 
 The [native dependency limitations](#native-dependency-limitations) distinguish
 known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
+
+### Verified candidate and macOS feedback, 2026-11-10
+
+Candidate `f7d3a655c6ec0bdd8e3d04aa5beff6ea109a5bcd` in
+[PR #19](https://github.com/Cameron-Lyons/textloom/pull/19) passes all nine
+[CI jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/42725926104)
+and both [native interaction jobs](https://github.com/Cameron-Lyons/textloom/actions/runs/42725926357).
+GitHub tested PR merge `b770e5b94283e572705d737e09b97f9b41951a4e`.
+The complete release command, Rust 1.95 feature matrix, minimum dependency
+versions, dependency policies, optimized tests, quick benchmarks, and package
+checks pass. All 78 QA-tool tests pass, including the foreground regressions.
+
+Downloaded artifacts match their recorded hashes and revision metadata.
+The Mac interaction report contains 70 passing checks, including 21 feature
+checks; the separate winit probe passes nine checks. Windows NVDA passes all
+15 checks. All 12 renderer reports across macOS, Linux X11, and Windows Mesa
+pass the strict validator with the expected modes and clipboard settings,
+graceful shutdown, zero errors, and matching TLFR round trips. Native-process
+and reader cleanup checks also pass. These automated reports retain their
+explicit manual, IME, audible-reader, and scale-transition limitations.
+
+The user tested the preserved `f7d3a65` native editor on macOS 27.3
+(26C5035r), then reported "it looks good" and confirmed "all of them" when
+asked about appearance/basic editing, Japanese/Chinese IMEs, VoiceOver,
+physical keyboard/touch, and display-scale changes. Those named categories
+are recorded as user-reported passes in the
+[macOS feedback record](https://github.com/Cameron-Lyons/textloom/blob/7b3d85b949fa065b41e3edfe864a812ad936d054/examples/native-editor/signoff/macos-f7d3a65-2026-11-10.txt).
+Individual protocol steps, input-source versions, reader commands, layouts,
+and scale values were not itemized. The T3 restart canceled the session before
+its native report finalized; the empty original report is retained locally.
+The feedback does not imply Windows/Linux or separate winit manual signoff.
+
+The package remains 1.0.0-rc.2. The Windows/X11/Orca failures listed below still
+require correction; no stable release, tag, or publication is claimed by this
+record. Source changes after the tested candidate require applicable checks.
+
+### Release hardening refreshed 2026-11-09
+
+This cleanup is based on merged main `205e2ee`, retaining its
+pending-`Unreleased` gate and 26 shell regressions. The preceding
+[CI run 41319846258](https://github.com/Cameron-Lyons/textloom/actions/runs/41319846258)
+and [native QA run 41319846228](https://github.com/Cameron-Lyons/textloom/actions/runs/41319846228)
+passed on PR #18 head `3d46bcb`. On cleanup head `bb8ffa5`, hosted
+[native QA run 42724892228](https://github.com/Cameron-Lyons/textloom/actions/runs/42724892228)
+passed Windows NVDA checks but failed macOS foreground activation after the
+external clipboard import passed. The failure occurred before input delivery;
+both apps were removed during cleanup, with the native session correctly
+recorded as not gracefully closed. The probe now retries this specific
+pre-input condition within its existing five-second limit and records the
+observed foreground PID. Regressions cover exactly-once editing after delayed
+activation, bounded failure without editing, and nonretryable uncertain
+delivery. The correction passed the subsequent hosted run recorded above.
+
+The README now provides a short installation and integration overview;
+`GUIDE.md` preserves the detailed
+contracts and is included in the verified Cargo package. Tagged checks reject
+empty, undated, and invalid-date changelog entries. Local release checks now
+include the QA-tool and headless cleanup regressions previously split across CI;
+POSIX-only cleanup tests explicitly skip on hosts without process-group signals.
+These changes do not alter the library's public API or editing implementation.
+
+The library, native example, and winit harness lock Tokio to the compatible
+1.53.3 patch, clearing
+[RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+The native example also replaces yanked `async-executor` 1.14.0 with 1.14.1.
+It updates `accesskit_unix` to 0.24.1 with compatible `accesskit` 0.25.2,
+`accesskit_atspi_common` 0.21.1, and `accesskit_consumer` 0.39.2 patches.
+The Unix patch fixes AT-SPI cache signal encoding and sorted adapter lookup.
+Its locked graph shares one AccessKit version and passes the Rust 1.95
+all-target host check and dependency policy. Subsequent Linux X11 renderer
+checks pass; these patches do not supply the missing Hypertext interface or
+establish Orca link/quote announcements.
+
+The VM command-line tool now preserves nonzero guest exits outside the host's
+one-byte status range. The new simulated-guest regression first reproduced a
+guest exit of 256 becoming host success; it now checks ordinary, large, and
+negative codes through the real job-server protocol. With the two foreground
+regressions, all 78 QA-tool tests and strict QA Clippy pass. The embedded
+AppleScript compiles with `osacompile` without executing native actions.
+
+`cargo-deny` passes advisories, bans, licenses, and sources for the library,
+native example, and QA tools under the existing policy. `cargo-audit` reports
+no vulnerabilities or yanked packages in the four lockfiles. It still reports
+upstream maintenance notices for the native example's transitive `zbus_names`,
+`zvariant`, and `zvariant_derive`; these are not suppressed in the audit evidence.
+
+Local validation uses macOS 27.3 (26C5035r), Apple Silicon, Rust 1.99.1, and
+the minimum Rust 1.95.0. Before the AccessKit and VM-tool fixes, the complete
+consolidated `check-release.sh --allow-dirty` passed on a working tree based on
+`27a930c`: all eight feature combinations, release-mode editing/search tests,
+native-host and QA-tool regressions, strict Clippy, warning-free rustdoc,
+quick benchmarks, headless examples, and packaged-source tests and consumer
+compilation. Stable/nightly formatting, workflow lint, and shell lint also pass.
+All-feature tests pass on 1.95.0, as do all-target
+checks of the native host and winit harness. The README and integration-guide
+Rust examples compile and pass. Core and adapter reviews found no additional
+production defect; an expanded independent Unicode search oracle passed on
+1,024 generated documents in all four search modes. No unused direct
+dependencies were found. After the AccessKit and VM-tool changes, the complete
+consolidated release check also passed on clean commit `bb8ffa5`, including
+the extracted package and native consumer. Its 131 tracked file hashes and
+verified package checksum are retained with the local evidence.
+
+Five 20-frame native renderer sessions built with Rust 1.95.0 pass strict report
+validation: default clipboard in editable, read-only, and disabled modes, and
+rich clipboard in read-only and disabled modes. All record graceful shutdown,
+zero errors, and matching TLFR snapshots. The executable hash and source label
+explicitly identify a working-tree build, not clean-commit platform signoff.
+No system-clipboard fixture or native interaction probe was run locally.
+Logs and reports are in `target/release-readiness-20261109/`.
+
+The package remains at 1.0.0-rc.2. Subsequent CI and the scoped macOS user
+confirmation are recorded above. Remaining platform/protocol evidence and
+the known native failures still prevent stable 1.0. Nothing has been published.
 
 ### Stable release readiness refreshed 2026-10-31
 
@@ -809,7 +923,9 @@ malformed-input regression tests when changing the codec.
    doctests, Clippy, documentation, benchmark smoke runs with
    `TEXTLOOM_BENCH_QUICK=1`, and headless examples. It also checks formatting
    and strict Clippy for the native host and its CLI/report/clipboard regression
-   tests without opening a window.
+   tests without opening a window. The same command checks QA-tool formatting,
+   tests, and Clippy, plus the headless macOS cleanup regressions;
+   Python 3 is required for those regression tests.
    It then runs all-feature tests and compiles
    every target from the extracted Cargo package. An explicit inventory check
    requires every packaged source, test, fixture, headless example, benchmark,
@@ -821,8 +937,9 @@ malformed-input regression tests when changing the codec.
    which needs nightly rustfmt for the Google Rust Style Guide's import and macro
    formatting options and covers every package in the repository. CI runs both.
 3. Review `cargo package --locked --list --allow-dirty`. Source, headless examples,
-   tests, fixtures, benchmark documentation, changelog, and license must be
-   included. The repository-only native host, workflows, and local build output
+   tests, fixtures, integration guide (`GUIDE.md`), benchmark documentation,
+   changelog, and license must be included. The repository-only native host,
+   workflows, and local build output
    must be absent. Include patterns are anchored to the package root so nested
    QA README/license files are excluded. The release script rejects repository-only
    directories in the extracted crate as well as requiring the intended inventory.

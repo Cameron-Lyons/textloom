@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Keep the README focused on installation and first use; preserve the detailed
+  editing, integration, and performance contracts in the packaged `GUIDE.md`.
+- Run QA-tool formatting, tests, and Clippy plus the headless macOS cleanup
+  regressions through `scripts/check-release.sh`, so local and CI release
+  checks use the same gate.
+- Replace the native example's yanked `async-executor` 1.14.0 lockfile entry
+  with the compatible 1.14.1 patch.
+- Update the native example to `accesskit_unix` 0.24.1 and its compatible
+  AccessKit patches, fixing AT-SPI cache signal encoding and adapter lookup.
+- The Windows VM CLI preserves failures whose guest exit codes do not fit
+  into the host's one-byte status; codes such as 256 previously wrapped to
+  success. In-range codes remain unchanged.
+- Native macOS QA retries delayed foreground activation within its existing
+  five-second limit before delivering input. Persistent activation failures,
+  wrong documents, and uncertain action delivery still fail the probe.
 - Refresh the library, native host, and winit harness lockfiles to Tokio 1.53.3,
   which fixes RUSTSEC-2026-0386. This transitive dependency is conditional on
   Emscripten's experimental Tokio integration and is inactive in native builds.
