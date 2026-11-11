@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Update all tracked lockfiles to `rustix` 1.1.6, fixing RUSTSEC-2026-0486.
 - Cache selected-link summaries independently from style summaries, avoiding
   repeated toolbar scans over unchanged selections.
 - Validate each adjacent HTML link target once across formatting changes,
