@@ -148,6 +148,7 @@ pub(super) fn paint_document(
             let end = rows.partition_point(|row| row.rect().top() <= bottom);
             VisibleParagraph {
                 layout,
+                unpainted: galley.clone(),
                 galley,
                 marker,
                 row_starts,
@@ -220,11 +221,12 @@ pub(super) fn paint_document(
             }
         }
     }
-    for paragraph in &visible {
+    for paragraph in &mut visible {
         let rect = paragraph.layout.rect.translate(origin.to_vec2());
         if !painter.clip_rect().intersects(rect) {
             continue;
         }
+        paragraph.finish_backgrounds();
         if let Some(marker) = &paragraph.marker {
             painter.galley(
                 origin + paragraph.layout.marker_position.to_vec2(),
@@ -293,6 +295,7 @@ fn visible_ranges<'a>(
 
 struct VisibleParagraph<'layout> {
     layout: ParagraphLayoutView<'layout>,
+    unpainted: Arc<Galley>,
     galley: Arc<Galley>,
     marker: Option<Arc<Galley>>,
     row_starts: Arc<[usize]>,
@@ -341,21 +344,38 @@ impl VisibleParagraph<'_> {
             if row.visuals.glyph_index_start == 0 {
                 painter.rect_filled(local.translate(offset + row.pos.to_vec2()), 0.0, color);
             } else {
-                splice_background(&mut self.galley, row_index, local, color);
+                append_background(&mut self.galley, row_index, local, color);
             }
+        }
+    }
+
+    fn finish_backgrounds(&mut self) {
+        // Appending each highlight is constant time. Move all added triangles
+        // behind the glyphs once per row, keeping the layers in paint order.
+        // Rotating after each match makes a heavily highlighted row quadratic.
+        let Some(galley) = Arc::get_mut(&mut self.galley) else {
+            return;
+        };
+        for index in self.rows.clone() {
+            let Some(row) = Arc::get_mut(&mut galley.rows[index].row) else {
+                continue;
+            };
+            let visuals = &mut row.visuals;
+            let added =
+                visuals.mesh.indices.len() - self.unpainted.rows[index].visuals.mesh.indices.len();
+            visuals.mesh.indices[visuals.glyph_index_start..].rotate_right(added);
+            visuals.glyph_index_start += added;
         }
     }
 }
 
-fn splice_background(galley: &mut Arc<Galley>, row_index: usize, rect: Rect, color: Color32) {
+fn append_background(galley: &mut Arc<Galley>, row_index: usize, rect: Rect, color: Color32) {
     let galley = Arc::make_mut(galley);
     let placed = &mut galley.rows[row_index];
     let row_bounds = rect.translate(placed.pos.to_vec2());
     let row = Arc::make_mut(&mut placed.row);
     let mesh = &mut row.visuals.mesh;
     mesh.add_colored_rect(rect, color);
-    mesh.indices[row.visuals.glyph_index_start..].rotate_right(6);
-    row.visuals.glyph_index_start += 6;
     row.visuals.mesh_bounds = row.visuals.mesh_bounds.union(rect);
     galley.mesh_bounds = galley.mesh_bounds.union(row_bounds);
     galley.num_vertices += 4;

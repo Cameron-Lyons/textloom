@@ -141,19 +141,21 @@ fn inline(output: &mut String, paragraph: &Paragraph) {
     if paragraph.text().is_empty() {
         output.push_str("<br>");
     }
+    let mut previous_link: Option<&Link> = None;
     let mut anchor: Option<&Link> = None;
     for span in paragraph.spans() {
-        let link = span.link.as_ref().filter(|link| is_safe_href(link));
-        if anchor != link {
+        let link = span.link.as_ref();
+        if previous_link != link {
             if anchor.is_some() {
                 output.push_str("</a>");
             }
-            if let Some(link) = link {
+            anchor = link.filter(|link| is_safe_href(link));
+            if let Some(link) = anchor {
                 output.push_str("<a href=\"");
                 escape(output, link.as_str());
                 output.push_str("\">");
             }
-            anchor = link;
+            previous_link = link;
         }
         let style = span.style;
         if style.bold {
@@ -216,7 +218,7 @@ fn inline(output: &mut String, paragraph: &Paragraph) {
 }
 
 fn is_safe_href(link: &Link) -> bool {
-    let target = link.as_str().trim();
+    let target = link.as_str().trim_start();
     !["javascript:", "vbscript:", "data:"].iter().any(|scheme| {
         target
             .get(..scheme.len())

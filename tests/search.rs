@@ -14,6 +14,84 @@ fn default_options() -> SearchOptions {
 }
 
 #[test]
+fn long_repetitive_multiline_queries_preserve_matches_navigation_and_replacement() {
+    let prefix = "A\nB\n".repeat(2_000);
+    // Many candidate starts agree with both edge lines and most middle lines.
+    let query = format!("A\n{}B\nC\nB", "B\nA\n".repeat(63));
+    let source = format!("{prefix}{query}\n{prefix}");
+    let expected = Position::new(4_000, 0)..Position::new(4_129, 1);
+    let document = Document::from_text(&source);
+    for case_sensitive in [true, false] {
+        for whole_word in [true, false] {
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word,
+            };
+            let query = if case_sensitive {
+                query.clone()
+            } else {
+                query.to_lowercase()
+            };
+            assert!(
+                Document::from_text(&prefix)
+                    .find(&query, options)
+                    .is_empty()
+            );
+            assert_eq!(
+                document.find(&query, options),
+                std::slice::from_ref(&expected)
+            );
+            let mut editor = Editor::new(document.clone());
+            assert!(editor.find_next(&query, options, SearchWrap::Stop).unwrap());
+            assert_eq!(editor.selection().range(), expected);
+            assert!(!editor.find_next(&query, options, SearchWrap::Stop).unwrap());
+            assert!(
+                editor
+                    .find_next(&query, options, SearchWrap::Around)
+                    .unwrap()
+            );
+            assert_eq!(editor.selection().range(), expected);
+
+            let end = editor.document().end();
+            editor.set_selection(Selection::caret(end)).unwrap();
+            assert!(
+                editor
+                    .find_previous(&query, options, SearchWrap::Stop)
+                    .unwrap()
+            );
+            assert_eq!(editor.selection().range(), expected);
+            assert!(
+                !editor
+                    .find_previous(&query, options, SearchWrap::Stop)
+                    .unwrap()
+            );
+            assert!(
+                editor
+                    .find_previous(&query, options, SearchWrap::Around)
+                    .unwrap()
+            );
+            assert_eq!(editor.selection().range(), expected);
+            assert!(
+                editor
+                    .replace_selected_match(&query, "done", options)
+                    .unwrap()
+            );
+            assert_eq!(
+                editor.document().plain_text(),
+                format!("{prefix}done\n{prefix}")
+            );
+            assert!(editor.undo());
+            assert_eq!(editor.document().plain_text(), source);
+            assert_eq!(editor.replace_all(&query, "done", options).unwrap(), 1);
+            assert_eq!(
+                editor.document().plain_text(),
+                format!("{prefix}done\n{prefix}")
+            );
+        }
+    }
+}
+
+#[test]
 fn literal_matches_are_ordered_nonoverlapping_and_empty_queries_match_nothing() {
     let document = Document::from_text("banana ana\nana");
     assert_eq!(

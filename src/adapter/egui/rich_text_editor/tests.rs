@@ -6512,6 +6512,110 @@ fn selection_is_spliced_between_code_backgrounds_and_glyphs() {
 }
 
 #[test]
+fn many_highlight_layers_preserve_geometry_and_paint_order_over_code() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text(&"match ".repeat(128));
+    editor.select_all();
+    editor
+        .apply_style(StylePatch {
+            code: Some(true),
+            underline: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let found = editor.document().find("match", SearchOptions::default());
+    let alternate: Vec<_> = found.iter().step_by(2).cloned().collect();
+    let mut appearance = appearance();
+    appearance.width = 100_000.0;
+    let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance);
+    let original = layouts.get(0).unwrap().galley;
+    assert_eq!(original.rows.len(), 1);
+    let colors = [
+        Color32::from_rgb(1, 2, 3),
+        Color32::from_rgb(4, 5, 6),
+        Color32::from_rgb(7, 8, 9),
+    ];
+    let mut cache = PaintCache::default();
+    for selection in [Some(editor.selection()), None] {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            paint::paint_document(
+                &ui.painter().with_clip_rect(Rect::EVERYTHING),
+                &mut cache,
+                editor.document(),
+                &layouts,
+                Pos2::ZERO,
+                &[
+                    BackgroundRanges {
+                        ranges: &found,
+                        fill: colors[0],
+                    },
+                    BackgroundRanges {
+                        ranges: &alternate,
+                        fill: colors[1],
+                    },
+                ],
+                selection,
+                colors[2],
+                &appearance.font.family,
+                appearance.color,
+                Color32::GRAY,
+            );
+        });
+        output.textures_delta.clear();
+        let painted = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(&text.galley),
+                _ => None,
+            })
+            .unwrap();
+        let row = &painted.rows[0];
+        let mesh = &row.visuals.mesh;
+        let base = &original.rows[0].visuals;
+        assert_eq!(
+            &mesh.indices[..base.glyph_index_start],
+            &base.mesh.indices[..base.glyph_index_start],
+            "code backgrounds retain their original paint order"
+        );
+        assert_eq!(
+            &mesh.indices[row.visuals.glyph_index_start..],
+            &base.mesh.indices[base.glyph_index_start..],
+            "glyphs and underlines stay above every highlight"
+        );
+        let selection_range = selection.map(Selection::range);
+        let expected = found
+            .iter()
+            .map(|range| (range, colors[0]))
+            .chain(alternate.iter().map(|range| (range, colors[1])))
+            .chain(selection_range.iter().map(|range| (range, colors[2])));
+        let (quads, remainder) =
+            mesh.indices[base.glyph_index_start..row.visuals.glyph_index_start].as_chunks::<6>();
+        assert!(remainder.is_empty());
+        assert_eq!(
+            quads.len(),
+            found.len() + alternate.len() + usize::from(selection.is_some())
+        );
+        for (indices, (range, color)) in quads.iter().zip(expected) {
+            let mut bounds = Rect::NOTHING;
+            for &index in indices {
+                let vertex = &mesh.vertices[index as usize];
+                assert_eq!(vertex.color, color);
+                bounds.extend_with(vertex.pos);
+            }
+            assert_eq!(bounds.left(), row.x_offset(CharIndex(range.start.byte)));
+            assert_eq!(bounds.right(), row.x_offset(CharIndex(range.end.byte)));
+            assert_eq!(bounds.height(), row.size.y);
+        }
+        assert_eq!(
+            &mesh.vertices[..base.mesh.vertices.len()],
+            base.mesh.vertices.as_slice(),
+            "highlighting must not alter original glyph geometry"
+        );
+    }
+}
+
+#[test]
 fn fills_paint_behind_glyphs_replace_code_backgrounds_and_keep_selection_visible() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("plain fill code");
@@ -9337,6 +9441,57 @@ fn linked_widget_editor() -> (Editor, Link) {
     editor.set_link(Some(link.clone())).unwrap();
     editor.set_selection(Selection::default()).unwrap();
     (editor, link)
+}
+
+#[test]
+fn stationary_link_hover_tracks_link_edits_and_undo() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("Visit example now");
+    let (_, widget) = link_frame(&context, &mut editor, vec![], 0.0, Modifiers::NONE, true);
+    let point = caret_point(&context, widget.response.rect, &editor, Position::new(0, 8));
+    let link = Link::try_new("https://example.com/docs").unwrap();
+    for (step, linked) in [false, true, false, true, false].into_iter().enumerate() {
+        match step {
+            1 | 2 => {
+                editor
+                    .set_selection(Selection::new(Position::new(0, 6), Position::new(0, 13)))
+                    .unwrap();
+                editor.set_link(linked.then(|| link.clone())).unwrap();
+            }
+            3 => assert!(editor.undo()),
+            4 => assert!(editor.redo()),
+            _ => {}
+        }
+        let events = if step == 0 {
+            vec![Event::PointerMoved(point)]
+        } else {
+            vec![]
+        };
+        let (output, _) = link_frame(
+            &context,
+            &mut editor,
+            events,
+            step as f64 + 1.0,
+            Modifiers::NONE,
+            true,
+        );
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            if linked {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Text
+            },
+            "step {step}"
+        );
+        let layouts = widget_cache(&context).layout.layouts;
+        let origin = widget.response.rect.min + Vec2::splat(PADDING);
+        assert_eq!(
+            navigation::link_at_point(editor.document(), &layouts, point - origin),
+            linked.then(|| link.clone()),
+            "step {step}"
+        );
+    }
 }
 
 #[test]

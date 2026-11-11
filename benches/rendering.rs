@@ -99,6 +99,7 @@ fn frame_config(
 }
 
 fn main() {
+    routed_pointer_frames();
     for paragraphs in [100, 10_000] {
         let source = document_text(paragraphs);
         let mut editor = Editor::from_text(&source);
@@ -196,12 +197,44 @@ fn main() {
         );
     }
     formatted_idle_frames();
+    formatted_hover_frames();
+    highlighted_code_frames();
     accessibility_frames();
     formatted_accessibility_frames();
     native_preedit_frames();
     long_preedit_frames();
     batched_typing_frames();
     initialization_and_invalidation_frames();
+}
+
+/// Measures ordinary batches through the installed input-routing plugin,
+/// without layout or editing work hiding the cost of routing the events.
+fn routed_pointer_frames() {
+    for count in [1, 32, 1_024] {
+        let context = egui::Context::default();
+        textloom::adapter::egui::install_input_routing(&context);
+        let events = vec![egui::Event::PointerMoved(egui::Pos2::new(20.0, 30.0)); count];
+        let render = || {
+            let output = context.run_ui(
+                egui::RawInput {
+                    events: events.clone(),
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            hint::black_box(output).drop_without_applying_deltas();
+        };
+        for _ in 0..5 {
+            render();
+        }
+        let iterations = scaled(1_000);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            render();
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        println!("{count:>6} pointer events: {elapsed:.2} µs / routed frame");
+    }
 }
 
 fn initialization_and_invalidation_frames() {
@@ -429,6 +462,56 @@ fn formatted_idle_frames() {
     }
 }
 
+/// Keeps the pointer over the last glyph of a long, unlinked row. Link hover
+/// should not scan its glyphs or its many formatting spans on each idle frame.
+fn formatted_hover_frames() {
+    for count in [1_000, 16_000, 64_000] {
+        let mut editor = formatted_editor(count);
+        editor
+            .set_selection(Selection::caret(editor.document().end()))
+            .expect("the document end is always valid");
+        let context = egui::Context::default();
+        let render = |editor: &mut Editor, pointer: Option<egui::Pos2>| {
+            let mut caret = egui::Pos2::ZERO;
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(count as f32 * 24.0 + 100.0, 100.0),
+                    )),
+                    events: pointer.into_iter().map(egui::Event::PointerMoved).collect(),
+                    ..Default::default()
+                },
+                |ui| {
+                    let result = RichTextEditor::new(editor)
+                        .id(egui::Id::unique("hover-bench"))
+                        .show(ui);
+                    assert!(result.errors.is_empty());
+                    assert!(result.accessibility_errors.is_empty());
+                    if pointer.is_some() {
+                        assert!(result.response.hovered());
+                    }
+                    caret = result.caret_rect.center();
+                    hint::black_box(result);
+                },
+            );
+            hint::black_box(output).drop_without_applying_deltas();
+            caret
+        };
+        let pointer = render(&mut editor, None) - egui::vec2(1.0, 0.0);
+        for _ in 0..5 {
+            render(&mut editor, Some(pointer));
+        }
+        let iterations = scaled(1_000);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            render(&mut editor, Some(pointer));
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        println!("{count:>6} styled spans: {elapsed:.2} µs / unlinked hover frame");
+    }
+}
+
 fn formatted_accessibility_frames() {
     use textloom::{Color, StylePatch};
 
@@ -468,6 +551,59 @@ fn formatted_accessibility_frames() {
             "recoloring should not change the text"
         );
         println!("{count:>6} styled spans: {elapsed:.2} µs / accessible formatting edit + frame");
+    }
+}
+
+/// Exercises many search highlights on one wide code row. Each frame must put
+/// all matches above the code fill and below the glyphs without repeatedly
+/// moving the whole row's triangle buffer.
+fn highlighted_code_frames() {
+    for count in [100, 1_000, 4_000] {
+        let mut editor = Editor::from_text(&"x ".repeat(count));
+        editor.select_all();
+        editor
+            .apply_style(textloom::StylePatch {
+                code: Some(true),
+                ..Default::default()
+            })
+            .expect(NO_COMPOSITION);
+        editor
+            .set_selection(Selection::default())
+            .expect("the document start is always valid");
+        let ranges = editor.document().find("x", Default::default());
+        assert_eq!(ranges.len(), count);
+        let context = egui::Context::default();
+        let mut render = || {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(count as f32 * 24.0 + 100.0, 100.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let result = RichTextEditor::new(&mut editor)
+                        .id(egui::Id::unique("highlight-bench"))
+                        .highlight_ranges(&ranges, egui::Color32::YELLOW)
+                        .show(ui);
+                    assert!(result.errors.is_empty());
+                    assert!(result.accessibility_errors.is_empty());
+                    hint::black_box(result);
+                },
+            );
+            hint::black_box(output).drop_without_applying_deltas();
+        };
+        for _ in 0..5 {
+            render();
+        }
+        let iterations = scaled(200);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            render();
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        println!("{count:>6} code highlights: {elapsed:.2} µs / retained frame");
     }
 }
 

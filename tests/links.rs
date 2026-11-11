@@ -768,6 +768,49 @@ fn html_wraps_each_link_once_and_drops_script_and_data_targets() {
 }
 
 #[test]
+fn html_link_transitions_preserve_styles_and_do_not_merge_across_blocked_targets() {
+    let safe = "https://example.com/?q=1&v=2";
+    let blocked = "  JAVASCRIPT:alert(1)  ";
+    let targets = [
+        Some(safe),
+        Some(safe),
+        Some(blocked),
+        Some(blocked),
+        None,
+        Some(safe),
+        Some("mailto:a@b"),
+        Some("mailto:a@b"),
+        Some("data:,text"),
+        Some(safe),
+    ];
+    let spans = targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            Span::new(
+                index..index + 1,
+                InlineStyle {
+                    bold: index % 2 == 0,
+                    ..InlineStyle::default()
+                },
+                // Equal targets use separate allocations, as an importer may provide.
+                target.map(link),
+            )
+        })
+        .collect();
+    let paragraph = Paragraph::try_new("abcdefghij", spans, ParagraphKind::Body).unwrap();
+    let document = Document::from_paragraphs([paragraph]);
+    let expected = "<div style=\"white-space:pre-wrap\"><p>\
+        <a href=\"https://example.com/?q=1&amp;v=2\"><strong>a</strong>b</a>\
+        <strong>c</strong>d<strong>e</strong>\
+        <a href=\"https://example.com/?q=1&amp;v=2\">f</a>\
+        <a href=\"mailto:a@b\"><strong>g</strong>h</a>\
+        <strong>i</strong><a href=\"https://example.com/?q=1&amp;v=2\">j</a></p></div>";
+    assert_eq!(document.to_html(), expected);
+    assert_eq!(Fragment::from_document(&document).to_html(), expected);
+}
+
+#[test]
 fn joined_graphemes_take_the_link_of_their_first_scalar() {
     let target = Some("https://example.com");
     let mut editor = linked_editor();

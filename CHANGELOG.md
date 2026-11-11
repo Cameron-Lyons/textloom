@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Cache selected-link summaries independently from style summaries, avoiding
+  repeated toolbar scans over unchanged selections.
+- Validate each adjacent HTML link target once across formatting changes,
+  including blocked schemes, instead of rescanning it for every span.
+- Preserve ordinary egui input buffers when no queued focus or clipboard
+  routing is needed, avoiding two temporary event collections per batch.
+- Filter control characters without rescanning the already validated prefix
+  of pasted, typed, or IME-committed text.
+- Share the immutable saved-state paragraph list between editor clones, avoiding
+  a second document-wide copy while keeping save tracking independent.
+- Skip link hit-testing in paragraphs without links, keeping idle hover work
+  independent of their text and formatting size.
+- Use optimized character searches when validating imported paragraph text,
+  and reuse cached word offsets without copying them for accessibility updates.
+- Bound the paragraph-local multiline search path so long, repetitive queries
+  use the linear text matcher instead of repeatedly comparing the same paragraphs.
+- Egui batches highlight geometry before placing it behind text, avoiding
+  repeated mesh rearrangement for rows with many search matches.
+- Build replacement paragraphs directly from a newline iterator, removing a
+  temporary allocation from typing and deletion.
 - Keep the README focused on installation and first use; preserve the detailed
   editing, integration, and performance contracts in the packaged `GUIDE.md`.
 - Run QA-tool formatting, tests, and Clippy plus the headless macOS cleanup

@@ -9,8 +9,8 @@
 use std::time::{Duration, Instant};
 use std::{env, hint, slice};
 use textloom::{
-    Document, Editor, Fragment, HistoryLimits, Link, Movement, ParagraphKind, Position,
-    SearchOptions, SearchWrap, Selection, SelectionMode, StylePatch,
+    Document, Editor, Fragment, HistoryLimits, InlineStyle, Link, Movement, Paragraph,
+    ParagraphKind, Position, SearchOptions, SearchWrap, Selection, SelectionMode, Span, StylePatch,
 };
 
 /// `expect` message for editing calls, which fail only while an IME
@@ -31,6 +31,7 @@ fn main() {
     fragment_capture();
     numbering_cache();
     saved_state_checks();
+    editor_snapshots();
     serialization();
     formatting();
     caret_link_queries();
@@ -41,6 +42,7 @@ fn main() {
     contextual_unicode_search();
     ascii_navigation();
     literal_search();
+    repetitive_multiline_search();
     sparse_whole_word_search();
     search_navigation();
     long_literal_navigation();
@@ -196,6 +198,19 @@ fn saved_state_checks() {
     }
 }
 
+fn editor_snapshots() {
+    for paragraphs in [100, 100_000] {
+        let editor = Editor::from_text(&"A short paragraph with café.\n".repeat(paragraphs));
+        measure(
+            &format!("{paragraphs} paragraphs editor clone"),
+            200,
+            || {
+                hint::black_box(editor.clone());
+            },
+        );
+    }
+}
+
 fn paragraph_import() {
     let source = "A short paragraph with Unicode café 👩\u{200d}💻.\n".repeat(100_000);
     let bytes = Document::from_text(&source).to_bytes();
@@ -222,22 +237,40 @@ fn paragraph_import() {
         );
         hint::black_box(document);
     });
-    let source = "café 👩\u{200d}💻. ".repeat(100_000);
-    let bytes = Document::from_text(&source).to_bytes();
-    measure("long Unicode paragraph snapshot import", 50, || {
-        let document = Document::from_bytes(hint::black_box(&bytes)).expect(OWN_SNAPSHOT);
-        assert_eq!(
-            document.paragraphs().len(),
-            1,
-            "the source text has no newlines"
+    for (label, phrase) in [
+        ("ASCII", "An ordinary paragraph. "),
+        ("Unicode", "café 👩\u{200d}💻. "),
+    ] {
+        let source = phrase.repeat(100_000);
+        let bytes = Document::from_text(&source).to_bytes();
+        measure(
+            &format!("long {label} paragraph snapshot import"),
+            50,
+            || {
+                let document = Document::from_bytes(hint::black_box(&bytes)).expect(OWN_SNAPSHOT);
+                assert_eq!(
+                    document.paragraphs().len(),
+                    1,
+                    "the source text has no newlines"
+                );
+                assert_eq!(
+                    document.paragraphs()[0].text().len(),
+                    source.len(),
+                    "the snapshot should keep the whole paragraph"
+                );
+                hint::black_box(document);
+            },
         );
-        assert_eq!(
-            document.paragraphs()[0].text().len(),
-            source.len(),
-            "the snapshot should keep the whole paragraph"
-        );
-        hint::black_box(document);
-    });
+        measure(&format!("long {label} paragraph construction"), 50, || {
+            let paragraph = Paragraph::try_new(
+                hint::black_box(&source),
+                vec![Span::new(0..source.len(), InlineStyle::default(), None)],
+                ParagraphKind::Body,
+            )
+            .expect("the source has no paragraph breaks and one span covering all its text");
+            hint::black_box(paragraph);
+        });
+    }
 }
 
 fn serialization() {
@@ -285,6 +318,30 @@ fn serialization() {
         document,
         "the native snapshot should round-trip styled spans losslessly"
     );
+
+    let mut linked = Editor::new(styled_repetitions("x", 10_000));
+    linked.select_all();
+    for (label, target, padding, anchors) in [
+        ("ordinary", "https://example.com", 0, 1),
+        ("padded", "https://example.com", 10_000, 1),
+        ("blocked padded", "javascript:alert(1)", 10_000, 0),
+    ] {
+        let padding = " ".repeat(padding);
+        let link = Link::try_new(&format!("{padding}{target}{padding}"))
+            .expect("the link is under 64 KiB and has no control characters");
+        linked.set_link(Some(link)).expect(NO_COMPOSITION);
+        let expected_html = linked.document().to_html();
+        assert_eq!(expected_html.matches("<a href=").count(), anchors);
+        measure(
+            &format!("10000 styled spans shared {label} link HTML export"),
+            100,
+            || {
+                let html = hint::black_box(linked.document()).to_html();
+                assert_eq!(html.len(), expected_html.len());
+                hint::black_box(html);
+            },
+        );
+    }
 }
 
 /// Returns a one-paragraph document of `phrase` repeated `repetitions` times,
@@ -317,6 +374,18 @@ fn caret_link_queries() {
         editor.select_all();
         editor.set_link(Some(target.clone())).expect(NO_COMPOSITION);
         editor.clear_history();
+        assert_eq!(
+            editor.selected_link(),
+            Some(target.clone()),
+            "all selected spans share one link"
+        );
+        measure(
+            &format!("{repetitions} linked styled spans repeated selection target"),
+            20_000,
+            || {
+                hint::black_box(hint::black_box(&editor).selected_link());
+            },
+        );
         for (label, byte) in [
             ("start", 0),
             ("middle", repetitions),
@@ -997,6 +1066,31 @@ fn literal_search() {
             "every paragraph is shorter than the needle"
         );
     });
+}
+
+fn repetitive_multiline_search() {
+    let document = Document::from_text(&"a\nb\n".repeat(8_000));
+    let query = format!("a\n{}b\nc\nb", "b\na\n".repeat(1_999));
+    for case_sensitive in [true, false] {
+        let options = SearchOptions {
+            case_sensitive,
+            whole_word: false,
+        };
+        measure(
+            if case_sensitive {
+                "16000 paragraphs repetitive multiline literal miss"
+            } else {
+                "16000 paragraphs repetitive multiline lowercase miss"
+            },
+            100,
+            || {
+                assert!(
+                    document.find(hint::black_box(&query), options).is_empty(),
+                    "repeated edge and middle lines never match the query's c line"
+                );
+            },
+        );
+    }
 }
 
 fn batch_replacement() {

@@ -65,6 +65,52 @@ fn invalid_selection_is_atomic() {
 }
 
 #[test]
+fn selected_links_follow_range_changes_clone_edits_and_history() {
+    use textloom::Link;
+
+    let first = Link::try_new("https://first.example").unwrap();
+    let second = Link::try_new("https://second.example").unwrap();
+    let mut editor = Editor::from_text("left\n\nright");
+    editor.select_all();
+    editor.set_link(Some(first.clone())).unwrap();
+    editor.clear_history();
+    for _ in 0..2 {
+        assert_eq!(editor.selected_link(), Some(first.clone()));
+    }
+    let all = editor.selection();
+    editor
+        .set_selection(Selection::new(all.focus, all.anchor))
+        .unwrap();
+    assert_eq!(editor.selected_link(), Some(first.clone()));
+
+    let mut branch = editor.clone();
+    branch.set_link(Some(second.clone())).unwrap();
+    assert_eq!(branch.selected_link(), Some(second.clone()));
+    assert_eq!(editor.selected_link(), Some(first.clone()));
+    editor
+        .set_selection(Selection::new(Position::new(0, 4), Position::new(2, 0)))
+        .unwrap();
+    assert_eq!(editor.selected_link(), None);
+    editor.select_all();
+    assert_eq!(editor.selected_link(), Some(first.clone()));
+
+    editor.set_link(None).unwrap();
+    assert_eq!(editor.selected_link(), None);
+    assert!(editor.undo());
+    assert_eq!(editor.selected_link(), Some(first));
+    assert!(editor.redo());
+    assert_eq!(editor.selected_link(), None);
+    let result: Result<(), Error> = editor.transaction(|editor| {
+        editor.set_link(Some(second.clone()))?;
+        assert_eq!(editor.selected_link(), Some(second.clone()));
+        Err(Error::InvalidRange)
+    });
+    assert_eq!(result, Err(Error::InvalidRange));
+    assert_eq!(editor.selected_link(), None);
+    assert_eq!(branch.selected_link(), Some(second));
+}
+
+#[test]
 fn style_lookup_rejects_invalid_utf8_and_grapheme_positions() {
     let mut editor = Editor::from_text("é e\u{301} 👩\u{200d}💻");
     editor.select_all();

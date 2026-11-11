@@ -121,6 +121,39 @@ fn plain_paste_key() -> Event {
 }
 
 #[test]
+fn ordinary_batches_preserve_event_storage_and_starting_modifiers() {
+    use egui::{Modifiers, Plugin};
+
+    let ctx = Context::default();
+    ctx.run_ui(raw(vec![Event::ModifiersChanged(Modifiers::SHIFT)]), |_| {})
+        .drop_without_applying_deltas();
+    let owner = Id::unique("ordinary-focus");
+    ctx.memory_mut(|memory| memory.request_focus(owner));
+    let mut routing = InputRouting::default();
+    let expected = vec![
+        Event::ModifiersChanged(Modifiers::NONE),
+        Event::Text("typed café".into()),
+        Event::Paste("pasted text".into()),
+        Event::PointerMoved(Pos2::new(50.0, 60.0)),
+        plain_paste_key(),
+    ];
+    let mut input = raw(expected.clone());
+    input.events.reserve(64);
+    let pointer = input.events.as_ptr();
+    let capacity = input.events.capacity();
+    routing.input_hook(&ctx, &mut input);
+    assert_eq!(input.events, expected);
+    assert_eq!(input.events.as_ptr(), pointer);
+    assert_eq!(input.events.capacity(), capacity);
+    let pass = routing.passes.last().unwrap();
+    assert_eq!(pass.modifiers, Modifiers::SHIFT);
+    assert_eq!(pass.viewport, ViewportId::ROOT);
+    assert_eq!(routing.focused[&ViewportId::ROOT], Some(owner));
+    assert!(routing.pending.is_empty());
+    assert!(routing.paste_requests.is_empty());
+}
+
+#[test]
 fn plain_paste_reply_keeps_its_owner_through_queued_focus_passes() {
     for max_passes in [1, 2, 8] {
         let ctx = context(max_passes);

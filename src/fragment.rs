@@ -330,7 +330,8 @@ impl Fragment {
             let length = input.length()?;
             let text =
                 str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidUtf8)?;
-            if text.contains(['\r', '\n']) {
+            // Separate searches avoid decoding every scalar just to find ASCII line breaks.
+            if text.contains('\r') || text.contains('\n') {
                 return Err(FragmentError::InvalidParagraphText);
             }
             let text = match (format, text.contains('\u{2029}')) {

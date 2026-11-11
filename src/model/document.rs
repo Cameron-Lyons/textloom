@@ -525,7 +525,7 @@ impl Document {
         let text = normalize_newlines(text);
         let first = &self.paragraphs[range.start.paragraph];
         let last = &self.paragraphs[range.end.paragraph];
-        let chunks: Vec<&str> = text.split('\n').collect();
+        let mut chunks = text.split('\n').peekable();
         let leading = removes_leading_paragraph(&range);
         let base = kind.unwrap_or_else(|| {
             if leading {
@@ -534,11 +534,12 @@ impl Document {
                 first.kind
             }
         });
-        let mut after = Vec::with_capacity(chunks.len());
+        let mut after = Vec::with_capacity(1);
         let mut insertion_end = 0;
-        for (index, chunk) in chunks.iter().enumerate() {
+        while let Some(chunk) = chunks.next() {
+            let index = after.len();
             let is_first = index == 0;
-            let is_last = index + 1 == chunks.len();
+            let is_last = chunks.peek().is_none();
             let kind = if is_first {
                 base
             } else if is_last {
