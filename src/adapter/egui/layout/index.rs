@@ -51,6 +51,7 @@ impl Entry {
         let offset = egui::vec2(0.0, y as f32);
         ParagraphLayoutView {
             galley: &layout.galley,
+            row_index: &layout.row_index,
             rect: layout.rect.translate(offset),
             marker: layout.marker.as_ref(),
             marker_position: layout.marker_position + offset,

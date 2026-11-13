@@ -459,6 +459,17 @@ impl Paragraph {
             .segment(byte)
     }
 
+    pub(crate) fn cached_word_boundary(&self, byte: usize) -> Option<bool> {
+        Some(self.indices.get()?.word_boundaries.get()?.contains(byte))
+    }
+
+    pub(crate) fn indexed_word_boundary(&self, byte: usize) -> bool {
+        self.text_indices()
+            .word_boundaries
+            .get_or_init(|| super::words::WordSelectionIndex::new(&self.text))
+            .contains(byte)
+    }
+
     pub(super) fn word_ranges(&self) -> &[Range<usize>] {
         self.text_indices()
             .words

@@ -1587,7 +1587,7 @@ fn execute(vm: &Vm, action: Action) -> Result<ExitCode> {
 }
 
 /// The `winvm` command.
-#[must_use]
+#[must_use = "return the command's exit status from main"]
 pub fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments.is_empty()

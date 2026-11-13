@@ -1747,7 +1747,7 @@ fn disposable_hosted_runner(
 }
 
 /// The `macos-interaction` command.
-#[must_use]
+#[must_use = "return the command's exit status from main"]
 pub fn main() -> ExitCode {
     // Check every marker before querying Accessibility, touching the clipboard,
     // or launching applications. GITHUB_ACTIONS is also set on self-hosted Macs.

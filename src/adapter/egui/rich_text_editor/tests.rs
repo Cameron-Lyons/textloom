@@ -1524,6 +1524,19 @@ fn cached_layout_frame(
             layouts = cache.layout(ui, editor, appearance);
         })
         .drop_without_applying_deltas();
+    for layout in layouts.iter() {
+        let mut offset = 0;
+        for (index, row) in layout.galley.rows.iter().enumerate() {
+            assert_eq!(layout.row_index.offset(&layout.galley, index), offset);
+            offset += row.char_count_including_newline().0;
+        }
+        assert_eq!(
+            layout
+                .row_index
+                .offset(&layout.galley, layout.galley.rows.len()),
+            offset
+        );
+    }
     layouts
 }
 
@@ -6536,7 +6549,14 @@ fn many_highlight_layers_preserve_geometry_and_paint_order_over_code() {
         Color32::from_rgb(7, 8, 9),
     ];
     let mut cache = PaintCache::default();
-    for selection in [Some(editor.selection()), None] {
+    let mut previous: Option<(Option<Selection>, Arc<egui::Galley>)> = None;
+    for selection in [
+        Some(editor.selection()),
+        Some(editor.selection()),
+        None,
+        None,
+        Some(editor.selection()),
+    ] {
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             paint::paint_document(
                 &ui.painter().with_clip_rect(Rect::EVERYTHING),
@@ -6570,6 +6590,15 @@ fn many_highlight_layers_preserve_geometry_and_paint_order_over_code() {
                 _ => None,
             })
             .unwrap();
+        if let Some((earlier_selection, earlier)) = &previous
+            && *earlier_selection == selection
+        {
+            assert!(
+                Arc::ptr_eq(earlier, painted),
+                "unchanged layers reuse the prepared galley"
+            );
+        }
+        previous = Some((selection, painted.clone()));
         let row = &painted.rows[0];
         let mesh = &row.visuals.mesh;
         let base = &original.rows[0].visuals;
@@ -6613,6 +6642,244 @@ fn many_highlight_layers_preserve_geometry_and_paint_order_over_code() {
             "highlighting must not alter original glyph geometry"
         );
     }
+}
+
+#[test]
+fn retained_styled_backgrounds_match_full_meshes_through_clipping_and_layer_changes() {
+    let context = egui::Context::default();
+    let text = "office café 👩\u{200d}💻 match\u{2028}".repeat(16);
+    let mut editor = Editor::from_text(&format!("{text}\n{text}"));
+    editor.select_all();
+    editor
+        .apply_style(StylePatch {
+            background: Some(Some(Color::YELLOW)),
+            underline: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut appearance = appearance();
+    appearance.width = 130.0;
+    let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance);
+    let found = editor.document().find("match", SearchOptions::default());
+    let alternates: Vec<_> = found.iter().step_by(2).cloned().collect();
+    let colors = [
+        Color32::from_rgb(1, 2, 3),
+        Color32::from_rgb(4, 5, 6),
+        Color32::from_rgb(7, 8, 9),
+    ];
+    let paint = |cache: &mut PaintCache,
+                 clip,
+                 origin,
+                 selection,
+                 layers: &[BackgroundRanges<'_>],
+                 selection_color| {
+        context.run_ui(egui::RawInput::default(), |ui| {
+            paint::paint_document(
+                &ui.painter().with_clip_rect(clip),
+                cache,
+                editor.document(),
+                &layouts,
+                origin,
+                layers,
+                selection,
+                selection_color,
+                &appearance.font.family,
+                appearance.color,
+                Color32::GRAY,
+            );
+        })
+    };
+    let meshes = |mut output: egui::FullOutput, clip| {
+        for shape in &mut output.shapes {
+            shape.clip_rect = clip;
+        }
+        output.textures_delta.clear();
+        context
+            .tessellate(output.shapes, output.pixels_per_point)
+            .into_iter()
+            .map(|primitive| {
+                let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                    panic!("text painting does not add callbacks");
+                };
+                (primitive.clip_rect, mesh)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut retained = PaintCache::default();
+    for (step, selection) in [
+        Some(editor.selection()),
+        None,
+        Some(Selection::new(Position::new(0, 2), Position::new(0, 3))),
+        Some(Selection::new(Position::new(0, 3), Position::new(1, 2))),
+        None,
+        Some(editor.selection()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let layers = [
+            BackgroundRanges {
+                ranges: &found,
+                fill: colors[step % 2],
+            },
+            BackgroundRanges {
+                ranges: &alternates,
+                fill: colors[(step + 1) % 2],
+            },
+        ];
+        let layers = if step == 4 { &[][..] } else { &layers[..] };
+        let origin = Pos2::new(10.0 + step as f32, 30.0 - step as f32 * 5.0);
+        let mut full = paint(
+            &mut PaintCache::default(),
+            Rect::EVERYTHING,
+            origin,
+            selection,
+            layers,
+            colors[2],
+        );
+        full.textures_delta.clear();
+        for shape in &full.shapes {
+            let egui::epaint::Shape::Text(text) = &shape.shape else {
+                continue;
+            };
+            assert_eq!(
+                text.galley.num_vertices,
+                text.galley
+                    .rows
+                    .iter()
+                    .map(|row| row.visuals.mesh.vertices.len())
+                    .sum()
+            );
+            assert_eq!(
+                text.galley.num_indices,
+                text.galley
+                    .rows
+                    .iter()
+                    .map(|row| row.visuals.mesh.indices.len())
+                    .sum()
+            );
+        }
+        if step == 2 {
+            let painted = full
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(&text.galley),
+                    _ => None,
+                })
+                .unwrap();
+            let bounds = painted.rows[0]
+                .visuals
+                .mesh
+                .vertices
+                .iter()
+                .filter(|vertex| vertex.color == colors[2])
+                .fold(Rect::NOTHING, |mut bounds, vertex| {
+                    bounds.extend_with(vertex.pos);
+                    bounds
+                });
+            let original = layouts.get(0).unwrap();
+            let row = &original.galley.rows[0];
+            assert!(
+                bounds.width() > 0.0,
+                "selection inside ffi must not collapse"
+            );
+            assert_eq!(bounds.left(), row.x_offset(CharIndex(2)));
+            assert_eq!(bounds.right(), row.x_offset(CharIndex(3)));
+        }
+        let rows = layouts.get(0).unwrap().galley;
+        for row in [0, 1, 8, rows.rows.len() - 1] {
+            for paragraph in 0..2 {
+                let top =
+                    layouts.get(paragraph).unwrap().rect.top() + origin.y + rows.rows[row].min_y();
+                let clip = Rect::from_min_size(Pos2::new(0.0, top + 0.5), Vec2::new(500.0, 30.0));
+                let expected = meshes(full.clone(), clip);
+                assert!(!expected.is_empty());
+                for _ in 0..2 {
+                    let clipped = paint(&mut retained, clip, origin, selection, layers, colors[2]);
+                    assert_eq!(
+                        meshes(clipped, clip),
+                        expected,
+                        "step={step}, paragraph={paragraph}, row={row}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_styled_backgrounds_refresh_when_the_atlas_is_recreated() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("office café 👩\u{200d}💻");
+    editor.select_all();
+    editor
+        .apply_style(StylePatch {
+            background: Some(Some(Color::YELLOW)),
+            ..Default::default()
+        })
+        .unwrap();
+    let appearance = appearance();
+    let layouts = cached_layout_frame(&context, &mut Cache::default(), &editor, &appearance);
+    let paint = |cache: &mut PaintCache| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            paint::paint_document(
+                &ui.painter().with_clip_rect(Rect::EVERYTHING),
+                cache,
+                editor.document(),
+                &layouts,
+                Pos2::ZERO,
+                &[],
+                Some(editor.selection()),
+                Color32::LIGHT_BLUE,
+                &appearance.font.family,
+                appearance.color,
+                Color32::GRAY,
+            );
+        });
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .find_map(|shape| match shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let mut retained = PaintCache::default();
+    let before = paint(&mut retained);
+    assert!(Arc::ptr_eq(&before, &paint(&mut retained)));
+    let mut fill = 0.0;
+    context
+        .run_ui(egui::RawInput::default(), |ui| {
+            let letters: String = ('A'..='Z').chain('a'..='z').collect();
+            for size in [150.0, 170.0, 190.0, 210.0, 230.0, 250.0] {
+                ui.label(egui::RichText::new(&letters).font(FontId::proportional(size)));
+            }
+            fill = ui.fonts(|fonts| fonts.font_atlas_fill_ratio());
+        })
+        .drop_without_applying_deltas();
+    assert!(fill > 0.8);
+    context
+        .run_ui(egui::RawInput::default(), |ui| {
+            ui.label(egui::RichText::new("WXYZ").font(FontId::proportional(64.0)));
+            fill = ui.fonts(|fonts| fonts.font_atlas_fill_ratio());
+        })
+        .drop_without_applying_deltas();
+    assert!(fill < 0.8, "the full atlas must have been recreated");
+    let after = paint(&mut retained);
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert_eq!(after, paint(&mut PaintCache::default()));
+    let uvs = |galley: &egui::Galley| {
+        galley
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.uv_rect))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(uvs(&before), uvs(&after));
+    assert!(Arc::ptr_eq(&after, &paint(&mut retained)));
 }
 
 #[test]
@@ -6950,11 +7217,187 @@ fn output_reports_caret_and_selection_geometry_even_when_unfocused() {
     assert_eq!(selection.left(), rect.left() + PADDING);
     assert!(selection.top() > rect.top() + PADDING && caret.bottom() <= rect.bottom());
     run(&mut editor, true);
-    let (offset, _) = run(&mut editor, true);
+    let (offset, (scrolled_caret, scrolled_selection, _)) = run(&mut editor, true);
     assert!(
         offset.y > 100.0,
         "hosts can reveal the selection: {offset:?}"
     );
+    assert_eq!(scrolled_caret, caret.translate(-offset));
+    assert_eq!(scrolled_selection, Some(selection.translate(-offset)));
+}
+
+#[test]
+fn retained_geometry_tracks_origin_layout_edits_and_preedit() {
+    let context = egui::Context::default();
+    let id = Id::unique("retained geometry");
+    let mut editor = Editor::from_text(&format!("{}\u{2028}last line\nend", "word ".repeat(80)));
+    editor.select_all();
+    let render = |editor: &mut Editor, offset: f32, width: f32, size: f32| {
+        let mut widget = None;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.add_space(offset);
+                ui.memory_mut(|memory| memory.request_focus(id));
+                widget = Some(
+                    RichTextEditor::new(editor)
+                        .id(id)
+                        .desired_width(width)
+                        .font(FontId::proportional(size))
+                        .show(ui),
+                );
+            },
+        );
+        let widget = widget.unwrap();
+        assert!(widget.errors.is_empty());
+        assert!(widget.accessibility_errors.is_empty());
+        let cache = context.data(|data| data.get_temp::<Cache>(id)).unwrap();
+        let preview = cache.preview.as_ref();
+        let document = preview.map_or(editor.document(), |preview| &preview.document);
+        let layouts = preview.map_or(&cache.layout.layouts, |preview| {
+            &preview.render_cache.layouts
+        });
+        let caret_position = preview.map_or(editor.selection().focus, |preview| preview.caret);
+        let selection = preview.map_or(Some(editor.selection()), |preview| preview.selection);
+        let origin = widget.response.rect.min + Vec2::splat(PADDING);
+        let expected_caret =
+            navigation::document_caret_rect(document, layouts, origin, caret_position, true);
+        assert_eq!(widget.caret_rect, expected_caret);
+        assert_eq!(
+            widget.selection_rect,
+            selection.and_then(|selection| navigation::selection_bounds(
+                document,
+                layouts,
+                origin,
+                selection,
+                width - PADDING * 2.0,
+            )),
+        );
+        if let Some(ime) = output.platform_output.ime {
+            assert_eq!(ime.cursor_rect, expected_caret);
+            let mut expected_area = expected_caret;
+            if let Some(preview) = preview {
+                let start = navigation::document_caret_rect(
+                    document,
+                    layouts,
+                    origin,
+                    preview.composition.replacement.range().start,
+                    true,
+                );
+                if start.top() == expected_caret.top() {
+                    expected_area = expected_area.union(start);
+                }
+            }
+            assert_eq!(ime.rect, expected_area.intersect(widget.response.rect));
+        }
+        output.drop_without_applying_deltas();
+        (widget.caret_rect, widget.selection_rect)
+    };
+    let initial = render(&mut editor, 0.0, 500.0, 14.0);
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), initial);
+    let moved = render(&mut editor, 35.0, 500.0, 14.0);
+    assert_eq!(moved.0, initial.0.translate(Vec2::new(0.0, 35.0)));
+    assert_eq!(
+        moved.1,
+        initial.1.map(|rect| rect.translate(Vec2::new(0.0, 35.0)))
+    );
+    assert_ne!(render(&mut editor, 0.0, 120.0, 14.0), initial);
+    assert_ne!(render(&mut editor, 0.0, 500.0, 28.0), initial);
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), initial);
+
+    editor
+        .set_selection(Selection::new(Position::new(0, 10), Position::new(0, 30)))
+        .unwrap();
+    render(&mut editor, 0.0, 500.0, 14.0);
+    editor
+        .set_link(Some(Link::try_new("https://example.com").unwrap()))
+        .unwrap();
+    let before_kind = render(&mut editor, 0.0, 500.0, 14.0);
+    let selection = editor.selection();
+    editor
+        .set_paragraph_kind(ParagraphKind::Ordered {
+            indent: 2,
+            start: Some(1234),
+        })
+        .unwrap();
+    let before_edit = render(&mut editor, 0.0, 500.0, 14.0);
+    assert_ne!(before_edit, before_kind);
+    assert_eq!(editor.selection(), selection);
+    assert!(editor.undo());
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), before_kind);
+    assert!(editor.redo());
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), before_edit);
+    editor.insert_text("café 👩\u{200d}💻").unwrap();
+    render(&mut editor, 0.0, 500.0, 14.0);
+    assert!(editor.undo());
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), before_edit);
+
+    editor
+        .update_composition("preedit text", Some(0..0))
+        .unwrap();
+    let preedit_start = render(&mut editor, 0.0, 500.0, 14.0);
+    editor
+        .update_composition("preedit text", Some(0..12))
+        .unwrap();
+    assert_ne!(render(&mut editor, 0.0, 500.0, 14.0), preedit_start);
+    editor
+        .update_composition("preedit\u{2028}text", Some(0..14))
+        .unwrap();
+    render(&mut editor, 35.0, 120.0, 28.0);
+    editor.cancel_composition();
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), before_edit);
+    editor
+        .update_composition("preedit text", Some(0..0))
+        .unwrap();
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), preedit_start);
+    editor.cancel_composition();
+    assert_eq!(render(&mut editor, 0.0, 500.0, 14.0), before_edit);
+}
+
+#[test]
+fn retained_geometry_updates_when_a_wrap_seam_changes_affinity() {
+    fn narrow(widget: RichTextEditor<'_>) -> RichTextEditor<'_> {
+        widget.desired_width(120.0)
+    }
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text("first second third fourth fifth sixth seventh");
+    let (_, widget) = widget_frame(&context, &mut editor, vec![], None, true, narrow);
+    let layout = widget_cache(&context).layout.layouts.get(0).unwrap();
+    let row = &layout.galley.rows[0];
+    let seam = Position::new(0, row.char_count_including_newline().0);
+    editor.set_selection(Selection::caret(seam)).unwrap();
+    let (_, next_row) = widget_frame(&context, &mut editor, vec![], None, true, narrow);
+    let point = widget.response.rect.min
+        + Vec2::splat(PADDING)
+        + layout.rect.min.to_vec2()
+        + Vec2::new(row.rect().right() + 1.0, row.rect().center().y);
+    let (_, previous_row) = widget_frame(
+        &context,
+        &mut editor,
+        vec![
+            Event::PointerMoved(point),
+            primary(point, true, Modifiers::NONE),
+        ],
+        None,
+        true,
+        narrow,
+    );
+    assert_eq!(editor.selection(), Selection::caret(seam));
+    assert!(previous_row.caret_rect.top() < next_row.caret_rect.top());
+    let (_, retained) = widget_frame(
+        &context,
+        &mut editor,
+        vec![primary(point, false, Modifiers::NONE)],
+        None,
+        true,
+        narrow,
+    );
+    assert_eq!(retained.caret_rect, previous_row.caret_rect);
 }
 
 #[test]
@@ -9495,6 +9938,80 @@ fn stationary_link_hover_tracks_link_edits_and_undo() {
 }
 
 #[test]
+fn stationary_link_hover_tracks_scrolling_and_relayout() {
+    let context = egui::Context::default();
+    let link = Link::try_new("https://example.com/docs").unwrap();
+    let mut editor = Editor::from_text("Visit example now\nVisit example now");
+    editor
+        .set_selection(Selection::new(Position::new(1, 6), Position::new(1, 13)))
+        .unwrap();
+    editor.set_link(Some(link.clone())).unwrap();
+    editor.set_selection(Selection::default()).unwrap();
+    let mut render = |offset: f32, size: f32, width: f32, pointer: Option<Pos2>| {
+        let mut rect = Rect::NOTHING;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                events: pointer.into_iter().map(Event::PointerMoved).collect(),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // Moving the widget changes the document coordinates of a
+                    // stationary pointer, as scrolling its parent would.
+                    ui.add_space(offset);
+                    let result = RichTextEditor::new(&mut editor)
+                        .id(Id::unique(WIDGET_ID))
+                        .read_only(true)
+                        .font(FontId::proportional(size))
+                        .desired_width(width)
+                        .show(ui);
+                    assert!(result.errors.is_empty());
+                    rect = result.response.rect;
+                });
+            },
+        );
+        let icon = output.platform_output.cursor_icon;
+        output.drop_without_applying_deltas();
+        (rect, icon)
+    };
+    let (rect, _) = render(0.0, 14.0, 500.0, None);
+    let layouts = widget_cache(&context).layout.layouts;
+    let second = layouts.get(1).unwrap();
+    let cursor = CCursor::new(CharIndex(8));
+    let point = second.galley.pos_from_cursor(cursor).center()
+        + second.rect.min.to_vec2()
+        + rect.min.to_vec2()
+        + Vec2::splat(PADDING);
+    let offset = second.rect.top();
+    for (step, (offset, size, width, linked)) in [
+        (0.0, 14.0, 500.0, true),
+        (0.0, 14.0, 500.0, true),
+        (offset, 14.0, 500.0, false),
+        (0.0, 14.0, 500.0, true),
+        (0.0, 28.0, 500.0, false),
+        (0.0, 14.0, 500.0, true),
+        (0.0, 14.0, 80.0, false),
+        (0.0, 14.0, 500.0, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (rect, icon) = render(offset, size, width, (step == 0).then_some(point));
+        assert!(rect.contains(point), "step {step}");
+        assert_eq!(
+            icon,
+            if linked {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Text
+            },
+            "step {step}"
+        );
+    }
+}
+
+#[test]
 fn command_link_click_keeps_its_press_modifiers_and_release_position() {
     let context = egui::Context::default();
     let (mut editor, link) = linked_widget_editor();
@@ -10141,4 +10658,230 @@ fn enter_and_backspace_leave_quotes_in_the_widget() {
     );
     assert_eq!(kinds(&editor), [ParagraphKind::Quote; 2]);
     assert_eq!(editor.document().plain_text(), "quoted\nx");
+}
+
+#[test]
+fn indexed_visual_navigation_matches_egui_after_shaping_and_grapheme_snapping() {
+    for text in [
+        "",
+        "x\u{2028}\u{2028}",
+        "office affine wider words",
+        "a\u{301}👩🏽\u{200d}💻\u{2028}s\u{2028}longer line\u{2028}",
+    ] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text(text);
+        let mut cache = Cache::default();
+        let mut appearance = appearance();
+        for width in [1.0, 27.0, 65.0, 500.0] {
+            appearance.width = width;
+            let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+            let layout = layouts.get(0).unwrap();
+            let source = editor.document().paragraphs()[0].clone();
+            // This galley has already passed through fallback shaping and
+            // ligature spreading, unlike a raw fonts.layout_job result.
+            for index in 0..=source.scalar_count() + 2 {
+                for prefer_next_row in [false, true] {
+                    let cursor = CCursor {
+                        index: CharIndex(index),
+                        prefer_next_row,
+                    };
+                    assert_eq!(
+                        layout.row_index.layout_from_cursor(&layout.galley, cursor),
+                        layout.galley.layout_from_cursor(cursor)
+                    );
+                    assert_eq!(
+                        layout.row_index.pos_from_cursor(&layout.galley, cursor),
+                        layout.galley.pos_from_cursor(cursor)
+                    );
+                }
+            }
+            for grapheme in 0..=source.grapheme_count() {
+                let byte = source.byte_from_grapheme(grapheme).unwrap();
+                editor
+                    .set_selection(Selection::caret(Position::new(0, byte)))
+                    .unwrap();
+                for prefer_next_row in [false, true] {
+                    let cursor = CCursor {
+                        index: CharIndex(source.scalar_index(byte).unwrap()),
+                        prefer_next_row,
+                    };
+                    for preferred_x in [None, Some(-10.0), Some(8.0), Some(33.0), Some(500.0)] {
+                        let nav = preferred_x.map(|preferred_x| navigation::VerticalNavigation {
+                            selection: editor.selection(),
+                            preferred_x,
+                            prefer_next_row,
+                        });
+                        let cursor = CCursor {
+                            prefer_next_row: nav.as_ref().is_none_or(|nav| nav.prefer_next_row),
+                            ..cursor
+                        };
+                        let x = preferred_x.unwrap_or_else(|| {
+                            layout.rect.left() + layout.galley.pos_from_cursor(cursor).center().x
+                        });
+                        for down in [false, true] {
+                            let expected = if down {
+                                layout
+                                    .galley
+                                    .cursor_down_one_row(&cursor, Some(x - layout.rect.left()))
+                                    .0
+                            } else {
+                                layout
+                                    .galley
+                                    .cursor_up_one_row(&cursor, Some(x - layout.rect.left()))
+                                    .0
+                            };
+                            let (expected_byte, affinity) = navigation::snap_vertical_cursor(
+                                &source,
+                                &layout.galley,
+                                &layout.row_index,
+                                expected,
+                                x - layout.rect.left(),
+                                down,
+                            )
+                            .unwrap();
+                            let actual = navigation::vertical_position(
+                                &editor,
+                                &layouts,
+                                nav.as_ref(),
+                                down,
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                (actual.position, actual.prefer_next_row, actual.preferred_x),
+                                (Position::new(0, expected_byte), affinity, x),
+                                "text={text:?}, width={width}, cursor={cursor:?}, down={down}"
+                            );
+                        }
+                    }
+                    for end in [false, true] {
+                        let target = if end {
+                            layout.galley.cursor_end_of_row(&cursor)
+                        } else {
+                            layout.galley.cursor_begin_of_row(&cursor)
+                        };
+                        let x = layout.galley.pos_from_cursor(target).center().x;
+                        let (byte, affinity) = navigation::snap_vertical_cursor(
+                            &source,
+                            &layout.galley,
+                            &layout.row_index,
+                            target,
+                            x,
+                            end,
+                        )
+                        .unwrap();
+                        let expected_x = layout.rect.left()
+                            + layout
+                                .galley
+                                .pos_from_cursor(CCursor {
+                                    index: CharIndex(source.scalar_index(byte).unwrap()),
+                                    prefer_next_row: affinity,
+                                })
+                                .center()
+                                .x;
+                        let actual = navigation::row_boundary_position(
+                            &editor,
+                            &layouts,
+                            prefer_next_row,
+                            end,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            (actual.position, actual.prefer_next_row, actual.preferred_x),
+                            (Position::new(0, byte), affinity, expected_x)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn indexed_pointer_hits_preserve_ligature_grapheme_and_link_boundaries() {
+    let context = egui::Context::default();
+    let mut editor =
+        Editor::from_text("office e\u{301} 👩🏽\u{200d}💻\u{2028}short\u{2028}\nlast words");
+    editor.select_all();
+    editor
+        .set_link(Some(Link::try_new("https://example.test").unwrap()))
+        .unwrap();
+    editor
+        .set_paragraph_kind(ParagraphKind::Bullet { indent: 1 })
+        .unwrap();
+    let mut cache = Cache::default();
+    let mut appearance = appearance();
+    for width in [32.0, 85.0, 500.0] {
+        appearance.width = width;
+        let layouts = cached_layout_frame(&context, &mut cache, &editor, &appearance);
+        for layout in layouts.iter() {
+            for row in &layout.galley.rows {
+                let mut xs = vec![-10.0, 0.0, row.size.x + 1.0];
+                for glyph in &row.glyphs {
+                    xs.extend([
+                        glyph.pos.x,
+                        (glyph.pos.x + glyph.max_x()) * 0.5,
+                        glyph.max_x(),
+                    ]);
+                }
+                for y in [
+                    row.min_y(),
+                    row.rect().center().y,
+                    row.max_y(),
+                    row.max_y().next_up(),
+                ] {
+                    for &x in &xs {
+                        let point = layout.rect.min.to_vec2() + Vec2::new(x + row.pos.x, y);
+                        let paragraph = layouts.paragraph_at_y(point.y);
+                        let target = layouts.get(paragraph).unwrap();
+                        let source = editor.document().paragraph(paragraph).unwrap();
+                        let local = point - target.rect.min.to_vec2();
+                        // Keep the original linear hover rule as an independent
+                        // oracle: the first containing row owns the glyph test.
+                        let mut scalar = 0;
+                        let mut expected_hit = None;
+                        for row in &target.galley.rows {
+                            if row.min_y() <= local.y && local.y < row.max_y() {
+                                let column = row.glyphs.iter().position(|glyph| {
+                                    glyph.pos.x <= local.x - row.pos.x
+                                        && local.x - row.pos.x < glyph.max_x()
+                                });
+                                expected_hit = column.map(|column| {
+                                    let byte = source.byte_from_scalar(scalar + column).unwrap();
+                                    Position::new(paragraph, source.boundary_at_or_before(byte))
+                                });
+                                break;
+                            }
+                            scalar += row.char_count_including_newline().0;
+                        }
+                        assert_eq!(
+                            navigation::grapheme_at_point(editor.document(), &layouts, point),
+                            expected_hit
+                        );
+                        assert_eq!(
+                            navigation::link_at_point(editor.document(), &layouts, point),
+                            expected_hit
+                                .and_then(|position| editor.document().link_at(position).cloned())
+                        );
+                        let cursor = target.galley.cursor_from_pos(local);
+                        let (byte, affinity) = navigation::snap_vertical_cursor(
+                            source,
+                            &target.galley,
+                            &target.row_index,
+                            cursor,
+                            local.x,
+                            false,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            navigation::hit_test(&editor, &layouts, point),
+                            CaretPlacement {
+                                position: Position::new(paragraph, byte),
+                                prefer_next_row: affinity,
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

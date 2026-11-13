@@ -2899,6 +2899,7 @@ dependencies = [
  "rustix 1.1.6",
  "textloom",
  "windows-win",
+ "winit",
  "wl-clipboard-rs",
  "x11rb",
 ]

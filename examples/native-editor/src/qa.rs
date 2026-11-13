@@ -139,7 +139,7 @@ struct InputCounts {
 }
 
 impl InputCounts {
-    /// Counts `events`, the raw events of one input pass.
+    /// Counts `events`, the original events of one host input batch.
     fn observe(&mut self, events: &[egui::Event]) {
         for event in events {
             match event {
@@ -305,10 +305,10 @@ impl Session {
         self.native_pixels_per_point = context.native_pixels_per_point();
     }
 
-    /// Counts the raw input events of the current pass. With input routing,
-    /// egui may run several passes per frame, each with its own events.
-    pub fn observe_input_pass(&mut self, context: &egui::Context) {
-        context.input(|input| self.input.observe(&input.raw.events));
+    /// Counts a host input batch before routing or adding internal focus events.
+    /// Call once from the host's raw input hook, not from individual UI passes.
+    pub fn observe_raw_input(&mut self, events: &[egui::Event]) {
+        self.input.observe(events);
     }
 
     /// Compares the editor and widget state after a UI pass with the previous
@@ -800,6 +800,7 @@ mod tests {
             let mut last_frame = None;
             let (mut first, mut second) = (String::new(), String::new());
             for _ in 0..6 {
+                session.observe_raw_input(&events);
                 let output = context.run_ui(
                     egui::RawInput {
                         focused: true,
@@ -812,7 +813,6 @@ mod tests {
                             last_frame = Some(frame);
                             session.begin_frame(ui.ctx());
                         }
-                        session.observe_input_pass(ui.ctx());
                         ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
                         ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
                     },

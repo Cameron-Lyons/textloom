@@ -67,8 +67,21 @@ struct PaintedGalley {
     // Retaining the source prevents its address from being reused by another layout.
     source: Arc<Galley>,
     current: Arc<Galley>,
-    row_starts: Arc<[usize]>,
+    backgrounds: Option<BackgroundGalley>,
     used: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct BackgroundQuad {
+    row: usize,
+    rect: Rect,
+    color: Color32,
+}
+
+#[derive(Clone)]
+struct BackgroundGalley {
+    quads: Vec<BackgroundQuad>,
+    galley: Arc<Galley>,
 }
 
 impl PaintCache {
@@ -89,18 +102,14 @@ impl PaintCache {
         }
     }
 
-    fn refresh(
-        &mut self,
-        fonts: &mut FontsView<'_>,
-        source: &Arc<Galley>,
-    ) -> (Arc<Galley>, Arc<[usize]>) {
+    fn refresh(&mut self, fonts: &mut FontsView<'_>, source: &Arc<Galley>) -> Arc<Galley> {
         let cached = self
             .galleys
             .entry(Arc::as_ptr(source) as usize)
             .or_insert_with(|| PaintedGalley {
                 source: source.clone(),
                 current: fonts.layout_job((*source.job).clone()),
-                row_starts: row_starts(source),
+                backgrounds: None,
                 used: true,
             });
         debug_assert!(
@@ -108,7 +117,41 @@ impl PaintCache {
             "painted galleys are keyed by source address, which the retained source keeps unique"
         );
         cached.used = true;
-        (cached.current.clone(), cached.row_starts.clone())
+        cached.current.clone()
+    }
+
+    fn with_backgrounds(
+        &mut self,
+        source: &Arc<Galley>,
+        quads: Vec<BackgroundQuad>,
+    ) -> Arc<Galley> {
+        let cached = self
+            .galleys
+            .get_mut(&(Arc::as_ptr(source) as usize))
+            .expect("visible galleys were refreshed before their backgrounds");
+        if let Some(backgrounds) = &cached.backgrounds
+            && backgrounds.quads == quads
+        {
+            return backgrounds.galley.clone();
+        }
+        // Mutating a galley clones its entire row vector. Keep one prepared
+        // variant per source so unchanged visible backgrounds do not copy
+        // potentially hundreds of thousands of hidden rows on every frame.
+        // Quad order captures the paint layers; coordinates stay galley-local.
+        let mut galley = cached.current.clone();
+        let mut first = usize::MAX;
+        let mut end = 0;
+        for quad in &quads {
+            append_background(&mut galley, quad.row, quad.rect, quad.color);
+            first = first.min(quad.row);
+            end = end.max(quad.row + 1);
+        }
+        finish_backgrounds(&mut galley, &cached.current, first..end);
+        cached.backgrounds = Some(BackgroundGalley {
+            quads,
+            galley: galley.clone(),
+        });
+        galley
     }
 
     fn end(&mut self) {
@@ -139,8 +182,8 @@ pub(super) fn paint_document(
     painter.fonts_mut(|fonts| {
         cache.begin(fonts, family);
         visible.extend(layouts.views_range(first..last).map(|layout| {
-            let (galley, row_starts) = cache.refresh(fonts, layout.galley);
-            let marker = layout.marker.map(|marker| cache.refresh(fonts, marker).0);
+            let galley = cache.refresh(fonts, layout.galley);
+            let marker = layout.marker.map(|marker| cache.refresh(fonts, marker));
             let offset = origin.y + layout.rect.min.y;
             let (top, bottom) = (clip.top() - offset - 5.0, clip.bottom() - offset + 5.0);
             let rows = &layout.galley.rows;
@@ -148,11 +191,10 @@ pub(super) fn paint_document(
             let end = rows.partition_point(|row| row.rect().top() <= bottom);
             VisibleParagraph {
                 layout,
-                unpainted: galley.clone(),
                 galley,
                 marker,
-                row_starts,
                 rows: start..end.max(start),
+                backgrounds: Vec::new(),
             }
         }));
         cache.end();
@@ -226,7 +268,12 @@ pub(super) fn paint_document(
         if !painter.clip_rect().intersects(rect) {
             continue;
         }
-        paragraph.finish_backgrounds();
+        if !paragraph.backgrounds.is_empty() {
+            paragraph.galley = cache.with_backgrounds(
+                paragraph.layout.galley,
+                std::mem::take(&mut paragraph.backgrounds),
+            );
+        }
         if let Some(marker) = &paragraph.marker {
             painter.galley(
                 origin + paragraph.layout.marker_position.to_vec2(),
@@ -244,17 +291,6 @@ fn fits(document: &Document, position: Position) -> bool {
         .is_some_and(|paragraph| paragraph.text().is_char_boundary(position.byte))
 }
 
-fn row_starts(galley: &Galley) -> Arc<[usize]> {
-    let mut start = 0;
-    let mut starts = Vec::with_capacity(galley.rows.len() + 1);
-    starts.push(start);
-    for row in &galley.rows {
-        start += row.char_count_including_newline().0;
-        starts.push(start);
-    }
-    starts.into()
-}
-
 fn visible_window(
     document: &Document,
     visible: &[VisibleParagraph<'_>],
@@ -264,7 +300,13 @@ fn visible_window(
     let last = first + visible.len() - 1;
     let start = document
         .paragraph(first)
-        .and_then(|paragraph| paragraph.byte_from_scalar(head.row_starts[head.rows.start]))
+        .and_then(|paragraph| {
+            paragraph.byte_from_scalar(
+                head.layout
+                    .row_index
+                    .offset(head.layout.galley, head.rows.start),
+            )
+        })
         .unwrap_or(0);
     let end = match tail.rows.end.checked_sub(1) {
         None => Some(0),
@@ -272,9 +314,10 @@ fn visible_window(
             let count = tail.layout.galley.rows[row]
                 .char_count_excluding_newline()
                 .0;
-            document
-                .paragraph(last)
-                .and_then(|paragraph| paragraph.byte_from_scalar(tail.row_starts[row] + count))
+            document.paragraph(last).and_then(|paragraph| {
+                paragraph
+                    .byte_from_scalar(tail.layout.row_index.offset(tail.layout.galley, row) + count)
+            })
         }
     }
     .unwrap_or(usize::MAX);
@@ -295,11 +338,10 @@ fn visible_ranges<'a>(
 
 struct VisibleParagraph<'layout> {
     layout: ParagraphLayoutView<'layout>,
-    unpainted: Arc<Galley>,
     galley: Arc<Galley>,
     marker: Option<Arc<Galley>>,
-    row_starts: Arc<[usize]>,
     rows: Range<usize>,
+    backgrounds: Vec<BackgroundQuad>,
 }
 
 impl VisibleParagraph<'_> {
@@ -313,14 +355,14 @@ impl VisibleParagraph<'_> {
     ) {
         let offset = origin.to_vec2() + self.layout.rect.min.to_vec2();
         let rows = &self.layout.galley.rows;
-        let starts = &self.row_starts[..rows.len()];
-        let first = starts
-            .partition_point(|&start| start <= chars.start)
-            .saturating_sub(1)
+        let first = self
+            .layout
+            .row_index
+            .row_at_scalar(chars.start)
             .max(self.rows.start);
         for row_index in first..self.rows.end {
             let row = &rows[row_index];
-            let row_start = starts[row_index];
+            let row_start = self.layout.row_index.offset(self.layout.galley, row_index);
             if row_start > chars.end {
                 break;
             }
@@ -344,28 +386,31 @@ impl VisibleParagraph<'_> {
             if row.visuals.glyph_index_start == 0 {
                 painter.rect_filled(local.translate(offset + row.pos.to_vec2()), 0.0, color);
             } else {
-                append_background(&mut self.galley, row_index, local, color);
+                self.backgrounds.push(BackgroundQuad {
+                    row: row_index,
+                    rect: local,
+                    color,
+                });
             }
         }
     }
+}
 
-    fn finish_backgrounds(&mut self) {
-        // Appending each highlight is constant time. Move all added triangles
-        // behind the glyphs once per row, keeping the layers in paint order.
-        // Rotating after each match makes a heavily highlighted row quadratic.
-        let Some(galley) = Arc::get_mut(&mut self.galley) else {
-            return;
+fn finish_backgrounds(galley: &mut Arc<Galley>, unpainted: &Galley, rows: Range<usize>) {
+    // Appending each highlight is constant time. Move all added triangles
+    // behind the glyphs once per row, keeping the layers in paint order.
+    // Rotating after each match makes a heavily highlighted row quadratic.
+    let Some(galley) = Arc::get_mut(galley) else {
+        return;
+    };
+    for index in rows {
+        let Some(row) = Arc::get_mut(&mut galley.rows[index].row) else {
+            continue;
         };
-        for index in self.rows.clone() {
-            let Some(row) = Arc::get_mut(&mut galley.rows[index].row) else {
-                continue;
-            };
-            let visuals = &mut row.visuals;
-            let added =
-                visuals.mesh.indices.len() - self.unpainted.rows[index].visuals.mesh.indices.len();
-            visuals.mesh.indices[visuals.glyph_index_start..].rotate_right(added);
-            visuals.glyph_index_start += added;
-        }
+        let visuals = &mut row.visuals;
+        let added = visuals.mesh.indices.len() - unpainted.rows[index].visuals.mesh.indices.len();
+        visuals.mesh.indices[visuals.glyph_index_start..].rotate_right(added);
+        visuals.glyph_index_start += added;
     }
 }
 

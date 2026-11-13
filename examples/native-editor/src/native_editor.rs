@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use eframe::egui;
 use textloom::adapter::egui::RichTextEditor;
 use textloom::{
-    Color, DecodeLimits, Document, Editor, Link, NamedColor, ParagraphKind, Position,
-    SearchOptions, SearchWrap, Selection, StylePatch,
+    Color, DecodeLimits, Document, Editor, InlineAttribute, Link, NamedColor, ParagraphKind,
+    Position, SearchOptions, SearchWrap, Selection, StylePatch,
 };
 
 use crate::clipboard::NativeClipboard;
@@ -44,6 +44,9 @@ pub(crate) struct NativeEditor {
     /// The egui frame number of the latest UI pass, which tells a new frame
     /// from another input pass of the same frame.
     last_frame: Option<u64>,
+    /// Events already prepared by raw_input_hook but not yet given to egui.
+    /// eframe retains this prefix across minimized, logic-only updates.
+    prepared_input_events: usize,
     /// QA observations, with `--qa-report` only.
     qa: Option<qa::Session>,
     /// Set when the smoke test, the clipboard self-test, or the report write
@@ -61,6 +64,8 @@ pub(crate) struct NativeEditor {
     font_color: Color,
     /// The link field's text while the field is open.
     link_url: Option<String>,
+    /// The rendered Link button, for ordered accessibility activation.
+    link_button_id: Option<egui::Id>,
     /// Whether to focus the link field when it is next shown.
     focus_link_field: bool,
     /// Commands from this pass's controls, applied after the document widget
@@ -83,6 +88,8 @@ pub(crate) struct NativeEditor {
 enum EditorCommand {
     /// Applies a style to the selection, or to typing at a caret.
     Style(StylePatch),
+    /// Toggles the selection's formatting after queued document input is applied.
+    ToggleStyle(InlineAttribute),
     ClearFormatting,
     RemoveLink,
     Undo,
@@ -106,15 +113,18 @@ enum EditorCommand {
         previous: bool,
         options: SearchOptions,
     },
+    /// Replaces the selected match of the Find field's text, if any, with
+    /// the Replace field's text.
+    ReplaceSelected(SearchOptions),
     /// Replaces every match of the Find field's text with the Replace field's
     /// text.
     ReplaceAll(SearchOptions),
 }
 
 impl NativeEditor {
-    /// Creates the host with its sample document: a heading, a body
-    /// paragraph, and a three-item bulleted list, with the caret at the start
-    /// of the body paragraph and no undo history.
+    /// Creates the host with its sample document: a heading, a body paragraph,
+    /// a two-item bulleted list, and a final body paragraph, with the caret at
+    /// the start of the first body paragraph and no undo history.
     pub(crate) fn new(
         options: &qa::Options,
         report: Option<ReportFile>,
@@ -152,6 +162,7 @@ impl NativeEditor {
             smoke_frames: options.smoke_test.then_some(0),
             smoke_error: false,
             last_frame: None,
+            prepared_input_events: 0,
             qa,
             failed,
             clipboard,
@@ -160,6 +171,7 @@ impl NativeEditor {
             fill_color: Color::YELLOW,
             font_color: Color::RED,
             link_url: None,
+            link_button_id: None,
             focus_link_field: false,
             commands: Vec::new(),
             text_field_ids: [None; 3],
@@ -232,6 +244,10 @@ impl NativeEditor {
                 let result = self.editor.apply_style(patch);
                 self.result(result);
             }
+            EditorCommand::ToggleStyle(attribute) => {
+                let result = self.editor.toggle_style(attribute);
+                self.result(result);
+            }
             EditorCommand::ClearFormatting => {
                 let result = self.editor.clear_formatting();
                 self.result(result);
@@ -250,16 +266,8 @@ impl NativeEditor {
                 self.focus_editor = true;
             }
             EditorCommand::ParagraphKind(kind) => {
-                if let ParagraphKind::Ordered { indent, .. } = kind {
-                    let result = self.editor.apply_numbered_list(indent);
-                    self.result(result);
-                } else {
-                    let selected = self.editor.selected_paragraphs();
-                    if let Some(kind) = chosen_kind(self.editor.document(), selected, kind) {
-                        let result = self.editor.set_paragraph_kind(kind);
-                        self.result(result);
-                    }
-                }
+                let result = apply_paragraph_choice(&mut self.editor, kind);
+                self.result(result);
             }
             EditorCommand::Indent => {
                 let result = self.editor.indent_list();
@@ -317,6 +325,17 @@ impl NativeEditor {
                 }
                 self.focus_editor = true;
             }
+            EditorCommand::ReplaceSelected(options) => {
+                match self
+                    .editor
+                    .replace_selected_match(&self.query, &self.replacement, options)
+                {
+                    Ok(true) => self.status = "Replaced selected match".into(),
+                    Ok(false) => self.status = "Select a match with Next or Previous first".into(),
+                    Err(error) => self.command_error(error),
+                }
+                self.focus_editor = true;
+            }
             EditorCommand::ReplaceAll(options) => {
                 match self
                     .editor
@@ -337,47 +356,16 @@ impl NativeEditor {
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(self.enabled && !self.read_only, |ui| {
                 let style = self.editor.selection_style();
-                for (label, active, patch) in [
-                    (
-                        "Bold",
-                        style.bold,
-                        StylePatch {
-                            bold: Some(style.bold != Some(true)),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "Italic",
-                        style.italic,
-                        StylePatch {
-                            italic: Some(style.italic != Some(true)),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "Underline",
-                        style.underline,
-                        StylePatch {
-                            underline: Some(style.underline != Some(true)),
-                            ..Default::default()
-                        },
-                    ),
+                for (label, active, attribute) in [
+                    ("Bold", style.bold, InlineAttribute::Bold),
+                    ("Italic", style.italic, InlineAttribute::Italic),
+                    ("Underline", style.underline, InlineAttribute::Underline),
                     (
                         "Strike",
                         style.strikethrough,
-                        StylePatch {
-                            strikethrough: Some(style.strikethrough != Some(true)),
-                            ..Default::default()
-                        },
+                        InlineAttribute::Strikethrough,
                     ),
-                    (
-                        "Code",
-                        style.code,
-                        StylePatch {
-                            code: Some(style.code != Some(true)),
-                            ..Default::default()
-                        },
-                    ),
+                    ("Code", style.code, InlineAttribute::Code),
                 ] {
                     let response = ui.selectable_label(active == Some(true), label);
                     let response = if active.is_none() {
@@ -388,7 +376,7 @@ impl NativeEditor {
                         response
                     };
                     if response.clicked() {
-                        self.commands.push(EditorCommand::Style(patch));
+                        self.commands.push(EditorCommand::ToggleStyle(attribute));
                     }
                 }
                 for target in [ColorTarget::Fill, ColorTarget::Font] {
@@ -409,15 +397,18 @@ impl NativeEditor {
                     || "Insert a link (Ctrl+K)".to_owned(),
                     |link| format!("Edit link to {link} (Ctrl+K)"),
                 );
-                if ui
+                let link_button = ui
                     .selectable_label(link.is_some(), "Link")
-                    .on_hover_text(hint)
-                    .clicked()
-                {
+                    .on_hover_text(hint);
+                self.link_button_id = Some(link_button.id);
+                if link_button.clicked() {
                     self.open_link_field();
                 }
                 if ui
-                    .add_enabled(link.is_some(), egui::Button::new("Remove link"))
+                    .add_enabled(
+                        link.is_some() || !self.editor.selection().is_caret(),
+                        egui::Button::new("Remove link"),
+                    )
                     .clicked()
                 {
                     self.commands.push(EditorCommand::RemoveLink);
@@ -479,14 +470,18 @@ impl NativeEditor {
                     start: None,
                 });
                 let mut chosen = None;
+                let selected_name = self.editor.selection_paragraph_kind().map(kind_name);
                 egui::ComboBox::from_id_salt("paragraph-kind")
-                    .selected_text(kind_name(current))
+                    .selected_text(selected_name.as_deref().unwrap_or("Mixed"))
                     .height(f32::INFINITY)
                     .show_ui(ui, |ui| {
                         for kind in choices {
                             let label = kind_name(kind);
                             if ui
-                                .selectable_label(label == kind_name(current), label)
+                                .selectable_label(
+                                    selected_name.as_deref() == Some(label.as_str()),
+                                    label,
+                                )
                                 .clicked()
                             {
                                 chosen = Some(kind);
@@ -554,29 +549,41 @@ impl NativeEditor {
                 .unwrap_or_default(),
         );
         self.focus_link_field = true;
+        self.focus_editor = false;
     }
 
     /// Shows the link field while it is open. Enter or Apply link queues the
     /// URL, which closes the field once applied; Escape, Cancel, or a disabled
     /// or read-only document closes it.
-    fn link_field(&mut self, ui: &mut egui::Ui) {
+    /// Returns whether a newly opened draft is still safe to refresh after the
+    /// document processes this pass's selection and composition changes.
+    fn link_field(&mut self, ui: &mut egui::Ui, ordered_open: bool) -> bool {
         self.text_field_ids[0] = None;
         let Some(mut url) = self.link_url.take() else {
-            return;
+            return false;
         };
         let (mut apply, mut cancel) = (false, false);
+        let opening = mem::take(&mut self.focus_link_field);
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Link URL");
+            let field_id = link_field_id();
+            if opening && ordered_open {
+                ui.memory_mut(|memory| memory.request_focus(field_id));
+            }
             let field_focus = ui.memory(|memory| memory.focused());
             let response = ui
                 .add(
                     egui::TextEdit::singleline(&mut url)
+                        .id(field_id)
                         .hint_text("https://")
                         .desired_width(320.0),
                 )
                 .labelled_by(label.id);
             self.text_field_ids[0] = Some(response.id);
-            if mem::take(&mut self.focus_link_field) {
+            changed = response.changed();
+            if opening && !ordered_open {
+                // Preserve pointer opening's event ownership within this pass.
                 response.request_focus();
             }
             apply |= field_finished_with_key(ui, &response, field_focus, egui::Key::Enter);
@@ -586,12 +593,13 @@ impl NativeEditor {
         });
         if cancel || !self.enabled || self.read_only {
             self.focus_editor = self.enabled;
-            return;
+            return false;
         }
         if apply {
             self.commands.push(EditorCommand::ApplyLink(url.clone()));
         }
         self.link_url = Some(url);
+        opening && !changed && !apply
     }
 
     /// Opens `link` in the system browser or mail client if it is a web or
@@ -612,7 +620,11 @@ impl NativeEditor {
                 let label = ui.label("Find");
                 let field_focus = ui.memory(|memory| memory.focused());
                 let query_response = ui
-                    .add(egui::TextEdit::singleline(&mut self.query).desired_width(180.0))
+                    .add(
+                        egui::TextEdit::singleline(&mut self.query)
+                            .id(egui::Id::unique("textloom-native-find"))
+                            .desired_width(180.0),
+                    )
                     .labelled_by(label.id);
                 self.text_field_ids[1] = Some(query_response.id);
                 let next = ui
@@ -650,19 +662,29 @@ impl NativeEditor {
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Replace");
             self.text_field_ids[2] = Some(
-                ui.add(egui::TextEdit::singleline(&mut self.replacement).desired_width(180.0))
-                    .labelled_by(label.id)
-                    .id,
-            );
-            if ui
-                .add_enabled(
-                    self.enabled && !self.read_only && !self.query.is_empty(),
-                    egui::Button::new("Replace all"),
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.replacement)
+                        .id(egui::Id::unique("textloom-native-replacement"))
+                        .desired_width(180.0),
                 )
-                .clicked()
-            {
-                self.commands.push(EditorCommand::ReplaceAll(options));
-            }
+                .labelled_by(label.id)
+                .id,
+            );
+            ui.add_enabled_ui(
+                self.enabled && !self.read_only && !self.query.is_empty(),
+                |ui| {
+                    if ui
+                        .button("Replace")
+                        .on_hover_text("Replace only the selected match")
+                        .clicked()
+                    {
+                        self.commands.push(EditorCommand::ReplaceSelected(options));
+                    }
+                    if ui.button("Replace all").clicked() {
+                        self.commands.push(EditorCommand::ReplaceAll(options));
+                    }
+                },
+            );
         });
     }
 }
@@ -963,26 +985,106 @@ fn set_item_start(
         return Ok(());
     };
     let kind = ParagraphKind::Ordered { indent, start };
-    let selection = editor.selection();
-    editor.transaction(|editor| {
+    with_preserved_selection(editor, |editor| {
         editor.set_selection(Selection::caret(Position::new(index, 0)))?;
-        editor.set_paragraph_kind(kind)?;
-        editor.set_selection(selection)
+        editor.set_paragraph_kind(kind)
     })
 }
 
-/// Returns `chosen` unless every paragraph in `selected`, a range of
-/// paragraph indexes, already has that kind.
-fn chosen_kind(
-    document: &Document,
-    selected: Range<usize>,
+/// Applies a paragraph menu choice in one undo step, keeping existing list
+/// levels and the selection. Choosing the current type leaves numbering alone.
+fn apply_paragraph_choice(
+    editor: &mut Editor,
     chosen: ParagraphKind,
-) -> Option<ParagraphKind> {
-    let paragraphs = &document.paragraphs()[selected];
-    (!paragraphs
-        .iter()
-        .all(|paragraph| paragraph.kind() == chosen))
-    .then_some(chosen)
+) -> Result<(), textloom::Error> {
+    let selected = editor.selected_paragraphs();
+    let paragraphs = &editor.document().paragraphs()[selected.clone()];
+    if paragraphs.iter().all(|paragraph| {
+        paragraph.kind() == chosen
+            || matches!(
+                (paragraph.kind(), chosen),
+                (ParagraphKind::Bullet { .. }, ParagraphKind::Bullet { .. })
+                    | (ParagraphKind::Ordered { .. }, ParagraphKind::Ordered { .. })
+            )
+    }) {
+        return Ok(());
+    }
+    let fallback = match chosen {
+        ParagraphKind::Bullet { indent } | ParagraphKind::Ordered { indent, .. } => indent,
+        _ => return editor.set_paragraph_kind(chosen),
+    };
+    let mut groups: Vec<(Range<usize>, u8)> = Vec::new();
+    for (offset, paragraph) in paragraphs.iter().enumerate() {
+        let indent = match paragraph.kind() {
+            ParagraphKind::Bullet { indent } | ParagraphKind::Ordered { indent, .. } => indent,
+            _ => fallback,
+        };
+        if let Some((range, previous)) = groups.last_mut()
+            && *previous == indent
+        {
+            range.end += 1;
+        } else {
+            let index = selected.start + offset;
+            groups.push((index..index + 1, indent));
+        }
+    }
+    let apply = |editor: &mut Editor, indent| {
+        if matches!(chosen, ParagraphKind::Ordered { .. }) {
+            editor.apply_numbered_list(indent)
+        } else {
+            editor.set_paragraph_kind(ParagraphKind::Bullet { indent })
+        }
+    };
+    if groups.len() == 1 {
+        // Retain a caret's pending style and the existing flat-selection behavior.
+        return apply(editor, groups[0].1);
+    }
+
+    with_preserved_selection(editor, |editor| {
+        for (range, indent) in groups {
+            let end = if range.end < editor.document().paragraphs().len() {
+                Position::new(range.end, 0)
+            } else {
+                editor.document().end()
+            };
+            editor.set_selection(Selection::new(Position::new(range.start, 0), end))?;
+            apply(editor, indent)?;
+        }
+        Ok(())
+    })
+}
+
+/// Groups paragraph-only edits, preserving selection and pending typing style.
+fn with_preserved_selection(
+    editor: &mut Editor,
+    edit: impl FnOnce(&mut Editor) -> Result<(), textloom::Error>,
+) -> Result<(), textloom::Error> {
+    let selection = editor.selection();
+    let typing_style = editor.typing_style();
+    let range = selection.range();
+    let no_selected_text = (range.start.paragraph..=range.end.paragraph).all(|index| {
+        let from = if index == range.start.paragraph {
+            range.start.byte
+        } else {
+            0
+        };
+        let to = if index == range.end.paragraph {
+            range.end.byte
+        } else {
+            editor.document().paragraphs()[index].text().len()
+        };
+        from == to
+    });
+    editor.transaction(|editor| {
+        edit(editor)?;
+        editor.set_selection(selection)?;
+        if no_selected_text {
+            // No text bytes (and therefore no spans) are selected. Restoring a
+            // pending style here cannot change the document's inline formatting.
+            editor.apply_style(typing_style.into())?;
+        }
+        Ok(())
+    })
 }
 
 /// The paragraph-kind menu's name for `kind`.
@@ -1011,31 +1113,71 @@ pub(crate) fn configure_context(context: &egui::Context) {
 fn take_command_shortcut(input: &mut egui::InputState, key: egui::Key) -> bool {
     let mut requested = false;
     input.events.retain(|event| {
-        let matches = matches!(
-            event,
-            egui::Event::Key {
-                key: pressed_key,
-                pressed: true,
-                modifiers,
-                ..
-            } if *pressed_key == key
-                && modifiers.command
-                && !modifiers.alt
-                && !(modifiers.mac_cmd && modifiers.ctrl)
-        );
+        let matches = command_shortcut(event, key);
         requested |= matches;
         !matches
     });
     requested
 }
 
+fn command_shortcut(event: &egui::Event, key: egui::Key) -> bool {
+    matches!(event, egui::Event::Key { key: pressed_key, pressed: true, modifiers, .. }
+        if *pressed_key == key && modifiers.command && !modifiers.alt
+            && !(modifiers.mac_cmd && modifiers.ctrl))
+}
+
+fn link_field_id() -> egui::Id {
+    egui::Id::unique("textloom-native-link-url")
+}
+
+// An internal ordering marker, consumed by the host before widgets see it.
+// InputRouting isolates Focus events, so the existing routing queue owns all
+// earlier and later input, including paste metadata and pass-limit overflow.
+fn open_link_marker_id() -> egui::Id {
+    egui::Id::unique("textloom-open-link-command")
+}
+
+fn is_open_link_marker(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::AccessKitActionRequest(request)
+        if request.action == egui::accesskit::Action::Focus
+            && request.target_tree == egui::accesskit::TreeId::ROOT
+            && request.data.is_none()
+            && request.target_node == open_link_marker_id().accesskit_id())
+}
+
 impl eframe::App for NativeEditor {
     fn raw_input_hook(&mut self, _context: &egui::Context, input: &mut egui::RawInput) {
+        // eframe prepends unconsumed input on every logic-only update. Only the
+        // appended suffix is new; otherwise counters and clipboard slots repeat.
+        let prepared = self.prepared_input_events.min(input.events.len());
+        self.prepared_input_events = input.events.len();
+        let events = &mut input.events[prepared..];
+        if let Some(qa) = &mut self.qa {
+            qa.observe_raw_input(events);
+        }
         if let Some(clipboard) = &mut self.clipboard {
             // An earlier queued Focus can change the eventual owner. Snapshot
             // eligible pastes now, before the clipboard can change again.
             let capture_native = self.enabled && !self.read_only && input.focused;
-            clipboard.capture_pastes(input, capture_native);
+            clipboard.capture_pastes(events, capture_native);
+        }
+        let opens_link = |event: &egui::Event| {
+            command_shortcut(event, egui::Key::K)
+                || matches!(event, egui::Event::AccessKitActionRequest(request)
+                    if request.action == egui::accesskit::Action::Click
+                        && request.target_tree == egui::accesskit::TreeId::ROOT
+                        && request.data.is_none()
+                        && self.link_button_id.is_some_and(|id| id.accesskit_id() == request.target_node))
+        };
+        for event in events {
+            if opens_link(event) {
+                *event = egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target_node: open_link_marker_id().accesskit_id(),
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                });
+            }
         }
     }
 
@@ -1065,6 +1207,25 @@ impl NativeEditor {
     /// updates the QA observations and the smoke test. Input routing can run
     /// several passes per frame.
     fn show(&mut self, ui: &mut egui::Ui) {
+        // The raw batch has reached egui. InputRouting now owns any remaining
+        // passes, while the next raw hook will receive a fresh host batch.
+        self.prepared_input_events = 0;
+        let open_link = ui.input_mut(|input| {
+            let mut requested = false;
+            input.events.retain(|event| {
+                let marker = is_open_link_marker(event);
+                requested |= marker;
+                !marker
+            });
+            requested
+        }) && self.enabled
+            && !self.read_only;
+        if open_link {
+            // Reopening is fresh field input, as Ctrl/Command+K was before
+            // routing. Document blur below may establish a new echo guard.
+            self.ime_handoff = None;
+            self.open_link_field();
+        }
         let frame = ui.ctx().cumulative_frame_nr();
         let new_frame = self.last_frame != Some(frame);
         if new_frame {
@@ -1072,9 +1233,6 @@ impl NativeEditor {
             if let Some(qa) = &mut self.qa {
                 qa.begin_frame(ui.ctx());
             }
-        }
-        if let Some(qa) = &mut self.qa {
-            qa.observe_input_pass(ui.ctx());
         }
         let focused = ui.memory(|memory| memory.focused());
         let document_was_focused = focused.is_some() && focused == self.document_id;
@@ -1150,10 +1308,11 @@ impl NativeEditor {
         if ui.input_mut(|input| take_command_shortcut(input, egui::Key::Q)) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        let mut refresh_link_prefill = false;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("TextLoom native editor");
             self.toolbar(ui);
-            self.link_field(ui);
+            refresh_link_prefill = self.link_field(ui, open_link);
             ui.separator();
             self.search(ui);
             ui.separator();
@@ -1259,6 +1418,29 @@ impl NativeEditor {
                 }
             }
         });
+        if refresh_link_prefill && let Some(url) = &mut self.link_url {
+            // Document blur may commit IME text, and accessibility selection can
+            // move the caret. Never replace an edited or already submitted draft.
+            let current = self
+                .editor
+                .selected_link()
+                .map(|link| link.to_string())
+                .unwrap_or_default();
+            if *url != current {
+                *url = current;
+                if let Some(mut state) =
+                    egui::text_edit::TextEditState::load(ui.ctx(), link_field_id())
+                {
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(url.chars().count()),
+                        )));
+                    state.store(ui.ctx(), link_field_id());
+                }
+                ui.ctx().request_repaint();
+            }
+        }
         // Let the document consume queued IME input before toolbar commands commit
         // its remaining preedit or change its selection and history.
         self.apply_commands(ui);
@@ -1344,6 +1526,13 @@ mod tests {
 
     impl Harness {
         fn new(name: &str) -> Self {
+            let mut harness = Self::unstarted(name);
+            harness.step(Vec::new());
+            harness.step(Vec::new());
+            harness
+        }
+
+        fn unstarted(name: &str) -> Self {
             let report = env::temp_dir().join(format!(
                 "textloom-host-{name}-{}-{}.json",
                 process::id(),
@@ -1366,7 +1555,7 @@ mod tests {
             let context = egui::Context::default();
             configure_context(&context);
             context.enable_accesskit();
-            let mut harness = Self {
+            Self {
                 app,
                 context,
                 time: 0.0,
@@ -1374,10 +1563,7 @@ mod tests {
                 commands: Vec::new(),
                 viewport_commands: Vec::new(),
                 report,
-            };
-            harness.step(Vec::new());
-            harness.step(Vec::new());
-            harness
+            }
         }
 
         fn step(&mut self, events: Vec<egui::Event>) {
@@ -1395,6 +1581,12 @@ mod tests {
                 ..Default::default()
             };
             self.app.raw_input_hook(&self.context, &mut input);
+            self.deliver(input);
+        }
+
+        /// Delivers a batch whose raw hook already ran (including logic-only
+        /// replays retained by eframe while the window is minimized).
+        fn deliver(&mut self, input: egui::RawInput) {
             let app = &mut self.app;
             let mut output = self.context.run_ui(input, |ui| app.show(ui));
             self.commands.append(&mut output.platform_output.commands);
@@ -1455,19 +1647,45 @@ mod tests {
         }
 
         fn accessibility_click(&mut self, label: &str) {
+            let event = self.accessibility_click_event(label);
+            self.step(vec![event]);
+        }
+
+        fn accessibility_click_event(&self, label: &str) -> egui::Event {
             let (&target, _) = self
                 .nodes
                 .iter()
                 .find(|(_, node)| node.role() == Role::Button && node.label() == Some(label))
                 .unwrap_or_else(|| panic!("no button labelled {label}"));
-            self.step(vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Click,
-                    target_node: target,
-                    target_tree: egui::accesskit::TreeId::ROOT,
-                    data: None,
-                },
-            )]);
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_node: target,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                data: None,
+            })
+        }
+
+        fn accessibility_caret_event(&self, text: &str) -> egui::Event {
+            let (&node, _) = self
+                .nodes
+                .iter()
+                .find(|(_, node)| node.role() == Role::TextRun && node.value() == Some(text))
+                .unwrap();
+            let position = egui::accesskit::TextPosition {
+                node,
+                character_index: 0,
+            };
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::SetTextSelection,
+                target_node: self.app.document_id.unwrap().accesskit_id(),
+                target_tree: egui::accesskit::TreeId::ROOT,
+                data: Some(egui::accesskit::ActionData::SetTextSelection(
+                    egui::accesskit::TextSelection {
+                        anchor: position,
+                        focus: position,
+                    },
+                )),
+            })
         }
 
         fn choose_paragraph_kind(&mut self, shown: &str, choice: &str) {
@@ -1508,6 +1726,135 @@ mod tests {
     impl Drop for Harness {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.report);
+        }
+    }
+
+    #[test]
+    fn toolbar_toggles_use_the_caret_after_queued_movement() {
+        for (label, attribute) in [
+            ("Bold", InlineAttribute::Bold),
+            ("Italic", InlineAttribute::Italic),
+            ("Underline", InlineAttribute::Underline),
+            ("Strike", InlineAttribute::Strikethrough),
+            ("Code", InlineAttribute::Code),
+        ] {
+            for initially_on in [false, true] {
+                let mut harness = Harness::new("queued-toggle-caret");
+                let editor = &mut harness.app.editor;
+                *editor = Editor::from_text("first\nsecond");
+                for (paragraph, on) in [(0, initially_on), (1, !initially_on)] {
+                    if on {
+                        editor.select_paragraph(paragraph).unwrap();
+                        editor.toggle_style(attribute).unwrap();
+                    }
+                }
+                editor
+                    .set_selection(Selection::caret(Position::default()))
+                    .unwrap();
+                editor.clear_history();
+                let before = editor.document().to_bytes();
+                let expected = editor.typing_style();
+                harness.step(Vec::new());
+                let click = harness.accessibility_click_event(label);
+                harness.step(vec![plain_key(egui::Key::ArrowDown), click]);
+                let editor = &mut harness.app.editor;
+                assert_eq!(editor.selection(), Selection::caret(Position::new(1, 0)));
+                assert_eq!(
+                    editor.typing_style(),
+                    expected,
+                    "{label}, source on={initially_on}"
+                );
+                assert_eq!(editor.document().to_bytes(), before);
+                assert_eq!(editor.undo_len(), 0);
+                editor.insert_text("X").unwrap();
+                assert_eq!(editor.document().style_at(Position::new(1, 1)), expected);
+                assert!(editor.undo());
+                assert_eq!(editor.document().to_bytes(), before);
+                assert_eq!(editor.typing_style(), expected);
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_toggle_uses_a_mixed_selection_created_in_the_same_batch() {
+        let mut harness = Harness::new("queued-toggle-selection");
+        let editor = &mut harness.app.editor;
+        *editor = Editor::from_text("plain bold");
+        editor
+            .set_selection(Selection::new(Position::new(0, 6), Position::new(0, 10)))
+            .unwrap();
+        editor.toggle_style(InlineAttribute::Bold).unwrap();
+        editor
+            .set_selection(Selection::caret(Position::new(0, 10)))
+            .unwrap();
+        editor.clear_history();
+        let before = editor.document().to_bytes();
+        harness.step(Vec::new());
+        let click = harness.accessibility_click_event("Bold");
+        harness.step(vec![
+            egui::Event::Key {
+                key: egui::Key::Home,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+            click,
+        ]);
+        let selection = Selection::new(Position::new(0, 10), Position::default());
+        let editor = &mut harness.app.editor;
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.selection_style().bold, Some(true));
+        assert_eq!(editor.undo_len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.document().to_bytes(), before);
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.selection_style().bold, None);
+        assert!(editor.redo());
+        assert_eq!(editor.selection(), selection);
+        assert_eq!(editor.selection_style().bold, Some(true));
+        harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn keyboard_and_toolbar_toggles_in_one_batch_both_apply() {
+        for ranged in [false, true] {
+            let mut harness = Harness::new("queued-toggle-twice");
+            harness.app.editor = Editor::from_text("word");
+            if ranged {
+                harness.app.editor.select_all();
+            }
+            let before = harness.app.editor.document().to_bytes();
+            let selection = harness.app.editor.selection();
+            harness.step(Vec::new());
+            let click = harness.accessibility_click_event("Bold");
+            harness.step(vec![
+                egui::Event::Key {
+                    key: egui::Key::B,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                click,
+            ]);
+            let editor = &mut harness.app.editor;
+            assert_eq!(editor.selection(), selection);
+            assert_eq!(editor.selection_style().bold, Some(false));
+            assert_eq!(editor.document().to_bytes(), before);
+            assert_eq!(editor.undo_len(), if ranged { 2 } else { 0 });
+            if ranged {
+                assert!(editor.undo());
+                assert_eq!(editor.selection_style().bold, Some(true));
+                assert!(editor.undo());
+                assert_eq!(editor.document().to_bytes(), before);
+                assert!(editor.redo());
+                assert!(editor.redo());
+                assert_eq!(editor.document().to_bytes(), before);
+                assert_eq!(editor.selection(), selection);
+            }
+            harness.assert_no_command_errors();
         }
     }
 
@@ -1866,6 +2213,143 @@ mod tests {
         let style = harness.app.editor.selection_style();
         assert_eq!(style.bold, Some(true));
         assert_eq!(style.italic, Some(true));
+    }
+
+    #[test]
+    fn replace_selected_match_preserves_other_matches_formatting_and_history() {
+        let mut harness = Harness::new("replace-selected");
+        harness.app.editor = Editor::from_text("café café");
+        harness.app.editor.select_all();
+        harness
+            .app
+            .editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        harness.app.editor.clear_history();
+        harness
+            .app
+            .editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        harness.app.query = "café".into();
+        harness.app.replacement = "日本".into();
+        harness.click("Next", Role::Button);
+        let selected = harness.app.editor.selection();
+        harness.click("Replace", Role::Button);
+        assert_eq!(harness.app.editor.document().plain_text(), "日本 café");
+        assert_eq!(harness.app.status, "Replaced selected match");
+        assert_eq!(harness.app.editor.undo_len(), 1);
+        assert_eq!(harness.app.editor.selection_style().bold, Some(true));
+        assert!(harness.editor_focused());
+        assert!(harness.app.editor.undo());
+        assert_eq!(harness.app.editor.document().plain_text(), "café café");
+        assert_eq!(harness.app.editor.selection(), selected);
+        assert!(harness.app.editor.redo());
+        assert_eq!(harness.app.editor.document().plain_text(), "日本 café");
+
+        // A caret or unrelated selection must never be replaced.
+        harness.click("Replace", Role::Button);
+        assert_eq!(harness.app.editor.document().plain_text(), "日本 café");
+        assert_eq!(harness.app.editor.undo_len(), 1);
+        assert_eq!(
+            harness.app.status,
+            "Select a match with Next or Previous first"
+        );
+        harness.click("Next", Role::Button);
+        harness.app.replacement.clear();
+        harness.click("Replace", Role::Button);
+        assert_eq!(harness.app.editor.document().plain_text(), "日本 ");
+        assert_eq!(harness.app.editor.undo_len(), 2);
+        harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn replace_selected_match_obeys_modes_and_current_search_options() {
+        for (label, text, query, selection) in [
+            ("Match case", "A a", "a", 0..1),
+            ("Whole words", "scatter cat", "cat", 1..4),
+        ] {
+            let mut harness = Harness::new("replace-selected-options");
+            harness.app.editor = Editor::from_text(text);
+            harness
+                .app
+                .editor
+                .set_selection(Selection::new(
+                    Position::new(0, selection.start),
+                    Position::new(0, selection.end),
+                ))
+                .unwrap();
+            harness.app.query = query.into();
+            harness.app.replacement = "x".into();
+            harness.step(Vec::new());
+            let events = [label, "Replace"]
+                .map(|label| {
+                    let (&target, _) = harness
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| {
+                            node.label() == Some(label)
+                                && matches!(node.role(), Role::Button | Role::CheckBox)
+                        })
+                        .unwrap();
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target_node: target,
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        data: None,
+                    })
+                })
+                .to_vec();
+            harness.step(events);
+            assert_eq!(harness.app.editor.document().plain_text(), text, "{label}");
+            assert_eq!(harness.app.editor.undo_len(), 0);
+            harness.assert_no_command_errors();
+        }
+        for (enabled, read_only) in [(false, false), (true, true)] {
+            let mut harness = Harness::new("replace-selected-mode");
+            harness.app.editor = Editor::from_text("match");
+            harness.app.editor.select_all();
+            harness.app.query = "match".into();
+            harness.app.replacement = "changed".into();
+            harness.app.enabled = enabled;
+            harness.app.read_only = read_only;
+            harness.click("Replace", Role::Button);
+            assert_eq!(harness.app.editor.document().plain_text(), "match");
+            assert_eq!(harness.app.editor.undo_len(), 0);
+            harness.assert_no_command_errors();
+        }
+    }
+
+    #[test]
+    fn replace_selected_match_during_composition_keeps_the_committed_input() {
+        for accessibility in [false, true] {
+            let mut harness = Harness::new("ime-replace-selected");
+            harness.app.editor = Editor::from_text("café café");
+            harness.app.query = "café".into();
+            harness.app.replacement = "changed".into();
+            harness.click("Next", Role::Button);
+            let selected = harness.app.editor.selection();
+            harness.preedit("日本");
+            if accessibility {
+                harness.accessibility_click("Replace");
+            } else {
+                harness.click("Replace", Role::Button);
+            }
+            assert_eq!(harness.app.editor.document().plain_text(), "日本 café");
+            assert!(harness.app.editor.composition().is_none());
+            assert_eq!(harness.app.editor.undo_len(), 1);
+            harness.step(vec![egui::Event::Ime(egui::ImeEvent::Commit(
+                "日本".into(),
+            ))]);
+            assert_eq!(harness.app.editor.document().plain_text(), "日本 café");
+            assert!(harness.app.editor.undo());
+            assert_eq!(harness.app.editor.document().plain_text(), "café café");
+            assert_eq!(harness.app.editor.selection(), selected);
+            harness.assert_no_command_errors();
+        }
     }
 
     #[test]
@@ -2351,18 +2835,418 @@ mod tests {
     }
 
     #[test]
-    fn choosing_the_shown_kind_converts_a_mixed_selection() {
-        let mut harness = Harness::new("mixed-kind");
+    fn choosing_current_bullets_keeps_mixed_indentation() {
+        let mut harness = Harness::new("nested-bullet-kind");
+        let editor = &mut harness.app.editor;
+        editor
+            .set_selection(Selection::caret(Position::new(3, 0)))
+            .unwrap();
+        editor.indent_list().unwrap();
+        editor
+            .set_selection(Selection::new(Position::new(2, 0), Position::new(3, 1)))
+            .unwrap();
+        editor.clear_history();
+        let before = editor.document().to_bytes();
+        let selection = editor.selection();
+        harness.choose_paragraph_kind("Bullets", "Bullets");
+        assert_eq!(harness.app.editor.document().to_bytes(), before);
+        assert_eq!(harness.app.editor.selection(), selection);
+        assert_eq!(harness.app.editor.undo_len(), 0);
+        assert!(harness.editor_focused());
+        harness.assert_no_command_errors();
+    }
+
+    fn list_harness(name: &str, text: &str, kinds: &[ParagraphKind]) -> Harness {
+        let mut harness = Harness::new(name);
+        harness.app.editor = Editor::from_text(text);
+        assert_eq!(
+            harness.app.editor.document().paragraphs().len(),
+            kinds.len()
+        );
+        for (index, &kind) in kinds.iter().enumerate() {
+            harness
+                .app
+                .editor
+                .set_selection(Selection::caret(Position::new(index, 0)))
+                .unwrap();
+            harness.app.editor.set_paragraph_kind(kind).unwrap();
+        }
+        harness.app.editor.clear_history();
+        harness
+    }
+
+    #[test]
+    fn choosing_list_types_preserves_nested_depths_selection_formatting_and_history() {
+        for numbered in [false, true] {
+            for backward in [false, true] {
+                for exclusive in [false, true] {
+                    let depths = [0, 2, 0, 1, 7];
+                    let kinds = depths.map(|indent| {
+                        if numbered {
+                            ParagraphKind::Ordered {
+                                indent,
+                                start: Some(7),
+                            }
+                        } else {
+                            ParagraphKind::Bullet { indent }
+                        }
+                    });
+                    let mut harness = list_harness(
+                        "nested-list-conversion",
+                        "first\nchild\nnext\nnested\noutside",
+                        &kinds,
+                    );
+                    let editor = &mut harness.app.editor;
+                    editor
+                        .set_selection(Selection::new(Position::new(0, 1), Position::new(0, 3)))
+                        .unwrap();
+                    editor
+                        .apply_style(StylePatch {
+                            bold: Some(true),
+                            ..StylePatch::default()
+                        })
+                        .unwrap();
+                    let start = Position::new(0, 1);
+                    let end = if exclusive {
+                        Position::new(4, 0)
+                    } else {
+                        Position::new(3, 2)
+                    };
+                    let selection = if backward {
+                        Selection::new(end, start)
+                    } else {
+                        Selection::new(start, end)
+                    };
+                    editor.set_selection(selection).unwrap();
+                    editor.clear_history();
+                    let before = editor.document().to_bytes();
+                    let typing_style = editor.typing_style();
+                    let spans: Vec<_> = editor
+                        .document()
+                        .paragraphs()
+                        .iter()
+                        .map(|paragraph| paragraph.spans().to_vec())
+                        .collect();
+                    let (shown, choice) = if numbered {
+                        ("Numbered list", "Bullets")
+                    } else {
+                        ("Bullets", "Numbered list")
+                    };
+                    harness.choose_paragraph_kind(shown, shown);
+                    assert_eq!(harness.app.editor.document().to_bytes(), before);
+                    assert_eq!(harness.app.editor.undo_len(), 0);
+                    harness.choose_paragraph_kind(shown, choice);
+                    let expected: Vec<_> = depths[..4]
+                        .iter()
+                        .map(|&indent| {
+                            if numbered {
+                                ParagraphKind::Bullet { indent }
+                            } else {
+                                ParagraphKind::Ordered {
+                                    indent,
+                                    start: (indent != 0).then_some(1),
+                                }
+                            }
+                        })
+                        .collect();
+                    let mut expected = expected;
+                    if !numbered {
+                        expected[0] = ParagraphKind::Ordered {
+                            indent: 0,
+                            start: Some(1),
+                        };
+                    }
+                    assert_eq!(harness.kinds(0..=3), expected);
+                    assert_eq!(harness.kinds(4..=4), [kinds[4]]);
+                    if !numbered {
+                        assert_eq!(harness.numbers(0..=3), [Some(1), Some(1), Some(2), Some(1)]);
+                    }
+                    assert_eq!(harness.app.editor.selection(), selection);
+                    assert_eq!(harness.app.editor.typing_style(), typing_style);
+                    assert_eq!(harness.app.editor.undo_len(), 1);
+                    for (paragraph, spans) in harness
+                        .app
+                        .editor
+                        .document()
+                        .paragraphs()
+                        .iter()
+                        .zip(&spans)
+                    {
+                        assert_eq!(paragraph.spans(), spans);
+                    }
+                    let changed = harness.app.editor.document().to_bytes();
+                    harness.choose_paragraph_kind(choice, choice);
+                    assert_eq!(harness.app.editor.document().to_bytes(), changed);
+                    assert_eq!(harness.app.editor.undo_len(), 1);
+                    assert!(harness.app.editor.undo());
+                    assert_eq!(harness.app.editor.document().to_bytes(), before);
+                    assert_eq!(harness.app.editor.selection(), selection);
+                    assert_eq!(harness.app.editor.typing_style(), typing_style);
+                    assert!(harness.app.editor.redo());
+                    assert_eq!(harness.app.editor.document().to_bytes(), changed);
+                    assert_eq!(harness.app.editor.selection(), selection);
+                    assert_eq!(harness.app.editor.typing_style(), typing_style);
+                    harness.assert_no_command_errors();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn choosing_numbered_list_continues_around_nested_runs() {
+        let ordered = |start| ParagraphKind::Ordered { indent: 0, start };
+        let mut harness = list_harness(
+            "nested-number-continuation",
+            "before\none\nchild\ntwo\nafter",
+            &[
+                ordered(Some(5)),
+                ParagraphKind::Bullet { indent: 0 },
+                ParagraphKind::Bullet { indent: 2 },
+                ParagraphKind::Bullet { indent: 0 },
+                ordered(None),
+            ],
+        );
         harness
             .app
             .editor
-            .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 3)))
+            .set_selection(Selection::new(Position::new(1, 0), Position::new(4, 0)))
             .unwrap();
-        harness.choose_paragraph_kind("Bullets", "Bullets");
+        harness.choose_paragraph_kind("Bullets", "Numbered list");
+        assert_eq!(
+            harness.kinds(0..=4),
+            [
+                ordered(Some(5)),
+                ordered(None),
+                ParagraphKind::Ordered {
+                    indent: 2,
+                    start: Some(1)
+                },
+                ordered(None),
+                ordered(None)
+            ]
+        );
+        assert_eq!(
+            harness.numbers(0..=4),
+            [Some(5), Some(6), Some(1), Some(7), Some(8)]
+        );
+        assert_eq!(harness.app.editor.undo_len(), 1);
+        harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn list_choices_preserve_empty_paragraphs_and_separator_typing_style() {
+        for backward in [false, true] {
+            let mut harness = list_harness(
+                "empty-list-conversion",
+                "head\n\n\nend\n",
+                &[
+                    ParagraphKind::Ordered {
+                        indent: 0,
+                        start: Some(5),
+                    },
+                    ParagraphKind::Ordered {
+                        indent: 2,
+                        start: None,
+                    },
+                    ParagraphKind::Ordered {
+                        indent: 2,
+                        start: None,
+                    },
+                    ParagraphKind::Ordered {
+                        indent: 1,
+                        start: None,
+                    },
+                    ParagraphKind::Ordered {
+                        indent: 7,
+                        start: None,
+                    },
+                ],
+            );
+            let start = Position::new(0, 4);
+            let end = Position::new(3, 0);
+            let selection = if backward {
+                Selection::new(end, start)
+            } else {
+                Selection::new(start, end)
+            };
+            let editor = &mut harness.app.editor;
+            editor.set_selection(selection).unwrap();
+            editor
+                .apply_style(StylePatch {
+                    bold: Some(true),
+                    italic: Some(true),
+                    ..StylePatch::default()
+                })
+                .unwrap();
+            let typing_style = editor.typing_style();
+            let before = editor.document().to_bytes();
+            harness.choose_paragraph_kind("Numbered list", "Bullets");
+            assert_eq!(
+                harness.kinds(0..=2),
+                [
+                    ParagraphKind::Bullet { indent: 0 },
+                    ParagraphKind::Bullet { indent: 2 },
+                    ParagraphKind::Bullet { indent: 2 }
+                ]
+            );
+            assert_eq!(
+                harness.kinds(3..=4),
+                [
+                    ParagraphKind::Ordered {
+                        indent: 1,
+                        start: None
+                    },
+                    ParagraphKind::Ordered {
+                        indent: 7,
+                        start: None
+                    }
+                ]
+            );
+            assert_eq!(harness.app.editor.selection(), selection);
+            assert_eq!(harness.app.editor.typing_style(), typing_style);
+            assert_eq!(harness.app.editor.undo_len(), 1);
+            assert!(harness.app.editor.undo());
+            assert_eq!(harness.app.editor.document().to_bytes(), before);
+            assert_eq!(harness.app.editor.typing_style(), typing_style);
+            assert!(harness.app.editor.redo());
+            assert_eq!(harness.app.editor.selection(), selection);
+            assert_eq!(harness.app.editor.typing_style(), typing_style);
+            harness.app.editor.insert_text("x").unwrap();
+            assert_eq!(harness.app.editor.document().plain_text(), "headxend\n");
+            assert_eq!(
+                harness.app.editor.document().style_at(Position::new(0, 5)),
+                typing_style
+            );
+            harness.assert_no_command_errors();
+        }
+
+        let mut harness = list_harness(
+            "final-empty-list",
+            "body\n",
+            &[ParagraphKind::Body, ParagraphKind::Bullet { indent: 7 }],
+        );
+        harness
+            .app
+            .editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            })
+            .unwrap();
+        let typing_style = harness.app.editor.typing_style();
+        let selection = harness.app.editor.selection();
+        harness.choose_paragraph_kind("Bullets", "Numbered list");
+        assert_eq!(
+            harness.kinds(1..=1),
+            [ParagraphKind::Ordered {
+                indent: 7,
+                start: Some(1)
+            }]
+        );
+        assert_eq!(harness.app.editor.selection(), selection);
+        assert_eq!(harness.app.editor.typing_style(), typing_style);
+        assert_eq!(harness.app.editor.undo_len(), 1);
+        harness.app.editor.insert_text("x").unwrap();
+        assert_eq!(harness.app.editor.document().plain_text(), "body\nx");
+        assert_eq!(
+            harness.app.editor.document().style_at(Position::new(1, 1)),
+            typing_style
+        );
+        harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn numbering_buttons_preserve_pending_typing_style() {
+        let mut harness = list_harness(
+            "numbering-pending-style",
+            "first\nsecond",
+            &[
+                ParagraphKind::Ordered {
+                    indent: 1,
+                    start: Some(5),
+                },
+                ParagraphKind::Ordered {
+                    indent: 1,
+                    start: None,
+                },
+            ],
+        );
+        let selection = Selection::caret(Position::new(1, 3));
+        harness.app.editor.set_selection(selection).unwrap();
+        harness
+            .app
+            .editor
+            .apply_style(StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            })
+            .unwrap();
+        let typing_style = harness.app.editor.typing_style();
+        let before = harness.app.editor.document().to_bytes();
+        harness.click("Restart at 1", Role::Button);
+        assert_eq!(harness.numbers(0..=1), [Some(5), Some(1)]);
+        assert_eq!(harness.app.editor.typing_style(), typing_style);
+        assert_eq!(harness.app.editor.selection(), selection);
+        assert!(harness.app.editor.undo());
+        assert_eq!(harness.app.editor.document().to_bytes(), before);
+        assert_eq!(harness.app.editor.typing_style(), typing_style);
+        assert!(harness.app.editor.redo());
+        assert_eq!(harness.app.editor.typing_style(), typing_style);
+        harness.click("Continue numbering", Role::Button);
+        assert_eq!(harness.numbers(0..=1), [Some(5), Some(6)]);
+        assert_eq!(harness.app.editor.typing_style(), typing_style);
+        assert_eq!(harness.app.editor.selection(), selection);
+        assert_eq!(harness.app.editor.undo_len(), 2);
+        harness.app.editor.insert_text("X").unwrap();
+        assert_eq!(
+            harness.app.editor.document().paragraphs()[1].text(),
+            "secXond"
+        );
+        assert_eq!(
+            harness.app.editor.document().style_at(Position::new(1, 4)),
+            typing_style
+        );
+        harness.assert_no_command_errors();
+    }
+
+    #[test]
+    fn paragraph_menu_reports_mixed_kinds_and_tracks_selection_and_history() {
+        let mut harness = Harness::new("mixed-kind");
+        for (anchor, focus, label) in [
+            (Position::new(1, 0), Position::new(2, 0), "Body"),
+            (Position::new(2, 0), Position::new(1, 0), "Body"),
+            (Position::new(2, 0), Position::new(3, 1), "Bullets"),
+            (Position::new(1, 0), Position::new(2, 3), "Mixed"),
+            (Position::new(2, 3), Position::new(1, 0), "Mixed"),
+        ] {
+            harness
+                .app
+                .editor
+                .set_selection(Selection::new(anchor, focus))
+                .unwrap();
+            harness.step(Vec::new());
+            assert!(
+                harness.nodes.values().any(|node| {
+                    node.role() == Role::ComboBox
+                        && (node.label() == Some(label) || node.value() == Some(label))
+                }),
+                "the paragraph menu should show {label} for {anchor:?} to {focus:?}"
+            );
+        }
+        let before = harness.app.editor.document().to_bytes();
+        let selection = harness.app.editor.selection();
+        harness.choose_paragraph_kind("Mixed", "Bullets");
         assert_eq!(
             harness.kinds(1..=2),
             [ParagraphKind::Bullet { indent: 0 }; 2]
         );
+        assert_eq!(harness.app.editor.undo_len(), 1);
+        harness.click("Undo", Role::Button);
+        assert_eq!(harness.app.editor.document().to_bytes(), before);
+        assert_eq!(harness.app.editor.selection(), selection);
+        harness.click("Mixed", Role::ComboBox);
+        harness.click("Quote", Role::Button);
+        assert_eq!(harness.kinds(1..=2), [ParagraphKind::Quote; 2]);
         harness.assert_no_command_errors();
     }
 
@@ -2392,7 +3276,7 @@ mod tests {
             .editor
             .set_selection(Selection::new(Position::new(1, 0), Position::new(3, 1)))
             .unwrap();
-        harness.choose_paragraph_kind("Numbered list", "Numbered list");
+        harness.choose_paragraph_kind("Mixed", "Numbered list");
         assert_eq!(
             harness.kinds(1..=4),
             [
@@ -2412,7 +3296,7 @@ mod tests {
         editor
             .set_selection(Selection::new(Position::new(3, 0), Position::new(4, 1)))
             .unwrap();
-        harness.choose_paragraph_kind("Body", "Numbered list");
+        harness.choose_paragraph_kind("Mixed", "Numbered list");
         assert_eq!(harness.numbers(3..=4), [Some(3), Some(4)]);
         harness.assert_no_command_errors();
     }
@@ -2425,7 +3309,7 @@ mod tests {
             .editor
             .set_selection(Selection::new(Position::new(1, 0), Position::new(2, 3)))
             .unwrap();
-        harness.choose_paragraph_kind("Bullets", "Quote");
+        harness.choose_paragraph_kind("Mixed", "Quote");
         assert_eq!(harness.kinds(1..=2), [ParagraphKind::Quote; 2]);
         assert_eq!(harness.kinds(3..=3), [ParagraphKind::Bullet { indent: 0 }]);
         let undo = harness.app.editor.undo_len();
@@ -2865,6 +3749,134 @@ mod tests {
     }
 
     #[test]
+    fn remove_link_handles_mixed_links_and_plain_text_without_changing_formatting() {
+        for backward in [false, true] {
+            for end in [
+                Position::new(0, 9),
+                Position::new(0, 13),
+                Position::new(1, 0),
+            ] {
+                let mut harness = Harness::new("mixed-remove-link");
+                let editor = &mut harness.app.editor;
+                *editor = Editor::from_text("one plain two\nkeep");
+                for (paragraph, start, end, url) in [
+                    (0, 0, 3, "https://example.com/one"),
+                    (0, 10, 13, "https://example.com/two"),
+                    (1, 0, 4, "https://example.com/keep"),
+                ] {
+                    editor
+                        .set_selection(Selection::new(
+                            Position::new(paragraph, start),
+                            Position::new(paragraph, end),
+                        ))
+                        .unwrap();
+                    editor.set_link(Some(Link::try_new(url).unwrap())).unwrap();
+                }
+                editor
+                    .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 3)))
+                    .unwrap();
+                editor
+                    .apply_style(StylePatch {
+                        bold: Some(true),
+                        background: Some(Some(Color::YELLOW)),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let selection = if backward {
+                    Selection::new(end, Position::default())
+                } else {
+                    Selection::new(Position::default(), end)
+                };
+                editor.set_selection(selection).unwrap();
+                editor.clear_history();
+                assert!(editor.selected_link().is_none(), "the selection is mixed");
+                let before = editor.document().to_bytes();
+                let typing_style = editor.typing_style();
+                let styles: Vec<_> = (0..=13)
+                    .map(|byte| editor.document().style_at(Position::new(0, byte)))
+                    .collect();
+
+                harness.click("Remove link", Role::Button);
+                let editor = &harness.app.editor;
+                assert_eq!(harness.link_at(0, 0), None);
+                assert_eq!(
+                    harness.link_at(0, 10).as_deref(),
+                    (end == Position::new(0, 9)).then_some("https://example.com/two")
+                );
+                assert_eq!(
+                    harness.link_at(1, 0).as_deref(),
+                    Some("https://example.com/keep")
+                );
+                assert_eq!(editor.document().plain_text(), "one plain two\nkeep");
+                assert_eq!(editor.selection(), selection);
+                assert_eq!(editor.typing_style(), typing_style);
+                assert_eq!(editor.undo_len(), 1);
+                assert_eq!(
+                    (0..=13)
+                        .map(|byte| editor.document().style_at(Position::new(0, byte)))
+                        .collect::<Vec<_>>(),
+                    styles
+                );
+                let changed = editor.document().to_bytes();
+                assert!(harness.editor_focused());
+                assert!(harness.app.editor.undo());
+                assert_eq!(harness.app.editor.document().to_bytes(), before);
+                assert_eq!(harness.app.editor.selection(), selection);
+                assert!(harness.app.editor.redo());
+                assert_eq!(harness.app.editor.document().to_bytes(), changed);
+                assert_eq!(harness.app.editor.selection(), selection);
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
+    fn remove_link_is_a_noop_without_links_and_respects_editing_modes() {
+        for (enabled, read_only) in [(true, false), (true, true), (false, false)] {
+            for accessibility in [false, true] {
+                let mut harness = Harness::new("remove-link-noop-or-mode");
+                let editor = &mut harness.app.editor;
+                *editor = Editor::from_text("linked plain");
+                if !enabled || read_only {
+                    editor
+                        .set_selection(Selection::new(Position::default(), Position::new(0, 6)))
+                        .unwrap();
+                    editor
+                        .set_link(Some(Link::try_new("https://example.com").unwrap()))
+                        .unwrap();
+                }
+                editor.select_all();
+                editor
+                    .apply_style(StylePatch {
+                        bold: Some(true),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                editor.clear_history();
+                editor.mark_saved();
+                let before = editor.document().to_bytes();
+                let selection = editor.selection();
+                let style = editor.typing_style();
+                harness.app.enabled = enabled;
+                harness.app.read_only = read_only;
+                harness.step(Vec::new());
+                if accessibility {
+                    harness.accessibility_click("Remove link");
+                } else {
+                    harness.click("Remove link", Role::Button);
+                }
+                let editor = &harness.app.editor;
+                assert_eq!(editor.document().to_bytes(), before);
+                assert_eq!(editor.selection(), selection);
+                assert_eq!(editor.typing_style(), style);
+                assert_eq!(editor.undo_len(), 0);
+                assert!(!editor.is_modified());
+                harness.assert_no_command_errors();
+            }
+        }
+    }
+
+    #[test]
     fn link_shortcut_preserves_altgr_text_and_combined_modifiers() {
         for modifiers in [
             egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::COMMAND,
@@ -2929,6 +3941,387 @@ mod tests {
                 .viewport_commands
                 .contains(&egui::ViewportCommand::Close)
         );
+    }
+
+    fn link_shortcut() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }
+    }
+
+    fn linked_paragraphs(name: &str) -> Harness {
+        let mut harness = Harness::new(name);
+        harness.app.editor = Editor::from_text("first\nsecond");
+        for (paragraph, url) in [
+            (0, "https://example.com/first"),
+            (1, "https://example.com/second"),
+        ] {
+            harness.app.editor.select_paragraph(paragraph).unwrap();
+            harness
+                .app
+                .editor
+                .set_link(Some(Link::try_new(url).unwrap()))
+                .unwrap();
+        }
+        harness
+            .app
+            .editor
+            .set_selection(Selection::caret(Position::default()))
+            .unwrap();
+        harness.app.editor.clear_history();
+        harness.step(Vec::new());
+        harness
+    }
+
+    #[test]
+    fn link_opening_uses_queued_movement_and_selection_before_prefilling() {
+        for keyboard in [false, true] {
+            for accessibility_selection in [false, true] {
+                let mut harness = linked_paragraphs("link-queued-prefill");
+                let before = harness.app.editor.document().to_bytes();
+                let movement = if accessibility_selection {
+                    harness.accessibility_caret_event("second")
+                } else {
+                    plain_key(egui::Key::ArrowDown)
+                };
+                let open = if keyboard {
+                    link_shortcut()
+                } else {
+                    harness.accessibility_click_event("Link")
+                };
+                harness.step(vec![movement, open]);
+                harness.step(Vec::new());
+                let selection = Selection::caret(Position::new(1, 0));
+                assert_eq!(harness.app.editor.selection(), selection);
+                assert_eq!(
+                    harness.app.link_url.as_deref(),
+                    Some("https://example.com/second")
+                );
+                harness.click("Apply link", Role::Button);
+                assert_eq!(harness.app.editor.document().to_bytes(), before);
+                assert_eq!(harness.app.editor.selection(), selection);
+                assert_eq!(harness.app.editor.undo_len(), 0);
+                harness.assert_no_command_errors();
+            }
+        }
+        let mut harness = linked_paragraphs("link-pointer-prefill");
+        let before = harness.app.editor.document().to_bytes();
+        let movement = harness.accessibility_caret_event("second");
+        harness.click_with_release_events("Link", Role::Button, vec![movement]);
+        assert_eq!(
+            harness.app.link_url.as_deref(),
+            Some("https://example.com/second")
+        );
+        harness.click("Apply link", Role::Button);
+        assert_eq!(harness.app.editor.document().to_bytes(), before);
+        assert_eq!(harness.app.editor.undo_len(), 0);
+    }
+
+    #[test]
+    fn link_opening_routes_text_pastes_and_real_focus_in_order_across_pass_limits() {
+        for max_passes in [1, 2, 8] {
+            for keyboard in [false, true] {
+                let mut harness = Harness::new("link-ordered-input");
+                harness.context.options_mut(|options| {
+                    options.max_passes = NonZeroUsize::new(max_passes).unwrap()
+                });
+                harness.app.editor = Editor::from_text("document");
+                // Two pastes in one host batch are plain-only: exercise capture
+                // slot accounting without reading or changing the OS clipboard.
+                harness.app.clipboard = Some(NativeClipboard::default());
+                let document = harness.app.document_id.unwrap();
+                let find = harness.app.text_field_ids[1].unwrap();
+                let open = if keyboard {
+                    link_shortcut()
+                } else {
+                    harness.accessibility_click_event("Link")
+                };
+                harness.step(vec![
+                    egui::Event::Text("before".into()),
+                    egui::Event::Paste("-paste".into()),
+                    open,
+                    egui::Event::Text("url".into()),
+                    egui::Event::Paste("-field".into()),
+                    accessibility_focus(find),
+                    egui::Event::Text("find".into()),
+                    accessibility_focus(document),
+                    egui::Event::Text("after".into()),
+                ]);
+                // Fresh host input must follow older pass-limit overflow.
+                harness.step(vec![egui::Event::Text("later".into())]);
+                for _ in 0..10 {
+                    harness.step(Vec::new());
+                }
+                assert_eq!(
+                    harness.app.editor.document().plain_text(),
+                    "before-pasteafterlaterdocument",
+                    "max_passes={max_passes} keyboard={keyboard}"
+                );
+                assert_eq!(harness.app.link_url.as_deref(), Some("url-field"));
+                assert_eq!(harness.app.query, "find");
+                assert_eq!(harness.app.text_field_ids[1], Some(find));
+                assert_eq!(
+                    harness
+                        .app
+                        .clipboard
+                        .as_ref()
+                        .unwrap()
+                        .pending_paste_count(),
+                    0
+                );
+                assert!(harness.editor_focused());
+                harness.assert_no_command_errors();
+                harness
+                    .app
+                    .qa
+                    .as_mut()
+                    .unwrap()
+                    .write_report(&harness.app.editor)
+                    .unwrap();
+                let report = fs::read_to_string(&harness.report).unwrap();
+                assert!(
+                    report.contains(&format!(
+                        "\"text\": 5, \"key_press\": {}, \"paste\": 2",
+                        usize::from(keyboard)
+                    )),
+                    "{report}"
+                );
+                assert!(
+                    report.contains(&format!(
+                        "\"accessibility_action\": {}",
+                        if keyboard { 2 } else { 3 }
+                    )),
+                    "{report}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_opening_rechecks_modes_when_queued_and_wins_over_startup_focus() {
+        for (enabled, read_only) in [(false, false), (true, true)] {
+            let mut harness = Harness::new("link-pending-mode");
+            harness
+                .context
+                .options_mut(|options| options.max_passes = NonZeroUsize::new(1).unwrap());
+            harness.app.editor = Editor::from_text("document");
+            harness.step(vec![
+                egui::Event::Text("before".into()),
+                link_shortcut(),
+                egui::Event::Text("after".into()),
+            ]);
+            assert!(harness.app.link_url.is_none());
+            harness.app.enabled = enabled;
+            harness.app.read_only = read_only;
+            for _ in 0..4 {
+                harness.step(Vec::new());
+            }
+            assert!(harness.app.link_url.is_none());
+            assert_eq!(harness.app.editor.document().plain_text(), "beforedocument");
+        }
+        let mut harness = Harness::unstarted("link-startup-focus");
+        harness.app.editor = Editor::from_text("document");
+        harness.step(vec![link_shortcut(), egui::Event::Text("url".into())]);
+        for _ in 0..3 {
+            harness.step(Vec::new());
+        }
+        assert_eq!(harness.app.editor.document().plain_text(), "document");
+        assert_eq!(harness.app.link_url.as_deref(), Some("url"));
+        assert!(
+            harness
+                .context
+                .memory(|memory| memory.has_focus(link_field_id()))
+        );
+    }
+
+    #[test]
+    fn link_opening_refreshes_prefill_after_ime_replacement_and_keeps_its_echo_out() {
+        let mut harness = Harness::new("link-ime-prefill");
+        harness.app.editor = Editor::from_text("a plain z");
+        harness.app.editor.select_all();
+        harness
+            .app
+            .editor
+            .set_link(Some(Link::try_new("https://example.com").unwrap()))
+            .unwrap();
+        harness
+            .app
+            .editor
+            .set_selection(Selection::new(Position::new(0, 2), Position::new(0, 7)))
+            .unwrap();
+        harness.app.editor.set_link(None).unwrap();
+        // Replacement is bounded by the same link, so the inserted text joins
+        // it even though the selected range itself contains unlinked text.
+        harness
+            .app
+            .editor
+            .set_selection(Selection::new(Position::new(0, 1), Position::new(0, 8)))
+            .unwrap();
+        harness.app.editor.clear_history();
+        let before = harness.app.editor.document().to_bytes();
+        assert!(harness.app.editor.selected_link().is_none());
+        harness.preedit("한");
+        harness.step(vec![
+            link_shortcut(),
+            egui::Event::Ime(egui::ImeEvent::Commit("한".into())),
+        ]);
+        for _ in 0..3 {
+            harness.step(Vec::new());
+        }
+        assert_eq!(harness.app.editor.document().plain_text(), "a한z");
+        assert_eq!(harness.app.link_url.as_deref(), Some("https://example.com"));
+        assert_eq!(harness.app.editor.undo_len(), 1);
+        harness.step(vec![egui::Event::Text("/suffix".into())]);
+        assert_eq!(
+            harness.app.link_url.as_deref(),
+            Some("https://example.com/suffix")
+        );
+        assert!(harness.app.editor.undo());
+        assert_eq!(harness.app.editor.document().to_bytes(), before);
+        assert!(harness.app.editor.redo());
+        assert_eq!(harness.app.editor.document().plain_text(), "a한z");
+    }
+
+    #[test]
+    fn link_opening_clears_a_removed_link_prefill_and_reopening_is_fresh_input() {
+        let mut harness = Harness::new("link-ime-cleared-prefill");
+        harness.app.editor = Editor::from_text("linked");
+        harness.app.editor.select_all();
+        harness
+            .app
+            .editor
+            .set_link(Some(Link::try_new("https://example.com").unwrap()))
+            .unwrap();
+        harness.preedit("한");
+        harness.step(vec![link_shortcut()]);
+        assert_eq!(harness.app.editor.document().plain_text(), "한");
+        // Full replacement at a link boundary is unlinked. Refresh also clamps
+        // the former URL's cursor so following field text is inserted correctly.
+        assert_eq!(harness.app.link_url.as_deref(), Some(""));
+        assert!(harness.app.ime_handoff.is_some());
+        harness.step(vec![
+            link_shortcut(),
+            egui::Event::Ime(egui::ImeEvent::Commit("한".into())),
+        ]);
+        for _ in 0..3 {
+            harness.step(Vec::new());
+        }
+        assert_eq!(harness.app.link_url.as_deref(), Some("한"));
+        assert_eq!(harness.app.editor.document().plain_text(), "한");
+    }
+
+    #[test]
+    fn link_opening_cancels_a_pending_document_plain_paste_reply() {
+        let mut harness = Harness::new("link-paste-owner");
+        harness.app.editor = Editor::from_text("document");
+        harness.step(vec![
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            },
+            link_shortcut(),
+        ]);
+        assert!(
+            harness
+                .viewport_commands
+                .contains(&egui::ViewportCommand::RequestPaste)
+        );
+        harness.step(vec![egui::Event::Paste("late clipboard reply".into())]);
+        for _ in 0..3 {
+            harness.step(Vec::new());
+        }
+        assert_eq!(harness.app.editor.document().plain_text(), "document");
+        assert_eq!(harness.app.link_url.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn link_opening_and_raw_observation_are_idempotent_during_logic_only_replays() {
+        use eframe::App as _;
+        let mut harness = Harness::new("link-logic-only-replay");
+        harness.app.editor = Editor::from_text("document");
+        harness.app.clipboard = Some(NativeClipboard::default());
+        let mut input = egui::RawInput {
+            focused: true,
+            events: vec![egui::Event::Text("before".into()), link_shortcut()],
+            ..Default::default()
+        };
+        harness.app.raw_input_hook(&harness.context, &mut input);
+        // eframe retains this transformed batch during minimized logic updates
+        // and appends newly arrived native events before calling the hook again.
+        input.events.extend([
+            egui::Event::Paste("one".into()),
+            egui::Event::Paste("two".into()),
+        ]);
+        harness.app.raw_input_hook(&harness.context, &mut input);
+        assert_eq!(
+            harness
+                .app
+                .clipboard
+                .as_ref()
+                .unwrap()
+                .pending_paste_count(),
+            2
+        );
+        harness.app.read_only = true;
+        input.events.push(egui::Event::Paste("three".into()));
+        harness.app.raw_input_hook(&harness.context, &mut input);
+        harness.app.raw_input_hook(&harness.context, &mut input);
+        assert_eq!(
+            harness
+                .app
+                .clipboard
+                .as_ref()
+                .unwrap()
+                .pending_paste_count(),
+            3
+        );
+        assert_eq!(
+            input
+                .events
+                .iter()
+                .filter(|event| is_open_link_marker(event))
+                .count(),
+            1
+        );
+        harness.app.read_only = false;
+        harness.deliver(input);
+        for _ in 0..4 {
+            harness.step(Vec::new());
+        }
+        assert_eq!(harness.app.editor.document().plain_text(), "beforedocument");
+        assert_eq!(harness.app.link_url.as_deref(), Some("onetwothree"));
+        assert_eq!(
+            harness
+                .app
+                .clipboard
+                .as_ref()
+                .unwrap()
+                .pending_paste_count(),
+            0
+        );
+        harness.step(vec![egui::Event::Text("fresh".into())]);
+        assert_eq!(harness.app.link_url.as_deref(), Some("onetwothreefresh"));
+        harness
+            .app
+            .qa
+            .as_mut()
+            .unwrap()
+            .write_report(&harness.app.editor)
+            .unwrap();
+        let report = fs::read_to_string(&harness.report).unwrap();
+        assert!(
+            report.contains("\"text\": 2, \"key_press\": 1, \"paste\": 3"),
+            "{report}"
+        );
+        assert!(report.contains("\"accessibility_action\": 0"), "{report}");
+        harness.assert_no_command_errors();
     }
 
     #[test]

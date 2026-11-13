@@ -14,6 +14,70 @@ fn default_options() -> SearchOptions {
 }
 
 #[test]
+fn unspaced_whole_word_navigation_matches_stream_after_indexing_and_edits() {
+    for (token, queries) in [
+        ("你好", ["你", "好", "你好"]),
+        ("🇺🇸🇨🇦", ["🇺🇸", "🇨🇦", "🇸🇨"]),
+        ("e\u{301}:β!?", ["E\u{301}:Β", "β", "!"]),
+        ("👩\u{200d}💻\u{2028}😀", ["👩\u{200d}💻", "😀", "💻"]),
+    ] {
+        let mut editor = Editor::from_text(&token.repeat(1_024));
+        for edited in [false, true] {
+            if edited {
+                // A leading regional indicator changes every flag pairing in
+                // the second fixture, invalidating the old boundary index.
+                editor
+                    .set_selection(Selection::caret(Position::default()))
+                    .unwrap();
+                editor.insert_text("🇺").unwrap();
+            }
+            let paragraph = editor.document().paragraph(0).unwrap();
+            let count = paragraph.grapheme_count();
+            let carets: Vec<_> = [count, count / 2, 0, count - 1]
+                .map(|index| Position::new(0, paragraph.byte_from_grapheme(index).unwrap()))
+                .into();
+            for query in queries {
+                for case_sensitive in [true, false] {
+                    let options = SearchOptions {
+                        case_sensitive,
+                        whole_word: true,
+                    };
+                    let expected = editor.document().find(query, options);
+                    for &caret in &carets {
+                        for backward in [true, false] {
+                            let found = if backward {
+                                expected.iter().rev().find(|range| range.end <= caret)
+                            } else {
+                                expected.iter().find(|range| range.start >= caret)
+                            };
+                            editor.set_selection(Selection::caret(caret)).unwrap();
+                            let actual = if backward {
+                                editor.find_previous(query, options, SearchWrap::Stop)
+                            } else {
+                                editor.find_next(query, options, SearchWrap::Stop)
+                            }
+                            .unwrap();
+                            assert_eq!(
+                                actual,
+                                found.is_some(),
+                                "{token:?}, {query:?}, edited={edited}, {caret:?}"
+                            );
+                            assert_eq!(
+                                editor.selection(),
+                                found.map_or(Selection::caret(caret), |range| Selection::new(
+                                    range.start,
+                                    range.end
+                                ))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn long_repetitive_multiline_queries_preserve_matches_navigation_and_replacement() {
     let prefix = "A\nB\n".repeat(2_000);
     // Many candidate starts agree with both edge lines and most middle lines.

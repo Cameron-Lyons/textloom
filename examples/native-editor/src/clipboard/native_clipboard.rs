@@ -599,19 +599,19 @@ impl NativeClipboard {
         }
     }
 
-    /// Captures the native item for a lone Paste in `input` if `capture_native`
+    /// Captures the native item for a lone Paste in `events` if `capture_native`
     /// is true, and records a slot for every Paste. Call it from the raw input
     /// hook, before egui routes the input.
-    pub fn capture_pastes(&mut self, input: &mut egui::RawInput, capture_native: bool) {
+    pub fn capture_pastes(&mut self, events: &mut [egui::Event], capture_native: bool) {
         let captured = if capture_native {
-            let result = capture_paste(&mut input.events, || self.capture());
+            let result = capture_paste(events, || self.capture());
             self.paste_result(result)
         } else {
             None
         };
         // Keep a slot even for plain-only or native-field pastes. Every delivered
         // Paste advances the queue, including ones the document does not handle.
-        self.pending_pastes.record(&input.events, captured);
+        self.pending_pastes.record(events, captured);
     }
 
     /// Takes the slots of the Paste events in one pass's `events` and stages
@@ -626,6 +626,11 @@ impl NativeClipboard {
     /// Discards a staged paste that the document did not use in this pass.
     pub fn clear_staged_paste(&mut self) {
         self.staged = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_paste_count(&self) -> usize {
+        self.pending_pastes.0.len()
     }
 
     /// Records a failed native capture while retaining the plain Paste event.

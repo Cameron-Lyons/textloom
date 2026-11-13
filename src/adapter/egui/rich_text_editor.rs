@@ -3,7 +3,7 @@
 use super::accessibility::AccessibilityError;
 use super::composition::CompositionPreview;
 use super::input::InputOptions;
-use super::layout::{Appearance, LayoutCache, ParagraphLayouts};
+use super::layout::{Appearance, LayoutCache, LayoutIdentity, ParagraphLayouts};
 use super::navigation::{CaretPlacement, VerticalNavigation};
 use super::paint::{BackgroundRanges, PaintCache};
 use super::{accessibility, input, input_routing, navigation, paint};
@@ -917,23 +917,26 @@ impl<'editor> RichTextEditor<'editor> {
                 .navigation
                 .as_ref()
                 .is_none_or(|navigation| navigation.prefer_next_row);
-        let local_caret = navigation::document_caret_rect(
+        let geometry = CachedGeometry::get(
+            &mut cache.geometry,
             display_document,
             display_layouts,
-            Pos2::ZERO,
-            caret_position,
-            prefer_next_row,
+            GeometryInput {
+                caret: CaretPlacement {
+                    position: caret_position,
+                    prefer_next_row,
+                },
+                selection: display_selection,
+                width: appearance.width,
+                composition_start: preview
+                    .map(|preview| preview.composition.replacement.range().start),
+            },
         );
+        let local_caret = geometry.caret;
         let caret = local_caret.translate(origin.to_vec2());
-        let selection_rect = display_selection.and_then(|selection| {
-            navigation::selection_bounds(
-                display_document,
-                display_layouts,
-                origin,
-                selection,
-                appearance.width,
-            )
-        });
+        let selection_rect = geometry
+            .selection
+            .map(|selection| selection.translate(origin.to_vec2()));
         if pointer_interaction
             || !was_focused
             || composition_changed
@@ -985,14 +988,8 @@ impl<'editor> RichTextEditor<'editor> {
                 .layer_transform_to_global(ui.layer_id())
                 .unwrap_or_default();
             let mut ime_area = caret;
-            if let Some(preview) = preview {
-                let start = navigation::document_caret_rect(
-                    display_document,
-                    display_layouts,
-                    origin,
-                    preview.composition.replacement.range().start,
-                    /* prefer_next_row= */ true,
-                );
+            if let Some(start) = geometry.composition_start {
+                let start = start.translate(origin.to_vec2());
                 if start.top() == caret.top() {
                     ime_area = ime_area.union(start);
                 }
@@ -1011,7 +1008,7 @@ impl<'editor> RichTextEditor<'editor> {
             .hover_pos()
             .filter(|_| preview.is_none() && ui.is_enabled())
             .and_then(|pointer| {
-                navigation::link_at_point(self.editor.document(), &layouts, pointer - origin)
+                cache.hovered_link(self.editor.document(), &layouts, pointer - origin)
             });
         if response.hovered() {
             let follows_links = self.read_only || ui.input(|input| input.modifiers.command);
@@ -1151,7 +1148,74 @@ pub(super) struct Cache {
     plain_text: Option<Arc<str>>,
     pub(super) preview: Option<Box<CompositionPreview>>,
     pub(super) accessibility: Option<Arc<accessibility::Snapshot>>,
+    link_hover: Option<(Vec2, Option<Link>)>,
+    geometry: Option<CachedGeometry>,
     interaction: InteractionState,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct GeometryInput {
+    caret: CaretPlacement,
+    selection: Option<Selection>,
+    width: f32,
+    composition_start: Option<Position>,
+}
+
+#[derive(Clone, Copy)]
+struct GeometryBounds {
+    caret: Rect,
+    selection: Option<Rect>,
+    composition_start: Option<Rect>,
+}
+
+#[derive(Clone)]
+struct CachedGeometry {
+    layout: LayoutIdentity,
+    input: GeometryInput,
+    bounds: GeometryBounds,
+}
+
+impl CachedGeometry {
+    fn get(
+        cache: &mut Option<Self>,
+        document: &Document,
+        layouts: &ParagraphLayouts,
+        input: GeometryInput,
+    ) -> GeometryBounds {
+        if let Some(cached) = cache
+            && cached.input == input
+            && cached.layout.matches(layouts)
+        {
+            return cached.bounds;
+        }
+        // Galley cursor queries scan its rows. Retain local geometry while the
+        // layout and selection stay unchanged, including for offscreen carets.
+        // The weak identity also distinguishes document and preedit layouts.
+        let caret = |position, prefer_next_row| {
+            navigation::document_caret_rect(
+                document,
+                layouts,
+                Pos2::ZERO,
+                position,
+                prefer_next_row,
+            )
+        };
+        let bounds = GeometryBounds {
+            caret: caret(input.caret.position, input.caret.prefer_next_row),
+            selection: input.selection.and_then(|selection| {
+                navigation::selection_bounds(document, layouts, Pos2::ZERO, selection, input.width)
+            }),
+            composition_start: input
+                .composition_start
+                .map(|position| caret(position, true)),
+        };
+        *cache = Some(Self {
+            layout: layouts.identity(),
+            input,
+            bounds,
+        });
+        bounds
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1223,8 +1287,27 @@ impl Cache {
         }
         if update.layout_changed {
             self.interaction.navigation = None;
+            self.link_hover = None;
         }
         update.layouts
+    }
+    fn hovered_link(
+        &mut self,
+        document: &Document,
+        layouts: &ParagraphLayouts,
+        point: Vec2,
+    ) -> Option<Link> {
+        // Layout changes invalidate this result. Document-local coordinates
+        // also change when scrolling moves text under a stationary pointer.
+        // Keep misses too, since unlinked text can share a paragraph with links.
+        if let Some((previous, link)) = &self.link_hover
+            && *previous == point
+        {
+            return link.clone();
+        }
+        let link = navigation::link_at_point(document, layouts, point);
+        self.link_hover = Some((point, link.clone()));
+        link
     }
     fn plain_text(&mut self, document: &Document) -> Arc<str> {
         self.plain_text

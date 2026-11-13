@@ -3173,6 +3173,110 @@ fn selected_paragraphs_and_block_kind_follow_paragraph_command_rules() {
 }
 
 #[test]
+fn repeated_paragraph_kind_queries_follow_edits_history_rollbacks_and_clones() {
+    let mut editor = Editor::from_text("one\n\nthree");
+    editor.select_all();
+    let all = editor.selection();
+    assert_eq!(editor.selection_paragraph_kind(), Some(BODY));
+    assert_eq!(editor.selection_paragraph_kind(), Some(BODY));
+    editor.set_paragraph_kind(QUOTE).unwrap();
+    assert_eq!(editor.selection_paragraph_kind(), Some(QUOTE));
+    let mut clone = editor.clone();
+
+    assert!(editor.undo());
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_paragraph_kind(), Some(BODY));
+    assert_eq!(clone.selection_paragraph_kind(), Some(QUOTE));
+    assert!(editor.redo());
+    assert_eq!(editor.selection_paragraph_kind(), Some(QUOTE));
+
+    let heading = ParagraphKind::Heading { level: 3 };
+    let result: Result<(), Error> = editor.transaction(|outer| {
+        outer.set_paragraph_kind(BODY)?;
+        assert_eq!(outer.selection_paragraph_kind(), Some(BODY));
+        let result: Result<(), Error> = outer.transaction(|inner| {
+            inner.set_paragraph_kind(heading)?;
+            assert_eq!(inner.selection_paragraph_kind(), Some(heading));
+            Err(Error::InvalidRange)
+        });
+        assert_eq!(result, Err(Error::InvalidRange));
+        assert_eq!(outer.selection_paragraph_kind(), Some(BODY));
+        Err(Error::InvalidRange)
+    });
+    assert_eq!(result, Err(Error::InvalidRange));
+    assert_eq!(editor.selection(), all);
+    assert_eq!(editor.selection_paragraph_kind(), Some(QUOTE));
+
+    caret(&mut clone, 1, 0);
+    clone.set_paragraph_kind(heading).unwrap();
+    clone.select_all();
+    assert_eq!(clone.selection_paragraph_kind(), None);
+    assert_eq!(editor.selection_paragraph_kind(), Some(QUOTE));
+
+    clone
+        .insert_fragment(&Fragment::from_text("new\n\ntext"))
+        .unwrap();
+    clone.select_all();
+    assert_eq!(clone.selection_paragraph_kind(), Some(BODY));
+    assert!(clone.undo());
+    assert_eq!(clone.selection_paragraph_kind(), None);
+    assert!(clone.redo());
+    clone.select_all();
+    assert_eq!(clone.selection_paragraph_kind(), Some(BODY));
+}
+
+#[test]
+fn repeated_paragraph_kind_queries_follow_covered_paragraphs_and_first_list_item() {
+    let mut editor = Editor::from_text("one\ntwo\nthree\nquote");
+    let first = ordered(Some(4));
+    let second = ParagraphKind::Ordered {
+        indent: 2,
+        start: Some(9),
+    };
+    for (paragraph, kind) in [(0, first), (1, second), (2, ordered(None)), (3, QUOTE)] {
+        caret(&mut editor, paragraph, 0);
+        editor.set_paragraph_kind(kind).unwrap();
+    }
+    for (selection, expected) in [
+        (
+            Selection::new(Position::new(0, 0), Position::new(2, 1)),
+            Some(first),
+        ),
+        // Moving within the same covered paragraphs, including reversal, preserves the kind.
+        (
+            Selection::new(Position::new(2, 3), Position::new(0, 1)),
+            Some(first),
+        ),
+        (
+            Selection::new(Position::new(0, 2), Position::new(3, 0)),
+            Some(first),
+        ),
+        // Including any of the quote text changes the uniform list into a mixed selection.
+        (
+            Selection::new(Position::new(0, 2), Position::new(3, 1)),
+            None,
+        ),
+        (
+            Selection::new(Position::new(1, 0), Position::new(3, 0)),
+            Some(second),
+        ),
+        (
+            Selection::new(Position::new(3, 0), Position::new(1, 1)),
+            Some(second),
+        ),
+        (Selection::caret(Position::new(3, 0)), Some(QUOTE)),
+        (
+            Selection::new(Position::new(1, 2), Position::new(3, 0)),
+            Some(second),
+        ),
+    ] {
+        editor.set_selection(selection).unwrap();
+        assert_eq!(editor.selection_paragraph_kind(), expected, "{selection:?}");
+        assert_eq!(editor.selection_paragraph_kind(), expected, "{selection:?}");
+    }
+}
+
+#[test]
 fn style_toggles_match_the_adapter_shortcut_rule() {
     let mut editor = bold_prefix_editor();
     editor.select_all();

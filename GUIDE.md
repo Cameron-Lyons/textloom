@@ -57,7 +57,8 @@ Replacing an editor inside a transaction leaves the replacement intact. An
 editor moved out of the callback becomes an independent snapshot once its
 transaction scopes end, retaining its edits as one undo step subject to history
 limits, like a clone. Errors and panics roll back only the editor still
-associated with the matching transaction guard.
+associated with the matching transaction guard. Explicit `clear_history()`,
+`set_history_limits()`, and `mark_saved()` calls remain in effect after rollback.
 
 ```rust
 use textloom::{Color, Editor, Link, ParagraphKind, Position, Selection, StylePatch};
@@ -236,8 +237,14 @@ fixtures passed on Linux X11/Wayland, macOS, and Windows; evidence is recorded i
 `RELEASING.md`. External-application interoperability, IME, dead keys/AltGr, and
 screen-reader behavior still need native platform signoff.
 The corrected macOS HTML offer preserves quote indentation in TextEdit 1.20
-(415) on macOS 26.6.2. IME, VoiceOver, physical-input, and display-scale signoff
-remain open; see [current macOS release evidence](RELEASING.md#macos-readiness-refreshed-2026-10-27).
+(415) on macOS 26.6.2. Later [macOS feedback on candidate
+`f7d3a65`](RELEASING.md#verified-candidate-and-macos-feedback-2026-11-10)
+records user-reported passes for basic editing, Japanese/Chinese IMEs,
+VoiceOver, physical keyboard/touch, and display-scale changes. Individual
+protocol steps and configuration details were not itemized, and the separate
+winit harness and other platforms were not covered. Outstanding protocol
+details and checks affected by later source changes still need evidence on
+the final clean candidate.
 
 `--qa-report PATH` creates a new report file at startup, exiting with status 2
 if it exists or cannot be created, and writes a JSON report on graceful exit.
@@ -353,7 +360,30 @@ resets and refreshes visible glyphs when needed. Each widget retains only its
 most recently visible painted galleys. Other viewports' passes and frames that
 hide the widget neither relay out the document, discard painted galleys, nor
 reset vertical navigation, and font atlas
-recreation refreshes only painted texture coordinates. Accessibility validates
+recreation refreshes only painted texture coordinates. For rows with inline
+fills or code backgrounds, the paint cache also retains one galley with the
+visible search and selection layers inserted behind its glyphs. Unchanged
+layers reuse it; changed layers still copy the paragraph's row vector and the
+affected visible rows. The extra row vector uses memory proportional to that
+paragraph's total row count.
+
+Visual cursor-to-row lookups use a retained scalar-offset index shared with
+painting. Arrow-key movement within a paragraph, Home/End, caret positioning,
+and grapheme snapping avoid rescanning preceding rows. Pointer clicks and drags,
+PageUp/PageDown, link hover, and cross-paragraph destinations also binary-search
+the existing row bounds when those bounds are finite and ordered. Layout
+construction validates that ordering; unusual unordered or nonfinite row bounds
+use the original linear lookup. Cursor hits retain inclusive row edges and the
+earliest row when distances tie; hover hits retain exclusive bottom edges.
+Finding a column or a glyph within the chosen row can still scan its glyphs.
+
+On a 64-bit target the row index occupies 24 bytes per paragraph layout.
+Single-row layouts need no index allocation; each multirow layout also retains
+one shared array of `(rows + 1)` scalar offsets built during shaping, including
+layouts outside the viewport. Reusing a retained layout reuses its offsets and
+geometry validation. No separate array of row coordinates is retained.
+
+Accessibility validates
 text and layout snapshots with shared identity tokens and locates text runs
 through an index. Egui paragraph node IDs stay stable across structural edits,
 shifted and renumbered paragraphs reuse their runs, and at a wrapped-row seam
