@@ -3,6 +3,7 @@
 
 mod index;
 mod layout_cache;
+mod rows;
 
 pub(super) use index::{LayoutIdentity, ParagraphLayouts};
 pub(crate) use layout_cache::ParagraphLayoutView;
@@ -11,3 +12,4 @@ pub(super) use layout_cache::paragraph_job;
 pub(super) use layout_cache::{
     Appearance, LayoutCache, ParagraphCache, ParagraphLayout, is_layout_text,
 };
+pub(crate) use rows::RowIndex;

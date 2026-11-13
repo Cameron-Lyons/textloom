@@ -704,6 +704,18 @@ fn all_true(expectations: &Value) -> bool {
         .is_some_and(|map| map.values().all(|value| value == true))
 }
 
+fn renderer_observation(mode: Mode, result: &Value, report_valid: bool, validator: &str) -> Value {
+    let output = result["output"].as_str().unwrap_or_default();
+    json!({
+        "process exited successfully": result["exit"].as_i64() == Some(0),
+        "rendered 20 frames": output.contains("Rendered 20 native frames"),
+        "clipboard roundtrip": mode != Mode::Editable
+            || output.contains("Native rich clipboard roundtrip and undo/redo passed"),
+        "report valid": report_valid,
+        "validator": crate::tail(validator, 500),
+    })
+}
+
 fn renderer_smoke(checks: &Checks) -> Result<Value> {
     let revision = provenance::revision(checks)?;
     let mut observed = Map::new();
@@ -721,10 +733,10 @@ fn renderer_smoke(checks: &Checks) -> Result<Value> {
 $env:GLUTIN_WGL_OPENGL_DLL = 'C:\textloom-qa\host\opengl32.dll'
 Remove-Item -LiteralPath {report} -ErrorAction SilentlyContinue
 $out = & C:\textloom-qa\host\textloom-native-example.exe --smoke-test --rich-clipboard {extra} --qa-report {report} 2>&1 | ForEach-Object {{ "$_" }}
+$hostExit = $LASTEXITCODE
 Send-HostFile {report} smoke-{name}.json
-Out-Json @{{ exit = $LASTEXITCODE; output = ($out -join "`n") }}"#
+Out-Json @{{ exit = $hostExit; output = ($out -join "`n") }}"#
         ))?;
-        let output = result["output"].as_str().unwrap_or_default();
         let expected = Expected {
             revision: revision.clone(),
             os: Os::Windows,
@@ -742,13 +754,7 @@ Out-Json @{{ exit = $LASTEXITCODE; output = ($out -join "`n") }}"#
         };
         observed.insert(
             name.to_owned(),
-            json!({
-                "rendered 20 frames": output.contains("Rendered 20 native frames"),
-                "clipboard roundtrip": mode != Mode::Editable
-                    || output.contains("Native rich clipboard roundtrip and undo/redo passed"),
-                "report valid": validation.is_ok(),
-                "validator": crate::tail(&message, 500),
-            }),
+            renderer_observation(mode, &result, validation.is_ok(), &message),
         );
     }
     let passed = observed.values().all(|mode| {
@@ -767,18 +773,63 @@ fn undo_until(
     chord: &str,
     limit: usize,
 ) -> Result<Option<usize>> {
-    let mut current = session.state()?.text;
+    undo_with_limit(session.state()?.text, text, limit, |previous| {
+        session.keys(&[chord])?;
+        Ok(session
+            .wait_state(3.0, |state| state.text != previous)?
+            .text)
+    })
+}
+
+fn undo_with_limit(
+    mut current: String,
+    text: &str,
+    limit: usize,
+    mut undo: impl FnMut(&str) -> Result<String>,
+) -> Result<Option<usize>> {
     for steps in 0..=limit {
         if current == text {
             return Ok(Some(steps));
         }
-        session.keys(&[chord])?;
-        let previous = current;
-        current = session
-            .wait_state(3.0, |state| state.text != previous)?
-            .text;
+        if steps == limit {
+            break;
+        }
+        current = undo(&current)?;
     }
     Ok(None)
+}
+
+/// Captured native keyboard states, kept separate from evaluation so the
+/// failure cases can be checked without a desktop or a VM.
+struct GermanKeyboardObservations<'state> {
+    layout: &'state str,
+    before: &'state TextState,
+    first: &'state TextState,
+    after_dead: &'state TextState,
+    after_altgr: &'state TextState,
+    restored: &'state TextState,
+    after_ctrl_alt: Option<&'state TextState>,
+    undo_steps: Option<usize>,
+}
+
+impl GermanKeyboardObservations<'_> {
+    fn expectations(&self) -> Result<Value> {
+        let [offset, end] = self.before.selection()?;
+        let inserted =
+            |text: &str| slice(&self.before.text, 0, offset) + text + &from(&self.before.text, end);
+        Ok(json!({
+            "the German layout is active": self.layout.ends_with("0407"),
+            "the first dead acute + e after switching layouts types é": self.first.text == inserted("é"),
+            "dead acute + a types á": self.after_dead.text == inserted("á"),
+            "AltGr+Q and AltGr+E type @€": self.after_altgr.text == inserted("á@€"),
+            "Ctrl+physical Y (Z on QWERTZ) undoes the typing": self.undo_steps.is_some()
+                && self.restored.text == self.before.text,
+            "undo restores the caret": self.restored.selection == self.before.selection,
+            "the document keeps focus": self.after_altgr.focused,
+            "Ctrl+Alt+Q leaves the window open": self.after_ctrl_alt.is_some(),
+            "Ctrl+Alt+Q types @": self.after_ctrl_alt.is_some_and(|state| state.text == inserted("@")),
+        }))
+    }
 }
 
 fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
@@ -789,10 +840,9 @@ fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
         let before = session.state()?;
         let [offset, _] = before.selection()?;
         let layout = session.input_method("de-DE")?;
-        // ´ is a dead key at the US = position. winit 0.30 loses the first dead key
-        // after a layout switch (it prepares the new layout on that key press and
-        // consumes the key's state; see RELEASING.md), so that is recorded but not
-        // required here.
+        // ´ is a dead key at the US = position. Check it immediately after
+        // switching layouts: a later successful attempt must not hide a lost
+        // first dead key (see the winit limitation in RELEASING.md).
         session.keys(&["equal", "e"])?;
         let first_state = session.wait(|state| state.text != before.text)?;
         let first = slice(&first_state.text, offset, offset + 1);
@@ -802,7 +852,7 @@ fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
             "passed": first_state.text == first_expected,
             "source_revision": provenance::revision(checks)?,
             "manual_signoff": "not_recorded",
-            "required_for_this_check": false,
+            "required_for_this_check": true,
             "preparatory_key_sent": false,
             "expected_insertion": "é",
             "observed_insertion": slice(&first_state.text, offset,
@@ -813,31 +863,33 @@ fn german_dead_keys_and_altgr(checks: &Checks) -> Result<Value> {
         fs::write(session.output.join("first-dead-key-diagnostic.json"), pretty(&first_diagnostic)?)?;
         let at = utf16(&before.text, offset);
         session.guest(&format!("Select-HostRange {at} {}; Out-Json @{{}}", at + 1))?;
-        session.keys(&["equal", "e"])?;
-        let after_dead = session.wait(|state| slice(&state.text, offset, offset + 1) != first || first == "é")?;
+        // Use a different composed letter so unchanged first-attempt text
+        // cannot count as evidence that the warmed-up attempt was processed.
+        session.keys(&["equal", "a"])?;
+        let after_dead = session.wait(|state| state.text != first_state.text)?;
         session.keys(&["alt_r+q", "alt_r+e"])?;
         let after_altgr = session.wait(|state| length(&state.text) >= length(&after_dead.text) + 2)?;
         session.screenshot("typed")?;
         // QWERTZ: the physical Y key is Z, and Latin logical keys select shortcuts.
         let undo_steps = undo_until(session, &before.text, "ctrl+y", 6)?;
         let restored = session.state()?;
-        // Windows also accepts Ctrl+Alt for AltGr. egui-winit drops typed text while
-        // Ctrl is held, so egui never types it, and egui's default quit shortcut,
-        // Ctrl+Q matched ignoring Alt, takes this chord and closes the window.
+        // Windows also accepts Ctrl+Alt for AltGr. Require the exact native
+        // character as well as survival: keeping the window open alone does
+        // not prove that its input reached the document.
         session.keys(&["ctrl+alt+q"])?;
         sleep(1.0);
         let survived = session.running()?;
         let after_ctrl_alt = if survived { Some(session.state()?) } else { None };
-        let expectations = json!({
-            "the German layout is active": layout.ends_with("0407"),
-            "dead acute + e types é": slice(&after_dead.text, offset, offset + 1) == "é"
-                && length(&after_dead.text) == length(&before.text) + 1,
-            "AltGr+Q and AltGr+E type @€": slice(&after_altgr.text, offset, offset + 3) == "é@€",
-            "Ctrl+physical Y (Z on QWERTZ) undoes the typing": undo_steps.is_some(),
-            "undo restores the caret": restored.selection == before.selection,
-            "the document keeps focus": after_altgr.focused,
-            "Ctrl+Alt+Q leaves the window open": survived,
-        });
+        let expectations = GermanKeyboardObservations {
+            layout: &layout,
+            before: &before,
+            first: &first_state,
+            after_dead: &after_dead,
+            after_altgr: &after_altgr,
+            restored: &restored,
+            after_ctrl_alt: after_ctrl_alt.as_ref(),
+            undo_steps,
+        }.expectations()?;
         Ok(json!({
             "passed": all_true(&expectations), "expectations": expectations, "layout": layout,
             "first dead key after the switch": first, "typed": slice(&after_altgr.text, offset, offset + 3),
@@ -1722,7 +1774,7 @@ const CHECKS: &[Check] = &[
     },
     Check {
         name: "german-dead-keys-and-altgr",
-        description: "German layout: dead acute + e, AltGr+Q/E, Ctrl+Alt+Q (Windows' AltGr), and undo with QWERTZ Ctrl+Z.",
+        description: "German layout: first dead acute + e without warm-up, a distinct dead acute + a retry, AltGr+Q/E, Ctrl+Alt+Q, and undo with QWERTZ Ctrl+Z.",
         run: german_dead_keys_and_altgr,
     },
     Check {
@@ -1950,6 +2002,143 @@ mod tests {
         assert_eq!(find("aXbX", "X", 2), Some(3));
         assert_eq!(find("aXb", "X", 2), None);
         assert_eq!(find("ab", "X", 10), None);
+    }
+
+    #[test]
+    fn renderer_checks_reject_failed_exits_even_after_successful_output_and_report() {
+        for mode in Mode::ALL {
+            let mut result = json!({
+                "exit": 0,
+                "output": "Rendered 20 native frames at 1 pixels per point\nNative rich clipboard roundtrip and undo/redo passed",
+            });
+            let passed = renderer_observation(mode, &result, true, "validated");
+            assert_eq!(passed["process exited successfully"], true);
+            for exit in [json!(1), json!(256), json!(-1), Value::Null, json!("0")] {
+                result["exit"] = exit;
+                let failed = renderer_observation(mode, &result, true, "validated");
+                assert_eq!(failed["rendered 20 frames"], true);
+                assert_eq!(failed["report valid"], true);
+                assert_eq!(failed["process exited successfully"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn undo_probe_checks_the_final_result_without_exceeding_its_limit() {
+        for (initial, limit, restores_at, expected, presses) in [
+            ("original", 3, 0, Some(0), 0),
+            ("changed", 0, 1, None, 0),
+            ("changed", 3, 3, Some(3), 3),
+            ("changed", 3, 4, None, 3),
+        ] {
+            let mut calls = 0;
+            let result = undo_with_limit(initial.into(), "original", limit, |_| {
+                calls += 1;
+                Ok(if calls == restores_at {
+                    "original"
+                } else {
+                    "changed"
+                }
+                .into())
+            })
+            .unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(calls, presses);
+        }
+        let mut calls = 0;
+        assert!(
+            undo_with_limit("changed".into(), "original", 3, |_| {
+                calls += 1;
+                Err("uncertain input delivery".into())
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn german_keyboard_checks_require_the_first_dead_key_and_ctrl_alt_text() {
+        let state = |text: &str| TextState {
+            text: text.into(),
+            selection: Some([2, 2]),
+            focused: true,
+            caret_box: None,
+            rect: None,
+        };
+        let before = state("🦀 original");
+        let first = state("🦀 éoriginal");
+        let dead = state("🦀 áoriginal");
+        let altgr = state("🦀 á@€original");
+        let ctrl_alt = state("🦀 @original");
+        let mut observations = GermanKeyboardObservations {
+            layout: "00000407",
+            before: &before,
+            first: &first,
+            after_dead: &dead,
+            after_altgr: &altgr,
+            restored: &before,
+            after_ctrl_alt: Some(&ctrl_alt),
+            undo_steps: Some(2),
+        };
+        assert!(all_true(&observations.expectations().unwrap()));
+
+        // The recorded failure was plain e on the first attempt, followed by
+        // successful warmed-up composition and physical AltGr input.
+        let lost_dead_key = state("🦀 eoriginal");
+        observations.first = &lost_dead_key;
+        let failed = observations.expectations().unwrap();
+        assert_eq!(failed["dead acute + a types á"], true);
+        assert_eq!(failed["AltGr+Q and AltGr+E type @€"], true);
+        assert!(!all_true(&failed));
+
+        // A surviving window that dropped Ctrl+Alt input must also fail.
+        observations.first = &first;
+        observations.after_ctrl_alt = Some(&before);
+        let failed = observations.expectations().unwrap();
+        assert_eq!(failed["Ctrl+Alt+Q leaves the window open"], true);
+        assert_eq!(failed["Ctrl+Alt+Q types @"], false);
+        assert!(!all_true(&failed));
+        observations.after_ctrl_alt = None;
+        assert!(!all_true(&observations.expectations().unwrap()));
+    }
+
+    #[test]
+    fn german_keyboard_checks_require_exact_document_and_history_restoration() {
+        let state = |text: &str| TextState {
+            text: text.into(),
+            selection: Some([0, 0]),
+            focused: true,
+            caret_box: None,
+            rect: None,
+        };
+        let before = state("original");
+        let first = state("éoriginal");
+        let dead = state("áoriginal");
+        let altgr = state("á@€original");
+        let ctrl_alt = state("@original");
+        let mut observations = GermanKeyboardObservations {
+            layout: "00000407",
+            before: &before,
+            first: &first,
+            after_dead: &dead,
+            after_altgr: &altgr,
+            restored: &before,
+            after_ctrl_alt: Some(&ctrl_alt),
+            undo_steps: Some(2),
+        };
+        // An unchanged successful first attempt cannot prove a warmed input.
+        observations.after_dead = &first;
+        assert!(!all_true(&observations.expectations().unwrap()));
+        observations.after_dead = &dead;
+        let corrupted = state("á@€ORIGINAL");
+        observations.after_altgr = &corrupted;
+        assert!(!all_true(&observations.expectations().unwrap()));
+        observations.after_altgr = &altgr;
+        observations.restored = &dead;
+        assert!(!all_true(&observations.expectations().unwrap()));
+        observations.restored = &before;
+        observations.undo_steps = None;
+        assert!(!all_true(&observations.expectations().unwrap()));
     }
 
     const LINE: Rect = [100, 300, 5, 15];

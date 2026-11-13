@@ -5,7 +5,7 @@ use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
 
 use crate::model::word_restart;
 use crate::types::Direction;
-use crate::{Document, Position, model};
+use crate::{Document, Paragraph, Position, model};
 
 /// Options for [`Document::find`] and the editor's search commands.
 ///
@@ -262,7 +262,8 @@ impl Document {
         edge: usize,
         direction: Direction,
     ) -> Option<Range<Position>> {
-        let text = self.paragraphs()[index].text();
+        let paragraph = &self.paragraphs()[index];
+        let text = paragraph.text();
         // A character spans at most four bytes and lowercases to at least one,
         // so windows sharing this many bytes keep candidates crossing an edge.
         let overlap = needle.len().saturating_mul(4);
@@ -297,8 +298,9 @@ impl Document {
                 if options.whole_word {
                     let words = match &mut words {
                         Some(words) if words.start <= start => words,
-                        words => words
-                            .insert(WordBoundaries::new(text, word_restart(text, window.start))),
+                        words => {
+                            words.insert(WordBoundaries::for_paragraph(paragraph, window.start))
+                        }
                     };
                     if !words.contains(end) || !words.contains(start) {
                         return None;
@@ -340,19 +342,19 @@ impl Document {
         else {
             return None;
         };
-        let (first, last) = (first.text(), last.text());
+        let (first_text, last_text) = (first.text(), last.text());
         let mut middle = middle
             .iter()
             .map(|paragraph| paragraph.text())
             .zip(middle_lines);
         let (start, end) = if options.case_sensitive {
-            (first.ends_with(first_line)
-                && last.starts_with(last_line)
+            (first_text.ends_with(first_line)
+                && last_text.starts_with(last_line)
                 && middle.all(|(text, line)| text == *line))
-            .then(|| (first.len() - first_line.len(), last_line.len()))?
+            .then(|| (first_text.len() - first_line.len(), last_line.len()))?
         } else {
-            let start = lowered_suffix_start(first, first_line)?;
-            let end = lowered_prefix_end(last, last_line)?;
+            let start = lowered_suffix_start(first_text, first_line)?;
+            let end = lowered_prefix_end(last_text, last_line)?;
             middle
                 .all(|(text, line)| lowered_prefix_end(text, line) == Some(text.len()))
                 .then_some((start, end))?
@@ -557,8 +559,8 @@ fn lowered_suffix_start(text: &str, suffix: &str) -> Option<usize> {
     remaining.as_str().is_empty().then_some(start)
 }
 
-fn is_word_boundary(text: &str, byte: usize) -> bool {
-    WordBoundaries::new(text, word_restart(text, byte)).contains(byte)
+fn is_word_boundary(paragraph: &Paragraph, byte: usize) -> bool {
+    WordBoundaries::for_paragraph(paragraph, byte).contains(byte)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -629,39 +631,81 @@ fn ascii_word_boundary(text: &[u8], byte: usize) -> Option<bool> {
 
 struct WordBoundaries<'text> {
     text: &'text str,
+    paragraph: Option<&'text Paragraph>,
     start: usize,
     boundaries: Vec<usize>,
-    remaining: UWordBoundIndices<'text>,
+    remaining: Option<UWordBoundIndices<'text>>,
 }
 
 impl<'text> WordBoundaries<'text> {
     fn new(text: &'text str, start: usize) -> Self {
         Self {
             text,
+            paragraph: None,
             start,
             boundaries: Vec::new(),
-            remaining: text[start..].split_word_bound_indices(),
+            remaining: None,
+        }
+    }
+
+    // Nearby navigation can revisit a long unspaced prefix on every press.
+    // Reuse the paragraph's compact, forward-segmented index after expensive
+    // scans. Full-paragraph searches retain their one-pass streaming behavior.
+    fn for_paragraph(paragraph: &'text Paragraph, start: usize) -> Self {
+        Self {
+            paragraph: Some(paragraph),
+            ..Self::new(paragraph.text(), start)
+        }
+    }
+
+    fn index_after_scan(&mut self, byte: usize, scanned: usize) -> Option<bool> {
+        if scanned > 4_096 && scanned >= self.text.len() / 2 {
+            let boundary = self.paragraph?.indexed_word_boundary(byte);
+            self.boundaries = Vec::new();
+            self.remaining = None;
+            Some(boundary)
+        } else {
+            None
         }
     }
 
     fn contains(&mut self, byte: usize) -> bool {
         debug_assert!(
             byte >= self.start,
-            "callers segment from a restart at or before every byte they query, but byte {byte} \
+            "word checks start at or before every byte they query, but byte {byte} \
              precedes {}",
             self.start
         );
         if let Some(boundary) = ascii_word_boundary(self.text.as_bytes(), byte) {
             return boundary;
         }
+        if let Some(boundary) = self
+            .paragraph
+            .and_then(|paragraph| paragraph.cached_word_boundary(byte))
+        {
+            return boundary;
+        }
+        // ASCII edges can be decided locally. Defer even finding a safe
+        // restart until Unicode context is needed: searching backwards for a
+        // space would otherwise scan an unrelated, possibly huge prefix.
+        if self.remaining.is_none() {
+            self.start = word_restart(self.text, self.start);
+            if let Some(boundary) = self.index_after_scan(byte, byte - self.start) {
+                return boundary;
+            }
+            self.remaining = Some(self.text[self.start..].split_word_bound_indices());
+        }
         while self
             .boundaries
             .last()
             .is_none_or(|boundary| *boundary < byte)
         {
-            let Some((boundary, _)) = self.remaining.next() else {
+            let Some((boundary, segment)) = self.remaining.as_mut().and_then(Iterator::next) else {
                 return false;
             };
+            if let Some(boundary) = self.index_after_scan(byte, boundary + segment.len()) {
+                return boundary;
+            }
             self.boundaries.push(self.start + boundary);
         }
         self.boundaries.binary_search(&byte).is_ok()
@@ -905,6 +949,107 @@ fn visit_overlapping_literals(
 mod tests {
     use super::*;
     use crate::Editor;
+
+    #[test]
+    fn ascii_word_checks_defer_prefix_scanning_until_unicode_context_is_needed() {
+        let prefix = "!?".repeat(4_096);
+        let text = format!("{prefix}a:β γ");
+        let start = prefix.len() - 2;
+        let mut words = WordBoundaries::new(&text, start);
+        assert!(words.contains(start + 1));
+        assert!(words.contains(text.len()));
+        assert!(words.remaining.is_none());
+        assert_eq!(words.start, start);
+
+        // The colon and Greek letter belong to the same word as the preceding
+        // ASCII letter. Restarting at the queried edge would invent a boundary.
+        assert!(!words.contains(prefix.len() + 2));
+        assert!(words.remaining.is_some());
+        assert_eq!(words.start, 0);
+        let boundaries: Vec<_> = text
+            .split_word_bound_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        for byte in text[start..]
+            .char_indices()
+            .map(|(byte, _)| start + byte)
+            .chain([text.len()])
+        {
+            assert_eq!(
+                words.contains(byte),
+                boundaries.binary_search(&byte).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn nearby_word_search_indexes_only_expensive_unicode_scans() {
+        let options = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::default()
+        };
+        for token in ["你好", "😀!?"] {
+            let document = Document::from_text(&token.repeat(2_000));
+            let paragraph = &document.paragraphs()[0];
+            let query = &token[..token.chars().next().unwrap().len_utf8()];
+            let mut editor = Editor::new(document.clone());
+            assert!(editor.find_next(query, options, SearchWrap::Stop).unwrap());
+            assert!(paragraph.cached_word_boundary(0).is_none());
+
+            editor
+                .set_selection(crate::Selection::caret(document.end()))
+                .unwrap();
+            assert!(
+                editor
+                    .find_previous(query, options, SearchWrap::Stop)
+                    .unwrap()
+            );
+            assert_eq!(paragraph.cached_word_boundary(0), Some(true));
+            let expected: Vec<_> = paragraph
+                .text()
+                .split_word_bound_indices()
+                .map(|(byte, _)| byte)
+                .chain([paragraph.text().len()])
+                .collect();
+            let mut words = WordBoundaries::for_paragraph(paragraph, 0);
+            for byte in paragraph.text().char_indices().map(|(byte, _)| byte) {
+                assert_eq!(words.contains(byte), expected.binary_search(&byte).is_ok());
+            }
+            assert!(words.remaining.is_none());
+            assert!(words.boundaries.is_empty());
+        }
+
+        let ascii = Document::from_text(&"!?".repeat(10_000));
+        let paragraph = &ascii.paragraphs()[0];
+        let mut words = WordBoundaries::for_paragraph(paragraph, paragraph.text().len() - 3);
+        assert!(words.contains(paragraph.text().len() - 2));
+        assert!(paragraph.cached_word_boundary(0).is_none());
+
+        // A short query near the start can still scan a huge, unbroken word.
+        // Cache that work too, without indexing an unrelated large suffix.
+        for text in ["é".repeat(10_000), format!("é {}", "你".repeat(10_000))] {
+            let document = Document::from_text(&text);
+            let paragraph = &document.paragraphs()[0];
+            let mut words = WordBoundaries::for_paragraph(paragraph, 0);
+            words.contains(2);
+            assert_eq!(
+                paragraph.cached_word_boundary(0).is_some(),
+                !text.contains(' ')
+            );
+        }
+
+        let text = "你好".repeat(2_000);
+        let document = Document::from_text(&format!("{text}\n{text}"));
+        let mut editor = Editor::new(document.clone());
+        assert!(
+            editor
+                .find_next("好\n你", options, SearchWrap::Stop)
+                .unwrap()
+        );
+        assert_eq!(document.paragraphs()[0].cached_word_boundary(0), Some(true));
+        assert!(document.paragraphs()[1].cached_word_boundary(0).is_none());
+    }
 
     fn assert_matches_flattened_stream(
         document: &Document,
@@ -1238,7 +1383,7 @@ mod tests {
                     "restart {restart} for byte {byte} in {text:?}"
                 );
                 assert_eq!(
-                    is_word_boundary(&text, byte),
+                    WordBoundaries::new(&text, byte).contains(byte),
                     boundaries.binary_search(&byte).is_ok(),
                     "byte {byte} in {text:?}"
                 );

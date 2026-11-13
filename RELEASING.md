@@ -22,6 +22,233 @@ known failures from missing evidence and identify the configurations and
 upstream fixes involved. Current automated evidence is recorded separately
 from the historical sessions below; neither substitutes for manual signoff.
 
+### Pointer lookup and Link input ordering, 2026-11-12
+
+Pointer hit testing, page movement, moving link hover, and cross-paragraph
+destinations now locate visual rows through ordered galley bounds. The lookup
+preserves egui's edge and tie semantics and falls back for unusual geometry.
+An independent probe passed 1,972,593 cursor comparisons plus hover checks.
+The [benchmark record](BENCHMARKS.md#november-12-continuation-indexed-pointer-and-page-targets)
+includes isolated measurements, cold/idle controls, and the fixed memory cost.
+Glyph searches within the selected row remain unchanged.
+
+Opening Link through Ctrl/Command+K or accessibility now preserves the order of
+preceding document input and following field input. Prefill follows selection
+changes and committed IME preedit, preventing an unchanged Apply from replacing
+another link's target. Pointer opening refreshes only an unchanged, unsubmitted
+draft. Startup focus, late IME echoes, pass-limit deferral, and editing modes
+retain their expected behavior. Stable Find and Replace identities preserve
+queued accessibility focus requests when the Link row opens. Raw QA observations
+exclude private routing events, and minimized-window replay does not duplicate
+input counts or captured clipboard slots.
+
+Rust 1.95 passes all 677 library unit/integration tests and nine doctests, and
+the Windows native host passes all-target cross-compilation. The complete
+release gate passes, including all feature combinations, optimized tests,
+103 native-host unit tests and the macOS integration test, 82 QA-tool tests,
+strict Clippy, rustdoc, benchmark smokes, and extracted-package tests and native
+consumer compilation. Stable/nightly formatting and diff checks pass.
+
+Fresh default-clipboard macOS smoke sessions pass strict validation in editable,
+read-only, and disabled modes, each with 21 frames, graceful shutdown, zero
+errors, and an equal TLFR round trip. The preserved executable is labelled
+`5b73fa9-pointer-link-20261112-working-tree`. Evidence, source inventory, review
+notes, probes, executable hashes, and logs are retained under
+`target/pointer-followup-20261112/`. The refreshed Linux handoff is
+`target/linux-handoff-20261112/pointer-link/textloom-linux-qa.tar.gz`, with a
+per-file hash manifest. Only these release-note results changed after the gate.
+
+Earlier timing samples without a confirmed quiet window remain separate
+diagnostics; published measurements use the coordinated reruns. Initial focused
+Link failures exposed the Find-ID defect and an incorrect IME link-inheritance
+fixture; corrected regressions and the full host suite pass.
+
+Known native dependency failures and platform interaction/signoff remain open.
+Linux desktop access is still deferred.
+
+### Queued formatting, mixed links, and visual navigation, 2026-11-12
+
+Formatting buttons now queue the attribute to toggle, then resolve its value
+after the document processes input and finishes IME composition. This fixes
+movement and toolbar activation in the same batch using the previous caret's
+formatting state. Actual-host regressions cover all five attributes, mixed
+selections created in the same batch, keyboard plus toolbar toggles, history,
+and composition. Remove link now works on mixed linked/plain selections and
+multiple targets, preserving formatting, selection, outside links, and one-step
+undo; unlinked selections are a no-op and editing modes remain enforced.
+
+The egui layout retains scalar offsets for visual rows and shares them with
+painting. Cursor conversion, within-paragraph arrow movement, Home/End, and
+grapheme snapping avoid repeated scans of preceding rows. Differential tests
+check egui's cursor and wrap-affinity semantics, and layout invalidation tests
+also validate the offsets. The [benchmark record](BENCHMARKS.md#november-12-continuation-indexed-visual-navigation)
+includes ordinary cold/idle controls and the retained-memory tradeoff. Pointer,
+page-target, and cross-paragraph row scans remain unchanged.
+
+Rust 1.95 passes all 674 library unit/integration tests and nine doctests, and
+the Windows native host passes all-target cross-compilation. The complete
+release gate passes, including all feature combinations, optimized tests,
+96 native-host unit tests and the macOS integration test, 82 QA-tool tests,
+strict Clippy, rustdoc, benchmark smokes, and extracted-package tests and native
+consumer compilation. Stable/nightly formatting and diff checks pass.
+
+Three fresh default-clipboard macOS smoke sessions pass strict validation in
+editable, read-only, and disabled modes, each with 21 frames, graceful shutdown,
+zero errors, and an equal TLFR round trip. The preserved executable is labelled
+`5b73fa9-navigation-commands-20261112-working-tree`. Evidence, source inventory,
+probes, executable hashes, and logs are retained under
+`target/continuation-20261112/`. The refreshed Linux handoff is
+`target/linux-handoff-20261112/navigation-commands/textloom-linux-qa.tar.gz`, with
+a per-file hash manifest. Only the release-note results changed after the gate.
+
+A targeted interchange oracle also passed 52,653 styled and linked Unicode
+replacement and TLFR round-trip cases; an initially incorrect style assumption
+is retained as a rejected diagnostic, not a production defect.
+
+Known native dependency failures and final platform interaction/signoff remain
+open. Linux desktop access is still deferred.
+
+### Styled selections and nested list commands, 2026-11-12
+
+Selections and search highlights over code or inline fills now reuse a prepared
+paint galley when their visible rectangles and colors are unchanged. This
+avoids copying hidden rows on every frame while preserving glyph metadata,
+clipping, ligatures, and layer order. Font-atlas recreation invalidates the
+prepared mesh. The [measurements](BENCHMARKS.md#november-12-continuation-selections-over-styled-backgrounds)
+include plain and unselected controls and describe the retained row-vector
+memory and cache-miss costs.
+
+The native paragraph menu now preserves each selected list item's nesting when
+converting list types. Reselecting Numbered list keeps existing levels and
+starts, and Restart/Continue numbering keeps pending typing styles. Regression
+tests cover actual menu/button actions, reversed selections, exclusive
+endpoints, empty paragraphs, list continuation, rich formatting, and exact
+selection and typing style through one-step undo/redo. Public editor APIs and
+their explicit-indent behavior are unchanged.
+
+Rust 1.95 passes all 671 library unit/integration tests and nine doctests, and
+the Windows host passes all-target cross-compilation. The complete release gate
+passes, including the feature matrix, 91 native-host unit tests and the macOS
+integration test, 82 QA-tool tests, strict Clippy, documentation, benchmark
+smokes, and extracted-package tests and consumer compilation. Stable and nightly
+formatting pass. The first gate stopped at a new benchmark assertion comparing
+normalized plain-text export with stored U+2028 text; the corrected assertion
+checks the stored paragraph directly, and the full gate passed on rerun.
+
+Fresh default-clipboard macOS smoke reports pass strict validation in editable,
+read-only, and disabled modes. Each records 21 frames, graceful shutdown, zero
+errors, and an equal TLFR round trip. The preserved executable is labelled
+`5b73fa9-styled-lists-20261112-working-tree`. Reports, source inventory, executable
+hashes, gate logs, and focused list-regression evidence are retained in
+`target/styled-lists-20261112/`; paint probe sources, binaries, hashes, and samples
+are in `target/styled-paint-20261112/`. The refreshed Linux source handoff is
+`target/linux-handoff-20261112/styled-lists/textloom-linux-qa.tar.gz`, with a
+per-file hash manifest. The final release-note update only records these results.
+
+Linux desktop access remains deferred. Known native dependency failures and
+platform interaction/signoff checks remain open.
+
+### Further local correctness and performance work, 2026-11-12
+
+The paragraph-format menu now reports mixed selections instead of showing only
+the focused paragraph's type. Regression tests also reproduced reselecting
+Bullets changing a nested list's levels, and an unchanged paragraph command
+leaving keyboard focus outside the document. The fixes preserve the selected
+nesting levels, rich content, selection, and history, and return focus to the
+document. The initial sample document remains unchanged.
+
+Repeated paragraph-kind summaries now use the existing selection-cache
+machinery. Expensive nearby Unicode whole-word searches reuse the paragraph's
+compact word-boundary index, and unchanged egui frames retain local caret,
+selection, and IME-start geometry. The
+[benchmark record](BENCHMARKS.md#november-12-continuation-unicode-navigation-and-retained-geometry)
+includes alternating before/after measurements, controls, and the initial-query
+and retained-memory tradeoffs. These changes preserve the public API and
+dependency versions.
+
+Rust 1.95 passes all 669 library unit/integration tests and nine doctests, and
+the Windows host passes all-target cross-compilation on that toolchain. All
+87 native-host unit tests and the applicable macOS integration test pass.
+The complete release gate passes, including all feature combinations,
+optimized tests, 82 QA-tool tests, strict Clippy, rustdoc, benchmark smoke runs,
+and extracted-package checks. Stable and nightly formatting pass. The first
+gate run caught a benchmark assertion comparing plain-text export to internal
+soft-break text; the corrected benchmark checks stored paragraph text and
+paragraph count directly, and the complete gate passed on rerun.
+
+Three fresh macOS default-clipboard smoke sessions pass strict report validation
+in editable, read-only, and disabled modes. Each records 21 frames, graceful
+shutdown, zero errors, and an equal TLFR round trip. The preserved executable
+is labelled `5b73fa9-local-followup-20261112-working-tree`. Reports, executable
+hashes, source inventory, benchmark probes, and logs are retained in
+`target/local-followup-20261112/`.
+
+Linux desktop access was deferred by the user. The known native dependency
+failures and outstanding platform validation remain open; this local work does
+not establish Windows/Linux interaction or final-revision manual signoff.
+
+### Native input hardening, 2026-11-12
+
+The Windows native example now intercepts actual printable Ctrl+Alt text before
+egui-winit 0.37 suppresses it, including Shift variants and completed dead keys.
+It restores the original modifiers immediately and tracks input state per
+window. Its custom event-loop integration distinguishes accepted shutdown from
+startup or unexpected runtime failure, including minimized-window shutdown.
+The library's dependencies and public adapter types are unchanged.
+
+Nine focused input/lifecycle regressions pass, including exactly-once delivery
+to the document and an egui text field. Windows all-target compilation and
+strict Clippy pass; Rust 1.95 also passes Windows all-target compilation and
+all 86 host unit tests plus the applicable macOS integration test. The complete
+automated release command also passes: feature combinations, optimized tests,
+host and QA-tool tests, strict Clippy, rustdoc, benchmark smoke runs, and
+extracted-package checks. Stable and nightly formatting pass.
+
+An isolated copy of the host exercises the custom event loop on macOS: its
+strictly validated default-clipboard smoke report records 21 frames, graceful
+shutdown, zero errors, and an equal TLFR round trip. Separate probes verify
+normal close and preserved app-creation errors for both event-loop return
+modes. The copy's platform switches, source hashes, executable hashes, reports,
+commands, and exit statuses are retained in `target/native-hardening-20261112/`.
+These probes verify event-loop behavior; Windows keyboard and IME interaction
+validation of the workaround remains pending.
+
+The Windows VM checks now require a successful first dead key immediately
+after switching layouts and exact Ctrl+Alt text insertion. Their distinct
+warmed-up retry cannot pass on unchanged first-attempt text, undo stays within
+its stated bound, and renderer checks require a zero process exit code even
+when earlier output and the report indicate success. Historical aggregate
+passes did not establish these stricter outcomes. All 82 QA-tool tests pass.
+The known native dependency failures below remain open; no stable release or
+native Windows signoff is claimed.
+
+### Local hardening, 2026-11-12
+
+The working tree based on `5b73fa9` reuses stationary egui link-hover results,
+defers whole-word Unicode setup when ASCII boundaries suffice, and exposes
+selected-match replacement in the native host. It also clarifies transaction
+rollback's treatment of explicit history and saved-state commands. The package
+remains `1.0.0-rc.2`; these are local changes, not a clean release candidate.
+
+The complete automated release command passes, including feature combinations,
+optimized tests, native-host and QA-tool tests, strict Clippy, rustdoc,
+benchmark smoke runs, and extracted-package checks. Stable/nightly formatting
+passes. Rust 1.95 passes all 662 unit/integration tests and nine doctests.
+Independent probes also pass 200,000 mixed editing operations and 3,579,185
+Unicode search/selection assertions. All four lockfiles have no reported
+vulnerabilities; the native example retains its three documented upstream
+maintenance notices.
+
+Three macOS renderer sessions pass strict validation in editable, read-only,
+and disabled modes with the default clipboard. The preserved executable is
+labelled `5b73fa9-quality-20261112-working-tree`, and its hash, source inventory,
+reports, and logs are retained in `target/quality-20261112/`. An initial smoke
+report lacked revision metadata because a concurrent build replaced the shared
+executable; that rejected report is preserved separately. The verified runs
+each rendered 21 frames at 2x scale, closed gracefully, and reported no errors.
+No interactive IME, screen-reader, physical-device, or scale-transition signoff
+is claimed, and the known native limitations below remain open.
+
 ### Verified candidate and macOS feedback, 2026-11-10
 
 Candidate `f7d3a655c6ec0bdd8e3d04aa5beff6ea109a5bcd` in
@@ -805,9 +1032,12 @@ for the precise interaction checks.
   needs a backport or a compatible upstream release. Textloom cannot recover
   text that winit did not deliver.
 - **Ctrl+Alt text in egui hosts:** egui-winit 0.37 suppresses text whenever
-  Control is held. Windows' Ctrl+Alt alternative to AltGr therefore does not
-  type characters in the egui host; physical AltGr is the tested alternative.
-  Textloom's separate winit adapter accepts the Windows Ctrl+Alt text events.
+  Control is held. The Windows example now forwards native printable Ctrl+Alt
+  text with temporary text-entry modifiers, then immediately restores the
+  original modifiers. Native Windows interaction checks of this workaround
+  remain pending; physical AltGr is the previously tested alternative.
+  Other egui hosts need equivalent integration or an upstream correction.
+  Textloom's separate winit adapter already accepts Windows Ctrl+Alt text.
   The example's earlier unintended Ctrl+Alt+Q quit has been fixed.
 - **X11 IME candidate placement with winit 0.30.13:** only the caret area's
   top-left point is sent to XIM, so a popup may overlap the caret line.
@@ -815,9 +1045,11 @@ for the precise interaction checks.
   widget to hide the X11 limitation would make other integrations incorrect.
 - **Linux reader semantics:** Orca reads the tested link and quote text but
   did not announce links at the caret or announce a block quote. AccessKit's
-  Unix adapter lacks the Hypertext interface used for link navigation.
-  Successful text, selection, and replacement probes do not certify those
-  semantic announcements or audible usability.
+  Unix adapter 0.24.1 lacks the Hypertext interface used for link navigation,
+  and its Hyperlink start/end offsets still return `-1`. Changing the widget's
+  existing link and block-quote roles alone does not supply those interfaces
+  or establish quote announcements. Successful text, selection, and replacement
+  probes do not certify those semantic announcements or audible usability.
 
 As of 2026-10-23, winit's latest stable release is 0.30.13, egui's is 0.37.0,
 and xcb-imdkit's latest tag is 1.0.9. An unreleased upstream fix or a locally

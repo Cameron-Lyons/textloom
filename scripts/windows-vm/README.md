@@ -66,6 +66,9 @@ screenshots and native reports; `--runs N` keeps artifacts in separate `run-N`
 subdirectories. Failed checks are recorded and the remaining
 checks still run; the command exits unsuccessfully if any selected check fails.
 Every result records `manual_signoff: "not_recorded"`.
+Renderer checks require a zero process exit code as well as successful output
+and a valid report; a shutdown failure cannot be hidden by an earlier success
+message.
 
 `build` records `target/windows-vm-build.json`: the source HEAD, dirty status,
 a SHA-256 inventory of tracked and nonignored untracked files, and hashes of
@@ -91,11 +94,16 @@ need real hardware.
 
 `german-dead-keys-and-altgr` separately records the first acute-dead-key attempt
 immediately after switching layouts, without a preparatory key, in
-`german/first-dead-key-diagnostic.json` and its screenshot. Its own `passed`
-field can be false even when the warmed-up dead-key/AltGr check passes: winit
-0.30.13 consumes the first pending dead key while preparing the new layout
-([upstream #4582](https://github.com/rust-windowing/winit/pull/4582)). Keep that
-diagnostic result separate when reporting the suite; it is not a waived pass.
+`german/first-dead-key-diagnostic.json` and its screenshot. That result is required
+for the overall check to pass; successful warmed-up input cannot hide a lost
+first dead key. The warmed-up attempt uses acute-plus-a (`á`), so unchanged text
+from the first attempt (`é`) cannot falsely pass the retry. Unpatched winit
+0.30.13 consumes the first pending dead key while
+preparing the new layout
+([upstream #4582](https://github.com/rust-windowing/winit/pull/4582)). The same check
+also requires Ctrl+Alt+Q to insert exactly `@` while preserving the rest of the
+document. Keeping the window open without inserting text is a failure. Historical
+aggregate passes predating these requirements do not establish either behavior.
 
 The feature checks also cover:
 

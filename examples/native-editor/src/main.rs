@@ -24,6 +24,8 @@ mod clipboard;
 mod ime_handoff;
 mod native_editor;
 mod qa;
+#[cfg(any(target_os = "windows", test))]
+mod windows_input;
 
 /// Runs a clipboard helper if the arguments request one, and otherwise the
 /// host window.
@@ -73,7 +75,11 @@ fn main() -> eframe::Result {
             .with_inner_size([920.0, 720.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    #[cfg(not(target_os = "windows"))]
+    let run_native = eframe::run_native;
+    #[cfg(target_os = "windows")]
+    let run_native = windows_input::run_native;
+    run_native(
         "TextLoom native example",
         options,
         Box::new(move |context| {

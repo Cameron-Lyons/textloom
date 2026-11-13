@@ -35,6 +35,7 @@ fn main() {
     serialization();
     formatting();
     caret_link_queries();
+    paragraph_kind_queries();
     empty_insertions();
     unicode_navigation();
     word_selection();
@@ -48,6 +49,8 @@ fn main() {
     search_navigation();
     long_literal_navigation();
     long_whole_word_navigation();
+    unspaced_ascii_whole_word_navigation();
+    unspaced_unicode_whole_word_navigation();
     batch_replacement();
     sparse_replacement();
     #[cfg(feature = "accesskit")]
@@ -490,6 +493,38 @@ fn caret_link_queries() {
                 },
             );
         }
+    }
+}
+
+fn paragraph_kind_queries() {
+    for paragraphs in [100, 100_000] {
+        let text = format!("{}last", "body\n".repeat(paragraphs - 1));
+        let mut editor = Editor::from_text(&text);
+        editor.select_all();
+        assert_eq!(editor.selection_paragraph_kind(), Some(ParagraphKind::Body));
+        measure(
+            &format!("{paragraphs} selected paragraphs repeated block kind"),
+            20_000,
+            || {
+                hint::black_box(hint::black_box(&editor).selection_paragraph_kind());
+            },
+        );
+        let selections = [
+            Selection::new(Position::new(0, 1), Position::new(paragraphs - 1, 3)),
+            Selection::new(Position::new(paragraphs - 1, 4), Position::new(0, 2)),
+        ];
+        let mut next = 0;
+        measure(
+            &format!("{paragraphs} selected paragraphs moving endpoints + block kind"),
+            20_000,
+            || {
+                editor
+                    .set_selection(selections[next])
+                    .expect(VALID_POSITION);
+                hint::black_box(editor.selection_paragraph_kind());
+                next ^= 1;
+            },
+        );
     }
 }
 
@@ -1480,6 +1515,88 @@ fn long_whole_word_navigation() {
                 );
             },
         );
+    }
+}
+
+fn unspaced_ascii_whole_word_navigation() {
+    let options = SearchOptions {
+        case_sensitive: true,
+        whole_word: true,
+    };
+    for count in [100, 100_000, 1_000_000] {
+        let mut editor = Editor::from_text(&"!?".repeat(count));
+        let byte = count * 2 - 3;
+        let caret = Selection::caret(Position::new(0, byte));
+        for (direction, backward, start) in
+            [("next", false, byte + 1), ("previous", true, byte - 1)]
+        {
+            measure(
+                &format!("{count} punctuation pairs whole-word find_{direction} near end"),
+                2_000,
+                || {
+                    editor.set_selection(caret).expect(VALID_POSITION);
+                    let found = if backward {
+                        editor.find_previous(hint::black_box("!"), options, SearchWrap::Stop)
+                    } else {
+                        editor.find_next(hint::black_box("!"), options, SearchWrap::Stop)
+                    };
+                    assert!(
+                        found.expect(NO_COMPOSITION),
+                        "the adjacent punctuation is a whole-word match"
+                    );
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(Position::new(0, start), Position::new(0, start + 1))
+                    );
+                },
+            );
+        }
+    }
+}
+
+fn unspaced_unicode_whole_word_navigation() {
+    let options = SearchOptions {
+        case_sensitive: true,
+        whole_word: true,
+    };
+    for count in [100, 100_000] {
+        for (script, token, query) in [("CJK", "你好", "你"), ("emoji", "😀!?", "😀")] {
+            let source = token.repeat(count);
+            let caret = Selection::caret(Position::new(0, token.len() * (count - 3)));
+            for backward in [false, true] {
+                let direction = if backward { "previous" } else { "next" };
+                let mut editor = Editor::from_text(&source);
+                editor.set_selection(caret).expect(VALID_POSITION);
+                let search = |editor: &mut Editor| {
+                    editor.set_selection(caret).expect(VALID_POSITION);
+                    let found = if backward {
+                        editor.find_previous(hint::black_box(query), options, SearchWrap::Stop)
+                    } else {
+                        editor.find_next(hint::black_box(query), options, SearchWrap::Stop)
+                    };
+                    assert!(found.expect(NO_COMPOSITION));
+                    let start = caret.focus.byte - usize::from(backward) * token.len();
+                    assert_eq!(
+                        editor.selection(),
+                        Selection::new(
+                            Position::new(0, start),
+                            Position::new(0, start + query.len())
+                        )
+                    );
+                };
+                let began = Instant::now();
+                search(&mut editor);
+                println!(
+                    "{count} unspaced {script} pairs cold whole-word find_{direction}: {:.2} µs / operation",
+                    began.elapsed().as_secs_f64() * 1_000_000.0
+                );
+                measure(
+                    &format!("{count} unspaced {script} pairs warm whole-word find_{direction}"),
+                    2_000,
+                    || search(&mut editor),
+                );
+            }
+        }
     }
 }
 

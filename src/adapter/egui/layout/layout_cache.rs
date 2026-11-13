@@ -1,6 +1,7 @@
 //! The [`LayoutCache`] that shapes paragraphs with egui's fonts, and the
 //! per-paragraph layouts it keeps between frames.
 
+use super::RowIndex;
 use super::index::ParagraphLayouts;
 use crate::model::{self, LINE_SEPARATOR, ParagraphChange};
 use crate::{Color, Document, InlineStyle, Paragraph, ParagraphKind, Span};
@@ -42,6 +43,7 @@ pub(in crate::adapter::egui) struct ParagraphCache {
 #[derive(Clone)]
 pub(in crate::adapter::egui) struct ParagraphLayout {
     pub(in crate::adapter::egui) galley: Arc<Galley>,
+    pub(in crate::adapter::egui) row_index: RowIndex,
     pub(in crate::adapter::egui) rect: Rect,
     pub(in crate::adapter::egui) marker: Option<Arc<Galley>>,
     pub(in crate::adapter::egui) marker_position: Pos2,
@@ -50,6 +52,7 @@ pub(in crate::adapter::egui) struct ParagraphLayout {
 
 pub(crate) struct ParagraphLayoutView<'layout> {
     pub(crate) galley: &'layout Arc<Galley>,
+    pub(crate) row_index: &'layout RowIndex,
     pub(crate) rect: Rect,
     pub(crate) marker: Option<&'layout Arc<Galley>>,
     pub(crate) marker_position: Pos2,
@@ -394,13 +397,17 @@ impl Shaper<'_, '_> {
             (0.0, 0.0)
         };
         let scale = size_scale(paragraph.kind());
-        let (galley, chars) = if let Some(previous) = previous
+        let (galley, chars, row_index) = if let Some(previous) = previous
             && previous.layout.rect.left() == indent
             && size_scale(previous.paragraph.kind()) == scale
             && ptr::eq(previous.paragraph.text(), paragraph.text())
             && ptr::eq(previous.paragraph.spans(), paragraph.spans())
         {
-            (Arc::clone(&previous.layout.galley), previous.chars)
+            (
+                Arc::clone(&previous.layout.galley),
+                previous.chars,
+                previous.layout.row_index.clone(),
+            )
         } else {
             let job = paragraph_job_with(
                 paragraph,
@@ -415,7 +422,8 @@ impl Shaper<'_, '_> {
                 galley = self.fonts.layout_job(scalar_layout_job(&galley.job));
             }
             spread_ligatures(&mut galley, paragraph);
-            (galley, chars)
+            let row_index = RowIndex::new(&galley);
+            (galley, chars, row_index)
         };
         ParagraphCache {
             paragraph: Arc::clone(paragraph),
@@ -426,6 +434,7 @@ impl Shaper<'_, '_> {
                 marker_position: Pos2::new(marker_x, 0.0),
                 quote_bar: quote_bar(paragraph.kind(), em, indent, &galley),
                 galley,
+                row_index,
                 marker,
             },
         }

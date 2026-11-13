@@ -1122,6 +1122,7 @@ mod tests {
                         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                         let rect = Rect::from_min_size(Pos2::ZERO, galley.size());
                         ParagraphLayout {
+                            row_index: layout::RowIndex::new(&galley),
                             galley,
                             rect,
                             marker: None,
@@ -1703,6 +1704,7 @@ mod tests {
         let paragraph = &snapshot.paragraphs[0];
         let run_id = paragraph.runs[0].id.accesskit_id();
         let layouts = ParagraphLayouts::from_test_layouts(vec![ParagraphLayout {
+            row_index: layout::RowIndex::new(&paragraph.galley),
             galley: Arc::clone(&paragraph.galley),
             rect: Rect::from_min_size(Pos2::ZERO, paragraph.galley.size()),
             marker: None,
@@ -1925,6 +1927,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, paragraph)| ParagraphLayout {
+                row_index: layout::RowIndex::new(&paragraph.galley),
                 galley: Arc::clone(&paragraph.galley),
                 rect: Rect::from_min_size(
                     Pos2::new(18.0, index as f32 * 150.0),

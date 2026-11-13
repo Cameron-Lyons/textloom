@@ -60,6 +60,7 @@ pub struct Editor {
     saved: SavePoint,
     style_cache: Mutex<Option<SelectionCache<Option<SelectionStyle>>>>,
     link_cache: Mutex<Option<SelectionCache<Option<Link>>>>,
+    paragraph_kind_cache: Mutex<Option<SelectionCache<Option<ParagraphKind>, usize>>>,
 }
 
 impl Default for Editor {
@@ -92,12 +93,18 @@ impl Clone for Editor {
                     .expect(SELECTION_CACHE_LOCK_HEALTHY)
                     .clone(),
             ),
+            paragraph_kind_cache: Mutex::new(
+                self.paragraph_kind_cache
+                    .lock()
+                    .expect(SELECTION_CACHE_LOCK_HEALTHY)
+                    .clone(),
+            ),
         }
     }
 }
 
-// Selection caches stay locked only while spans are scanned and the result is stored,
-// which does not panic, so no thread poisons the locks.
+// Selection caches stay locked only while spans or paragraphs are scanned and the
+// result is stored, which does not panic, so no thread poisons the locks.
 const SELECTION_CACHE_LOCK_HEALTHY: &str = "no panic occurs while a selection cache is locked";
 
 impl Debug for Editor {
@@ -145,9 +152,9 @@ impl SavePoint {
 }
 
 #[derive(Clone)]
-struct SelectionCache<T> {
+struct SelectionCache<T, I = Position> {
     identity: Arc<()>,
-    range: Range<Position>,
+    range: Range<I>,
     value: T,
 }
 
@@ -177,6 +184,7 @@ impl Editor {
             composition: None,
             style_cache: Mutex::new(None),
             link_cache: Mutex::new(None),
+            paragraph_kind_cache: Mutex::new(None),
         }
     }
 
@@ -224,17 +232,21 @@ impl Editor {
         if self.selection.is_caret() {
             return self.typing_style.into();
         }
-        self.cached_selection(&self.style_cache, Self::scan_selection_style)
-            .unwrap_or_else(|| self.typing_style.into())
+        self.cached_selection(
+            &self.style_cache,
+            self.selection.range(),
+            Self::scan_selection_style,
+        )
+        .unwrap_or_else(|| self.typing_style.into())
     }
 
-    fn cached_selection<T: Clone>(
+    fn cached_selection<T: Clone, I: PartialEq>(
         &self,
-        cache: &Mutex<Option<SelectionCache<T>>>,
+        cache: &Mutex<Option<SelectionCache<T, I>>>,
+        range: Range<I>,
         scan: impl FnOnce(&Self) -> T,
     ) -> T {
         let identity = self.document.content_identity();
-        let range = self.selection.range();
         let mut cache = cache.lock().expect(SELECTION_CACHE_LOCK_HEALTHY);
         if let Some(cached) = cache.as_ref()
             && Arc::ptr_eq(&cached.identity, &identity)
@@ -278,7 +290,11 @@ impl Editor {
         if self.selection.is_caret() {
             return self.document.caret_link(self.selection.focus).cloned();
         }
-        self.cached_selection(&self.link_cache, Self::scan_selected_link)
+        self.cached_selection(
+            &self.link_cache,
+            self.selection.range(),
+            Self::scan_selected_link,
+        )
     }
 
     fn scan_selected_link(&self) -> Option<Link> {
@@ -315,18 +331,22 @@ impl Editor {
     /// block format menu, or `None` if they differ.
     ///
     /// Bullets count as one kind whatever their indents, and so do ordered
-    /// items whatever their indents and starts.
+    /// items whatever their indents and starts. Multi-paragraph queries are
+    /// cached until the document or covered paragraphs change.
     #[must_use]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the expect checks an internal invariant: a selection covers a paragraph"
-    )]
     pub fn selection_paragraph_kind(&self) -> Option<ParagraphKind> {
-        let mut kinds = self.document.paragraphs()[self.selected_paragraphs()]
-            .iter()
-            .map(|paragraph| paragraph.kind());
-        let first = kinds.next().expect("a selection covers a paragraph");
-        kinds.all(|kind| same_block(first, kind)).then_some(first)
+        let range = self.selected_paragraphs();
+        let first = self.document.paragraphs()[range.start].kind();
+        if range.len() == 1 {
+            return Some(first);
+        }
+        self.cached_selection(&self.paragraph_kind_cache, range.clone(), |editor| {
+            editor.document.paragraphs()[range]
+                .iter()
+                .skip(1)
+                .all(|paragraph| same_block(first, paragraph.kind()))
+                .then_some(first)
+        })
     }
 
     /// Returns whether there is a step to undo.
@@ -421,10 +441,13 @@ impl Editor {
     /// merge. The step is recorded whenever the document changed, even if the
     /// changes cancel out. When `edit` returns `Err` or panics, the document,
     /// selection, typing style, and IME composition return to their state
-    /// before the call, and history is unchanged. A transaction inside another
-    /// joins the outer step, and its failure reverts only its own edits. While
-    /// a transaction is open, [`undo`](Editor::undo) and
-    /// [`redo`](Editor::redo) do nothing.
+    /// before the call, without recording or discarding history for those
+    /// edits. Explicit calls to [`clear_history`](Editor::clear_history),
+    /// [`set_history_limits`](Editor::set_history_limits), and
+    /// [`mark_saved`](Editor::mark_saved) remain in effect after rollback.
+    /// A transaction inside another joins the outer step, and its failure
+    /// reverts only its own edits. While a transaction is open,
+    /// [`undo`](Editor::undo) and [`redo`](Editor::redo) do nothing.
     ///
     /// If `edit` puts another editor in this one's place, commit and rollback
     /// leave that editor as it is. An editor moved out of the callback becomes

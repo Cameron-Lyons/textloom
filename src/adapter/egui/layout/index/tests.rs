@@ -51,6 +51,7 @@ impl Fixture {
                 rect: egui::Rect::from_min_size(egui::pos2(indent, 0.0), galley.rect.size()),
                 marker_position: egui::pos2(marker_x, 0.0),
                 quote_bar,
+                row_index: super::super::RowIndex::new(&galley),
                 galley: Arc::new(galley),
                 marker,
             },
@@ -371,6 +372,7 @@ fn y_partitions_match_rectangle_predicates_at_every_edge_and_gap_midpoint() {
                 .map(|cache| {
                     let offset = egui::vec2(0.0, y as f32);
                     let layout = ParagraphLayout {
+                        row_index: cache.layout.row_index.clone(),
                         galley: cache.layout.galley.clone(),
                         rect: cache.layout.rect.translate(offset),
                         marker: cache.layout.marker.clone(),

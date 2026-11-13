@@ -197,7 +197,12 @@ fn main() {
         );
     }
     formatted_idle_frames();
-    formatted_hover_frames();
+    formatted_hover_frames(false);
+    formatted_hover_frames(true);
+    retained_selection_geometry_frames();
+    retained_styled_selection_frames();
+    retained_vertical_navigation_frames();
+    moving_link_hover_frames();
     highlighted_code_frames();
     accessibility_frames();
     formatted_accessibility_frames();
@@ -462,11 +467,19 @@ fn formatted_idle_frames() {
     }
 }
 
-/// Keeps the pointer over the last glyph of a long, unlinked row. Link hover
-/// should not scan its glyphs or its many formatting spans on each idle frame.
-fn formatted_hover_frames() {
+/// Keeps the pointer over the last glyph of a long row, with or without links.
+/// Idle hover should not rescan its glyphs or formatting spans each frame.
+fn formatted_hover_frames(linked: bool) {
     for count in [1_000, 16_000, 64_000] {
         let mut editor = formatted_editor(count);
+        if linked {
+            editor.select_all();
+            editor
+                .set_link(Some(
+                    textloom::Link::try_new("https://example.com").expect("valid URL"),
+                ))
+                .expect(NO_COMPOSITION);
+        }
         editor
             .set_selection(Selection::caret(editor.document().end()))
             .expect("the document end is always valid");
@@ -508,7 +521,8 @@ fn formatted_hover_frames() {
             render(&mut editor, Some(pointer));
         }
         let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
-        println!("{count:>6} styled spans: {elapsed:.2} µs / unlinked hover frame");
+        let kind = if linked { "linked" } else { "unlinked" };
+        println!("{count:>6} styled spans: {elapsed:.2} µs / {kind} hover frame");
     }
 }
 
@@ -551,6 +565,70 @@ fn formatted_accessibility_frames() {
             "recoloring should not change the text"
         );
         println!("{count:>6} styled spans: {elapsed:.2} µs / accessible formatting edit + frame");
+    }
+}
+
+/// Long paragraphs can contain many visual lines without paragraph breaks.
+/// Retained caret/selection bounds should not scan those hidden lines each frame.
+fn retained_selection_geometry_frames() {
+    for lines in [1_000, 10_000, 100_000] {
+        let source = "x\u{2028}".repeat(lines);
+        let mut editor = Editor::from_text(&source);
+        let context = egui::Context::default();
+        for (label, selection) in [
+            ("start caret", Selection::default()),
+            ("end caret", Selection::caret(editor.document().end())),
+            (
+                "full selection",
+                Selection::new(Position::default(), editor.document().end()),
+            ),
+        ] {
+            editor
+                .set_selection(selection)
+                .expect("valid document endpoints");
+            for _ in 0..5 {
+                frame(&context, &mut editor);
+            }
+            let iterations = scaled(1_000);
+            let start = Instant::now();
+            for _ in 0..iterations {
+                frame(&context, &mut editor);
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+            assert_eq!(editor.document().paragraphs().len(), 1);
+            assert_eq!(editor.document().paragraphs()[0].text(), source);
+            assert_eq!(editor.selection(), selection);
+            println!("{lines:>6} soft-break lines: {elapsed:.2} µs / retained {label} frame");
+        }
+    }
+}
+
+/// Selecting visible styled rows must not repeatedly copy every hidden row of
+/// a long paragraph to insert the selection above its intrinsic backgrounds.
+fn retained_styled_selection_frames() {
+    for lines in [1_000, 10_000, 100_000] {
+        let source = "x\u{2028}".repeat(lines);
+        let mut editor = Editor::from_text(&source);
+        editor.select_all();
+        editor
+            .apply_style(textloom::StylePatch {
+                code: Some(true),
+                ..Default::default()
+            })
+            .expect(NO_COMPOSITION);
+        let context = egui::Context::default();
+        for _ in 0..5 {
+            frame(&context, &mut editor);
+        }
+        let iterations = scaled(1_000);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            frame(&context, &mut editor);
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        assert_eq!(editor.document().paragraphs().len(), 1);
+        assert_eq!(editor.document().paragraphs()[0].text(), source);
+        println!("{lines:>6} styled soft-break lines: {elapsed:.2} µs / retained selection frame");
     }
 }
 
@@ -718,4 +796,122 @@ fn long_preedit_frames() {
         "",
         "preedit text should never enter the document"
     );
+}
+
+/// Active navigation should use the retained row index even near the end of
+/// one huge paragraph. An up/down pair preserves the final caret so this
+/// isolates navigation from changed selection geometry and painting.
+fn retained_vertical_navigation_frames() {
+    for (label, source) in [
+        ("100k soft lines", "x\u{2028}".repeat(100_000)),
+        ("1M wrapped characters", "word ".repeat(200_000)),
+    ] {
+        let mut editor = Editor::from_text(&source);
+        let context = egui::Context::default();
+        frame(&context, &mut editor);
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("bench")));
+        let position = editor.document().end();
+        editor
+            .set_selection(Selection::caret(position))
+            .expect("document end is valid");
+        for (movement, keys) in [
+            ("up/down", [egui::Key::ArrowUp, egui::Key::ArrowDown]),
+            ("page up/down", [egui::Key::PageUp, egui::Key::PageDown]),
+        ] {
+            let events: Vec<_> = keys
+                .into_iter()
+                .map(|key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect();
+            for _ in 0..5 {
+                frame_with_events(&context, &mut editor, events.clone());
+            }
+            let iterations = scaled(300);
+            let start = Instant::now();
+            for _ in 0..iterations {
+                frame_with_events(&context, &mut editor, events.clone());
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+            assert_eq!(editor.selection(), Selection::caret(position));
+            assert_eq!(editor.document().paragraphs().len(), 1);
+            assert_eq!(editor.document().paragraphs()[0].text(), source);
+            println!("{label}: {elapsed:.2} µs / retained {movement} pair + frame");
+        }
+    }
+}
+
+/// Moving hover invalidates the stationary-pointer cache, so row lookup must
+/// remain bounded even when the viewport is near the end of one long paragraph.
+fn moving_link_hover_frames() {
+    for (label, source) in [
+        ("100k soft lines", "x\u{2028}".repeat(100_000)),
+        ("1M wrapped characters", "word ".repeat(200_000)),
+    ] {
+        let mut editor = Editor::from_text(&source);
+        editor.select_all();
+        editor
+            .set_link(Some(
+                textloom::Link::try_new("https://example.test").expect("valid URL"),
+            ))
+            .expect(NO_COMPOSITION);
+        editor
+            .set_selection(Selection::default())
+            .expect("document start is valid");
+        let context = egui::Context::default();
+        let render = |editor: &mut Editor, height: f32, pointer: Option<egui::Pos2>| {
+            let mut next_height = 0.0;
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events: pointer.into_iter().map(egui::Event::PointerMoved).collect(),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .animated(false)
+                        .vertical_scroll_offset((height - 600.0).max(0.0))
+                        .show(ui, |ui| {
+                            let output = RichTextEditor::new(editor)
+                                .font(egui::FontId::monospace(16.0))
+                                .read_only(true)
+                                .id(egui::Id::unique("moving-link-bench"))
+                                .show(ui);
+                            assert!(output.errors.is_empty());
+                            assert!(output.accessibility_errors.is_empty());
+                            next_height = output.response.rect.height();
+                            hint::black_box(output);
+                        });
+                },
+            );
+            let cursor = output.platform_output.cursor_icon;
+            hint::black_box(output).drop_without_applying_deltas();
+            (next_height, cursor)
+        };
+        let (height, _) = render(&mut editor, 0.0, None);
+        for _ in 0..5 {
+            render(&mut editor, height, Some(egui::pos2(10.0, 30.0)));
+        }
+        let iterations = scaled(300);
+        let start = Instant::now();
+        for index in 0..iterations {
+            let (_, cursor) = render(
+                &mut editor,
+                height,
+                Some(egui::pos2(10.0 + (index % 2) as f32, 30.0)),
+            );
+            assert_eq!(cursor, egui::CursorIcon::PointingHand);
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        assert_eq!(editor.selection(), Selection::default());
+        assert_eq!(editor.document().paragraphs()[0].text(), source);
+        println!("{label}: {elapsed:.2} µs / moving link hover near paragraph end");
+    }
 }

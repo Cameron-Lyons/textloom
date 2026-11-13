@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+- Preserve document input before opening the native Link field and route later
+  input to the field. Prefill follows the final selection and IME commit, so
+  opening another link cannot accidentally apply the previous link's target.
+  Retained input replay while minimized does not duplicate QA counts or paste
+  captures, and private focus-routing events stay out of native input counts.
+  Find and Replace keep stable accessibility identities when Link opens.
+- Index egui pointer, page, and cross-paragraph row lookups, keeping clicks,
+  drags, PageUp/PageDown, and moving link hover fast in long wrapped paragraphs.
+  Preserve row-edge and nearest-row tie behavior, with the original lookup as
+  a fallback for unusual geometry.
+- Share indexed visual-row offsets between egui navigation and painting,
+  avoiding repeated prefix-row scans during arrow movement, Home/End, and caret
+  positioning in long wrapped paragraphs.
+- Native formatting buttons toggle the selection after queued movement and
+  IME input have been processed, avoiding stale formatting decisions when
+  navigation and button activation arrive in the same input batch.
+- The native Remove link command works across selections containing multiple
+  link targets or a mixture of linked and plain text, preserving formatting and
+  one-step undo.
+- Reuse prepared egui selection and search backgrounds over inline fills and
+  code, avoiding repeated copies of hidden rows in unchanged styled paragraphs.
+- The native paragraph menu shows mixed selections accurately and preserves
+  each item's nesting when converting list types. Choosing the current type
+  keeps nesting and numbering and returns keyboard focus to the document
+  without adding an undo step.
+- Native Restart/Continue numbering commands preserve pending typing styles,
+  including through undo and redo.
+- Cache paragraph-kind summaries by covered paragraphs, avoiding repeated scans
+  of large unchanged selections in formatting menus.
+- Reuse the compact Unicode word-boundary index for expensive nearby whole-word
+  searches. Repeated navigation in long unspaced text avoids prefix segmentation;
+  small and locally decidable ASCII queries stay lazy.
+- Retain caret, selection, and IME-start geometry across unchanged layouts,
+  avoiding repeated row scans in paragraphs with many wrapped or soft-break lines.
+- The Windows native example preserves printable Ctrl+Alt text supplied by the
+  keyboard layout, including Shift variants and completed dead keys, before
+  egui-winit's Control-key filter discards it. Focus, IME, and modifier state
+  remain scoped to each window. Native Windows interaction validation is pending.
+- Windows VM checks now require the first dead key after a layout switch and
+  exact Ctrl+Alt text insertion. A distinct warmed-up probe prevents unchanged
+  text from falsely passing, and bounded undo probes stop at their stated limit.
+  Renderer checks reject nonzero process exits even with successful output and
+  a valid report.
+- Reuse egui link hover results while the pointer and document layout are
+  unchanged, avoiding repeated glyph scans in long linked paragraphs.
+- Defer whole-word search's Unicode prefix scan until a candidate needs Unicode
+  context, keeping nearby ASCII matches fast even after long unspaced text.
+- The native example adds **Replace** for one selected search match, preserving
+  formatting and undo/redo, honoring current search options and editing modes,
+  and finishing queued IME input before replacing text.
+- Clarify that transaction rollback leaves explicit history clearing,
+  history-limit changes, and saved-state markers in effect.
 - Update all tracked lockfiles to `rustix` 1.1.6, fixing RUSTSEC-2026-0486.
 - Cache selected-link summaries independently from style summaries, avoiding
   repeated toolbar scans over unchanged selections.

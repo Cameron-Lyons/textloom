@@ -13,8 +13,11 @@ cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-di
 
 The toolbar demonstrates uniform/mixed selection styles, inline formatting,
 fill and font colors, links, headings, block quotes, lists, indentation,
-undo/redo, and read-only/disabled modes. Find supports case
-and whole-word options; replace-all is one undo step.
+undo/redo, and read-only/disabled modes. Find supports case and whole-word
+options. **Replace** changes only the selected match, keeping its formatting;
+use **Next** or **Previous** to select a match first. An empty replacement
+deletes the match. **Replace all** changes every match. Each command is one undo
+step and respects the current search options and editing mode.
 
 - **Fill Color** and **Font Color** are Excel-style split buttons: the swatch
   button applies the last color chosen, initially Yellow and Red, and the arrow
@@ -22,27 +25,39 @@ and whole-word options; replace-all is one undo step.
 - **Link** and Ctrl/Command+K open a URL field prefilled with the selected link.
   AltGr and combinations with Alt or both Control and macOS Command do not
   trigger the shortcut.
+  The shortcut and accessibility activation preserve input order: preceding
+  document input finishes before the field opens, and following text reaches
+  the field. The URL reflects the final selection and committed preedit.
   Applying it links the selection, or edits the link at the caret; with the
   caret outside a link it inserts the URL as linked text. An empty URL removes
-  the link, and an invalid URL reports an error. **Remove link** removes the
-  selected link or the link at the caret. Editing or removing a selection inside
-  one link applies to the whole link in one undo step.
+  the link, and an invalid URL reports an error. **Remove link** removes links
+  from a selection, including mixed linked/plain text, or the link at the caret.
+  Editing or removing a selection inside one link applies to the whole link in
+  one undo step.
 - Ctrl/Command+click on a link, or a click in read-only mode, opens it in the
   system browser or mail client. Only `http`, `https`, and `mailto` targets
   open; others show a status message.
-- The paragraph-kind choice includes **Quote**. **Numbered list** extends a
-  list ending right before the selection or starts one at 1, as
-  Ctrl/Command+Shift+7 does. When the caret is in a numbered item, the toolbar
-  shows its number (**Item N.**) and offers **Restart at 1** and **Continue
+- The paragraph-kind menu shows **Mixed** when the selected paragraphs have
+  different types, and includes **Quote**. **Numbered list** extends a
+  list ending right before the selection or starts one at 1. Menu choices
+  preserve each existing list item's nesting level. Ctrl/Command+Shift+7
+  applies numbering at level zero. When the caret is in a numbered item, the
+  toolbar shows its number (**Item N.**) and offers **Restart at 1** and **Continue
   numbering**, which continues the list before it, even across body text. Each
-  is one undo step.
+  is one undo step and preserves the selection and pending typing style.
+  Choosing **Bullets** or **Numbered list** again keeps each
+  selected item's nesting and numbering. Choosing an already-applied paragraph
+  format returns focus to the document without adding an undo step.
 - Enter starts a new paragraph, continuing a list or quote; Shift+Enter starts a
   new line within the paragraph.
 - Ctrl/Command+Q closes the window. Unlike egui's default quit shortcut, it
   ignores chords with Alt, so Ctrl+Alt+Q, which Windows treats as AltGr+Q (`@`
-  on a German layout), leaves the window open. egui-winit drops text typed
-  while Ctrl is held, so such chords type nothing in egui hosts; AltGr types
-  them.
+  on a German layout), leaves the window open. The Windows host preserves
+  printable Ctrl+Alt text reported by the native keyboard layout before
+  egui-winit's Control-key filter drops it. This applies to the document and
+  the Link, Find, and Replace fields, retaining Shift and restoring the original
+  modifiers immediately after the event. Pending dead keys and IME composition
+  keep their normal event handling.
 
 Capture/restore keeps a native rich snapshot in memory. Restoring clears
 editing history. Use `--read-only` to start with editing disabled while
@@ -71,6 +86,9 @@ focus traversal; fresh input or a new composition in the field ends the guard.
 AccessKit focus changes run in separate egui passes, preserving text before and
 after a handoff between the document and native fields. Longer sequences continue
 on the next repaint if they reach egui's pass limit.
+Input retained while the window is minimized is counted and captured only once
+when eframe replays it; internal focus-routing events do not count as native
+accessibility input in QA reports.
 On Linux, AccessKit's Unix adapter 0.24 activates with current AT-SPI services,
 gives the application its desktop parent, and exposes `EditableText`.
 Plain clipboard behavior remains the default. Add `--rich-clipboard` to enable
@@ -164,9 +182,11 @@ desktop signoff remains required.
 For native QA, pass `--qa-report PATH` and close the window normally after testing.
 The host creates PATH before opening its window and exits with status 2 if the
 file already exists or cannot be created, so an unusable path cannot discard a
-session. It writes the JSON report only on graceful exit; after an abnormal exit
-the file stays empty, which report validation rejects. A report write failure or
-smoke-test failure returns a nonzero exit status. Choose a new file for each run.
+session. It writes the JSON report during application shutdown; a crash or forced
+termination can leave the file empty, which report validation rejects. Framework
+error cleanup can still finalize a report, so successful validation requires a
+zero process exit status as well as a valid report. A report write failure or
+smoke-test failure also returns a nonzero exit status. Choose a new file for each run.
 Without this flag, the host records no report and writes no document file.
 
 The report contains OS/architecture, egui/native display scale, font-supply flags,

@@ -1,9 +1,10 @@
 use std::ops::Range;
 
+use egui::epaint::text::cursor::LayoutCursor;
 use egui::text::{CCursor, CharIndex};
 use egui::{Galley, Pos2, Rect, Vec2};
 
-use super::layout::ParagraphLayouts;
+use super::layout::{ParagraphLayouts, RowIndex};
 use crate::{Document, Editor, Error, Link, Paragraph, Position, Selection};
 
 #[derive(Clone)]
@@ -48,10 +49,16 @@ pub(super) fn hit_test(editor: &Editor, layouts: &ParagraphLayouts, point: Vec2)
         return document_start;
     };
     let local = point - layout.rect.min.to_vec2();
-    let cursor = layout.galley.cursor_from_pos(local);
-    let (byte, prefer_next_row) =
-        snap_vertical_cursor(source, &layout.galley, cursor, local.x, false)
-            .unwrap_or((source.text().len(), cursor.prefer_next_row));
+    let cursor = layout.row_index.cursor_from_pos(&layout.galley, local);
+    let (byte, prefer_next_row) = snap_vertical_cursor(
+        source,
+        &layout.galley,
+        &layout.row_index,
+        cursor,
+        local.x,
+        false,
+    )
+    .unwrap_or((source.text().len(), cursor.prefer_next_row));
     CaretPlacement {
         position: Position::new(paragraph, byte),
         prefer_next_row,
@@ -67,20 +74,16 @@ pub(super) fn grapheme_at_point(
     let layout = layouts.get(paragraph)?;
     let source = document.paragraph(paragraph)?;
     let local = point - layout.rect.min.to_vec2();
-    let mut scalar = 0;
-    for row in &layout.galley.rows {
-        if row.min_y() <= local.y && local.y < row.max_y() {
-            let x = local.x - row.pos.x;
-            let column = row
-                .glyphs
-                .iter()
-                .position(|glyph| glyph.pos.x <= x && x < glyph.max_x())?;
-            let byte = source.byte_from_scalar(scalar + column)?;
-            return Some(Position::new(paragraph, source.boundary_at_or_before(byte)));
-        }
-        scalar += row.char_count_including_newline().0;
-    }
-    None
+    let index = layout.row_index.containing_row(&layout.galley, local.y)?;
+    let row = &layout.galley.rows[index];
+    let x = local.x - row.pos.x;
+    let column = row
+        .glyphs
+        .iter()
+        .position(|glyph| glyph.pos.x <= x && x < glyph.max_x())?;
+    let scalar = layout.row_index.offset(&layout.galley, index);
+    let byte = source.byte_from_scalar(scalar + column)?;
+    Some(Position::new(paragraph, source.boundary_at_or_before(byte)))
 }
 
 pub(super) fn link_at_point(
@@ -156,11 +159,14 @@ pub(super) fn document_caret_rect(
                 .unwrap_or_else(|| paragraph.scalar_count())
         });
     layout
-        .galley
-        .pos_from_cursor(CCursor {
-            index: CharIndex(index),
-            prefer_next_row,
-        })
+        .row_index
+        .pos_from_cursor(
+            &layout.galley,
+            CCursor {
+                index: CharIndex(index),
+                prefer_next_row,
+            },
+        )
         .translate(origin.to_vec2() + layout.rect.min.to_vec2())
 }
 
@@ -198,50 +204,62 @@ pub(super) fn vertical_position(
         index: CharIndex(source.scalar_index(focus.byte)?),
         prefer_next_row: navigation.is_none_or(|navigation| navigation.prefer_next_row),
     };
-    let row = layout.galley.layout_from_cursor(cursor).row;
+    let layout_cursor = layout.row_index.layout_from_cursor(&layout.galley, cursor);
+    let row = layout_cursor.row;
     let preferred_x = navigation.map_or_else(
-        || layout.rect.left() + layout.galley.pos_from_cursor(cursor).center().x,
+        || {
+            layout.rect.left()
+                + layout
+                    .galley
+                    .pos_from_layout_cursor(&layout_cursor)
+                    .center()
+                    .x
+        },
         |navigation| navigation.preferred_x,
     );
-    let (paragraph, target, cursor) = if down && row + 1 < layout.galley.rows.len() {
-        let cursor = layout
-            .galley
-            .cursor_down_one_row(&cursor, Some(preferred_x - layout.rect.left()))
-            .0;
-        (focus.paragraph, layout, cursor)
-    } else if !down && row > 0 {
-        let cursor = layout
-            .galley
-            .cursor_up_one_row(&cursor, Some(preferred_x - layout.rect.left()))
-            .0;
-        (focus.paragraph, layout, cursor)
-    } else if down && focus.paragraph + 1 < layouts.len() {
-        let paragraph = focus.paragraph + 1;
-        let target = layouts.get(paragraph)?;
-        let y = target.galley.rows.first()?.rect().center().y;
-        let cursor = target
-            .galley
-            .cursor_from_pos(Vec2::new(preferred_x - target.rect.left(), y));
-        (paragraph, target, cursor)
-    } else if !down && focus.paragraph > 0 {
-        let paragraph = focus.paragraph - 1;
-        let target = layouts.get(paragraph)?;
-        let y = target.galley.rows.last()?.rect().center().y;
-        let cursor = target
-            .galley
-            .cursor_from_pos(Vec2::new(preferred_x - target.rect.left(), y));
-        (paragraph, target, cursor)
-    } else {
-        let cursor = if down {
-            layout.galley.end()
+    let (paragraph, target, cursor) =
+        if (down && row + 1 < layout.galley.rows.len()) || (!down && row > 0) {
+            let target_row = if down { row + 1 } else { row - 1 };
+            let placed = &layout.galley.rows[target_row];
+            let column = placed.char_at(preferred_x - layout.rect.left() - placed.pos.x);
+            let cursor = layout.row_index.cursor_from_layout(
+                &layout.galley,
+                LayoutCursor {
+                    row: target_row,
+                    column,
+                },
+            );
+            (focus.paragraph, layout, cursor)
+        } else if down && focus.paragraph + 1 < layouts.len() {
+            let paragraph = focus.paragraph + 1;
+            let target = layouts.get(paragraph)?;
+            let y = target.galley.rows.first()?.rect().center().y;
+            let cursor = target.row_index.cursor_from_pos(
+                &target.galley,
+                Vec2::new(preferred_x - target.rect.left(), y),
+            );
+            (paragraph, target, cursor)
+        } else if !down && focus.paragraph > 0 {
+            let paragraph = focus.paragraph - 1;
+            let target = layouts.get(paragraph)?;
+            let y = target.galley.rows.last()?.rect().center().y;
+            let cursor = target.row_index.cursor_from_pos(
+                &target.galley,
+                Vec2::new(preferred_x - target.rect.left(), y),
+            );
+            (paragraph, target, cursor)
         } else {
-            layout.galley.begin()
+            let cursor = if down {
+                layout.row_index.end(&layout.galley)
+            } else {
+                layout.galley.begin()
+            };
+            (focus.paragraph, layout, cursor)
         };
-        (focus.paragraph, layout, cursor)
-    };
     let source = editor.document().paragraph(paragraph)?;
     let x = preferred_x - target.rect.left();
-    let (byte, prefer_next_row) = snap_vertical_cursor(source, &target.galley, cursor, x, down)?;
+    let (byte, prefer_next_row) =
+        snap_vertical_cursor(source, &target.galley, &target.row_index, cursor, x, down)?;
     Some(NavigationTarget {
         position: Position::new(paragraph, byte),
         preferred_x,
@@ -279,12 +297,16 @@ pub(super) fn page_position(
     let paragraph = layouts.paragraph_at_y(y).min(layouts.len().checked_sub(1)?);
     let target = layouts.get(paragraph)?;
     let x = preferred_x - target.rect.left();
-    let cursor = target.galley.cursor_from_pos(Vec2::new(
-        x,
-        (y - target.rect.top()).clamp(0.0, target.galley.rect.bottom()),
-    ));
+    let cursor = target.row_index.cursor_from_pos(
+        &target.galley,
+        Vec2::new(
+            x,
+            (y - target.rect.top()).clamp(0.0, target.galley.rect.bottom()),
+        ),
+    );
     let source = document.paragraph(paragraph)?;
-    let (byte, prefer_next_row) = snap_vertical_cursor(source, &target.galley, cursor, x, down)?;
+    let (byte, prefer_next_row) =
+        snap_vertical_cursor(source, &target.galley, &target.row_index, cursor, x, down)?;
     Some(NavigationTarget {
         position: Position::new(paragraph, byte),
         preferred_x,
@@ -305,21 +327,45 @@ pub(super) fn row_boundary_position(
         index: CharIndex(source.scalar_index(focus.byte)?),
         prefer_next_row,
     };
-    let target = if end {
-        layout.galley.cursor_end_of_row(&cursor)
+    let row = layout
+        .row_index
+        .layout_from_cursor(&layout.galley, cursor)
+        .row;
+    let column = if end {
+        layout
+            .galley
+            .rows
+            .get(row)
+            .map_or(CharIndex(0), |row| row.char_count_excluding_newline())
     } else {
-        layout.galley.cursor_begin_of_row(&cursor)
+        CharIndex(0)
     };
-    let target_x = layout.galley.pos_from_cursor(target).center().x;
-    let (byte, prefer_next_row) =
-        snap_vertical_cursor(source, &layout.galley, target, target_x, end)?;
+    let target = layout
+        .row_index
+        .cursor_from_layout(&layout.galley, LayoutCursor { row, column });
+    let target_x = layout
+        .row_index
+        .pos_from_cursor(&layout.galley, target)
+        .center()
+        .x;
+    let (byte, prefer_next_row) = snap_vertical_cursor(
+        source,
+        &layout.galley,
+        &layout.row_index,
+        target,
+        target_x,
+        end,
+    )?;
     let preferred_x = layout.rect.left()
         + layout
-            .galley
-            .pos_from_cursor(CCursor {
-                index: CharIndex(source.scalar_index(byte)?),
-                prefer_next_row,
-            })
+            .row_index
+            .pos_from_cursor(
+                &layout.galley,
+                CCursor {
+                    index: CharIndex(source.scalar_index(byte)?),
+                    prefer_next_row,
+                },
+            )
             .center()
             .x;
     Some(NavigationTarget {
@@ -361,6 +407,7 @@ pub(super) fn paragraph_boundary_position(editor: &Editor, end: bool) -> Positio
 pub(super) fn snap_vertical_cursor(
     source: &Paragraph,
     galley: &Galley,
+    rows: &RowIndex,
     cursor: CCursor,
     x: f32,
     down: bool,
@@ -371,27 +418,31 @@ pub(super) fn snap_vertical_cursor(
     if before == after {
         return Some((byte, cursor.prefer_next_row));
     }
-    let target_row = galley.layout_from_cursor(cursor).row;
+    let target_row = rows.layout_from_cursor(galley, cursor).row;
     let on_target_row = |byte| {
         let index = CharIndex(source.scalar_index(byte)?);
         [cursor.prefer_next_row, !cursor.prefer_next_row]
             .into_iter()
             .find(|&prefer_next_row| {
-                galley
-                    .layout_from_cursor(CCursor {
+                rows.layout_from_cursor(
+                    galley,
+                    CCursor {
                         index,
                         prefer_next_row,
-                    })
-                    .row
-                    == target_row
+                    },
+                )
+                .row == target_row
             })
     };
     let distance = |byte, prefer_next_row| {
         let index = CharIndex(source.scalar_index(byte)?);
-        let caret = galley.pos_from_cursor(CCursor {
-            index,
-            prefer_next_row,
-        });
+        let caret = rows.pos_from_cursor(
+            galley,
+            CCursor {
+                index,
+                prefer_next_row,
+            },
+        );
         Some((caret.center().x - x).abs())
     };
     match (on_target_row(before), on_target_row(after)) {

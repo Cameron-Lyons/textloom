@@ -1037,3 +1037,247 @@ Unicode position validation. Differential tests compare cached and uncached
 selections against full forward segmentation, including soft breaks, emoji,
 combining marks, and grapheme expansion. These paths do not promise constant
 time for every script or paragraph shape.
+
+## November 12: stationary link hover and nearby ASCII whole-word matches
+
+The rendering harness now measures stationary hover over both linked and
+unlinked rows with 1,000, 16,000, and 64,000 styled spans. A retained hover result
+avoids repeating glyph hit-testing at an unchanged document-relative pointer
+position. Content, appearance, font, and scale changes invalidate the result;
+scrolling changes the pointer's document-relative coordinates. Moving the
+pointer still performs hit-testing, so this change targets idle hover cost.
+
+The editing harness adds whole-word next/previous searches near the end of
+paragraphs containing 100, 100,000, and 1,000,000 ASCII punctuation pairs.
+Search checks locally decidable ASCII boundaries before finding a Unicode
+segmentation restart. This removes the unrelated prefix scan from these nearby
+matches. Candidates needing Unicode context still use the existing safe restart
+and forward word segmentation; unspaced non-ASCII text may still require a long
+scan. Regression coverage checks the transition from ASCII decisions to Unicode
+context in the same matcher.
+
+Quick runs passed for both workloads. Initial before/after timings were taken
+while other validation jobs compiled, so they are not recorded as stable timing
+baselines here.
+
+## November 12 continuation: Unicode navigation and retained geometry
+
+Nearby whole-word navigation now shares the compact word-boundary index used
+by word selection. It builds that index only when the Unicode context scan
+exceeds 4 KiB and covers at least half the paragraph. ASCII decisions and short
+local scans still avoid it. Formatting changes share the index; text changes
+invalidate it, and undo can restore an indexed paragraph. Single-paragraph
+full searches retain their streaming scan. Short multiline searches can reuse
+the index for expensive boundary checks at their edges.
+
+The following optimized probes ran on Apple Silicon with Rust 1.99.1. Search
+figures are medians from three alternating before/after runs of the same probe,
+with separate fresh editors for each direction and 200 repeated queries in the
+600 KB cases. Queries are case-sensitive whole-word searches without wrapping;
+each timed call resets the caret three repeated units before the paragraph end.
+Values are microseconds per query; the first query is separate.
+
+| Whole-word navigation near the end | Before | After |
+| --- | ---: | ---: |
+| 600 KB unspaced CJK, repeated next | 1,916.023 | 0.158 |
+| 600 KB unspaced CJK, repeated previous | 1,917.069 | 0.170 |
+| 600 KB emoji/punctuation, repeated next | 3,391.779 | 0.168 |
+| 600 KB emoji/punctuation, repeated previous | 3,372.009 | 0.163 |
+| CJK, first next query | 1,988.166 | 2,066.750 |
+| CJK, first previous query | 1,909.208 | 2,089.291 |
+| ASCII punctuation control, repeated next | 0.069 | 0.073 |
+| Spaced Cyrillic control, repeated previous | 3.177 | 3.007 |
+
+The initial expensive query pays for construction and retained memory. Dense
+boundaries use about one quarter of the text's byte length on a 64-bit target;
+a single long word needs only its endpoint blocks. Rejecting many candidate
+matches throughout one huge word can still require a backward scan. These
+results do not imply constant-time search for every query distribution.
+
+The renderer also retains local caret, selection, and IME-start rectangles
+while layout identity, positions, wrap affinity, and width are unchanged.
+Each frame still translates them into the current widget coordinates, so
+scrolling and movement do not reuse an old screen position. The probe uses one
+paragraph of `x` followed by U+2028 repeatedly, a fixed 800-by-600 viewport,
+500 warmed frames per sample, and three alternating executable runs.
+
+| Retained frame | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| 50,000 soft-break lines, end caret | 27.181 | 3.096 |
+| 50,000 soft-break lines, full selection | 51.904 | 3.863 |
+| 250,000 soft-break lines, end caret | 121.565 | 3.214 |
+| 250,000 soft-break lines, full selection | 242.272 | 4.019 |
+| 250,000 soft-break lines, start caret control | 3.083 | 3.151 |
+
+This removes repeated cursor-row scans from unchanged frames; it does not
+eliminate layout costs or every navigation and styled-selection paint cost.
+The benchmark harness includes retained geometry cases and repeated/moving
+paragraph-kind summaries. The latter cache is keyed by document content and
+covered paragraphs, with a direct single-paragraph path. The native menu uses
+it to report mixed block selections. Probe sources, binary hashes, alternating
+samples, and Unicode search provenance are retained locally under
+`target/local-followup-20261112/`.
+
+## November 12 continuation: selections over styled backgrounds
+
+Inline fills and code backgrounds require selection and search layers inside
+the text mesh, after those backgrounds and before the glyphs. Preparing those
+layers previously copied the paragraph's entire row vector on every frame,
+including hidden rows. The paint cache now retains one prepared galley per
+visible source, keyed by its ordered local background rectangles and colors.
+Unchanged frames reuse it. Atlas recreation discards the prepared variants;
+the glyph metadata and layer order remain intact.
+
+These optimized headless probes used Rust 1.99.1 on Apple Silicon. Both versions
+include the retained geometry cache measured above. One paragraph repeats
+`x` followed by U+2028, the styled case applies code formatting, and an
+800-by-600 viewport shows the document in a vertical scroll area. Each sample
+averages 500 warmed frames. The table gives medians from three alternating
+before/after executable runs; the unselected caret control is sampled twice
+per run. Compilation was paused during measurement.
+
+| Retained frame | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| 5,000 styled soft-break lines, full selection | 25.190 | 3.202 |
+| 50,000 styled soft-break lines, full selection | 176.443 | 3.337 |
+| 250,000 styled soft-break lines, full selection | 849.156 | 3.427 |
+| 250,000 styled soft-break lines, end caret control | 2.994 | 3.015 |
+| 250,000 plain soft-break lines, full selection control | 3.922 | 3.799 |
+
+This measures egui frame construction, excluding tessellation, GPU submission,
+and native interaction. Changing the visible styled rectangles still copies
+the row vector and affected meshes; the cache retains that extra row vector
+until its source leaves the visible paint cache. Its memory cost therefore
+scales with the paragraph's total row count. Plain rows keep their existing
+paint path. The rendering harness includes the styled full-selection case;
+probe sources, preserved binaries, SHA-256 manifests, and raw samples are in
+`target/styled-paint-20261112/`.
+
+## November 12 continuation: indexed visual navigation
+
+Cursor-to-row conversion now binary-searches retained scalar offsets shared by
+navigation and painting. Within a paragraph, ArrowUp/Down, Home/End, caret
+geometry, and grapheme snapping no longer scan all preceding rows. Differential
+tests compare both cursor positions and wrap affinity with egui's existing
+behavior, including empty rows, newlines, ligatures, and out-of-range cursors.
+
+Optimized headless probes ran on Apple Silicon with Rust 1.99.1 and the same
+feature-unified dependency binaries before and after. Each frame delivers
+ArrowUp then ArrowDown, ending at the original caret, so retained geometry and
+paint caches hit in both versions. The 800-by-600 scroll viewport contains one
+paragraph of repeated `x` plus U+2028, or wrapped ASCII from repeated `word `.
+Values are medians of three alternating executable runs, each averaging 300
+warmed frames. No competing compilation or measurement ran during the samples.
+
+| Frame workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| 1,000 soft-break lines, bottom up/down | 6.011 | 3.204 |
+| 10,000 soft-break lines, bottom up/down | 32.262 | 3.536 |
+| 100,000 soft-break lines, bottom up/down | 287.422 | 3.719 |
+| 1,000,000 wrapped ASCII characters, bottom up/down | 42.932 | 3.644 |
+| 100,000 soft-break lines, near-start up/down control | 3.573 | 3.666 |
+| 1,000,000 wrapped ASCII characters, idle control | 3.295 | 3.165 |
+
+The index moves work into initial layout and retains offsets for offscreen
+multirow paragraphs too. On a 64-bit target it adds 16 bytes to each paragraph
+layout; a multirow layout also owns an Arc allocation with `(rows + 1)` eight-byte
+offsets. Single-row layouts allocate no array. Reusing a source layout shares
+its existing index; separately shaped identical paragraphs can own separate
+arrays even when egui shares their galley. Painting no longer keeps its own
+visible-source offset array.
+
+Separate process controls measured the first egui frame, including font
+initialization, and then 500 warmed idle frames. Each row is the median of
+three alternating before/after runs; all use the same viewport, an unfocused
+editor, and inactive accessibility. Wrapped paragraphs contain 80 repetitions
+of `word ` and occupy four rows; the unique case adds a numbered prefix.
+
+| Control | First frame before/after (ms) | Idle before/after (µs) |
+| --- | ---: | ---: |
+| 10,000 unique single-row paragraphs | 52.841 / 53.555 | 4.409 / 4.515 |
+| 10,000 identical wrapped paragraphs | 11.667 / 12.269 | 3.175 / 3.173 |
+| 1,000 unique wrapped paragraphs | 37.944 / 38.321 | 3.382 / 3.298 |
+
+The repeated wrapped control's median process peak RSS was 25.1 MB before and
+26.2 MB after. RSS includes allocator and runtime effects; small differences
+are not precise allocation measurements. These probes measure frame construction,
+not native keyboard latency, tessellation, or GPU rendering. Pointer hit-tests,
+page targets, and cross-paragraph destinations still use egui's row scans, and
+column selection can scan glyphs within a row. Sources, preserved binaries,
+hashes, raw samples, and methodology are in `target/continuation-20261112/adapter/`
+and `target/continuation-20261112/controls/`.
+
+## November 12 continuation: indexed pointer and page targets
+
+Pointer clicks and drags, PageUp/PageDown, cross-paragraph destinations, and
+moving link hover now locate rows through the existing galley's bounds. Layout
+construction checks that both upper and lower bounds are finite and ordered;
+unusual geometry retains the original linear lookup. The indexed path preserves
+egui's five-point outer margin, first containing row, and earliest equal-distance
+candidate, including floating-point distance plateaus. Cursor hits include both
+row edges; hover excludes the bottom edge. Glyph-x searches remain unchanged.
+An independent differential probe checked 1,972,593 cursor comparisons, including
+wrap affinity, plus hover-row comparisons across gaps, overlaps, zero heights,
+NaNs, infinities, and extreme coordinates, without a mismatch.
+
+Both optimized versions include the preceding scalar-row index. These headless
+probes ran on Apple Silicon with Rust 1.99.1, identical probe sources, and the
+same all-features rendering-benchmark dependency graph; the egui dependency
+binary was byte-identical. One paragraph repeats `x` plus U+2028, or wrapped
+ASCII from repeated `word `, in an 800-by-600 scroll viewport. The hover probe
+links the whole paragraph and alternates the pointer between two adjacent x
+coordinates near the bottom of the scrolled document. Every measured frame
+asserts the pointing-hand cursor. Stationary hover and hover near the paragraph
+start are controls. Page samples deliver PageUp then PageDown and assert that
+the final caret and stored paragraph text remain unchanged.
+
+Values are medians from three alternating before/after executable runs, each
+averaging 300 warmed frames. The 24 processes ran sequentially, in before/after,
+after/before, before/after order, with all implementation agents explicitly
+holding compilation, tests, and other measurements. Earlier samples without
+that confirmed hold remain separate diagnostics and are excluded here.
+
+| Frame workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| 10,000 soft-break lines, moving bottom hover | 8.935 | 3.798 |
+| 100,000 soft-break lines, moving bottom hover | 51.420 | 3.901 |
+| 1,000,000 wrapped ASCII characters, moving bottom hover | 14.167 | 3.858 |
+| 100,000 soft-break lines, PageUp/PageDown | 208.903 | 3.863 |
+| 1,000,000 wrapped ASCII characters, PageUp/PageDown | 3,184.645 | 3.626 |
+| 100,000 soft-break lines, stationary bottom hover control | 3.706 | 3.752 |
+| 1,000,000 wrapped ASCII characters, moving top hover control | 3.616 | 3.961 |
+| 1,000,000 wrapped ASCII characters, idle control | 2.981 | 3.084 |
+
+The old position lookup called `Row::char_at` again for each preceding row that
+improved its vertical-distance estimate. Selecting the row first avoids those
+repeated glyph scans, which explains the larger gain in the wrapped page case.
+A column search can still scan glyphs within the chosen row; the results do not
+imply constant-time interaction with arbitrarily long single visual lines.
+
+The geometry-order flag adds eight bytes per retained paragraph layout after
+padding on a 64-bit target, bringing the row index's fixed size to 24 bytes.
+Validation runs during index construction and retains no coordinate array.
+The existing multirow scalar-offset arrays and allocation-free single-row
+representation otherwise remain unchanged.
+
+Separate controls measured the first egui frame, including font initialization,
+and 500 warmed idle frames in fresh processes. Editors were unfocused, with
+default styling and inactive accessibility. Wrapped paragraphs contain 80
+repetitions of `word ` and occupy four rows; unique cases add numbered prefixes.
+The following medians use three alternating runs in a separately confirmed
+quiet window. Peak RSS comes from `/usr/bin/time -l`; MB here means 1,000,000 bytes.
+
+| Control | First frame before/after (ms) | Idle before/after (µs) | Peak RSS before/after (MB) |
+| --- | ---: | ---: | ---: |
+| 10,000 unique single-row paragraphs | 52.162 / 51.807 | 4.180 / 4.300 | 118.784 / 118.276 |
+| 10,000 identical wrapped paragraphs | 12.052 / 12.023 | 3.185 / 3.157 | 21.643 / 21.758 |
+| 1,000 unique wrapped paragraphs | 38.460 / 38.094 | 3.331 / 3.335 | 101.351 / 100.958 |
+
+These controls show similar cold and idle costs. RSS includes allocator and
+runtime variation, so small changes, including apparent decreases, do not
+measure the fixed index cost precisely. All results concern egui frame
+construction, excluding native input latency, tessellation, and GPU rendering.
+The rendering harness now includes page pairs and moving link hover. Sources,
+preserved binaries, SHA-256 manifests, raw samples, quiet-window records, and
+the independent oracle are retained under `target/pointer-followup-20261112/`;
+the control medians are in `controls/results.json` within that directory.

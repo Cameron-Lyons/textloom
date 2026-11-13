@@ -39,6 +39,12 @@ impl WordSelectionIndex {
         }
     }
 
+    pub(super) fn contains(&self, byte: usize) -> bool {
+        self.blocks
+            .binary_search_by_key(&(byte / 64), |block| block.index)
+            .is_ok_and(|index| self.blocks[index].bits & (1_u64 << (byte % 64)) != 0)
+    }
+
     // Callers select a character, so byte is strictly before the text's end.
     pub(super) fn segment(&self, byte: usize) -> Range<usize> {
         let block_index = byte / 64;
@@ -153,6 +159,30 @@ pub(crate) fn word_restart(text: &str, byte: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_boundaries_match_forward_segmentation_in_sparse_and_dense_blocks() {
+        for text in [
+            String::new(),
+            "a".repeat(1_025),
+            "你好".repeat(100),
+            "🇺🇸🇨🇦a\u{301}:β  \u{ad}👩\u{200d}💻!?".repeat(100),
+        ] {
+            let index = WordSelectionIndex::new(&text);
+            let expected: Vec<_> = text
+                .split_word_bound_indices()
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for byte in 0..=text.len() + 64 {
+                assert_eq!(
+                    index.contains(byte),
+                    expected.binary_search(&byte).is_ok(),
+                    "byte {byte} of {text:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn word_selection_matches_full_paragraph_segmentation() {
