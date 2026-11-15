@@ -42,11 +42,13 @@ impl Span {
     }
 }
 
+#[cfg(any(test, feature = "egui", feature = "accesskit"))]
 pub(crate) struct SpanCursor<'spans> {
     spans: &'spans [Span],
     index: usize,
 }
 
+#[cfg(any(test, feature = "egui", feature = "accesskit"))]
 impl<'spans> SpanCursor<'spans> {
     pub(crate) fn new(spans: &'spans [Span]) -> Self {
         Self { spans, index: 0 }
@@ -256,13 +258,12 @@ impl Paragraph {
             while !self.text.is_char_boundary(byte) {
                 byte -= 1;
             }
-            self.local_grapheme_boundary(byte, Direction::Backward)
-                .unwrap_or_else(|| {
-                    let boundaries = self.grapheme_boundaries();
-                    boundaries[boundaries
-                        .partition_point(|offset| *offset <= byte)
-                        .saturating_sub(1)]
-                })
+            local_grapheme_boundary(&self.text, byte, Direction::Backward).unwrap_or_else(|| {
+                let boundaries = self.grapheme_boundaries();
+                boundaries[boundaries
+                    .partition_point(|offset| *offset <= byte)
+                    .saturating_sub(1)]
+            })
         }
     }
 
@@ -283,13 +284,12 @@ impl Paragraph {
             while !self.text.is_char_boundary(byte) {
                 byte += 1;
             }
-            self.local_grapheme_boundary(byte, Direction::Forward)
-                .unwrap_or_else(|| {
-                    let boundaries = self.grapheme_boundaries();
-                    boundaries[boundaries
-                        .partition_point(|offset| *offset < byte)
-                        .min(boundaries.len() - 1)]
-                })
+            local_grapheme_boundary(&self.text, byte, Direction::Forward).unwrap_or_else(|| {
+                let boundaries = self.grapheme_boundaries();
+                boundaries[boundaries
+                    .partition_point(|offset| *offset < byte)
+                    .min(boundaries.len() - 1)]
+            })
         }
     }
 
@@ -306,24 +306,6 @@ impl Paragraph {
                 .is_boundary(context.chunk, context.start)
                 .unwrap_or_else(|_| self.grapheme_boundaries().binary_search(&byte).is_ok())
         }
-    }
-
-    fn local_grapheme_boundary(&self, byte: usize, direction: Direction) -> Option<usize> {
-        let context = self.grapheme_context(byte);
-        let mut cursor = GraphemeCursor::new(byte, self.text.len(), true);
-        if cursor.is_boundary(context.chunk, context.start).ok()? {
-            return Some(byte);
-        }
-        Some(match direction {
-            Direction::Forward => cursor
-                .next_boundary(context.chunk, context.start)
-                .ok()?
-                .unwrap_or(self.text.len()),
-            Direction::Backward => cursor
-                .prev_boundary(context.chunk, context.start)
-                .ok()?
-                .unwrap_or(0),
-        })
     }
 
     fn grapheme_context(&self, byte: usize) -> GraphemeContext<'_> {
@@ -613,6 +595,38 @@ impl Paragraph {
         }
     }
 
+    // Both ends must be grapheme boundaries of this text; callers validate them.
+    // A cut at a grapheme boundary keeps the segmentation on each side, since
+    // contextual runs and regional-indicator pairs never straddle a boundary, so
+    // clipped canonical spans still end on boundaries and need no normalization.
+    pub(super) fn slice(self: &Arc<Self>, range: Range<usize>, kind: ParagraphKind) -> Arc<Self> {
+        debug_assert!(
+            self.is_grapheme_boundary(range.start) && self.is_grapheme_boundary(range.end),
+            "slice ends must be grapheme boundaries, not {range:?}"
+        );
+        if range == (0..self.text.len()) {
+            return self.with_kind(kind);
+        }
+        let text = &self.text[range.clone()];
+        let spans: Vec<_> = self.spans[self.overlapping(range.clone())]
+            .iter()
+            .map(|span| Span {
+                range: span.range.start.max(range.start) - range.start
+                    ..span.range.end.min(range.end) - range.start,
+                style: span.style,
+                link: span.link.clone(),
+            })
+            .collect();
+        Arc::new(Self {
+            text: Arc::from(text),
+            linked: self.linked && has_links(&spans),
+            spans: spans.into(),
+            kind,
+            ascii: self.ascii || text.is_ascii(),
+            indices: OnceLock::new(),
+        })
+    }
+
     pub(super) fn styled(text: String, raw_spans: Vec<Span>, kind: ParagraphKind) -> Self {
         let ascii = text.is_ascii();
         let spans = normalize_spans(&text, raw_spans, ascii);
@@ -779,21 +793,72 @@ fn normalize_spans(text: &str, raw: Vec<Span>, ascii: bool) -> Vec<Span> {
     if ascii || raw.len() <= 1 {
         return raw;
     }
-    if raw[..raw.len() - 1].iter().all(|span| {
+    let first = raw[..raw.len() - 1].iter().position(|span| {
         let context = grapheme_context(text, span.range.end);
-        GraphemeCursor::new(span.range.end, text.len(), true)
+        !GraphemeCursor::new(span.range.end, text.len(), true)
             .is_boundary(context.chunk, context.start)
             .unwrap_or(false)
-    }) {
+    });
+    let Some(first) = first else {
         return raw;
-    }
+    };
     let mut result = Vec::with_capacity(raw.len());
-    let mut spans = SpanCursor::new(&raw);
-    for (start, grapheme) in text.grapheme_indices(true) {
-        let (style, link) = spans.at(start);
-        push_span(&mut result, start..start + grapheme.len(), style, link);
+    let mut spans = raw.into_iter();
+    result.extend(spans.by_ref().take(first));
+    let mut start = result.last().map_or(0, |span| span.range.end);
+    let mut boundaries = None;
+    for span in spans {
+        if span.range.end <= start {
+            continue;
+        }
+        // A joined grapheme keeps the style and link of its first scalar.
+        // Round each span's end forward; later spans may be swallowed entirely.
+        let end = if span.range.end == text.len() {
+            text.len()
+        } else {
+            let local = boundaries
+                .is_none()
+                .then(|| local_grapheme_boundary(text, span.range.end, Direction::Forward))
+                .flatten();
+            local.unwrap_or_else(|| {
+                // Once wider context is needed, stream the rest in one pass;
+                // repeated cursor queries could rescan long RI runs. `start` is
+                // a boundary, and segmentation resumed at any boundary finds
+                // the same later boundaries.
+                let resume = start;
+                boundaries
+                    .get_or_insert_with(|| {
+                        text[resume..]
+                            .grapheme_indices(true)
+                            .map(move |(byte, _)| resume + byte)
+                            .chain([text.len()])
+                    })
+                    .find(|byte| *byte >= span.range.end)
+                    .expect("the final text boundary follows every span")
+            })
+        };
+        push_span(&mut result, start..end, span.style, span.link.as_ref());
+        start = end;
     }
     result
+}
+
+fn local_grapheme_boundary(text: &str, byte: usize, direction: Direction) -> Option<usize> {
+    let context = grapheme_context(text, byte);
+    let mut cursor = GraphemeCursor::new(byte, text.len(), true);
+    if cursor.is_boundary(context.chunk, context.start).ok()? {
+        return Some(byte);
+    }
+    Some(match direction {
+        Direction::Forward => cursor
+            .next_boundary(context.chunk, context.start)
+            .ok()?
+            .unwrap_or(text.len()),
+        Direction::Backward => cursor
+            .prev_boundary(context.chunk, context.start)
+            .ok()?
+            .unwrap_or(0),
+    })
 }
 
 // A window of text around a byte offset, for `GraphemeCursor` queries that would otherwise
@@ -886,6 +951,127 @@ fn push_symbol_runs(stops: &mut Vec<Range<usize>>, bytes: &[u8], gap: Range<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn span_repairs_match_full_grapheme_segmentation() {
+        let links = [None, Some(Link::try_new("https://example.com").unwrap())];
+        let mut state = 0x8d31_902a_u64;
+        let mut check = |text: &str| {
+            for stride in [1, 2, 3, 7] {
+                let mut raw = Vec::new();
+                let mut start = 0;
+                for (index, (byte, character)) in text.char_indices().enumerate() {
+                    let end = byte + character.len_utf8();
+                    if (index + 1).is_multiple_of(stride) || end == text.len() {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        push_span(
+                            &mut raw,
+                            start..end,
+                            InlineStyle {
+                                bold: state & 1 != 0,
+                                italic: state & 2 != 0,
+                                ..Default::default()
+                            },
+                            links[(state >> 8) as usize % links.len()].as_ref(),
+                        );
+                        start = end;
+                    }
+                }
+                let mut expected = Vec::new();
+                let mut spans = SpanCursor::new(&raw);
+                for (start, grapheme) in text.grapheme_indices(true) {
+                    let (style, link) = spans.at(start);
+                    push_span(&mut expected, start..start + grapheme.len(), style, link);
+                }
+                assert_eq!(
+                    normalize_spans(text, raw.clone(), text.is_ascii()),
+                    expected,
+                    "{text:?}, stride {stride}, spans {raw:?}"
+                );
+            }
+        };
+        for text in [
+            "",
+            "ordinary ASCII text",
+            "ae\u{301}\u{308}x",
+            "a👩🏽\u{200d}💻b👨\u{200d}👩\u{200d}👧\u{200d}👦",
+            "\u{600}a\u{600}\u{600}b",
+            "각가각",
+            "क्\u{200d}ष\u{903}क्\u{93c}ष",
+            "x\u{2028}e\u{301}",
+        ] {
+            check(text);
+        }
+        // Cross the local context window in both directions, including an
+        // ordinary prefix before the first boundary needing streaming context.
+        for length in [31, 32, 33, 64, 65, 129] {
+            check(&format!("prefix e{}x", "\u{301}".repeat(length)));
+            check(&format!("prefix e{}", "\u{301}".repeat(length)));
+            check(&format!("prefix {}suffix", "🇦".repeat(length)));
+            check(&format!("prefix 👩{}\u{200d}💻x", "\u{301}".repeat(length)));
+            check(&format!("prefix 👩{}\u{200d}💻", "\u{301}".repeat(length)));
+            check(&format!("prefix क{}षx", "्\u{93c}".repeat(length)));
+        }
+        let parts = [
+            "a", "é", "\u{301}", "\u{600}", "👩", "\u{200d}", "💻", "🇦", "क", "्", "ष",
+        ];
+        for first in parts {
+            for second in parts {
+                for third in parts {
+                    check(&format!("p{first}{second}{third}s"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slices_keep_exact_link_and_ascii_flags() {
+        let link = Link::try_new("https://example.com").unwrap();
+        for text in [
+            "ab cd ef",
+            "ab👩🏽\u{200d}💻cd e\u{301}f",
+            "é linked ascii tail",
+        ] {
+            let boundaries: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain([text.len()])
+                .collect();
+            for linked_parity in [0, 1] {
+                let spans = boundaries
+                    .windows(2)
+                    .enumerate()
+                    .map(|(index, ends)| {
+                        Span::new(
+                            ends[0]..ends[1],
+                            InlineStyle {
+                                bold: index.is_multiple_of(3),
+                                ..Default::default()
+                            },
+                            (index % 2 == linked_parity).then(|| link.clone()),
+                        )
+                    })
+                    .collect();
+                let paragraph =
+                    Arc::new(Paragraph::try_new(text, spans, ParagraphKind::Body).unwrap());
+                for (index, &start) in boundaries.iter().enumerate() {
+                    for &end in &boundaries[index..] {
+                        let slice = paragraph.slice(start..end, ParagraphKind::Body);
+                        assert_eq!(
+                            slice.linked,
+                            has_links(&slice.spans),
+                            "{text:?} {start}..{end}"
+                        );
+                        assert_eq!(
+                            slice.ascii,
+                            slice.text.is_ascii(),
+                            "{text:?} {start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn span_cursor_scans_forward_for_bridges_and_grapheme_normalization() {

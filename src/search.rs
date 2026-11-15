@@ -79,31 +79,33 @@ impl Document {
         options: SearchOptions,
         range: &Range<Position>,
     ) -> bool {
+        // The editor supplies its validated selection, so its endpoints are
+        // already grapheme boundaries inside this document.
         if query.is_empty() || range.is_empty() {
             return false;
         }
         let needle = search_needle(query, options);
-        if !needle.contains('\n') {
-            return range.start.paragraph == range.end.paragraph
-                && self
-                    .find_paragraph_match(
-                        range.start.paragraph,
-                        &needle,
-                        options,
-                        Some(range.start),
-                        Direction::Forward,
-                        ParagraphSearch::new(&needle, options),
-                    )
-                    .is_some_and(|found| found == *range);
+        if !self.range_matches_text(range, &needle, options.case_sensitive)
+            || (options.whole_word && !self.has_word_edges(range))
+        {
+            return false;
         }
-        if let Some(lines) = paragraph_lines(&needle) {
+        // A matching selection belongs to the forward stream unless an earlier
+        // accepted occurrence could overlap it. Only that case needs a search.
+        // Normalization can add a border ("Aa" lowers to "aa"), so check the
+        // needle rather than the query.
+        if never_overlaps(&needle) {
+            return true;
+        }
+        if !needle.contains('\n') {
             return self
-                .find_lines_match(
+                .find_paragraph_match(
                     range.start.paragraph,
-                    &lines,
+                    &needle,
                     options,
                     Some(range.start),
                     Direction::Forward,
+                    ParagraphSearch::Scan,
                 )
                 .is_some_and(|found| found == *range);
         }
@@ -116,6 +118,59 @@ impl Document {
             ControlFlow::Break(())
         });
         found
+    }
+
+    fn range_matches_text(
+        &self,
+        range: &Range<Position>,
+        needle: &str,
+        case_sensitive: bool,
+    ) -> bool {
+        let mut lines = needle.split('\n');
+        for index in range.start.paragraph..=range.end.paragraph {
+            let Some(line) = lines.next() else {
+                return false;
+            };
+            let paragraph = &self.paragraphs()[index];
+            let text = paragraph.text();
+            let start = if index == range.start.paragraph {
+                range.start.byte
+            } else {
+                0
+            };
+            let end = if index == range.end.paragraph {
+                range.end.byte
+            } else {
+                text.len()
+            };
+            let selected = &text[start..end];
+            let matches = if case_sensitive {
+                selected == line
+            } else {
+                selected.eq_ignore_ascii_case(line)
+                    || (!paragraph.is_ascii()
+                        && lowered_prefix_end(selected, line) == Some(selected.len()))
+            };
+            if !matches {
+                return false;
+            }
+        }
+        lines.next().is_none()
+    }
+
+    // Edges in one paragraph share a segmenter, so the stream that decides the
+    // start continues to the end instead of restarting.
+    fn has_word_edges(&self, range: &Range<Position>) -> bool {
+        let first = &self.paragraphs()[range.start.paragraph];
+        let mut words = WordBoundaries::for_paragraph(first, range.start.byte);
+        if !words.contains(range.start.byte) {
+            return false;
+        }
+        if range.start.paragraph == range.end.paragraph {
+            words.contains(range.end.byte)
+        } else {
+            is_word_boundary(&self.paragraphs()[range.end.paragraph], range.end.byte)
+        }
     }
 
     pub(crate) fn find_relative(
@@ -949,6 +1004,90 @@ fn visit_overlapping_literals(
 mod tests {
     use super::*;
     use crate::Editor;
+
+    #[test]
+    fn selected_match_membership_agrees_with_the_forward_stream() {
+        let long_query = format!("!{}?", "ab\n".repeat(20));
+        let overlapping_query = "ab\n".repeat(18);
+        let texts = [
+            String::new(),
+            "banana ababa ana aaa".to_owned(),
+            "Foo cat category foo".to_owned(),
+            "İi\u{307} KȺ ΟΣΑ ΣΣ".to_owned(),
+            "a e\u{301} 👩\u{200d}💻 \u{600}a".to_owned(),
+            "ab\u{2028}cd\nEF\n\nİ".to_owned(),
+            "🇺🇸🇨🇦🇺🇸".to_owned(),
+            format!("prefix\n{long_query}\nsuffix"),
+            "ab\n".repeat(21),
+            "\n\n\n".to_owned(),
+        ];
+        let queries = [
+            "",
+            "a",
+            "aa",
+            "ana",
+            "aba",
+            "foo",
+            "cat",
+            "i",
+            "i\u{307}",
+            "İ",
+            "kⱥ",
+            "οσ",
+            "Σ",
+            "e\u{301}",
+            "💻",
+            "🇺🇸",
+            "\n",
+            "\r\n",
+            "\u{2029}",
+            "\u{2028}",
+            "cd\nEF",
+            "cd\r\nEF",
+            "EF\n\nİ",
+            &long_query,
+            &overlapping_query,
+            // Only the normalized needles ("aa" and "\n\n") overlap themselves.
+            "Aa",
+            "\r\n\n",
+        ];
+        for text in texts {
+            let document = Document::from_text(&text);
+            let positions: Vec<_> = document
+                .paragraphs()
+                .iter()
+                .enumerate()
+                .flat_map(|(index, paragraph)| {
+                    paragraph
+                        .text()
+                        .grapheme_indices(true)
+                        .map(move |(byte, _)| Position::new(index, byte))
+                        .chain([Position::new(index, paragraph.text().len())])
+                })
+                .collect();
+            for query in queries {
+                for case_sensitive in [true, false] {
+                    for whole_word in [true, false] {
+                        let options = SearchOptions {
+                            case_sensitive,
+                            whole_word,
+                        };
+                        let matches = document.find(query, options);
+                        for (index, &start) in positions.iter().enumerate() {
+                            for &end in &positions[index..] {
+                                let range = start..end;
+                                assert_eq!(
+                                    document.is_match(query, options, &range),
+                                    matches.contains(&range),
+                                    "{text:?}, {query:?}, {options:?}, {range:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ascii_word_checks_defer_prefix_scanning_until_unicode_context_is_needed() {

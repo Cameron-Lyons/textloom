@@ -182,6 +182,106 @@ fn selected_fragment_clips_styles_preserves_kinds_and_shares_complete_paragraphs
 }
 
 #[test]
+fn partial_unicode_fragments_keep_styles_links_and_rebase_navigation() {
+    use textloom::Link;
+    use unicode_segmentation::UnicodeSegmentation as _;
+
+    let link = Link::try_new("https://example.com/copied").unwrap();
+    for text in [
+        "ab e\u{301}👩🏽\u{200d}💻\u{2028}尾 cd",
+        "🇺🇸🇨🇦🇫🇷🇩🇪🇯🇵",
+        "\u{600}aक्ष\u{600}b e\u{301}",
+    ] {
+        let boundaries: Vec<_> = text
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let spans = (0..boundaries.len() - 1)
+            .step_by(2)
+            .enumerate()
+            .map(|(index, start)| {
+                Span::new(
+                    boundaries[start]..boundaries[(start + 2).min(boundaries.len() - 1)],
+                    InlineStyle {
+                        bold: index % 2 == 0,
+                        italic: index % 2 != 0,
+                        ..Default::default()
+                    },
+                    (index % 2 == 0).then(|| link.clone()),
+                )
+            })
+            .collect();
+        let document =
+            Document::from_paragraphs([
+                Paragraph::try_new(text, spans, ParagraphKind::Quote).unwrap()
+            ]);
+        let source = &document.paragraphs()[0];
+        assert_eq!(source.grapheme_count(), boundaries.len() - 1);
+        assert_eq!(source.scalar_count(), text.chars().count());
+        assert_eq!(
+            source.byte_from_scalar(text.chars().count()),
+            Some(text.len())
+        );
+        let _ = source.next_word(0);
+        for first in 0..boundaries.len() {
+            for last in first..boundaries.len() {
+                let (start, end) = (boundaries[first], boundaries[last]);
+                let fragment = document
+                    .fragment(Position::new(0, start)..Position::new(0, end))
+                    .unwrap();
+                let copied = &fragment.paragraphs()[0];
+                assert_eq!(copied.text(), &text[start..end]);
+                assert_eq!(copied.kind(), ParagraphKind::Quote);
+                assert_eq!(copied.grapheme_count(), last - first);
+                assert_eq!(copied.scalar_count(), text[start..end].chars().count());
+                let fresh = Document::from_text(copied.text());
+                for (index, byte) in text[start..end]
+                    .char_indices()
+                    .map(|(byte, _)| byte)
+                    .chain([end - start])
+                    .enumerate()
+                {
+                    assert_eq!(copied.byte_from_scalar(index), Some(byte));
+                }
+                let copied_document = Document::from_fragment(&fragment);
+                for (index, &byte) in boundaries[first..=last].iter().enumerate() {
+                    let local = byte - start;
+                    assert_eq!(copied.byte_from_grapheme(index), Some(local));
+                    assert_eq!(copied.grapheme_index(local), Some(index));
+                    assert_eq!(
+                        copied.next_word(local),
+                        fresh.paragraphs()[0].next_word(local)
+                    );
+                    assert_eq!(
+                        copied.previous_word(local),
+                        fresh.paragraphs()[0].previous_word(local)
+                    );
+                    if byte < end {
+                        let next = copied.next_grapheme(local);
+                        assert_eq!(
+                            copied_document.style_at(Position::new(0, next)),
+                            document.style_at(Position::new(0, start + next))
+                        );
+                        assert_eq!(
+                            copied_document.link_at(Position::new(0, local)),
+                            document.link_at(Position::new(0, byte))
+                        );
+                    }
+                }
+                assert_eq!(
+                    Fragment::from_bytes(&fragment.to_bytes()).unwrap(),
+                    fragment
+                );
+                if start == 0 && end == text.len() {
+                    assert!(Arc::ptr_eq(source, copied));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn partial_rich_paste_keeps_surviving_edge_styles_and_restores_selection() {
     let document = Document::from_fragment(&rich_fragment());
     let fragment = document

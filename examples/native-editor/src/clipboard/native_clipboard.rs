@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
-use std::process::{self, Child, Command, Stdio};
+use std::process::{self, Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -202,26 +202,31 @@ fn native_html(fragment: &Fragment) -> String {
     let html = fragment.to_html();
     #[cfg(target_os = "macos")]
     let html = {
+        const PREFIX: &str = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>";
+        const SUFFIX: &str = "</body></html>";
         // This operates only on our escaped, non-nested quote export. AppKit
         // ignores block margins and stylesheet text-indent; inline paragraph
         // margins work, but a zero indent puts the first line at absolute zero.
         // A positive subpixel indent makes it relative to the paragraph margin.
-        let mut styled = String::with_capacity(html.len());
+        let mut wrapped = String::with_capacity(PREFIX.len() + html.len() + SUFFIX.len());
+        wrapped.push_str(PREFIX);
         for section in html.split_inclusive("</blockquote>") {
             if let Some((before, quote)) = section.split_once("<blockquote>") {
-                styled.push_str(before);
+                wrapped.push_str(before);
                 // Avoid a second margin in other HTML consumers.
-                styled.push_str("<blockquote style=\"margin-left:0\">");
-                styled.push_str(
-                    &quote.replace("<p>", "<p style=\"margin-left:36px;text-indent:0.01px\">"),
-                );
+                wrapped.push_str("<blockquote style=\"margin-left:0\">");
+                let mut paragraphs = quote.split("<p>");
+                wrapped.push_str(paragraphs.next().unwrap_or_default());
+                for paragraph in paragraphs {
+                    wrapped.push_str("<p style=\"margin-left:36px;text-indent:0.01px\">");
+                    wrapped.push_str(paragraph);
+                }
             } else {
-                styled.push_str(section);
+                wrapped.push_str(section);
             }
         }
-        format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{styled}</body></html>"
-        )
+        wrapped.push_str(SUFFIX);
+        wrapped
     };
     html
 }
@@ -379,81 +384,95 @@ fn read_field(input: &mut impl Read) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// A helper's successful answer.
-enum Reply {
-    /// The copy helper acknowledged its item with [`READY`].
-    Ready,
-    /// The read helper's capture: `None` when the clipboard holds no rich item.
-    Item(Option<NativeItem>),
-}
-
 /// Kills `child`, if it is still running, and reaps it.
 fn stop_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// Sends `item` to a copy helper and waits for its acknowledgement, or, with no
-/// item, waits for a read helper's capture. Pipe I/O runs on a worker thread so
-/// that the wait ends at `deadline`.
+/// Sends `item` to a copy helper and waits for its [`READY`] acknowledgement.
 ///
-/// Returns the reply together with the helper, which may still be running.
+/// Returns the item, whose representations read-back verification compares,
+/// together with the helper, which may still be running.
 ///
 /// # Errors
 ///
-/// Fails if the helper's pipes are unavailable, the exchange fails or misses
-/// `deadline`, or the reply is invalid. The helper is then stopped and reaped.
-fn exchange(
-    mut child: Child,
-    item: Option<NativeItem>,
+/// Fails as [`exchange`] does, or if the helper does not acknowledge the item.
+fn exchange_copy(
+    child: Child,
+    item: NativeItem,
     deadline: Instant,
-) -> Result<(Reply, Child), String> {
-    let Some(mut output) = child.stdout.take() else {
+) -> Result<(NativeItem, Child), String> {
+    exchange(child, deadline, move |input, mut output| {
+        let input = input.ok_or("Clipboard helper stdin was unavailable")?;
+        write_item(input, &item)?;
+        let mut ready = [0; 6];
+        output
+            .read_exact(&mut ready)
+            .map_err(|_| "Clipboard publication failed")?;
+        if &ready != READY {
+            return Err("Clipboard helper returned an invalid acknowledgement".into());
+        }
+        Ok(item)
+    })
+}
+
+/// Waits for a read helper's capture: `None` when the clipboard holds no rich
+/// item.
+///
+/// Returns the capture together with the helper, which may still be running.
+///
+/// # Errors
+///
+/// Fails as [`exchange`] does, or if the capture is invalid.
+fn exchange_read(child: Child, deadline: Instant) -> Result<(Option<NativeItem>, Child), String> {
+    exchange(child, deadline, |input, mut output| {
+        drop(input);
+        let mut present = [0; 1];
+        output
+            .read_exact(&mut present)
+            .map_err(|_| "Clipboard capture failed")?;
+        match present[0] {
+            0 => Ok(None),
+            1 => read_item(output).map(Some),
+            _ => Err("Clipboard helper returned an invalid response".into()),
+        }
+    })
+}
+
+/// Runs `transfer` over the helper's pipes on a worker thread, so that the
+/// wait for its result ends at `deadline`.
+///
+/// # Errors
+///
+/// Fails if the helper's stdout is unavailable, or `transfer` fails or misses
+/// `deadline`. The helper is then stopped and reaped.
+fn exchange<T: Send + 'static>(
+    mut child: Child,
+    deadline: Instant,
+    transfer: impl FnOnce(Option<ChildStdin>, ChildStdout) -> Result<T, String> + Send + 'static,
+) -> Result<(T, Child), String> {
+    let Some(output) = child.stdout.take() else {
         stop_child(child);
         return Err("Clipboard helper stdout was unavailable".into());
     };
     let input = child.stdin.take();
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = thread::Builder::new().spawn(move || {
-        let result = (|| {
-            if let Some(item) = item {
-                let input = input.ok_or("Clipboard helper stdin was unavailable")?;
-                write_item(input, &item)?;
-                let mut ready = [0; 6];
-                output
-                    .read_exact(&mut ready)
-                    .map_err(|_| "Clipboard publication failed")?;
-                if &ready != READY {
-                    return Err("Clipboard helper returned an invalid acknowledgement".into());
-                }
-                Ok(Reply::Ready)
-            } else {
-                drop(input);
-                let mut present = [0; 1];
-                output
-                    .read_exact(&mut present)
-                    .map_err(|_| "Clipboard capture failed")?;
-                match present[0] {
-                    0 => Ok(Reply::Item(None)),
-                    1 => read_item(output).map(|item| Reply::Item(Some(item))),
-                    _ => Err("Clipboard helper returned an invalid response".into()),
-                }
-            }
-        })();
-        let _ = sender.send(result);
+        let _ = sender.send(transfer(input, output));
     });
     wait_for_reply(child, worker, receiver, deadline)
 }
 
-/// Waits until `deadline` for the reply that `worker` sends through
+/// Waits until `deadline` for the result that `worker` sends through
 /// `receiver`, and joins it. On any failure, stops and reaps `child` before
 /// returning the error.
-fn wait_for_reply(
+fn wait_for_reply<T>(
     child: Child,
     worker: io::Result<JoinHandle<()>>,
-    receiver: mpsc::Receiver<Result<Reply, String>>,
+    receiver: mpsc::Receiver<Result<T, String>>,
     deadline: Instant,
-) -> Result<(Reply, Child), String> {
+) -> Result<(T, Child), String> {
     let worker = match worker {
         Ok(worker) => worker,
         Err(_) => {
@@ -552,12 +571,9 @@ impl NativeClipboard {
             .command("--native-clipboard-read")?
             .spawn()
             .map_err(|_| "Clipboard capture helper could not start")?;
-        let (reply, child) = exchange(child, None, deadline)?;
+        let (item, child) = exchange_read(child, deadline)?;
         stop_child(child);
-        match reply {
-            Reply::Item(item) => Ok(item),
-            Reply::Ready => Err("Clipboard capture returned an invalid reply".into()),
-        }
+        Ok(item)
     }
 
     /// Reads the clipboard's rich item within [`OPERATION_TIMEOUT`].
@@ -579,7 +595,7 @@ impl NativeClipboard {
             .command("--native-clipboard-copy")?
             .spawn()
             .map_err(|_| "Clipboard publication helper could not start")?;
-        let (_, child) = exchange(child, Some(item.clone()), deadline)?;
+        let (item, child) = exchange_copy(child, item, deadline)?;
         let verify_deadline = Instant::now() + OPERATION_TIMEOUT;
         loop {
             if let Ok(Some(captured)) = self.capture_until(verify_deadline)
@@ -860,6 +876,48 @@ mod tests {
 
     fn item() -> NativeItem {
         NativeItem::from_fragment(&Fragment::from_text("café 日本語👩🏽\u{200d}💻\nsecond")).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_html_preserves_wrappers_quote_groups_and_escaped_text() {
+        let prefix = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>";
+        let suffix = "</body></html>";
+        for (text, expected) in [
+            ("", "<div style=\"white-space:pre-wrap\"><p><br></p></div>"),
+            (
+                "café <p> & \"'\u{2028}尾",
+                "<div style=\"white-space:pre-wrap\"><p>café &lt;p&gt; &amp; &quot;&#39;<br>尾</p></div>",
+            ),
+        ] {
+            let fragment = Fragment::from_text(text);
+            assert_eq!(
+                native_html(&fragment),
+                format!("{prefix}{expected}{suffix}")
+            );
+        }
+
+        let mut editor = Editor::from_text("<p>\n\nbody <blockquote>\nquote &\u{2028}tail\n");
+        for paragraph in [0, 1, 3] {
+            editor
+                .set_selection(Selection::caret(Position::new(paragraph, 0)))
+                .unwrap();
+            editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+        }
+        let expected = concat!(
+            "<div style=\"white-space:pre-wrap\">",
+            "<blockquote style=\"margin-left:0\">",
+            "<p style=\"margin-left:36px;text-indent:0.01px\">&lt;p&gt;</p>",
+            "<p style=\"margin-left:36px;text-indent:0.01px\"><br></p></blockquote>",
+            "<p>body &lt;blockquote&gt;</p>",
+            "<blockquote style=\"margin-left:0\">",
+            "<p style=\"margin-left:36px;text-indent:0.01px\">quote &amp;<br>tail</p>",
+            "</blockquote><p><br></p></div>",
+        );
+        assert_eq!(
+            native_html(&Fragment::from_document(editor.document())),
+            format!("{prefix}{expected}{suffix}")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1428,20 +1486,91 @@ for imported in [value, roundtrip] {
 
     #[cfg(unix)]
     #[test]
-    fn native_deadline_terminates_and_reaps_stalled_pipe_worker() {
+    fn copy_acknowledgement_returns_the_original_publication_allocations() {
+        let original = item();
+        let expected = original.clone();
+        let allocations = (
+            original.plain.as_ptr(),
+            original.html.as_ptr(),
+            original.rich.as_ptr(),
+        );
         let child = Command::new("sh")
-            .args(["-c", "exec sleep 30"])
+            .args(["-c", "cat >/dev/null; printf 'READY\\n'; exec sleep 30"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let started = Instant::now();
-        let result = exchange(child, None, started + Duration::from_millis(25));
-        assert!(result.is_err());
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "stalled child or pipe worker survived"
+        let (returned, child) =
+            exchange_copy(child, original, Instant::now() + Duration::from_secs(3)).unwrap();
+        stop_child(child);
+        assert_eq!(returned, expected);
+        assert_eq!(
+            (
+                returned.plain.as_ptr(),
+                returned.html.as_ptr(),
+                returned.rich.as_ptr(),
+            ),
+            allocations
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_acknowledgement_failures_reject_the_publication() {
+        for (script, expected) in [
+            (
+                "cat >/dev/null; printf 'WRONG\\n'; exec sleep 30",
+                "Clipboard helper returned an invalid acknowledgement",
+            ),
+            ("cat >/dev/null", "Clipboard publication failed"),
+        ] {
+            let child = Command::new("sh")
+                .args(["-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            match exchange_copy(child, item(), Instant::now() + Duration::from_secs(3)) {
+                Err(error) => assert_eq!(error, expected),
+                Ok((_, child)) => {
+                    stop_child(child);
+                    panic!("an invalid acknowledgement cannot publish an item");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_deadline_terminates_and_reaps_stalled_pipe_worker() {
+        let mut large = item();
+        // Larger than any OS pipe buffer, so the write itself blocks.
+        large.plain = "x".repeat(1024 * 1024);
+        // Exercise a blocked capture, copy acknowledgement, and pipe write.
+        for publication in [None, Some(item()), Some(large)] {
+            let child = Command::new("sh")
+                .args(["-c", "exec sleep 30"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(25);
+            let result = match publication {
+                Some(item) => exchange_copy(child, item, deadline).map(|(_, child)| child),
+                None => exchange_read(child, deadline).map(|(_, child)| child),
+            };
+            // The helper never reads, writes, or exits, so only the deadline can
+            // end the exchange; an early failure would skip the path under test.
+            assert_eq!(
+                result.map(stop_child).unwrap_err(),
+                "Native clipboard operation timed out"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "stalled child or pipe worker survived"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1457,7 +1586,7 @@ for imported in [value, roundtrip] {
             .spawn()
             .unwrap();
         let pid = Pid::from_raw(child.id() as i32).unwrap();
-        let (_sender, receiver) = mpsc::channel();
+        let (_sender, receiver) = mpsc::channel::<Result<Option<NativeItem>, String>>();
         let events = vec![egui::Event::Paste("plain fallback".into())];
         let mut input = egui::RawInput {
             events: events.clone(),

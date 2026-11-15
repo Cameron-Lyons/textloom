@@ -29,11 +29,13 @@ fn main() {
     transaction_edits();
     paragraph_import();
     fragment_capture();
+    rich_paragraph_slices();
     numbering_cache();
     saved_state_checks();
     editor_snapshots();
     serialization();
     formatting();
+    linked_history();
     caret_link_queries();
     paragraph_kind_queries();
     empty_insertions();
@@ -41,12 +43,14 @@ fn main() {
     word_selection();
     cold_zero_index_navigation();
     long_unicode_edits();
+    joined_unicode_edits();
     contextual_unicode_search();
     ascii_navigation();
     literal_search();
     repetitive_multiline_search();
     sparse_whole_word_search();
     search_navigation();
+    selected_replacement();
     long_literal_navigation();
     long_whole_word_navigation();
     unspaced_ascii_whole_word_navigation();
@@ -621,6 +625,253 @@ fn formatting() {
             original,
             "every formatting edit should have been undone"
         );
+    }
+}
+
+fn selected_replacement() {
+    for count in [100, 100_000] {
+        let selected = format!("!{}?", "A".repeat(count));
+        let query = selected.to_ascii_lowercase();
+        for (label, suffix) in [("ASCII", ""), ("mixed Unicode", " café")] {
+            let source = format!("{selected}{suffix}");
+            let mut editor = Editor::from_text(&source);
+            let selection = Selection::new(Position::default(), Position::new(0, selected.len()));
+            let options = SearchOptions {
+                case_sensitive: false,
+                whole_word: false,
+            };
+            measure(
+                &format!(
+                    "{count} selected ASCII letters confirm lowercase replacement in {label} paragraph"
+                ),
+                100,
+                || {
+                    editor.set_selection(selection).expect(VALID_POSITION);
+                    assert!(
+                        editor
+                            .replace_selected_match(hint::black_box(&query), &selected, options)
+                            .expect(NO_COMPOSITION)
+                    );
+                },
+            );
+            assert_eq!(editor.document().plain_text(), source);
+            assert_eq!(editor.undo_len(), 0);
+        }
+    }
+    for count in [100, 100_000] {
+        let source = format!("other {}match banana", "café 👩\u{200d}💻 ".repeat(count));
+        let mut editor = Editor::from_text(&source);
+        for (label, query, case_sensitive) in [
+            ("literal", "match", true),
+            ("lowercase", "match", false),
+            ("overlapping", "ana", false),
+        ] {
+            editor
+                .set_selection(Selection::new(
+                    Position::default(),
+                    Position::new(0, query.len()),
+                ))
+                .expect(VALID_POSITION);
+            let options = SearchOptions {
+                case_sensitive,
+                whole_word: false,
+            };
+            measure(
+                &format!("{count} Unicode repetitions reject selected {label} replacement"),
+                100,
+                || {
+                    assert!(
+                        !editor
+                            .replace_selected_match(hint::black_box(query), "X", options)
+                            .expect(NO_COMPOSITION)
+                    );
+                },
+            );
+        }
+        assert_eq!(editor.document().plain_text(), source);
+        assert_eq!(editor.undo_len(), 0);
+
+        let query = format!("!{}?", "ab\n".repeat(20));
+        let source = format!("{}{query}\nsuffix", "padding paragraph\n".repeat(count));
+        let mut editor = Editor::from_text(&source);
+        let selection = Selection::new(Position::new(count, 0), Position::new(count + 20, 1));
+        measure(
+            &format!("{count} preceding paragraphs confirm selected multiline replacement"),
+            100,
+            || {
+                editor.set_selection(selection).expect(VALID_POSITION);
+                assert!(
+                    editor
+                        .replace_selected_match(
+                            hint::black_box(&query),
+                            &query,
+                            SearchOptions::default()
+                        )
+                        .expect(NO_COMPOSITION)
+                );
+            },
+        );
+        assert_eq!(editor.document().plain_text(), source);
+        assert_eq!(
+            editor.undo_len(),
+            0,
+            "replacing a match with itself is unchanged"
+        );
+    }
+
+    let mut editor = Editor::from_text("banana");
+    editor
+        .set_selection(Selection::new(Position::new(0, 3), Position::new(0, 6)))
+        .expect(VALID_POSITION);
+    measure(
+        "short overlapping selection excluded by match stream",
+        10_000,
+        || {
+            assert!(
+                !editor
+                    .replace_selected_match("ana", "X", SearchOptions::default())
+                    .expect(NO_COMPOSITION)
+            );
+        },
+    );
+}
+
+fn rich_paragraph_slices() {
+    let phrase = "café 👩\u{200d}💻 ";
+    for count in [100, 10_000] {
+        let document = styled_repetitions(phrase, count);
+        let source = document.plain_text();
+        let range = Position::new(0, 1)..Position::new(0, source.len() - 1);
+        assert_eq!(
+            document
+                .fragment(range.clone())
+                .expect(VALID_POSITION)
+                .plain_text(),
+            &source[1..source.len() - 1]
+        );
+        measure(
+            &format!("{count} Unicode styled spans partial rich copy"),
+            200,
+            || {
+                hint::black_box(
+                    document
+                        .fragment(hint::black_box(range.clone()))
+                        .expect(VALID_POSITION),
+                );
+            },
+        );
+        measure(
+            &format!("{count} Unicode styled spans whole rich copy"),
+            1_000,
+            || {
+                hint::black_box(
+                    document
+                        .fragment(Position::default()..document.end())
+                        .expect(VALID_POSITION),
+                );
+            },
+        );
+        let mut editor = Editor::new(document);
+        editor
+            .set_selection(Selection::caret(Position::new(
+                0,
+                count / 2 * phrase.len() + 1,
+            )))
+            .expect(VALID_POSITION);
+        let original = editor.document().to_bytes();
+        measure(
+            &format!("{count} Unicode styled spans split + undo"),
+            200,
+            || {
+                editor.insert_paragraph().expect(NO_COMPOSITION);
+                assert!(editor.undo(), "the split should record an undo step");
+            },
+        );
+        assert_eq!(editor.document().to_bytes(), original);
+    }
+}
+
+fn joined_unicode_edits() {
+    for count in [100, 100_000] {
+        let padding = "word ".repeat(count);
+        for (label, cluster, offset, insertion, joined) in [
+            ("combining mark", "eX", 1, "\u{301}", "e\u{301}X"),
+            ("emoji joiner", "👩💻", 4, "\u{200d}", "👩\u{200d}💻"),
+        ] {
+            let source = format!("{padding}{cluster}{padding}");
+            let mut editor = Editor::from_text(&source);
+            editor
+                .set_selection(Selection::caret(Position::new(0, padding.len() + offset)))
+                .expect(VALID_POSITION);
+            editor
+                .apply_style(StylePatch {
+                    italic: Some(true),
+                    ..Default::default()
+                })
+                .expect(NO_COMPOSITION);
+            editor.insert_text(insertion).expect(NO_COMPOSITION);
+            assert_eq!(
+                editor.document().plain_text(),
+                format!("{padding}{joined}{padding}")
+            );
+            assert_eq!(editor.document().paragraphs()[0].spans().len(), 1);
+            assert_eq!(
+                editor.document().paragraphs()[0].spans()[0].style,
+                InlineStyle::default()
+            );
+            assert!(editor.undo());
+            measure(
+                &format!("{count} padding words {label} insertion + undo"),
+                100,
+                || {
+                    editor
+                        .insert_text(hint::black_box(insertion))
+                        .expect(NO_COMPOSITION);
+                    assert!(editor.undo(), "the joined text should record an undo step");
+                },
+            );
+            assert_eq!(editor.document().plain_text(), source);
+        }
+    }
+}
+
+fn linked_history() {
+    let target = Link::try_new("https://example.com/shared").expect("a valid link target");
+    let replacement = Link::try_new("https://example.com/changed").expect("a valid link target");
+    for count in [100, 10_000] {
+        let mut editor = Editor::new(styled_repetitions("x", count));
+        editor.select_all();
+        editor.set_link(Some(target.clone())).expect(NO_COMPOSITION);
+        editor.clear_history();
+        editor
+            .set_selection(Selection::new(
+                Position::new(0, count / 2),
+                Position::new(0, count / 2 + 1),
+            ))
+            .expect(VALID_POSITION);
+        let original = editor.document().to_bytes();
+        for (label, change_link) in [("format", false), ("change link", true)] {
+            measure(
+                &format!("{count} linked styled spans {label} + undo"),
+                1_000,
+                || {
+                    if change_link {
+                        editor
+                            .set_link(Some(replacement.clone()))
+                            .expect(NO_COMPOSITION);
+                    } else {
+                        editor
+                            .apply_style(StylePatch {
+                                underline: Some(true),
+                                ..Default::default()
+                            })
+                            .expect(NO_COMPOSITION);
+                    }
+                    assert!(editor.undo(), "the changed span should record an undo step");
+                },
+            );
+            assert_eq!(editor.document().to_bytes(), original);
+        }
     }
 }
 

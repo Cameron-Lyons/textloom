@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Check Replace-button matches against the selected text before searching outside
+  it, so a mismatched selection returns without a scan. Queries that cannot
+  overlap themselves then need only whole-word endpoint checks, while
+  self-overlapping queries such as `ana` still confirm that the selection is the
+  forward match stream's occurrence. Results are unchanged.
+- Return native clipboard publication buffers from the helper exchange for
+  verification instead of cloning them. Build macOS clipboard HTML directly in
+  its final wrapper, preserving quote indentation and exact exported content.
+- Copy partial rich paragraphs and split paragraph edges directly from validated
+  text and spans, avoiding temporary text buffers and repeated normalization.
+- Normalize joined Unicode formatting at span boundaries, preserving the first
+  scalar's style and link without segmenting unaffected text. Contextual sequences
+  that exceed the local window use one forward segmentation pass from the last
+  confirmed boundary.
+- Avoid temporary link-address lists and duplicate neighbor scans when estimating
+  undo history memory, and hash each run of a repeated neighbor link once.
+  Formatting and link edits in heavily styled linked paragraphs retain the same
+  history accounting with less allocation and copying.
 - Preserve document input before opening the native Link field and route later
   input to the field. Prefill follows the final selection and IME commit, so
   opening another link cannot accidentally apply the previous link's target.
