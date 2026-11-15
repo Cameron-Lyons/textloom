@@ -227,14 +227,7 @@ impl Document {
                 }
             }
             levels.push(paragraph.kind);
-            if slice.bytes == (0..paragraph.text.len()) {
-                paragraphs.push(paragraph.with_kind(kind));
-            } else {
-                let mut text = String::with_capacity(slice.bytes.len());
-                let mut spans = Vec::new();
-                paragraph::append_slice(&mut text, &mut spans, paragraph, slice.bytes);
-                paragraphs.push(Arc::new(Paragraph::styled(text, spans, kind)));
-            }
+            paragraphs.push(paragraph.slice(slice.bytes, kind));
         }
         Ok(Fragment::captured(paragraphs, numbering))
     }
@@ -547,12 +540,12 @@ impl Document {
             } else {
                 continuation_kind(base, index)
             };
-            if chunk.is_empty() && !is_last && is_first && range.start.byte == first.text.len() {
-                after.push(first.with_kind(kind));
+            if chunk.is_empty() && !is_last && is_first {
+                after.push(first.slice(0..range.start.byte, kind));
                 continue;
             }
-            if chunk.is_empty() && is_last && !is_first && range.end.byte == 0 {
-                after.push(last.with_kind(kind));
+            if chunk.is_empty() && is_last && !is_first {
+                after.push(last.slice(range.end.byte..last.text.len(), kind));
                 continue;
             }
             let capacity = chunk

@@ -1281,3 +1281,172 @@ The rendering harness now includes page pairs and moving link hover. Sources,
 preserved binaries, SHA-256 manifests, raw samples, quiet-window records, and
 the independent oracle are retained under `target/pointer-followup-20261112/`;
 the control medians are in `controls/results.json` within that directory.
+
+## November 13: linked undo history accounting
+
+History accounting now traverses borrowed links instead of allocating temporary
+address lists for the changed paragraph and its neighbors. Equal-length edits
+check their shared neighbor once, and a fully shared prefix returns immediately.
+Link targets are still charged by allocation identity, with repeated references
+charged once and targets shared with neighboring history paragraphs excluded.
+
+The new `linked_history()` workload in `benches/editing.rs` uses a single ASCII
+paragraph with alternating bold/italic spans, all sharing one link. Each timed
+operation underlines one middle character or gives it a new link, then undoes
+the change. Snapshot equality is checked outside timing. These are medians of
+three alternating baseline/current runs, each averaging 1,000 operations, on
+Apple Silicon macOS with Rust 1.100.0, the `egui` feature, locked dependencies,
+and Cargo's default release profile. The baseline is `3ce847c`; both versions
+use identical focused harnesses and separate build directories. No other agent
+builds, tests, or benchmarks ran during measurement.
+
+| Styled linked spans | Operation | Before (µs) | After (µs) |
+| ---: | --- | ---: | ---: |
+| 100 | Format + undo | 2.60 | 1.04 |
+| 100 | Change link + undo | 5.28 | 2.52 |
+| 10,000 | Format + undo | 170.62 | 90.75 |
+| 10,000 | Change link + undo | 419.16 | 223.97 |
+
+Unlinked controls remained similar: short insert/undo samples across 100 to
+100,000 paragraphs measured 0.32–0.34 µs, and local formatting/undo in 10,000
+unlinked spans measured 20.35 µs before and 20.29 µs after. Sub-microsecond
+formatting controls varied by hundredths of a microsecond. These averages are
+workload-specific, not confidence intervals or native input-latency measurements.
+Linked accounting still scales with the affected paragraph's formatting spans.
+
+The focused harness, source snapshots, binaries, raw samples, SHA-256 hashes,
+and final medians are retained under `target/cleanup-20261113/`; see
+`editing-final-probe.rs`, `measure-final.py`, `final-sha256.json`, and
+`final-results.json`. The regular editing benchmark also runs the new workload.
+
+## November 13 continuation: rich slices and Unicode joins
+
+Partial rich copies and standalone paragraph-split edges now build immutable text
+directly from validated slices. They clip and rebase existing formatting spans,
+avoiding a temporary text buffer and redundant grapheme validation. Complete
+paragraph copies still share their source paragraph, and partial copies build
+fresh navigation indexes only when queried.
+
+When edits join Unicode scalars into one grapheme, formatting normalization now
+rounds span ends to grapheme boundaries instead of processing every grapheme in
+the paragraph. The first scalar still supplies each resulting grapheme's style
+and link. Local queries use the existing bounded context window; if more context
+is required, one forward segmentation iterator, started at the last confirmed
+boundary, handles all remaining span ends.
+This retains linear worst-case segmentation for long contextual sequences.
+
+These measurements compare the preceding linked-history improvement with this
+continuation, using identical focused harnesses, locked dependencies, the `egui`
+feature, separate build directories, and Cargo's default release profile on
+Apple Silicon macOS with Rust 1.100.0. Values are medians of three alternating
+baseline/current runs, with no concurrent agent builds, tests, or benchmarks.
+
+The slice workload repeats `café 👩‍💻 ` in alternating bold/italic spans. Partial
+copy omits the first and last ASCII character; splitting divides a middle span
+after its first character and undoes the split. Each run averages 200 operations.
+
+| Unicode styled spans | Operation | Before (µs) | After (µs) |
+| ---: | --- | ---: | ---: |
+| 100 | Partial rich copy | 1.25 | 0.36 |
+| 100 | Split + undo | 1.67 | 0.77 |
+| 10,000 | Partial rich copy | 106.52 | 22.84 |
+| 10,000 | Split + undo | 110.97 | 22.88 |
+
+The join workload inserts a combining acute accent after `e`, or a ZWJ between
+`👩` and `💻`, with italic typing enabled to create a different raw formatting
+span. Each side of the join contains the stated number of `word ` repetitions.
+Every run averages 100 insert/undo pairs; setup checks that the joined cluster
+retains its first scalar's unformatted style. The long case has about 1 MB of text.
+
+| Padding words per side | Insertion + undo | Before (µs) | After (µs) |
+| ---: | --- | ---: | ---: |
+| 100 | Combining mark | 13.03 | 0.50 |
+| 100 | Emoji joiner | 13.34 | 0.54 |
+| 100,000 | Combining mark | 12,500.13 | 30.06 |
+| 100,000 | Emoji joiner | 12,431.37 | 29.86 |
+
+Whole-paragraph rich-copy controls measured about 0.03 µs in both versions, and
+the long regional-indicator edit control measured 168.68 / 169.62 µs. Ordinary
+long Unicode insertion measured 14.36 / 11.09 µs. Formatting controls were broadly
+similar; the unchanged-formatting scan over 10,000 spans measured 14.60 / 15.61 µs.
+Samples include allocator and process variation; these averages are not confidence
+intervals or native input-latency measurements. Edits still copy affected text,
+and slicing still copies the selected text and formatting spans.
+
+Regression tests compare normalization against complete Unicode segmentation,
+including combining marks, emoji, flags, Indic conjuncts, Hangul, long context,
+and EOF joins. Slice and split tests cover styles, links, paragraph kinds,
+rebased navigation, native round trips, and undo/redo. Sources, focused harness,
+binaries, raw samples, hashes, and medians are retained in
+`target/continuation-20261113/` (`editing-probe.rs`, `measure.py`, `sha256.json`,
+and `results.json`). Both new workloads also run in the regular editing harness.
+
+## November 13 continuation: selected replacement and clipboard copies
+
+`replace_selected_match` now compares the normalized query with the selected
+paragraph slices before looking outside the selection. Mismatches return
+immediately; an exact match with a nonoverlapping query needs only whole-word
+endpoint checks, when enabled. Overlapping queries retain the original forward
+match-stream check. Selections that differ from the query only in ASCII case
+match without scalar-by-scalar lowercase mapping; other comparisons preserve
+lowercase expansions and final-sigma folding. The
+preflight preserves soft breaks and performs no selected-text allocation.
+
+The new `selected_replacement()` workload was measured against the preceding
+rich-slice/Unicode-join source, with identical focused harnesses and locked
+dependencies, the `egui` feature, separate build directories, and Cargo's default
+release profile on Apple Silicon macOS with Rust 1.100.0. Values are medians of
+three alternating baseline/current runs without concurrent agent builds or tests.
+
+Rejection cases select `other` or its first three letters before 100,000
+repetitions of `café 👩‍💻 ` and later occurrences of the queries. They attempt
+literal/lowercase `match`, or overlapping lowercase `ana`, 100 times per run.
+Successful cases replace selected text with itself to avoid history while
+including replacement overhead. The multiline selection contains 21 paragraphs
+after 100,000 unrelated paragraphs; the ASCII selection is 100,000 capital `A`s
+between unique delimiters, searched in lowercase. Each averages 100 operations.
+
+| Selected replacement workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Literal mismatch before long Unicode suffix | 134.72 | <0.1 |
+| Lowercase mismatch before long Unicode suffix | 4,000.23 | <0.1 |
+| Overlapping-query mismatch before long Unicode suffix | 5,301.35 | <0.1 |
+| Selected multiline match after 100,000 paragraphs | 416.67 | 2.46 |
+| Selected ASCII match in an ASCII paragraph | 316.95 | 34.19 |
+| Selected ASCII match before an unselected Unicode suffix | 361.42 | 34.66 |
+
+An excluded overlapping `ana` selection in `banana` measured 0.05 µs in both
+versions. Existing find-navigation controls stayed around 0.15–0.21 µs. The
+sub-microsecond rejection values are near the harness's measurement floor;
+they show that unrelated suffixes are no longer scanned, not precise latency
+ratios. Whole-word context and overlapping-query membership may still require
+work outside the selection. Differential tests compare every valid selection
+with the full match stream across Unicode, newline, whole-word, and overlap cases.
+
+The native host also moves the publication item through the pipe worker and
+returns it for verification, removing clones of its plain text, HTML, and rich
+bytes. A fake-helper regression verifies that all three allocation addresses and
+contents survive acknowledgment, with malformed replies and blocked-pipe timeout
+cleanup covered separately.
+
+macOS HTML wrapping now streams quote styling into the final document string.
+An isolated probe uses the actual before/after wrapper functions with precomputed
+HTML; both include cloning that input, but exclude library HTML export, process
+startup, AppKit import, and system clipboard operations. Each large sample uses
+100,000 repeated units and 20 iterations per run, again with three alternating
+runs. Body units contain one paragraph, quote units one single-paragraph quote,
+and mixed units a body paragraph followed by a two-paragraph quote.
+
+| HTML wrapping workload | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Body units | 455.59 | 294.12 |
+| Quote units | 15,393.34 | 7,728.50 |
+| Mixed units | 19,265.82 | 11,537.50 |
+
+These are elapsed-time averages without confidence intervals, and do not measure
+native clipboard latency. Exact-output tests preserve the wrapper, quote styles,
+escaping, empty paragraphs, and soft breaks. Source snapshots, focused search
+harness, wrapper probe, binaries, hashes, and raw samples are retained under
+`target/clipboard-search-20261113/`; see `editing-probe.rs`, `measure.py`,
+`results.json`, `sha256.json`, `native-html-probe.rs`, and
+`native-html-results.txt`. The regular editing harness runs the new search cases.

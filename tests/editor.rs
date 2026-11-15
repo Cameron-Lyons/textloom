@@ -1334,6 +1334,94 @@ fn joining_and_splitting_paragraphs_are_reversible() {
 }
 
 #[test]
+fn splitting_formatted_unicode_preserves_slices_kinds_and_undo() {
+    use textloom::Link;
+    use unicode_segmentation::UnicodeSegmentation as _;
+
+    let prefix = "abé🇺🇸";
+    let text = format!("{prefix}e\u{301}\u{2028}cd");
+    let spans = vec![
+        Span::new(
+            0..prefix.len(),
+            InlineStyle {
+                bold: true,
+                ..Default::default()
+            },
+            Some(Link::try_new("https://example.com/split").unwrap()),
+        ),
+        Span::new(
+            prefix.len()..text.len(),
+            InlineStyle {
+                italic: true,
+                ..Default::default()
+            },
+            None,
+        ),
+    ];
+    for kind in [
+        ParagraphKind::Body,
+        ParagraphKind::Heading { level: 2 },
+        ParagraphKind::Quote,
+        ParagraphKind::Ordered {
+            indent: 1,
+            start: Some(7),
+        },
+    ] {
+        let source =
+            Document::from_paragraphs([Paragraph::try_new(&text, spans.clone(), kind).unwrap()]);
+        let boundaries = text.grapheme_indices(true).map(|(byte, _)| byte);
+        for split in boundaries.chain([text.len()]) {
+            let mut editor = Editor::new(source.clone());
+            caret(&mut editor, 0, split);
+            editor.insert_paragraph().unwrap();
+            assert_eq!(editor.selection(), Selection::caret(Position::new(1, 0)));
+            assert_eq!(editor.document().paragraphs().len(), 2);
+            let suffix_kind = match kind {
+                ParagraphKind::Heading { .. } if split == text.len() => ParagraphKind::Body,
+                ParagraphKind::Ordered { indent, .. } => ParagraphKind::Ordered {
+                    indent,
+                    start: None,
+                },
+                _ => kind,
+            };
+            assert_eq!(kinds(&editor), [kind, suffix_kind]);
+            for (index, (start, end)) in [(0, split), (split, text.len())].into_iter().enumerate() {
+                let paragraph = &editor.document().paragraphs()[index];
+                assert_eq!(paragraph.text(), &text[start..end]);
+                for (byte, grapheme) in paragraph.text().grapheme_indices(true) {
+                    assert_eq!(
+                        editor
+                            .document()
+                            .style_at(Position::new(index, byte + grapheme.len())),
+                        source.style_at(Position::new(0, start + byte + grapheme.len()))
+                    );
+                    assert_eq!(
+                        editor.document().link_at(Position::new(index, byte)),
+                        source.link_at(Position::new(0, start + byte))
+                    );
+                }
+            }
+            let split_document = Fragment::from_document(editor.document());
+            assert_eq!(
+                Fragment::from_bytes(&split_document.to_bytes()).unwrap(),
+                split_document
+            );
+            assert!(editor.undo());
+            assert!(Arc::ptr_eq(
+                &editor.document().paragraphs()[0],
+                &source.paragraphs()[0]
+            ));
+            assert_eq!(
+                editor.selection(),
+                Selection::caret(Position::new(0, split))
+            );
+            assert!(editor.redo());
+            assert_eq!(Fragment::from_document(editor.document()), split_document);
+        }
+    }
+}
+
+#[test]
 fn vertical_movement_preserves_grapheme_column_across_short_paragraph() {
     let mut editor = Editor::from_text("abcdef\nx\n🦀🦀🦀🦀🦀🦀");
     caret(&mut editor, 0, 5);

@@ -426,58 +426,61 @@ fn side_bytes(paragraphs: &[Arc<Paragraph>], other: &[Arc<Paragraph>]) -> usize 
 
 fn link_bytes(
     paragraph: &Paragraph,
-    near: [Option<&Paragraph>; 2],
+    mut near: [Option<&Paragraph>; 2],
     charged: &mut HashSet<usize>,
 ) -> usize {
-    let links = |paragraph: &Paragraph| -> Vec<usize> {
-        paragraph
-            .spans
-            .iter()
-            .filter_map(|span| span.link.as_ref().map(Link::address))
-            .collect()
-    };
-    let own = links(paragraph);
-    let near: Vec<Vec<usize>> = near
-        .into_iter()
-        .flatten()
-        .filter(|other| other.linked)
-        .map(links)
-        .collect();
+    // Equal-length changes have the same aligned and shifted neighbor.
+    if let [Some(first), Some(second)] = near
+        && std::ptr::eq(first, second)
+    {
+        near[1] = None;
+    }
+    let near = near.into_iter().flatten().filter(|other| other.linked);
+    let own = paragraph_links(paragraph);
+    // Links in a prefix or suffix shared with a neighbor are never charged, so
+    // only the remaining middle is compared with every neighbor link.
     let (mut prefix, mut suffix) = (0, 0);
-    for other in &near {
-        prefix = prefix.max(
-            own.iter()
-                .zip(other)
-                .take_while(|(left, right)| left == right)
-                .count(),
-        );
+    for other in near.clone() {
+        let mut theirs = paragraph_links(other);
+        let Some(shared) = own.clone().position(|link| {
+            theirs
+                .next()
+                .is_none_or(|other| other.address() != link.address())
+        }) else {
+            // This neighbor starts with every link in the paragraph.
+            return 0;
+        };
+        prefix = prefix.max(shared);
         suffix = suffix.max(
-            own.iter()
+            own.clone()
                 .rev()
-                .zip(other.iter().rev())
-                .take_while(|(left, right)| left == right)
+                .zip(paragraph_links(other).rev())
+                .take_while(|(left, right)| left.address() == right.address())
                 .count(),
         );
     }
-    let start = prefix.min(own.len());
-    let middle = &own[start..own.len().saturating_sub(suffix).max(start)];
-    if middle.is_empty() {
+    let end = own.clone().count().saturating_sub(suffix);
+    if prefix >= end {
         return 0;
     }
-    let shared: HashSet<usize> = near.iter().flatten().copied().collect();
-    let targets = paragraph
-        .spans
-        .iter()
-        .filter_map(|span| span.link.as_ref())
-        .skip(start)
-        .take(middle.len());
+    // Neighboring styled spans often repeat one link; hash each run once.
+    let mut previous = None;
+    let shared: HashSet<usize> = near
+        .flat_map(paragraph_links)
+        .map(Link::address)
+        .filter(|&address| previous.replace(address) != Some(address))
+        .collect();
     let mut bytes: usize = 0;
-    for link in targets {
+    for link in own.skip(prefix).take(end - prefix) {
         if !shared.contains(&link.address()) && charged.insert(link.address()) {
             bytes = bytes.saturating_add(link.as_str().len());
         }
     }
     bytes
+}
+
+fn paragraph_links(paragraph: &Paragraph) -> impl DoubleEndedIterator<Item = &Link> + Clone {
+    paragraph.spans.iter().filter_map(|span| span.link.as_ref())
 }
 
 struct Allocations<'paragraphs> {
@@ -515,6 +518,84 @@ impl<'paragraphs> Allocations<'paragraphs> {
                     .collect()
             })
             .contains(&target)
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::{InlineStyle, ParagraphKind, Span};
+
+    #[test]
+    fn link_charges_match_distinct_unshared_allocations() {
+        // Equal targets can have distinct allocations; repeated references to
+        // one allocation must be charged only once, even across paragraphs.
+        let links = ["https://a", "https://longer", "https://a"]
+            .map(|target| Link::try_new(target).unwrap());
+        let patterns: &[&[Option<usize>]] = &[
+            &[],
+            &[None],
+            &[Some(0)],
+            &[Some(1)],
+            &[Some(2)],
+            &[Some(0), Some(0)],
+            &[Some(0), None, Some(1)],
+            &[Some(0), Some(1), Some(0)],
+            &[Some(2), Some(1), Some(2)],
+            &[Some(0), Some(1), Some(2), Some(0)],
+            &[Some(1), Some(0), Some(2), Some(1), Some(0)],
+        ];
+        let paragraphs: Vec<_> = patterns
+            .iter()
+            .map(|pattern| {
+                let spans = pattern
+                    .iter()
+                    .enumerate()
+                    .map(|(index, link)| {
+                        Span::new(
+                            index..index + 1,
+                            InlineStyle {
+                                bold: index.is_multiple_of(2),
+                                ..Default::default()
+                            },
+                            link.map(|index| links[index].clone()),
+                        )
+                    })
+                    .collect();
+                Paragraph::try_new(&"x".repeat(pattern.len()), spans, ParagraphKind::Body).unwrap()
+            })
+            .collect();
+        let neighbors: Vec<_> = std::iter::once(None)
+            .chain(paragraphs.iter().map(Some))
+            .collect();
+        for first in &neighbors {
+            for second in &neighbors {
+                let near = [*first, *second];
+                let shared: HashSet<_> = near
+                    .iter()
+                    .flatten()
+                    .flat_map(|paragraph| paragraph.spans())
+                    .filter_map(|span| span.link.as_ref().map(Link::address))
+                    .collect();
+                for paragraph in &paragraphs {
+                    for initial in [HashSet::new(), HashSet::from([links[0].address()])] {
+                        let mut expected_charged = initial.clone();
+                        let expected: usize = paragraph
+                            .spans()
+                            .iter()
+                            .filter_map(|span| span.link.as_ref())
+                            .filter(|link| !shared.contains(&link.address()))
+                            .filter(|link| expected_charged.insert(link.address()))
+                            .map(|link| link.as_str().len())
+                            .sum();
+                        let mut charged = initial;
+                        assert_eq!(link_bytes(paragraph, near, &mut charged), expected);
+                        assert_eq!(charged, expected_charged);
+                        assert_eq!(link_bytes(paragraph, near, &mut charged), 0);
+                    }
+                }
+            }
+        }
     }
 }
 
