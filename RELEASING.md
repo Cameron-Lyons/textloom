@@ -2,25 +2,18 @@
 
 ## Current work toward 1.0
 
-The changes in [PR #16](https://github.com/Cameron-Lyons/textloom/pull/16) are
-unreleased; the package version remains 1.0.0-rc.2. They restore native
-paste-as-plain-text with egui 0.37, repair repeated Windows rich-copy ownership,
-and expand macOS TextEdit and Windows VM interaction checks. The native host
-now reports clipboard operation failures instead of allowing a plain fallback
-to leave every QA error counter at zero. The Windows example uses
-`clipboard-win` 5.4.3 or later; 5.4.1 was yanked on 2026-10-23.
+The [1.0.0-rc.2 changelog](CHANGELOG.md#100-rc2) includes native input and
+clipboard fixes, editing and navigation performance improvements, API migration
+notes, and the open platform limitations for the GitHub prerelease. Changelog
+changes trigger hosted macOS TextEdit and Windows NVDA checks so the release PR
+exercises both workflows alongside CI.
 
-Stable 1.0 still requires final platform signoff and correction of the known
-native integration failures. The scoped macOS hands-on confirmation below
-records the user's results; other platform evidence and unitemized protocol
-details remain open. Automated clipboard transport and external-renderer
-assertions do not establish physical-input or audible-reader usability.
-Record unavailable checks explicitly rather than treating them as passes.
-
-The [native dependency limitations](#native-dependency-limitations) distinguish
-known failures from missing evidence and identify the configurations and
-upstream fixes involved. Current automated evidence is recorded separately
-from the historical sessions below; neither substitutes for manual signoff.
+Stable 1.0 still requires final native platform signoff and resolution of the
+known failures in the supported configurations. The
+[native dependency limitations](#native-dependency-limitations) identify those
+configurations and the relevant upstream fixes. The macOS hands-on confirmation
+below applies to the tested build and named scenarios. Physical-input and
+audible screen-reader signoff remain open for the final revision.
 
 ### Pointer lookup and Link input ordering, 2026-11-12
 

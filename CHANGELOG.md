@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 1.0.0-rc.2
+
+2026-11-17. Second release candidate for 1.0.0. This candidate improves
+editing and navigation performance in large styled and Unicode documents,
+fixes native selection and clipboard behavior, and follows the
+[Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html).
+The API may still change before 1.0.0. See the migration notes below for public
+API changes since 1.0.0-rc.1.
+
+### Known limitations
+
+- On Windows with winit 0.30.13, the first dead key after a keyboard layout
+  switch can be lost. The native example has a workaround for egui-winit
+  dropping printable Ctrl+Alt text. Windows keyboard and IME verification of
+  that workaround is pending, and other egui hosts need equivalent handling.
+- On X11, Fcitx 5 with unpatched xcb-imdkit 1.0.9 can stop accepting keyboard
+  input after focus moves during composition. Use a build with the
+  per-input-context fix or a tested Wayland configuration. With winit 0.30.13
+  on X11, the IME candidate popup can overlap the caret line.
+- On Linux, Orca can read the tested link and quote text, but link-at-caret and
+  block-quote announcements remain incomplete with AccessKit's Unix backend.
+- Final platform signoff is open, including physical-input, IME, display-scale,
+  and audible screen-reader checks. See the
+  [native dependency limitations](RELEASING.md#native-dependency-limitations)
+  and the [native host validation record](RELEASING.md#native-host-validation-record)
+  for affected configurations and existing evidence.
+
+### Changes since 1.0.0-rc.1
+
 - Check Replace-button matches against the selected text before searching outside
   it, so a mismatched selection returns without a scan. Queries that cannot
   overlap themselves then need only whole-word endpoint checks, while
@@ -111,8 +140,8 @@
 - Refresh the library, native host, and winit harness lockfiles to Tokio 1.53.3,
   which fixes RUSTSEC-2026-0386. This transitive dependency is conditional on
   Emscripten's experimental Tokio integration and is inactive in native builds.
-- Release verification rejects tags while the changelog has pending Unreleased
-  changes or the selected version lacks a valid release date. Local release
+- Release verification rejects tags while the changelog has pending changes
+  or the selected version lacks a valid release date. Local release
   checks and CI exercise these gates with isolated changelog fixtures.
 - Egui: Ctrl/Command+Shift+V requests a native clipboard read when the host
   delivers only the key event, as egui-winit 0.37 does. Default and rich
@@ -146,15 +175,6 @@
   required for 1.0. The corrected exporter clears the recorded TextEdit 1.20
   quote-import presentation failure on the tested configuration; see the
   current evidence in `RELEASING.md`.
-
-## 1.0.0-rc.2
-
-2026-10-22. Second release candidate for 1.0.0. The code follows the
-[Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html),
-which changes some public API names and types from 1.0.0-rc.1; see the
-migration notes below. Every public item is documented. The API may still
-change before 1.0.0. Hands-on Windows checks and several macOS and
-physical-device checks are still pending; see `RELEASING.md`.
 
 - `Error`, `FragmentError`, `AccessKitError`, and the egui
   `AccessibilityError` implement `Copy`. `AccessibilitySnapshot` implements
