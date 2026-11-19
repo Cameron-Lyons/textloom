@@ -15,6 +15,98 @@ configurations and the relevant upstream fixes. The macOS hands-on confirmation
 below applies to the tested build and named scenarios. Physical-input and
 audible screen-reader signoff remain open for the final revision.
 
+### Editing, search and pointer checks, 2026-11-19
+
+Word deletion matched whole-paragraph navigation in 42,442 generated checks
+at grapheme boundaries. Long multiline queries were compared with an
+independent full-text search for Unicode case mappings, empty paragraphs,
+overlap, selection membership and navigation in both directions. The measured
+costs and repetitive-search controls are in [BENCHMARKS.md](BENCHMARKS.md#word-deletion-and-long-multiline-search-2026-11-19).
+
+Egui input tests covered a click that starts and ends on separate occurrences
+of the same URL, touch taps on a link spanning several styles, and document
+replacement during a gesture. The native example's input-batch test confirmed
+that a rich paste after a Japanese IME commit keeps bold formatting through
+undo and redo. Reversing the event order left only the committed Japanese text.
+
+### Native accessibility and clipboard checks, 2026-11-19
+
+The native example exposed list item positions 1 of 2 and 2 of 2 through
+AT-SPI 2.62.1 in a private Xvfb and D-Bus session. Outdenting one item changed
+the other to 1 of 1. Undo restored both positions and the full Unicode editor
+text. The direct adapter's consumer tests cover list splits, sizes inherited
+from containers, stable text positions, undo, redo and tree reactivation.
+The native X11 and Wayland rich clipboard fixtures passed copy, paste, undo
+and redo with zero reported errors. On Wayland, LibreOffice Writer offered
+formatted HTML and plain Unicode text without a Textloom fragment. The default
+and rich-enabled hosts pasted the exact two-line text and preserved it through
+undo and redo. Copying it back from rich mode confirmed the plain fallback.
+
+Windows 11 UI Automation also returned positions 1 of 2 and 2 of 2, then 1 of 1
+after a Backspace at the first item, and both original positions after undo.
+Stock `accesskit_windows` 0.35.1 reported generic UIA Level 1 for the heading.
+It returned unsupported for the separate HeadingLevel property and the
+document text range's StyleId attribute. Native numbering checks
+verified the original and nested item order. NVDA 2026.2 passed all 15 automated
+checks on the same Windows 11 host build as the final UIA probe. These covered
+focus, caret movement, Unicode selection, replacement, undo and redo, and
+graceful exit. The NVDA probe captures speech sequences for assertions.
+
+With the [Windows heading patches](GUIDE.md#heading-levels-on-windows),
+the same editor exposed distinct HeadingLevel and text-range StyleId values
+for headings 1 through 6. Changing a heading to body text cleared its heading
+level. Undo restored it and redo cleared it again. A range spanning heading
+and body text returned UI Automation's mixed value. With heading reporting
+enabled, NVDA 2026.2 queued “heading level 1” when returning to the heading
+and “heading level 3” after changing its level. The body line had no heading
+announcement. The stock provider read the same lines without heading levels.
+
+With the optional [Linux Hypertext patches](GUIDE.md#inline-links-with-orca-on-linux),
+Orca 51.1 read all three link roles in “Read alpha link Beta link then omega
+link and final words.” The stock backend read the words without those roles.
+Through libatspi, the patched document exposed five ordered links, each with
+its own anchor, URL, and half-open range in Unicode scalar offsets. Lookups
+covered every offset, adjacent links, style changes within one link, an inline
+soft break, a link ending a non-final paragraph, insertion, removal and undo.
+The Linux host's caret description also announced entry on a native Right
+arrow. In whole-line reading that lands inside a link, Orca can speak an
+additional “Link” when the focused document's description changes.
+
+The same open Linux editor moved between two private Sway outputs at 1×, 2×,
+then 1×. Selection survived each move. Pointer placement, drag selection,
+replacement and undo worked at every scale. The same character measured 19,
+38 and 19 physical pixels high through AT-SPI. In a separate 80-line
+document, wheel scrolling worked on each output, Mozc's candidate panel
+opened beside the caret on the last line, and one undo restored the document
+after each Japanese commit. Both sessions used virtual input and exited
+gracefully with zero reported errors.
+
+With the winit X11 reset patch, Fcitx 5.1.23 and stock xcb-imdkit 1.0.9
+retained keyboard input through Document → Find → Document in three runs.
+A Return-confirmed Japanese candidate appeared once in Document when a click
+immediately moved focus to Find. The next keys reached their intended fields. The direct winit
+harness discarded an unconfirmed candidate on an explicit interruption and
+delivered a confirmed candidate once. A separate read-only transition
+disabled input and accepted a new composition after re-enabling it.
+In a two-window trace, only consecutive requests for the same window reset
+the context in place. An intervening cursor-area update or an enable for a
+different window kept the original context transitions.
+
+The reset applies when winit opens the `@im=fcitx` input method. An
+independent X11 test used IBus 1.5.34 and ibus-hangul 1.5.5. A direct
+disable and re-enable discarded the unconfirmed `하`, then accepted a new
+`나` and plain `q`, matching stock winit. In the native editor, moving to
+Find committed `하` once in Document, left Find empty and routed the next
+key to Find.
+
+Local checks cover all eight feature combinations, the native example,
+strict Clippy, rustdoc, benchmark smoke tests, the extracted crate and a
+consumer built with the prepared native dependencies.
+Rust 1.95 passed 703 library unit and integration tests plus nine doctests.
+The library cross-checked for Windows x64 and macOS ARM64. The native host
+and direct winit harness also cross-checked for Windows using the same
+prepared winit source as the Linux tests.
+
 ### Pointer lookup and Link input ordering, 2026-11-12
 
 Pointer hit testing, page movement, moving link hover, and cross-paragraph
@@ -997,7 +1089,7 @@ steps for the feature rows.
 | Egui touchpad tap-to-click places the caret, commits a preedit, and activates links | Linux press-and-release in one frame passed: it placed the caret, committed a Mozc preedit once, and opened a link in read-only mode. Physical touchpads pending |
 | Fill Color and Font Color: apply, No Fill/Automatic, undo/redo; selections and found matches stay visible over fills; fill survives external rich copy | Linux passed: AT-SPI attributes confirmed yellow, a menu color, the button repeating it, No Fill removing only that fill, Red, a menu color, and Automatic; each command undid and redid in one step. A selection and a found match painted visibly over the fill. LibreOffice kept the fill and font color. macOS and Windows pending |
 | Soft line breaks: Shift+Enter in a list item and a heading; caret, selection, Home/End, and Up/Down across the break; screen-reader line reading; external plain copy shows a line break; HTML paste into Word/TextEdit shows the break | Linux passed: the numbered item kept its number and marker, the heading stayed one heading, Home/End/Up/Down and Shift+Left followed the visual lines, AT-SPI and Orca read the two lines separately, plain copy had a line break, and LibreOffice showed one numbered paragraph with a line break. macOS and Windows pending |
-| Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Linux passed: add, edit, and remove were one undo step each and kept the selection; Ctrl+click, a read-only click, and AT-SPI activation opened the URL once without moving the caret; the `javascript:` target was refused with a status message; hovering showed the target, and the cursor became a pointing hand only with Ctrl held or in read-only mode; LibreOffice kept the hyperlink. Orca read link text but did not announce links at the caret, because AccessKit's Unix adapter has no Hypertext interface. macOS and Windows pending |
+| Links: Link button and Ctrl/Command+K add, edit, remove, and undo; Ctrl/Command+click and read-only click open the browser; `javascript:` targets refused; pointing hand and target tooltip on hover; screen reader announces and activates links; copy to Word/TextEdit keeps the hyperlink | Linux passed: add, edit, and remove were one undo step each and kept the selection; Ctrl+click, a read-only click, and AT-SPI activation opened the URL once without moving the caret; the `javascript:` target was refused with a status message; hovering showed the target, and the cursor became a pointing hand only with Ctrl held or in read-only mode; LibreOffice kept the hyperlink. Orca read the link text. Its Present Link command found the focused document entry when the caret was inside a link. macOS and Windows pending |
 | Block quotes: bar continuous across consecutive quotes in light and dark themes; Enter/Backspace behavior; screen reader announces a block quote and reads through it; HTML paste into Word/TextEdit shows a block quote | Linux dark theme passed: one bar spanned three consecutive quote paragraphs; Enter continued the quote, and Enter on an empty quote paragraph or Backspace at a quote's start made body text in one undo step; AT-SPI exposed one block quote; LibreOffice used its Quotations style. Orca read through the quote without announcing it. With `--theme light` and `--theme dark`, one bar ran along the quote's left edge for the full height of three consecutive quote paragraphs, in egui's weak text color (contrast 2.96:1 light, 2.78:1 dark). macOS and Windows pending |
 | Numbering controls: Numbered list and Ctrl/Command+Shift+7 extend or start lists; markers and the "Item N." label continue past body text and restart after headings; Restart at 1 and Continue numbering change only the focused item in one undo step; copied items keep their numbers in Word/TextEdit | Linux passed: markers and the "Item N." label read 1, 2, 3; body text in the middle gave 1, 2, and changing it back restored 1, 2, 3; Restart at 1 and Continue numbering changed only the focused item, one undo step each; Ctrl+Shift+7 extended the list; an item after a heading restarted at 1; LibreOffice showed 2 and 3. macOS and Windows pending |
 
@@ -1011,38 +1103,65 @@ claim and record the affected configuration; an upstream attribution is not
 passing signoff. See the [native protocol](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/NATIVE_QA.md)
 for the precise interaction checks.
 
-- **X11 with Fcitx 5 and xcb-imdkit 1.0.9:** composing in Document, clicking
-  Find, and returning to Document can stop all keyboard input. The upstream
+- With **stock winit 0.30.13 on X11, Fcitx 5 and xcb-imdkit 1.0.9**,
+  composing in Document, clicking Find, and returning to Document can stop
+  all keyboard input. The
   [per-input-context synchronization fix](https://github.com/fcitx/xcb-imdkit/pull/18)
-  restores the tested round trip. Use a distribution build carrying that fix,
-  or a tested Wayland configuration; restarting Fcitx recovers a stuck session
-  but does not prevent recurrence. Do not describe this X11 combination as
-  fully supported solely because a basic composition test passes.
-- **Windows with winit 0.30.13:** the first dead key immediately after switching
-  layouts can be lost. Subsequent dead keys and ordinary AltGr input passing
-  do not clear this failure. The upstream
+  restored the round trip in two runs. The tests recorded the library loaded
+  by Fcitx. The earlier winit caret-area and focus fixes alone still lost the
+  next character and composition in both stock-server trials. The additional
+  [winit X11 reset patch](GUIDE.md#x11-and-windows-fixes-for-winit-03013)
+  keeps the existing input context alive during an egui composition
+  interruption. In a private X11 session with the original server, keyboard
+  input and new compositions worked after switching between fields.
+- On **Windows with stock winit 0.30.13**, the first dead key immediately after switching
+  layouts can be lost. On 2026-11-19 the Windows 11 VM reproduced this on the
+  German layout. The first acute accent followed by e inserted plain e.
+  The subsequent acute accent followed by a inserted á. The upstream
   [layout-change initialization fix](https://github.com/rust-windowing/winit/pull/4582)
-  needs a backport or a compatible upstream release. Textloom cannot recover
-  text that winit did not deliver.
+  is available in the [application backports](GUIDE.md#x11-and-windows-fixes-for-winit-03013).
+  The patched native editor inserted é on its first acute accent followed by e
+  without a preparatory keystroke. All nine German keyboard checks passed,
+  including Ctrl+Alt+Q, undo, caret restoration and focus. The direct winit
+  harness produced `@@€` from the three AltGr and Ctrl+Alt chords.
 - **Ctrl+Alt text in egui hosts:** egui-winit 0.37 suppresses text whenever
   Control is held. The Windows example now forwards native printable Ctrl+Alt
   text with temporary text-entry modifiers, then immediately restores the
-  original modifiers. Native Windows interaction checks of this workaround
-  remain pending; physical AltGr is the previously tested alternative.
+  original modifiers. On 2026-11-19 the Windows 11 VM verified that Ctrl+Alt+Q
+  inserted exactly `@` in the native example's document and preserved focus.
+  The separate winit harness accepted both German AltGr and Ctrl+Alt text and
+  committed the first Japanese composition with the candidate list beside the caret.
   Other egui hosts need equivalent integration or an upstream correction.
   Textloom's separate winit adapter already accepts Windows Ctrl+Alt text.
   The example's earlier unintended Ctrl+Alt+Q quit has been fixed.
-- **X11 IME candidate placement with winit 0.30.13:** only the caret area's
-  top-left point is sent to XIM, so a popup may overlap the caret line.
-  Wayland needs the actual caret rectangle; moving that rectangle in the
-  widget to hide the X11 limitation would make other integrations incorrect.
-- **Linux reader semantics:** Orca reads the tested link and quote text but
-  did not announce links at the caret or announce a block quote. AccessKit's
-  Unix adapter 0.24.1 lacks the Hypertext interface used for link navigation,
-  and its Hyperlink start/end offsets still return `-1`. Changing the widget's
-  existing link and block-quote roles alone does not supply those interfaces
-  or establish quote announcements. Successful text, selection, and replacement
-  probes do not certify those semantic announcements or audible usability.
+- For **X11 candidate placement with stock winit 0.30.13**, XIM receives only
+  the top-left point. Fcitx/Mozc overlapped ordinary 19–24 px lines by 9–14 px.
+  Moving the point to the bottom caused an 11 px overlap above a 48 px line
+  near the display edge. With the application backport, the candidate window
+  opened flush against either edge of the 48 px line. Native egui passed the
+  two-paragraph and 300-line scrolled fixtures, and Wayland retained its caret
+  rectangle. Both adapters forward the full rectangle. See the
+  [installation instructions](GUIDE.md#x11-and-windows-fixes-for-winit-03013)
+  and [upstream XIM fix](https://github.com/rust-windowing/winit/pull/4158).
+- With **stock winit 0.30.13 on X11**, making a focused read-only editor
+  editable recreated its XIM context. The window
+  and document retained focus, but typing `nihon` entered Latin text.
+  With the focus backport, the XIM trace showed focus transfer to the new
+  context, Mozc committed にほん once, and undo restored the selected word.
+  The implementation adapts an [upstream proposal](https://github.com/rust-windowing/winit/pull/4727)
+  to winit 0.30.13.
+- In the private Wayland session on 2026-11-19, **Orca 51** passed nine checks
+  covering document focus, Unicode line reading, soft breaks, selection, text replacement and undo/redo. With editing focus in
+  Document, its Present Link command reported “Not on a link” at linked text.
+  Orca checks the focused accessible object for this command. The Linux native
+  example now describes a linked grapheme or quoted paragraph at a collapsed
+  caret. Orca announced entry, then read the next quoted line and selected text
+  without repeating the context. With the stock backend, a whole line read
+  from ordinary text can still contain an unannounced inline link. The
+  [optional workspace patches](GUIDE.md#inline-links-with-orca-on-linux)
+  supply AT-SPI Hypertext and valid Hyperlink endpoints. Orca then announced
+  inline links during whole-line reading. The test captured Orca's speech output log.
+  Audible usability on a physical system remains open.
 
 As of 2026-10-23, winit's latest stable release is 0.30.13, egui's is 0.37.0,
 and xcb-imdkit's latest tag is 1.0.9. An unreleased upstream fix or a locally
