@@ -439,16 +439,14 @@ impl<'editor> RichTextEditor<'editor> {
                 page_height: (ui.clip_rect().height() - row_height).max(row_height),
                 heading_shortcuts: self.heading_shortcuts,
             };
-            let press_event = if !drag_to_select {
-                None
-            } else if response.is_pointer_button_down_on() {
+            let press_event = if response.is_pointer_button_down_on() {
                 primary_pointer_event(ui, PointerEventKind::Press)
             } else if response.clicked() {
                 primary_pointer_event(ui, PointerEventKind::ClickPress)
             } else {
                 None
             };
-            let pressed = press_event.is_some();
+            let pressed = drag_to_select && press_event.is_some();
             let clicked = response.clicked()
                 && (!drag_to_select || response.double_clicked() || response.triple_clicked());
             let pointer = response.interact_pointer_pos();
@@ -495,8 +493,7 @@ impl<'editor> RichTextEditor<'editor> {
             let ends_composition = ((pressed || clicked) && click_pointer.is_some())
                 || dragged
                 || !(pressed || clicked || response.has_focus());
-            let follows_links = self.read_only || click_modifiers.command;
-            let previous_press = cache.interaction.link_press.take();
+            let mut link_press = cache.interaction.link_press.take();
             let applied = if was_focused && ends_composition && !focus_left {
                 apply_queued_ime(
                     self.editor,
@@ -512,6 +509,13 @@ impl<'editor> RichTextEditor<'editor> {
             } else {
                 Vec::new()
             };
+            if !drag_to_select && let Some((pointer, modifiers)) = press_event {
+                // An unfocused touch press must leave scrolling and focus alone.
+                // Remember its link until egui distinguishes a tap from a swipe.
+                link_press = (self.read_only || modifiers.command)
+                    .then(|| LinkPress::at(self.editor, &layouts, pointer - origin))
+                    .flatten();
+            }
             if pressed || clicked {
                 pointer_interaction = true;
                 cache.interaction.navigation = None;
@@ -525,29 +529,12 @@ impl<'editor> RichTextEditor<'editor> {
                         cache.interaction.remember_composition_end(committed, now);
                     }
                     let single = !response.double_clicked() && !response.triple_clicked();
-                    let link = (follows_links && single)
-                        .then(|| {
-                            navigation::link_at_point(
-                                self.editor.document(),
-                                &layouts,
-                                pointer - origin,
-                            )
-                        })
-                        .flatten();
-                    if let Some(link) = link {
-                        if pressed {
-                            let anchor =
-                                navigation::hit_test(self.editor, &layouts, pointer - origin)
-                                    .position;
-                            cache.interaction.link_press = Some(LinkPress {
-                                link,
-                                anchor,
-                                revision: self.editor.document().revision(),
-                            });
-                        } else {
-                            clicked_link = Some(link);
-                        }
-                    } else {
+                    if pressed {
+                        link_press = (single && (self.read_only || click_modifiers.command))
+                            .then(|| LinkPress::at(self.editor, &layouts, pointer - origin))
+                            .flatten();
+                    }
+                    if !single || link_press.is_none() {
                         let CaretPlacement {
                             position,
                             prefer_next_row,
@@ -581,22 +568,13 @@ impl<'editor> RichTextEditor<'editor> {
                     }
                 }
             }
-            let mut link_press = if pressed {
-                cache.interaction.link_press.take()
-            } else {
-                previous_press
-            };
             if response.clicked()
                 && !response.double_clicked()
                 && !response.triple_clicked()
                 && let Some(press) = link_press.take()
-                && press.revision == self.editor.document().revision()
                 && let Some(pointer) = released_pointer
-                && navigation::link_at_point(self.editor.document(), &layouts, pointer - origin)
-                    .as_ref()
-                    == Some(&press.link)
             {
-                clicked_link = Some(press.link);
+                clicked_link = press.release(self.editor.document(), &layouts, pointer - origin);
             }
             if dragged && let Some(pointer) = drag_pointer {
                 pointer_interaction = true;
@@ -612,7 +590,7 @@ impl<'editor> RichTextEditor<'editor> {
                 } = navigation::hit_test(self.editor, &layouts, pointer - origin);
                 let anchor = link_press
                     .take()
-                    .filter(|press| press.revision == self.editor.document().revision())
+                    .filter(|press| press.matches(self.editor.document()))
                     .map_or(self.editor.selection().anchor, |press| press.anchor);
                 record(
                     self.editor.set_selection(Selection::new(anchor, position)),
@@ -833,6 +811,8 @@ impl<'editor> RichTextEditor<'editor> {
                 interrupted = true;
                 cache.interaction.remember_composition_end(committed, now);
             }
+        } else {
+            cache.interaction.link_press = None;
         }
 
         cache.observe_focus(self.editor, ui.is_enabled() && response.has_focus());
@@ -1251,9 +1231,36 @@ enum FocusExit {
 
 #[derive(Clone)]
 struct LinkPress {
-    link: Link,
+    grapheme: Position,
     anchor: Position,
-    revision: u64,
+    document: Arc<()>,
+}
+
+impl LinkPress {
+    fn at(editor: &Editor, layouts: &ParagraphLayouts, point: Vec2) -> Option<Self> {
+        let document = editor.document();
+        let (grapheme, _) = navigation::linked_grapheme_at_point(document, layouts, point)?;
+        Some(Self {
+            grapheme,
+            anchor: navigation::hit_test(editor, layouts, point).position,
+            document: document.content_identity(),
+        })
+    }
+
+    fn matches(&self, document: &Document) -> bool {
+        Arc::ptr_eq(&self.document, &document.content_identity())
+    }
+
+    fn release(self, document: &Document, layouts: &ParagraphLayouts, point: Vec2) -> Option<Link> {
+        if !self.matches(document) {
+            return None;
+        }
+        let (hit, link) = navigation::linked_grapheme_at_point(document, layouts, point)?;
+        // Press and release usually hit the same glyph. Only resolve the full
+        // styled range when the pointer actually moved to another grapheme.
+        (hit == self.grapheme || document.link_range_at(hit)?.contains(&self.grapheme))
+            .then(|| link.clone())
+    }
 }
 
 impl Cache {
@@ -1283,7 +1290,6 @@ impl Cache {
         if update.document_changed {
             self.plain_text = None;
             self.preview = None;
-            self.interaction.link_press = None;
         }
         if update.layout_changed {
             self.interaction.navigation = None;

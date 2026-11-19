@@ -174,10 +174,19 @@ impl NativeItem {
     /// fragment's text differs from the plain representation after line break
     /// normalization.
     pub(super) fn fragment(&self) -> Result<Fragment, String> {
+        self.fragment_matching(&normalize_text(&self.plain))
+    }
+
+    fn fragment_matching(&self, normalized_plain: &str) -> Result<Fragment, String> {
         let payload = &self.envelope()?[ENVELOPE_SIZE..];
         let fragment = Fragment::from_bytes_with_limits(payload, TLFR_LIMITS)
             .map_err(|_| "Clipboard fragment payload was rejected")?;
-        if fragment.plain_text() != normalize_text(&self.plain) {
+        // Plain export writes LF for both a paragraph boundary and a soft break.
+        let lines = fragment
+            .paragraphs()
+            .iter()
+            .flat_map(|paragraph| paragraph.text().split('\u{2028}'));
+        if !lines.eq(normalized_plain.split('\n')) {
             return Err("Clipboard representations do not describe the same text".into());
         }
         Ok(fragment)
@@ -233,10 +242,16 @@ fn native_html(fragment: &Fragment) -> String {
 
 /// Converts CRLF and lone CR line breaks to LF.
 fn normalize_text(text: &str) -> Cow<'_, str> {
-    if !text.contains('\r') {
+    let Some((first, rest)) = text.split_once('\r') else {
         return Cow::Borrowed(text);
+    };
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(first);
+    for part in rest.split('\r') {
+        normalized.push('\n');
+        normalized.push_str(part.strip_prefix('\n').unwrap_or(part));
     }
-    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    Cow::Owned(normalized)
 }
 
 /// A rich paste captured for one Paste event.
@@ -274,16 +289,23 @@ fn capture_paste(
     let Some(item) = capture()? else {
         return Ok(None);
     };
-    let Ok(fragment) = item.fragment() else {
-        return Ok(None);
-    };
-    let captured_plain = fragment.plain_text();
-    if normalize_text(plain) != captured_plain {
+    let native_text = normalize_text(&item.plain);
+    let event_text = normalize_text(plain);
+    if native_text != event_text {
         return Ok(None);
     }
-    *plain = captured_plain;
+    let Ok(fragment) = item.fragment_matching(&native_text) else {
+        return Ok(None);
+    };
+    if let Cow::Owned(normalized) = event_text {
+        *plain = normalized;
+    }
+    let captured_plain = match native_text {
+        Cow::Borrowed(_) => item.plain,
+        Cow::Owned(normalized) => normalized,
+    };
     Ok(Some(CapturedPaste {
-        plain: plain.clone(),
+        plain: captured_plain,
         fragment,
     }))
 }
@@ -511,7 +533,7 @@ pub struct NativeClipboard {
     /// clipboard until replaced, so it is stopped only then or on drop.
     copy_owner: Option<Child>,
     pending_pastes: PendingPastes,
-    /// The rich paste for the current pass, if the document owns its input.
+    /// The rich paste available to the document widget during the current pass.
     staged: Option<CapturedPaste>,
     /// Failed rich copy/capture operations awaiting host status and QA reporting.
     errors: VecDeque<String>,
@@ -630,13 +652,10 @@ impl NativeClipboard {
         self.pending_pastes.record(events, captured);
     }
 
-    /// Takes the slots of the Paste events in one pass's `events` and stages
-    /// their capture for the document, if `document_owns_input`.
-    pub fn stage_paste(&mut self, events: &[egui::Event], document_owns_input: bool) {
-        self.staged = self
-            .pending_pastes
-            .take_pass(events)
-            .filter(|_| document_owns_input);
+    /// Advances every delivered Paste slot, including those for native fields.
+    /// Only the document widget can consume the capture during this pass.
+    pub fn stage_paste(&mut self, events: &[egui::Event]) {
+        self.staged = self.pending_pastes.take_pass(events);
     }
 
     /// Discards a staged paste that the document did not use in this pass.
@@ -647,6 +666,16 @@ impl NativeClipboard {
     #[cfg(test)]
     pub(crate) fn pending_paste_count(&self) -> usize {
         self.pending_pastes.0.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pending_paste(fragment: Fragment) -> Self {
+        let mut clipboard = Self::default();
+        clipboard.pending_pastes.0.push_back(Some(CapturedPaste {
+            plain: fragment.plain_text(),
+            fragment,
+        }));
+        clipboard
     }
 
     /// Records a failed native capture while retaining the plain Paste event.
@@ -1143,6 +1172,37 @@ for imported in [value, roundtrip] {
         );
         assert!(clipboard.take_error().is_none());
         assert_eq!(input.events, events);
+    }
+
+    #[test]
+    fn rich_paste_reuses_plain_buffers_and_compares_soft_and_paragraph_breaks() {
+        let fragment = Fragment::from_text("a\u{2028}\u{2028}b\n\nc\u{2028}\n");
+        let item = NativeItem::from_fragment(&fragment).unwrap();
+        let plain = "a\n\nb\n\nc\n\n";
+        assert_eq!(item.plain, plain);
+        let event_text = plain.to_owned();
+        let event_buffer = event_text.as_ptr();
+        let native_buffer = item.plain.as_ptr();
+        let mut events = [egui::Event::Paste(event_text)];
+        let captured = capture_paste(&mut events, || Ok(Some(item)))
+            .unwrap()
+            .unwrap();
+        let egui::Event::Paste(event) = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(event.as_ptr(), event_buffer);
+        assert_eq!(captured.plain.as_ptr(), native_buffer);
+        assert_eq!(captured.fragment, fragment);
+
+        let mut item = NativeItem::from_fragment(&fragment).unwrap();
+        item.plain = plain.replace('\n', "\r");
+        let mut events = [egui::Event::Paste(plain.replace('\n', "\r\n"))];
+        let captured = capture_paste(&mut events, || Ok(Some(item)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(events, [egui::Event::Paste(plain.to_owned())]);
+        assert_eq!(captured.plain, plain);
+        assert_eq!(captured.fragment, fragment);
     }
 
     #[test]

@@ -10244,6 +10244,107 @@ fn link_drags_discard_anchors_from_a_changed_document() {
 }
 
 #[test]
+fn link_taps_follow_only_the_original_occurrence_in_the_original_document() {
+    let target = Link::try_new("https://example.com").unwrap();
+    let make_editor = || {
+        let mut editor = Editor::from_text("ai cd");
+        for (start, end) in [(0, 2), (3, 5)] {
+            editor
+                .set_selection(Selection::new(
+                    Position::new(0, start),
+                    Position::new(0, end),
+                ))
+                .unwrap();
+            editor.set_link(Some(target.clone())).unwrap();
+        }
+        // The first link crosses two formatting spans.
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
+            .unwrap();
+        editor.toggle_style(InlineAttribute::Bold).unwrap();
+        editor.set_selection(Selection::default()).unwrap();
+        editor
+    };
+    for touch in [false, true] {
+        for (same_occurrence, replace_document, same_frame) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let context = egui::Context::default();
+            let mut editor = make_editor();
+            let modifiers = Modifiers::NONE;
+            let (_, widget) = link_frame(&context, &mut editor, vec![], 0.0, modifiers, true);
+            let layouts = widget_cache(&context).layout.layouts;
+            let layout = layouts.get(0).unwrap();
+            let row = &layout.galley.rows[0];
+            let origin = widget.response.rect.min + Vec2::splat(PADDING);
+            let point = |x| {
+                origin
+                    + layout.rect.min.to_vec2()
+                    + row.pos.to_vec2()
+                    + Vec2::new(x, row.size.y * 0.5)
+            };
+            let press = point(row.glyphs[1].max_x() - 0.25);
+            let release = if same_occurrence {
+                point(row.glyphs[0].max_x() - 0.25)
+            } else {
+                point(row.glyphs[3].pos.x + 0.25)
+            };
+            assert_eq!(
+                navigation::link_at_point(editor.document(), &layouts, press - origin),
+                Some(target.clone())
+            );
+            let mut events = Vec::new();
+            let contact = |pos, phase| Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                pos,
+                phase,
+                force: None,
+            };
+            if touch {
+                events.push(contact(press, egui::TouchPhase::Start));
+            }
+            events.extend([Event::PointerMoved(press), primary(press, true, modifiers)]);
+            if !same_frame {
+                link_frame(
+                    &context,
+                    &mut editor,
+                    std::mem::take(&mut events),
+                    0.1,
+                    modifiers,
+                    true,
+                );
+            }
+            if replace_document {
+                editor = make_editor();
+            }
+            if touch {
+                events.push(contact(release, egui::TouchPhase::End));
+            }
+            events.extend([
+                Event::PointerMoved(release),
+                primary(release, false, modifiers),
+            ]);
+            let (_, widget) = link_frame(&context, &mut editor, events, 0.2, modifiers, true);
+            let case = format!(
+                "touch={touch} same_occurrence={same_occurrence} replace_document={replace_document} same_frame={same_frame}"
+            );
+            assert!(widget.response.clicked(), "fixture should produce a click");
+            assert_eq!(
+                widget.clicked_link.as_ref(),
+                (same_occurrence && !replace_document).then_some(&target),
+                "{case}"
+            );
+            assert_eq!(editor.selection(), Selection::default(), "{case}");
+        }
+    }
+}
+
+#[test]
 fn link_releases_discard_presses_from_a_changed_document() {
     let context = egui::Context::default();
     let (mut editor, link) = linked_widget_editor();
