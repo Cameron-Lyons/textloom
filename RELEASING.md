@@ -60,6 +60,12 @@ and body text returned UI Automation's mixed value. With heading reporting
 enabled, NVDA 2026.2 queued “heading level 1” when returning to the heading
 and “heading level 3” after changing its level. The body line had no heading
 announcement. The stock provider read the same lines without heading levels.
+Across 68 UI Automation checks, moving by format stopped at heading, body
+and italic boundaries. Applying italic to three characters produced a
+three-character format unit, and undo restored the original nine-character
+unit. All 13 provider tests passed from the Windows foreground desktop.
+The upstream focus test requires that desktop. In a background session, its
+global-focus assertion failed on both the stock and patched provider.
 
 With the optional [Linux Hypertext patches](GUIDE.md#inline-links-with-orca-on-linux),
 Orca 51.1 read all three link roles in “Read alpha link Beta link then omega
