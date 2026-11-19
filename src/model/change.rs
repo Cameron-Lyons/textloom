@@ -156,6 +156,10 @@ impl Document {
 
     fn record_change(&mut self, start: usize, old_len: usize, new_len: usize) {
         self.revision = self.revision.saturating_add(1);
+        self.untouched_prefix = self.untouched_prefix.min(start);
+        self.untouched_suffix = self
+            .untouched_suffix
+            .min(self.paragraphs.len() - (start + new_len));
         #[cfg(any(feature = "egui", feature = "accesskit"))]
         {
             let previous_identity = mem::replace(&mut self.identity, Arc::new(()));
@@ -169,7 +173,7 @@ impl Document {
         }
         #[cfg(not(any(feature = "egui", feature = "accesskit")))]
         {
-            let _ = (start, old_len, new_len);
+            let _ = old_len;
             self.identity = Arc::new(());
         }
     }

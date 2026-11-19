@@ -285,6 +285,26 @@ fn saved_state_checks() {
                 hint::black_box(hint::black_box(&editor).is_modified());
             },
         );
+        for (label, at) in [
+            ("first", 0),
+            ("middle", paragraphs / 2),
+            ("last", paragraphs),
+        ] {
+            editor
+                .set_selection(Selection::caret(Position::new(at, 0)))
+                .expect(VALID_POSITION);
+            editor.mark_saved();
+            measure(
+                &format!("{paragraphs} paragraphs {label} edit and undo with saved-state checks"),
+                2_000,
+                || {
+                    editor.insert_text("x").expect(NO_COMPOSITION);
+                    assert!(hint::black_box(&editor).is_modified());
+                    assert!(editor.undo(), "the edit should be undoable");
+                    assert!(!hint::black_box(&editor).is_modified());
+                },
+            );
+        }
     }
 }
 
@@ -1042,6 +1062,16 @@ fn sparse_whole_word_search() {
             },
         );
     }
+    let gap = "世界 ".repeat(70_000);
+    let document = Document::from_text(&format!("δ {gap}δ {gap}δ"));
+    let stride = gap.len() + "δ ".len();
+    let expected = [0, stride, 2 * stride]
+        .map(|start| Position::new(0, start)..Position::new(0, start + "δ".len()));
+    measure(
+        "long Unicode paragraph with three sparse whole-word matches",
+        50,
+        || assert_eq!(document.find(hint::black_box("δ"), options), expected),
+    );
 }
 
 fn short_paragraph_edits() {
@@ -1481,6 +1511,63 @@ fn repetitive_multiline_search() {
                     )
                     .expect(NO_COMPOSITION)
             );
+        },
+    );
+    let query = format!("first\n{}last", "k\n".repeat(20));
+    let source = format!(
+        "FIRST\n{}LAST\n{}",
+        "K\n".repeat(20),
+        "café\t👩🏽‍💻".repeat(110_000),
+    );
+    let mut editor = Editor::from_text(&source);
+    measure(
+        "22-line lowercase find_next before a long paragraph",
+        100,
+        || {
+            editor
+                .set_selection(Selection::caret(Position::default()))
+                .expect(VALID_POSITION);
+            assert!(
+                editor
+                    .find_next(
+                        hint::black_box(&query),
+                        SearchOptions {
+                            case_sensitive: false,
+                            whole_word: true
+                        },
+                        SearchWrap::Stop,
+                    )
+                    .expect(NO_COMPOSITION)
+            );
+            assert_eq!(editor.selection().focus, Position::new(21, 4));
+        },
+    );
+    let block = format!("--FIRST\n{}LAST--", "K\n".repeat(20));
+    let prefix = "noise\n".repeat(100_000);
+    let mut editor = Editor::from_text(&format!("{prefix}{block}\n{block}"));
+    let options = SearchOptions {
+        case_sensitive: false,
+        whole_word: true,
+    };
+    editor
+        .set_selection(Selection::caret(Position::new(100_022, 0)))
+        .expect(VALID_POSITION);
+    measure(
+        "22-line lowercase find_next and find_previous after 100000 paragraphs",
+        100,
+        || {
+            assert!(
+                editor
+                    .find_next(hint::black_box(&query), options, SearchWrap::Stop)
+                    .expect(NO_COMPOSITION)
+            );
+            assert_eq!(editor.selection().range().start, Position::new(100_022, 2));
+            assert!(
+                editor
+                    .find_previous(hint::black_box(&query), options, SearchWrap::Stop)
+                    .expect(NO_COMPOSITION)
+            );
+            assert_eq!(editor.selection().range().start, Position::new(100_000, 2));
         },
     );
 }

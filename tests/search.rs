@@ -294,6 +294,51 @@ fn whole_words_use_unicode_word_boundaries() {
 }
 
 #[test]
+fn whole_word_matches_survive_sparse_unicode_candidates_and_overlapping_rejections() {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let text = format!(
+        "δ δ:δ:δ δ:δ {}δ {}δ:δ δ 🇺{}🇺 δ {}δ",
+        "世界 ".repeat(1_000),
+        "α".repeat(3_000),
+        "🇨".repeat(1_501),
+        " \u{301}α".repeat(1_000),
+    );
+    let document = Document::from_text(&text);
+    let words: Vec<_> = text
+        .split_word_bound_indices()
+        .map(|(byte, _)| byte)
+        .chain([text.len()])
+        .collect();
+    let graphemes: Vec<_> = text
+        .grapheme_indices(true)
+        .map(|(byte, _)| byte)
+        .chain([text.len()])
+        .collect();
+    for query in ["δ", "δ:δ", "🇨🇨", "🇨🇺", " α", " \u{301}"] {
+        let mut expected = Vec::new();
+        let mut consumed = 0;
+        for &start in &graphemes {
+            let end = start + query.len();
+            if start >= consumed
+                && text[start..].starts_with(query)
+                && words.binary_search(&start).is_ok()
+                && words.binary_search(&end).is_ok()
+                && graphemes.binary_search(&end).is_ok()
+            {
+                expected.push(Position::new(0, start)..Position::new(0, end));
+                consumed = end;
+            }
+        }
+        let options = SearchOptions {
+            whole_word: true,
+            ..default_options()
+        };
+        assert_eq!(document.find(query, options), expected, "{query:?}");
+    }
+}
+
+#[test]
 fn matches_beside_ascii_punctuation_and_digits_follow_word_segmentation() {
     use unicode_segmentation::UnicodeSegmentation;
 
