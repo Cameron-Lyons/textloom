@@ -154,6 +154,14 @@ jobs:
         run: cargo clippy --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target -- -D warnings
       - name: Native host CLI and report tests
         run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Patched Windows UI Automation provider tests
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          probe=$(mktemp -d target/windows-heading.XXXXXX)
+          python scripts/native-qa/prepare_native.py accesskit-windows "$probe/provider"
+          manifest="$probe/provider/accesskit_windows-0.35.1/Cargo.toml"
+          cargo test --locked --manifest-path "$manifest" --target-dir target --lib
       - name: Tests and doctests
         run: cargo test --locked --all-features
       - name: Build native renderer and report validator

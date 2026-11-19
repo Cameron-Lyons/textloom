@@ -1,0 +1,175 @@
+Traverse clipped text runs in document order or in reverse
+
+Textloom compatibility patch for accesskit_consumer-0.39.2.
+Base: crates.io accesskit_consumer-0.39.2 (SHA-256 f3da8f27636015191b2264ee1df681503170a632cafd832fdc1edfdd4e3a2fd3)
+Upstream project: https://github.com/AccessKit/accesskit
+Textloom changes are MIT licensed. Apply this patch at the crate root.
+
+The Windows text range provider needs run endpoints to move by semantic
+formatting and return clipped search results without walking characters or
+converting offsets from the start of the document. Keep degenerate ranges
+at their original text run so a caret at a wrap or empty heading retains
+its affinity. An italic-only change also starts a new format unit.
+
+diff --git a/src/text.rs b/src/text.rs
+--- a/src/text.rs
++++ b/src/text.rs
+@@ -676,31 +676,80 @@
+     where
+         F: FnMut(&NodeRef<'a>) -> Option<T>,
+     {
+-        // If the range is degenerate, we don't want to normalize it.
+-        // This is important e.g. when getting the bounding rectangle
+-        // of the caret range when the caret is at the end of a wrapped line.
+-        let (start, end) = if self.is_degenerate() {
+-            (self.start, self.start)
+-        } else {
+-            let start = self.start.biased_to_start(&self.node);
+-            let end = self.end.biased_to_end(&self.node);
+-            (start, end)
+-        };
+-        if let Some(result) = f(&start.node) {
++        self.walk_nodes(false, |node| f(&node))
++    }
++
++    fn walk_nodes<F, T>(&self, backward: bool, mut f: F) -> Option<T>
++    where
++        F: FnMut(NodeRef<'a>) -> Option<T>,
++    {
++        // A caret keeps its run affinity, including at the end of a wrapped line.
++        if self.is_degenerate() {
++            return f(self.start.node);
++        }
++        let start = self.start.biased_to_start(&self.node).node;
++        let end = self.end.biased_to_end(&self.node).node;
++        let (first, last) = if backward { (end, start) } else { (start, end) };
++        if let Some(result) = f(first) {
+             return Some(result);
+         }
+-        if start.node.id() == end.node.id() {
++        if first.id() == last.id() {
+             return None;
+         }
+-        for node in start.node.following_text_runs(&self.node) {
+-            if let Some(result) = f(&node) {
+-                return Some(result);
+-            }
+-            if node.id() == end.node.id() {
+-                break;
+-            }
++        let mut visit = |node: NodeRef<'a>| {
++            let result = f(node);
++            (result.is_some() || node.id() == last.id()).then_some(result)
++        };
++        if backward {
++            first
++                .preceding_text_runs(&self.node)
++                .find_map(&mut visit)
++                .flatten()
++        } else {
++            first
++                .following_text_runs(&self.node)
++                .find_map(&mut visit)
++                .flatten()
+         }
+-        None
++    }
++
++    /// Visits this range one text run at a time, in document order or in
++    /// reverse. Each subrange is clipped to the original endpoints. A
++    /// degenerate range is visited once with its original caret affinity.
++    /// Returning `Some` ends the traversal and returns that result.
++    pub fn traverse_runs<F, T>(&self, backward: bool, mut f: F) -> Option<T>
++    where
++        F: FnMut(Self) -> Option<T>,
++    {
++        if self.is_degenerate() {
++            return f(*self);
++        }
++        self.walk_nodes(backward, |node| {
++            let start = if node.id() == self.start.node.id() {
++                self.start.character_index
++            } else {
++                0
++            };
++            let end = if node.id() == self.end.node.id() {
++                self.end.character_index
++            } else {
++                node.data().character_lengths().len()
++            };
++            if start == end {
++                return None;
++            }
++            f(Self {
++                node: self.node,
++                start: InnerPosition {
++                    node,
++                    character_index: start,
++                },
++                end: InnerPosition {
++                    node,
++                    character_index: end,
++                },
++            })
++        })
+     }
+ 
+     pub fn traverse_text<F, T>(&self, mut f: F) -> Option<T>
+@@ -1419,6 +1468,11 @@
+                 let node = state.node_by_id(nid(NodeId(0))).unwrap();
+                 let range = node.document_range();
+                 assert_eq!(range.$getter(), RangePropertyValue::Mixed);
++                // This flag is the only format difference between the two runs.
++                let boundary = node.text_position_from_global_usv_index(7).unwrap();
++                assert!(boundary.is_format_start());
++                assert_eq!(range.start().forward_to_format_start(), boundary);
++                assert_eq!(range.end().backward_to_format_start(), boundary);
+             }
+         })*
+     }
+@@ -1434,6 +1488,7 @@
+             || self.language() != other.language()
+             || self.font_size() != other.font_size()
+             || self.font_weight() != other.font_weight()
++            || self.is_italic() != other.is_italic()
+             || self.background_color() != other.background_color()
+             || self.foreground_color() != other.foreground_color()
+             || self.overline() != other.overline()
+@@ -2121,6 +2176,37 @@
+     }
+ 
+     #[test]
++    fn traversing_clipped_runs_preserves_order_and_caret_affinity() {
++        use alloc::vec::Vec;
++
++        let tree = main_multiline_tree(None);
++        let root = tree.state().node_by_id(nid(NodeId(1))).unwrap();
++        let mut range = root.document_range();
++        range.set_start(root.text_position_from_global_usv_index(3).unwrap());
++        range.set_end(root.text_position_from_global_usv_index(49).unwrap());
++        let collect = |backward| {
++            let mut runs = Vec::new();
++            range.traverse_runs(backward, |run| {
++                runs.push(run.text());
++                None::<()>
++            });
++            runs
++        };
++        let forward = collect(false);
++        assert!(forward.len() > 1);
++        assert_eq!(forward.concat(), range.text());
++        assert_eq!(collect(true), forward.into_iter().rev().collect::<Vec<_>>());
++        let end = root
++            .document_start()
++            .forward_to_line_end()
++            .to_degenerate_range();
++        for backward in [false, true] {
++            let only = end.traverse_runs(backward, Some).unwrap();
++            assert!(only == end);
++        }
++    }
++
++    #[test]
+     fn multiline_document_range() {
+         let tree = main_multiline_tree(None);
+         let state = tree.state();

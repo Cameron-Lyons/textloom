@@ -99,5 +99,28 @@ awk -v package_path="../package/textloom-$version" '
     END { if (!rewritten) exit 1 }
 ' "$native_example_manifest" > "$native_package_check_dir/Cargo.toml"
 cargo check --locked --all-targets --manifest-path "$native_package_check_dir/Cargo.toml" --target-dir "$package_target_dir"
+python3 scripts/native-qa/prepare_winit.py "$native_package_check_dir/winit"
+python3 scripts/native-qa/prepare_native.py accesskit "$native_package_check_dir/accesskit"
+python3 scripts/native-qa/prepare_native.py accesskit-windows "$native_package_check_dir/accesskit-windows"
+cat >> "$native_package_check_dir/Cargo.toml" <<'TOML'
+
+[patch.crates-io]
+winit = { path = "winit" }
+accesskit_atspi_common = { path = "accesskit/accesskit_atspi_common-0.21.1" }
+accesskit_unix = { path = "accesskit/accesskit_unix-0.24.1" }
+accesskit_consumer = { path = "accesskit-windows/accesskit_consumer-0.39.2" }
+accesskit_windows = { path = "accesskit-windows/accesskit_windows-0.35.1" }
+TOML
+cargo check --offline --all-targets --manifest-path "$native_package_check_dir/Cargo.toml" --target-dir "$package_target_dir"
+for package in winit@0.30.13 accesskit_atspi_common@0.21.1 accesskit_unix@0.24.1 accesskit_consumer@0.39.2 accesskit_windows@0.35.1; do
+    if [[ $(cargo pkgid --locked --manifest-path "$native_package_check_dir/Cargo.toml" "$package") != path+file:* ]]; then
+        echo "The native host did not resolve the prepared source for $package." >&2
+        exit 1
+    fi
+done
+if [[ $(uname -s) == Linux ]]; then
+    cargo test --locked --offline --manifest-path "$native_package_check_dir/Cargo.toml" \
+        --target-dir "$package_target_dir" -p accesskit_atspi_common -p accesskit_unix -p accesskit_consumer --lib
+fi
 echo "Textloom $version automated release checks passed. No release has been published."
 echo 'Before publishing, complete native host validation and clean-commit CI as described in RELEASING.md.'
