@@ -8881,6 +8881,12 @@ fn nonempty_preedit_consumes_cut_paste_and_text() {
 
 #[test]
 fn touch_swipes_scroll_until_the_editor_is_focused() {
+    for web_order in [false, true] {
+        check_touch_scroll_and_selection(web_order);
+    }
+}
+
+fn check_touch_scroll_and_selection(web_order: bool) {
     let context = egui::Context::default();
     let mut editor = Editor::from_text(&"line of text\n".repeat(80));
     let id = Id::unique("touch");
@@ -8917,14 +8923,38 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
     };
     let swipe = |run: &mut dyn FnMut(&mut Editor, Vec<Event>) -> Vec2, editor: &mut Editor| {
         let mut point = Pos2::new(100.0, 300.0);
-        run(
-            editor,
-            vec![
-                touch(egui::TouchPhase::Start, point),
-                Event::PointerMoved(point),
-                primary(point, true, Modifiers::NONE),
-            ],
-        );
+        let start = touch(egui::TouchPhase::Start, point);
+        let press = primary(point, true, Modifiers::NONE);
+        let events = if web_order {
+            vec![press, start]
+        } else {
+            vec![start, Event::PointerMoved(point), press]
+        };
+        run(editor, events);
+        run(editor, Vec::new());
+        if web_order {
+            // A second finger generates another press at the held primary
+            // position followed only by the newly changed contact.
+            let second = Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::Start,
+                pos: point + Vec2::new(40.0, 0.0),
+                force: None,
+            };
+            run(editor, vec![primary(point, true, Modifiers::NONE), second]);
+            assert!(input_routing::primary_pointer_is_touch(&context));
+            run(
+                editor,
+                vec![Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(2),
+                    phase: egui::TouchPhase::End,
+                    pos: point + Vec2::new(40.0, 0.0),
+                    force: None,
+                }],
+            );
+        }
         for _ in 0..10 {
             point.y -= 20.0;
             run(
@@ -8945,15 +8975,9 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
         );
         run(editor, Vec::new())
     };
-    let known = Pos2::new(100.0, 300.0);
-    run(
-        &mut editor,
-        vec![
-            touch(egui::TouchPhase::Start, known),
-            touch(egui::TouchPhase::End, known),
-        ],
-    );
     run(&mut editor, Vec::new());
+    run(&mut editor, Vec::new());
+    assert!(!context.input(|i| i.has_touch_screen()));
     let offset = swipe(&mut run, &mut editor);
     assert!(offset.y > 0.0, "{offset:?}");
     assert_eq!(editor.selection(), Selection::caret(Position::default()));
@@ -8985,6 +9009,99 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
         !editor.selection().is_caret(),
         "a focused editor drag-selects"
     );
+}
+
+#[test]
+fn first_mouse_drag_selects_after_touch_focused_a_native_field() {
+    for (manual, max_passes, web_order) in [(false, 2, false), (false, 1, true), (true, 1, false)] {
+        let context = egui::Context::default();
+        context.options_mut(|o| o.max_passes = NonZeroUsize::new(max_passes).unwrap());
+        let mut editor = Editor::from_text(&"abcdefghijklmnopqrstuvwxyz\n".repeat(60));
+        let native = Id::unique("native");
+        let rich = Id::unique("rich");
+        let mut text = String::new();
+        let mut time = 0.0;
+        let mut frame = |editor: &mut Editor, events: Vec<Event>| {
+            time += 0.025;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut field = Rect::NOTHING;
+            let mut rich_rect = Rect::NOTHING;
+            let mut offset = 0.0;
+            let mut draw = |ui: &mut egui::Ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    field = ui
+                        .add(egui::TextEdit::singleline(&mut text).id(native))
+                        .rect;
+                    let scroll = egui::ScrollArea::vertical().animated(false).show(ui, |ui| {
+                        rich_rect = RichTextEditor::new(editor).id(rich).show(ui).response.rect;
+                    });
+                    offset = scroll.state.clamped_offset().y;
+                });
+            };
+            let output = if manual {
+                context.begin_pass(raw);
+                context.root_ui(draw);
+                context.end_pass()
+            } else {
+                context.run_ui(raw, &mut draw)
+            };
+            output.drop_without_applying_deltas();
+            (field.center(), rich_rect, offset)
+        };
+        frame(&mut editor, vec![]);
+        let (field, rect, _) = frame(&mut editor, vec![]);
+        let contact = |pos, phase| Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            pos,
+            phase,
+            force: None,
+        };
+        let mut tap = vec![
+            contact(field, egui::TouchPhase::Start),
+            Event::PointerMoved(field),
+            primary(field, true, Modifiers::NONE),
+        ];
+        if web_order {
+            tap = vec![
+                primary(field, true, Modifiers::NONE),
+                contact(field, egui::TouchPhase::Start),
+            ];
+        }
+        tap.extend([
+            primary(field, false, Modifiers::NONE),
+            Event::PointerGone,
+            contact(field, egui::TouchPhase::End),
+        ]);
+        frame(&mut editor, tap);
+        frame(&mut editor, vec![]);
+        assert!(context.memory(|m| m.has_focus(native)));
+
+        let start = rect.min + Vec2::new(15.0, 130.0);
+        let end = start + Vec2::new(92.0, -42.0);
+        // No hover or setup frame between the device switch and the press.
+        let mut press = vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::NONE),
+        ];
+        if manual {
+            // An unrelated finger at another location can arrive in the same
+            // input batch as a genuine mouse press on a hybrid device.
+            press.push(contact(field, egui::TouchPhase::Start));
+        }
+        frame(&mut editor, press);
+        frame(&mut editor, vec![Event::PointerMoved(end)]);
+        frame(&mut editor, vec![primary(end, false, Modifiers::NONE)]);
+        let (_, _, scroll) = frame(&mut editor, vec![]);
+        assert!(context.memory(|m| m.has_focus(rich)));
+        assert!(editor.selection().anchor.paragraph > editor.selection().focus.paragraph);
+        assert_eq!(scroll, 0.0);
+    }
 }
 
 #[test]

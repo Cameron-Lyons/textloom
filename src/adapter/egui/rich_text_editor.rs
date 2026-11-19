@@ -417,8 +417,8 @@ impl<'editor> RichTextEditor<'editor> {
             width,
             height.max(row_height * rows + PARAGRAPH_GAP * (rows - 1.0)) + PADDING * 2.0,
         ));
-        let drag_to_select =
-            !ui.input(|input| input.has_touch_screen()) || ui.memory(|memory| memory.has_focus(id));
+        let drag_to_select = !input_routing::primary_pointer_is_touch(ui.ctx())
+            || ui.memory(|memory| memory.has_focus(id));
         let sense = if drag_to_select {
             Sense::click_and_drag()
         } else {

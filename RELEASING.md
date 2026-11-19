@@ -29,6 +29,16 @@ replacement during a gesture. The native example's input-batch test confirmed
 that a rich paste after a Japanese IME commit keeps bold formatting through
 undo and redo. Reversing the event order left only the committed Japanese text.
 
+A private Wayland compositor delivered touch and mouse input to the native
+example. The first and second unfocused touch swipes each scrolled 260 logical
+pixels while Find retained focus and the document caret stayed in place. A
+mouse drag between the same two points selected the same 12 characters both
+before and after touch input. A focused touch drag selected text, a tap during
+Japanese composition committed the preedit once, and a read-only link opened
+once. On Windows 11, a native injected touch tap placed the caret and a
+focused touch drag selected text. With Find focused, an ordinary mouse drag
+selected `Select` both in a fresh session and after a touch tap.
+
 ### Native accessibility and clipboard checks, 2026-11-19
 
 The native example exposed list item positions 1 of 2 and 2 of 2 through
