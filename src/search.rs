@@ -97,26 +97,24 @@ impl Document {
         if never_overlaps(&needle) {
             return true;
         }
-        if !needle.contains('\n') {
-            return self
-                .find_paragraph_match(
-                    range.start.paragraph,
-                    &needle,
-                    options,
-                    Some(range.start),
-                    Direction::Forward,
-                    ParagraphSearch::Scan,
-                )
-                .is_some_and(|found| found == *range);
-        }
         let mut found = false;
-        let _ = self.visit_flattened_matches(&needle, options, |candidate| {
-            if candidate.start < range.start {
+        let check = |candidate: Range<Position>| {
+            if candidate.end <= range.start {
                 return ControlFlow::Continue(());
             }
             found = candidate == *range;
             ControlFlow::Break(())
-        });
+        };
+        if needle.contains('\n') {
+            let _ = self.visit_multiline_matches(
+                &needle,
+                paragraph_lines(&needle).as_deref(),
+                options,
+                check,
+            );
+        } else {
+            let _ = self.visit_paragraph_matches(range.start.paragraph, &needle, options, check);
+        }
         found
     }
 
@@ -187,10 +185,10 @@ impl Document {
         let wrap = wrap == SearchWrap::Around;
         let needle = search_needle(query, options);
         let lines = paragraph_lines(&needle);
-        if lines.is_none() && needle.contains('\n') {
+        if needle.contains('\n') && (lines.is_none() || !never_overlaps(&needle)) {
             let mut found = None;
             let mut wrapped = None;
-            let _ = self.visit_flattened_matches(&needle, options, |range| {
+            let _ = self.visit_multiline_matches(&needle, lines.as_deref(), options, |range| {
                 match direction {
                     Direction::Backward => {
                         if range.end <= selection.start {
@@ -468,17 +466,33 @@ impl Document {
             }
             return ControlFlow::Continue(());
         }
-        if let Some(lines) = paragraph_lines(needle) {
-            for index in 0..self.paragraphs().len() {
-                if let Some(range) =
-                    self.find_lines_match(index, &lines, options, None, Direction::Forward)
-                {
-                    accept(range)?;
-                }
+        self.visit_multiline_matches(needle, paragraph_lines(needle).as_deref(), options, accept)
+    }
+
+    fn visit_multiline_matches(
+        &self,
+        needle: &str,
+        lines: Option<&[&str]>,
+        options: SearchOptions,
+        mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let Some(lines) = lines else {
+            return self.visit_flattened_matches(needle, options, accept);
+        };
+        // The first line must be a suffix, so each paragraph has at most one
+        // candidate. Resume in the ending paragraph: a match may start there
+        // if its first line comes after the previous match's last line.
+        let mut end = Position::default();
+        for (index, _) in self.paragraphs().windows(lines.len()).enumerate() {
+            if index >= end.paragraph
+                && let Some(range) =
+                    self.find_lines_match(index, lines, options, Some(end), Direction::Forward)
+            {
+                end = range.end;
+                accept(range)?;
             }
-            return ControlFlow::Continue(());
         }
-        self.visit_flattened_matches(needle, options, accept)
+        ControlFlow::Continue(())
     }
 
     fn visit_flattened_matches(
@@ -561,7 +575,7 @@ fn never_overlaps(needle: &str) -> bool {
     has_unique_start(needle) || literal_prefixes(needle.as_bytes()).last() == Some(&0)
 }
 
-// A line of such a query must end, fill, or start the paragraph it matches.
+// A multiline query's lines match a suffix, complete paragraphs, and a prefix.
 // Bound the number of paragraphs compared at every candidate so repetitive
 // multiline queries cannot turn this fast path into a quadratic scan. Longer
 // queries use the flattened text matcher instead.
@@ -571,7 +585,7 @@ fn paragraph_lines(needle: &str) -> Option<Vec<&str>> {
         return None;
     }
     let lines: Vec<_> = needle.split('\n').take(MAX_LINES + 1).collect();
-    (lines.len() <= MAX_LINES && never_overlaps(needle)).then_some(lines)
+    (lines.len() <= MAX_LINES).then_some(lines)
 }
 
 fn lowercase_char(character: char) -> impl DoubleEndedIterator<Item = char> {
@@ -1259,6 +1273,28 @@ mod tests {
             }
         }
         Some(matches.len())
+    }
+
+    #[test]
+    fn overlapping_multiline_matches_resume_at_the_previous_end() {
+        for (text, query) in [
+            ("a\na\na\na", "a\na"),
+            ("É\néé\né", "É\né"),
+            ("\n\n\n\n\n", "\r\n\n"),
+            ("i\u{307}\nİ İ\ni\u{307}", "İ\nİ"),
+        ] {
+            let document = Document::from_text(text);
+            for whole_word in [false, true] {
+                let options = SearchOptions {
+                    case_sensitive: false,
+                    whole_word,
+                };
+                let count = assert_matches_flattened_stream(&document, query, options);
+                if !whole_word {
+                    assert_eq!(count, Some(2), "{text:?}, {query:?}");
+                }
+            }
+        }
     }
 
     #[test]

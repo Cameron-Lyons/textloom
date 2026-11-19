@@ -1421,7 +1421,17 @@ fn apply_queued_ime(
         input.events[..end.unwrap_or(input.events.len())]
             .iter()
             .enumerate()
-            .filter(|(_, event)| matches!(event, Event::Ime(_)))
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    Event::Ime(_)
+                        | Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                )
+            })
             .map(|(index, event)| (index, event.clone()))
             .collect()
     });
@@ -1429,6 +1439,11 @@ fn apply_queued_ime(
     let now = ui.input(|input| input.time);
     let revision = editor.document().revision();
     for (index, event) in queued {
+        // Escape cancels an active preedit in event order, before a queued
+        // commit or click. An ordinary Escape belongs to the focused widget.
+        if matches!(event, Event::Key { .. }) && editor.composition().is_none() {
+            continue;
+        }
         let composition = composition_before_event(editor, &event);
         if input::handle_event(
             editor,

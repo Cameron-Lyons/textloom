@@ -549,11 +549,14 @@ fn read_format(
     if length > Link::MAX_LEN {
         return Err(FragmentError::InvalidLink);
     }
-    let target = str::from_utf8(input.take(length)?).map_err(|_| FragmentError::InvalidLink)?;
-    let link = match last_link {
-        Some(link) if link.as_str() == target => link.clone(),
-        _ => Link::try_new(target).map_err(|_| FragmentError::InvalidLink)?,
-    };
+    let bytes = input.take(length)?;
+    if let Some(link) = last_link
+        && link.as_str().as_bytes() == bytes
+    {
+        return Ok((style, Some(link.clone())));
+    }
+    let target = str::from_utf8(bytes).map_err(|_| FragmentError::InvalidLink)?;
+    let link = Link::try_new(target).map_err(|_| FragmentError::InvalidLink)?;
     *last_link = Some(link.clone());
     Ok((style, Some(link)))
 }
