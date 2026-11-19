@@ -217,13 +217,24 @@ pub(super) fn paint_document(
             }
         }
     }
-    let selection_range = selection.map(Selection::range);
+    let selection_range = selection
+        .filter(|selection| !selection.is_caret())
+        .map(Selection::range);
     let selection_layer = selection_range.as_ref().map(|range| BackgroundRanges {
         ranges: slice::from_ref(range),
         fill: selection_fill,
     });
-    let layers = backgrounds.iter().copied().chain(selection_layer);
-    let window = visible_window(document, &visible, first);
+    let mut layers = backgrounds
+        .iter()
+        .copied()
+        .chain(selection_layer)
+        .filter(|layer| !layer.ranges.is_empty())
+        .peekable();
+    // Mapping visible rows to bytes can build a scalar index for the whole
+    // paragraph. Only highlights and nonempty selections need that window.
+    let window = layers
+        .peek()
+        .and_then(|_| visible_window(document, &visible, first));
     for BackgroundRanges { ranges, fill } in layers {
         for range in visible_ranges(ranges, window.as_ref()) {
             if range.start >= range.end

@@ -667,9 +667,15 @@ fn native_format_encodes_links_after_fills_and_rejects_invalid_targets() {
         }
         output
     };
-    let valid = encode(&[(1, 0x80, b"https://a"), (2, 0x81, b"https://a")]);
+    let target = "https://é".as_bytes();
+    let valid = encode(&[(1, 0x80, target), (2, 0x81, target)]);
     let fragment = Fragment::from_bytes(&valid).unwrap();
     assert_eq!(fragment.to_bytes(), valid);
+    let invalid_target = b"https://\xc3\xff";
+    assert_eq!(
+        Fragment::from_bytes(&encode(&[(1, 0x80, target), (2, 0x81, invalid_target)])),
+        Err(FragmentError::InvalidLink)
+    );
     assert!(
         Fragment::from_bytes(&encode(&[(1, 0x80, b"https://a"), (2, 0x80, b"https://b")])).is_ok()
     );

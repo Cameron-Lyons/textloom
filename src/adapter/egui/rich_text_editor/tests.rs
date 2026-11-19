@@ -7704,6 +7704,33 @@ fn ime_events_queued_before_a_click_apply_before_the_click_commits() {
 }
 
 #[test]
+fn escape_before_a_click_cancels_preedit_before_the_click_or_its_commit_echo() {
+    for echo in [false, true] {
+        let context = egui::Context::default();
+        let mut editor = Editor::from_text("abc");
+        let rect = composing_frame(&context, &mut editor, "候");
+        let point = Pos2::new(rect.right() - PADDING, rect.center().y);
+        let mut events = vec![key(Key::Escape, Modifiers::NONE)];
+        if echo {
+            events.extend(candidate_commit("候"));
+        }
+        events.extend([
+            Event::PointerMoved(point),
+            primary(point, true, Modifiers::NONE),
+        ]);
+        let (_, widget) = widget_frame(&context, &mut editor, events, Some(0.2), true, unchanged);
+        assert_eq!(editor.document().plain_text(), "abc", "echo={echo}");
+        assert_eq!(
+            editor.selection(),
+            Selection::caret(editor.document().end())
+        );
+        assert!(editor.composition().is_none());
+        assert!(!editor.can_undo());
+        assert!(widget.response.has_focus());
+    }
+}
+
+#[test]
 fn a_click_after_queued_ime_commits_hit_tests_the_committed_text() {
     let context = egui::Context::default();
     let mut editor = Editor::from_text("abc");
@@ -9621,6 +9648,16 @@ fn soft_line_breaks_lay_out_rows_for_carets_and_hits() {
         navigation::hit_test(&editor, &layouts, point(1, 0.0)).position,
         Position::new(0, 5)
     );
+}
+
+#[test]
+fn painting_without_highlights_or_selection_keeps_unicode_scalar_indices_lazy() {
+    let context = egui::Context::default();
+    let mut editor = Editor::from_text(&"日本語 ".repeat(2_000));
+    widget_frame(&context, &mut editor, vec![], None, true, |widget| {
+        widget.highlight_ranges(&[], Color32::YELLOW)
+    });
+    assert!(!editor.document().paragraph(0).unwrap().has_scalar_index());
 }
 
 #[test]

@@ -1460,6 +1460,29 @@ fn repetitive_multiline_search() {
             },
         );
     }
+    let source = format!(
+        "a\na\na\na\n{}",
+        "long Unicode paragraph 👩‍💻. ".repeat(100_000)
+    );
+    let mut editor = Editor::from_text(&source);
+    measure(
+        "overlapping multiline find_next before a long paragraph",
+        160,
+        || {
+            editor
+                .set_selection(Selection::caret(Position::default()))
+                .expect(VALID_POSITION);
+            assert!(
+                editor
+                    .find_next(
+                        hint::black_box("a\na"),
+                        SearchOptions::default(),
+                        SearchWrap::Stop
+                    )
+                    .expect(NO_COMPOSITION)
+            );
+        },
+    );
 }
 
 fn batch_replacement() {

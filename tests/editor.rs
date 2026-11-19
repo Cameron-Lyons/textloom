@@ -65,6 +65,62 @@ fn invalid_selection_is_atomic() {
 }
 
 #[test]
+fn moving_shared_link_targets_between_paragraphs_preserves_undo() {
+    use textloom::Link;
+
+    let links = ["a", "b"].map(|s| Link::try_new(&s.repeat(8192)).unwrap());
+    let paragraph = |text: &str, link: &Link| {
+        Paragraph::try_new(
+            text,
+            vec![Span::new(
+                0..text.len(),
+                InlineStyle::default(),
+                Some(link.clone()),
+            )],
+            ParagraphKind::Body,
+        )
+        .unwrap()
+    };
+    let mut editor = Editor::new(Document::from_paragraphs([
+        paragraph("first", &links[0]),
+        paragraph("second", &links[1]),
+    ]));
+    editor.set_history_limits(HistoryLimits {
+        max_bytes: 4096,
+        ..HistoryLimits::default()
+    });
+    let pasted = Fragment::from_document(&Document::from_paragraphs([
+        paragraph("new first", &links[1]),
+        paragraph("new second", &links[0]),
+    ]));
+    editor.select_all();
+    editor.insert_fragment(&pasted).unwrap();
+    assert!(editor.undo());
+    assert_eq!(editor.document().plain_text(), "first\nsecond");
+    assert!(editor.redo());
+    assert_eq!(editor.document().plain_text(), "new first\nnew second");
+}
+
+#[test]
+fn sparse_link_edit_charges_one_shared_target_once() {
+    use textloom::Link;
+
+    let link = Link::try_new(&"x".repeat(8192)).unwrap();
+    let mut editor = Editor::from_text(&format!("first{}last", "\n".repeat(20)));
+    editor.set_history_limits(HistoryLimits {
+        max_bytes: link.as_str().len() + 4096,
+        ..HistoryLimits::default()
+    });
+    editor.select_all();
+    editor.set_link(Some(link.clone())).unwrap();
+    assert!(editor.history_bytes() >= link.as_str().len());
+    assert!(editor.undo());
+    assert_eq!(editor.selected_link(), None);
+    assert!(editor.redo());
+    assert_eq!(editor.selected_link(), Some(link));
+}
+
+#[test]
 fn selected_links_follow_range_changes_clone_edits_and_history() {
     use textloom::Link;
 

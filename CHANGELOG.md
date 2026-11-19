@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Escape now cancels an active egui text composition before a later click or
+  commit in the same input batch.
+- Undo history counts each shared hyperlink target once per side of an edit,
+  including rich pastes that move links between paragraphs and sparse changes.
+- Overlapping multiline searches of up to 16 lines read paragraphs directly.
+  The egui widget skips a Unicode position index when painting plain text with
+  no highlights or range selection, and native snapshots decode repeated links
+  across styled spans faster.
+
 ## 1.0.0-rc.2
 
 2026-11-17. Second release candidate for 1.0.0. This candidate improves
