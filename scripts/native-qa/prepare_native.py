@@ -12,6 +12,16 @@ from urllib.request import urlopen
 
 
 # Directory names match Cargo.lock. Each patch is relative to its crate root.
+EGUI_INPUT = (
+    "egui-0.37.0",
+    "bec9144f49b7a28b5f395d3147e325b4fe3e77ba686eac11d1bdf0a7da3f375f",
+    ("touch-cancel",),
+)
+WINIT = (
+    "winit-0.30.13",
+    "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d",
+    ("x11-area", "x11-focus", "x11-reset", "x11-touch-pointer", "windows-layout", "windows-touch-cancel"),
+)
 PROFILES = {
     "eframe-web": [
         (
@@ -19,19 +29,18 @@ PROFILES = {
             "9c5642501a65ca657d05f00c643a5c14ff2346cb3818032bfe23d58e1f8e5f84",
             ("touch",),
         ),
-        (
-            "egui-0.37.0",
-            "bec9144f49b7a28b5f395d3147e325b4fe3e77ba686eac11d1bdf0a7da3f375f",
-            ("touch-cancel",),
-        ),
+        EGUI_INPUT,
     ],
-    "winit": [
+    "egui-winit": [
         (
-            "winit-0.30.13",
-            "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d",
-            ("x11-area", "x11-focus", "x11-reset", "windows-layout"),
+            "egui-winit-0.37.0",
+            "e4e449f4c4a2a60c7ccb4ba7fa4078417bfe1f9ddc03b5e05ce75748e33a70de",
+            ("touch",),
         ),
+        EGUI_INPUT,
+        WINIT,
     ],
+    "winit": [WINIT],
     "accesskit": [
         (
             "accesskit_atspi_common-0.21.1",

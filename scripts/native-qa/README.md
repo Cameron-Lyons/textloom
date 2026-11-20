@@ -7,6 +7,12 @@ refuse ordinary desktop invocation. Use the
 [native signoff protocol](../../examples/native-editor/NATIVE_QA.md) for human
 testing on the intended release platforms.
 
+The hosted interaction jobs check Cargo's compiler output for the prepared
+egui, egui-winit, and winit sources used to build the native example.
+The separate macOS and Windows CI jobs exercise the registry dependencies.
+See the [native example](../../examples/native-editor/README.md) to run the
+interaction build locally.
+
 The macOS probe, `macos-interaction` in [`scripts/qa-tools`](../qa-tools),
 sends native keys through the runner's pre-authorized
 `osascript`/System Events path. A small AppKit inspector checks clipboard

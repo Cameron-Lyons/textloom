@@ -257,6 +257,33 @@ manual signoff as unrecorded. Reports and smoke runs provide observations;
 manual native checks still need separate steps and outcomes. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md)
 for report revision labeling, font examples, and host checks.
 
+### Touch input in native egui applications
+
+In egui-winit 0.37.0, a touch tap during a mouse drag can move the selection
+anchor and end the drag while the mouse button is still down. Native egui
+hosts, including eframe applications, can use the corrected input integration
+to keep the gesture with the device that started it.
+
+From the application's workspace, prepare the sources and add the
+overrides to its root `Cargo.toml`.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py egui-winit vendor/native-input
+```
+
+```toml
+[patch.crates-io]
+egui = { path = "vendor/native-input/egui-0.37.0" }
+egui-winit = { path = "vendor/native-input/egui-winit-0.37.0" }
+winit = { path = "vendor/native-input/winit-0.30.13" }
+```
+
+Use the workspace's existing patch table if it has one. This profile
+includes the [X11 and Windows winit fixes](#x11-and-windows-fixes-for-winit-03013).
+Run `cargo check` to update the application lockfile. For an application
+that also targets the web, use one egui override and add eframe from the
+web profile below. Both profiles prepare the same egui source.
+
 ### Touch input in eframe web applications
 
 Stock eframe 0.37.0 handles both DOM pointer and touch events. In Chromium,
@@ -266,9 +293,15 @@ the user intended to scroll. At that point egui has no device information
 with which to distinguish the press from a real mouse click.
 
 The corrected host sends one gesture for the primary contact. Other fingers
-still supply multitouch input. Losing browser focus cancels active contacts,
-so lifting a finger afterward leaves focus on the new target. A canceled
-touch also preserves a separately held mouse button.
+still supply multitouch input. If a mouse, pen, or finger starts dragging,
+it keeps control of that drag until release or cancellation. For example,
+touching the screen during a mouse selection leaves the selection anchored
+where the mouse was pressed. Moving focus outside the editor cancels the
+gesture, so a late release leaves focus on the new target. On desktop
+WebKitGTK, mixing a held mouse button with touchscreen input on one Wayland
+seat can produce mouse motion at the touch location and omit the mouse
+release. The browser reports that motion with the same device ID and
+button state as genuine mouse movement.
 
 For a web application using this version, prepare the corrected eframe and egui
 sources from the [Textloom repository](https://github.com/Cameron-Lyons/textloom/tree/main/scripts/native-qa).
@@ -312,6 +345,13 @@ Call `set_read_only(true, &mut editor)` for a selectable viewer: navigation and 
 
 Direct winit and egui-winit hosts using 0.30.13 can opt into these fixes.
 
+- On X11, touch contacts and their compatibility cursor motions carry the
+  XI2 physical source device ID. Ordinary mouse motion keeps its existing
+  ID. A host can distinguish motion from the touchscreen while a mouse drag
+  is active.
+- On Windows, a touch carrying `POINTER_FLAG_CANCELED` produces
+  `TouchPhase::Cancelled`, including when the same message carries
+  `POINTER_FLAG_UP`. A normal lift still produces `TouchPhase::Ended`.
 - On X11, the backend passes the whole caret rectangle to XIM so Fcitx can
   place its candidate window above or below the line. On-the-spot input needs
   libX11 1.8.11 or newer and an input method that honors the rectangle.

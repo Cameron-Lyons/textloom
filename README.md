@@ -100,10 +100,11 @@ The widget handles selection, keyboard shortcuts, IME previews, and accessibilit
 link activation is reported to the host, which decides which targets to open.
 
 The [egui integration guide](GUIDE.md#egui) covers focus and input routing,
-clipboard replies, fonts, shortcuts, and cache lifetime. Browser hosts using
-eframe 0.37.0 can enable the [touch correction](GUIDE.md#touch-input-in-eframe-web-applications).
-Run the complete native
-host from a repository checkout:
+clipboard replies, fonts, shortcuts, and cache lifetime. Mixed mouse and
+touch input on egui 0.37.0 has optional source corrections for
+[native hosts](GUIDE.md#touch-input-in-native-egui-applications) and
+[web applications](GUIDE.md#touch-input-in-eframe-web-applications).
+Run the complete native host from a repository checkout:
 
 ```sh
 cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target

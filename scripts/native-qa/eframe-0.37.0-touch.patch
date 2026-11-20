@@ -1,7 +1,15 @@
 diff --git a/src/web/app_runner.rs b/src/web/app_runner.rs
 --- a/src/web/app_runner.rs
 +++ b/src/web/app_runner.rs
-@@ -235,7 +235,7 @@
+@@ -109,6 +109,7 @@
+         // Tell egui right away about native_pixels_per_point
+         // so that the app knows about it during app creation:
+         egui_ctx.input_mut(|i| {
++            i.pointer.set_explicit_capture(true);
+             let viewport_info = i.raw.viewports.entry(egui::ViewportId::ROOT).or_default();
+             viewport_info.native_pixels_per_point = Some(super::native_pixels_per_point());
+             i.pixels_per_point = super::native_pixels_per_point();
+@@ -235,7 +236,7 @@
      pub fn has_focus(&self) -> bool {
          let window = web_sys::window().unwrap();
          let document = window.document().unwrap();
@@ -10,25 +18,29 @@ diff --git a/src/web/app_runner.rs b/src/web/app_runner.rs
              return false;
          }
  
-@@ -246,7 +246,7 @@
-         let has_focus = self.has_focus();
-         if self.input.raw.focused != has_focus {
-             log::trace!("{} Focus changed to {has_focus}", self.canvas().id());
--            self.input.set_focus(has_focus);
-+            self.input.set_focus(has_focus, &self.egui_ctx);
- 
-             if !has_focus {
-                 // We lost focus - good idea to save
 diff --git a/src/web/backend.rs b/src/web/backend.rs
 --- a/src/web/backend.rs
 +++ b/src/web/backend.rs
-@@ -11,8 +11,14 @@
+@@ -7,12 +7,26 @@
+ use super::percent_decode;
+ 
+ // ----------------------------------------------------------------------------
++
++/// The first device to press the primary button owns its position and release.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(crate) enum PrimaryOwner {
++    Pointer(i32),
++    Touch(egui::TouchId),
++}
+ 
  /// Data gathered between frames.
  #[derive(Default)]
  pub(crate) struct WebInput {
 -    /// Required because we don't get a position on touchend
-+    /// The first eligible touch on this canvas emulates the primary pointer button.
-     pub primary_touch: Option<egui::TouchId>,
+-    pub primary_touch: Option<egui::TouchId>,
++    pub primary_owner: Option<PrimaryOwner>,
++    /// Each auxiliary button keeps the physical pointer ID that pressed it.
++    pub auxiliary_owners: [Option<(i32, bool)>; egui::NUM_POINTER_BUTTONS - 1],
 +
 +    /// Last positions of contacts that started on this canvas.
 +    touches: Vec<(egui::TouchId, egui::Pos2)>,
@@ -38,16 +50,7 @@ diff --git a/src/web/backend.rs b/src/web/backend.rs
  
      /// Helps to track the delta scale from gesture events
      pub accumulated_scale: f32,
-@@ -53,7 +59,7 @@
-     }
- 
-     /// On alt-tab, or user clicking another HTML element.
--    pub fn set_focus(&mut self, focused: bool) {
-+    pub fn set_focus(&mut self, focused: bool, ctx: &egui::Context) {
-         if self.raw.focused == focused {
-             return;
-         }
-@@ -62,7 +68,60 @@
+@@ -62,7 +76,110 @@
          self.modifiers = egui::Modifiers::default(); // Avoid sticky modifier keys on alt-tab:
          self.raw.focused = focused;
          self.raw.events.push(egui::Event::WindowFocused(focused));
@@ -63,17 +66,67 @@ diff --git a/src/web/backend.rs b/src/web/backend.rs
 +                    force: None,
 +                });
 +            }
-+            if let Some(id) = self.primary_touch.take() {
++            if self.primary_owner.take().is_some() {
 +                self.raw.events.push(egui::Event::PointerGone);
-+                ctx.input_mut(|i| {
-+                    i.pointer.cancel_button_on_touch(
-+                        egui::TouchDeviceId(0),
-+                        id,
-+                        egui::PointerButton::Primary,
-+                    )
-+                });
 +            }
++            self.auxiliary_owners.fill(None);
 +            self.compatibility_pointers.clear();
++        }
++    }
++
++    pub fn claim_primary(&mut self, owner: PrimaryOwner) -> bool {
++        if self.primary_owner.is_some() {
++            return false;
++        }
++        self.primary_owner = Some(owner);
++        // There is only one widget click origin. An overlapping auxiliary press
++        // can still be held/released, but no longer owns its original click.
++        for (_, can_click) in self.auxiliary_owners.iter_mut().flatten() {
++            *can_click = false;
++        }
++        true
++    }
++
++    /// None for a stray press or release. A captured auxiliary may update its
++    /// button state without activating a widget at the other device's position.
++    pub fn physical_button(
++        &mut self,
++        id: i32,
++        button: egui::PointerButton,
++        pressed: bool,
++    ) -> Option<bool> {
++        if button == egui::PointerButton::Primary {
++            let owner = PrimaryOwner::Pointer(id);
++            if pressed {
++                if self.primary_owner == Some(owner) {
++                    // A new primary down from the same device proves its previous
++                    // release was lost. End the old capture without clicking.
++                    self.raw.events.push(egui::Event::PointerGone);
++                    self.primary_owner = None;
++                }
++                return self.claim_primary(owner).then_some(true);
++            }
++            if self.primary_owner != Some(owner) {
++                return None;
++            }
++            self.primary_owner = None;
++            return Some(true);
++        }
++        let slot = &mut self.auxiliary_owners[button as usize - 1];
++        if pressed {
++            if slot.is_some() {
++                return None;
++            }
++            let can_click = self.primary_owner.is_none();
++            *slot = Some((id, can_click));
++            Some(can_click)
++        } else {
++            let (old_id, can_click) = (*slot)?;
++            if old_id != id {
++                return None;
++            }
++            *slot = None;
++            Some(can_click)
 +        }
 +    }
 +
@@ -112,6 +165,21 @@ diff --git a/src/web/backend.rs b/src/web/backend.rs
 diff --git a/src/web/events.rs b/src/web/events.rs
 --- a/src/web/events.rs
 +++ b/src/web/events.rs
+@@ -1,10 +1,10 @@
+ use crate::web::string_from_js_value;
+ 
+ use super::{
+-    AppRunner, Closure, DEBUG_RESIZE, JsCast as _, JsValue, WebRunner, button_from_mouse_event,
+-    location_hash, modifiers_from_kb_event, modifiers_from_mouse_event, modifiers_from_wheel_event,
+-    native_pixels_per_point, pos_from_mouse_event, prefers_color_scheme, primary_touch_pos,
+-    push_touches, text_from_keyboard_event, translate_key,
++    AppRunner, Closure, DEBUG_RESIZE, JsCast as _, JsValue, PrimaryOwner, WebRunner,
++    button_from_mouse_event, location_hash, modifiers_from_kb_event, modifiers_from_mouse_event,
++    modifiers_from_wheel_event, native_pixels_per_point, pos_from_mouse_event,
++    prefers_color_scheme, push_touches, text_from_keyboard_event, translate_key,
+ };
+ 
+ use js_sys::Reflect;
 @@ -67,6 +67,12 @@
  
      install_blur_focus(runner_ref, &document)?;
@@ -125,7 +193,7 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  
      prevent_default_and_stop_propagation(
          runner_ref,
-@@ -90,16 +96,32 @@
+@@ -90,16 +96,36 @@
      // Use `document` here to notice if the user releases a drag outside of the canvas:
      // See https://github.com/emilk/egui/issues/3157
      install_mousemove(runner_ref, &document)?;
@@ -134,8 +202,8 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +    let use_touch_events = Reflect::has(canvas.as_ref(), &JsValue::from_str("ontouchstart"))
 +        .unwrap_or(false)
 +        || !Reflect::has(window.as_ref(), &JsValue::from_str("PointerEvent")).unwrap_or(false);
-+    install_pointerup(runner_ref, &document, use_touch_events)?;
-+    install_pointerdown(runner_ref, &canvas, use_touch_events)?;
++    install_pointer_button(runner_ref, &document, use_touch_events, false)?;
++    install_pointer_button(runner_ref, &canvas, use_touch_events, true)?;
      install_mouseleave(runner_ref, &canvas)?;
  
 -    install_touchstart(runner_ref, &canvas)?;
@@ -152,25 +220,44 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +        ("pointermove", egui::TouchPhase::Move),
 +        ("pointercancel", egui::TouchPhase::Cancel),
 +    ] {
-+        if use_touch_events && phase == egui::TouchPhase::Move {
-+            continue;
-+        }
 +        runner_ref.add_event_listener(
 +            &document,
 +            name,
 +            move |event: web_sys::PointerEvent, runner| {
-+                handle_pointer_touch(runner, &event, phase, use_touch_events);
++                if handle_pointer_touch(runner, &event, phase, use_touch_events) {
++                    return;
++                }
++                if phase == egui::TouchPhase::Move {
++                    physical_pointer_move(runner, &event);
++                } else {
++                    cancel_physical_pointer(runner, &event);
++                }
 +            },
 +        )?;
 +    }
  
      install_wheel(runner_ref, &canvas)?;
      install_gesture(runner_ref, &canvas)?;
-@@ -531,13 +553,86 @@
+@@ -531,98 +557,192 @@
      Ok(())
  }
  
 -fn install_pointerdown(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
+-    runner_ref.add_event_listener(
+-        target,
+-        "pointerdown",
+-        |event: web_sys::PointerEvent, runner: &mut AppRunner| {
+-            let modifiers = modifiers_from_mouse_event(&event);
+-            runner.input.set_modifiers(modifiers);
+-            let mut should_stop_propagation = true;
+-            if let Some(button) = button_from_mouse_event(&event) {
+-                let pos = pos_from_mouse_event(runner.canvas(), &event, runner.egui_ctx());
+-                let modifiers = runner.input.modifiers;
+-                let egui_event = egui::Event::PointerButton {
+-                    pos,
+-                    button,
+-                    pressed: true,
+-                    modifiers,
 +/// Touch-capable browsers may provide both Pointer Events and Touch Events.
 +/// Use Touch Events when advertised, or track this canvas's contact IDs directly.
 +fn handle_pointer_touch(
@@ -197,7 +284,20 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +                    .position(|p| *p == id)
 +                else {
 +                    return true;
-+                };
+                 };
+-                should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
+-                runner.input.raw.events.push(egui_event);
+-
+-                // In Safari we are only allowed to write to the clipboard during the
+-                // event callback, which is why we run the app logic here and now:
+-                runner.logic();
+-
+-                // Make sure we paint the output of the above logic call asap:
+-                runner.needs_repaint.repaint_asap();
+-            }
+-
+-            // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
+-            if should_stop_propagation {
 +                runner.input.compatibility_pointers.swap_remove(index);
 +            }
 +            egui::TouchPhase::Move => return true,
@@ -212,10 +312,47 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +                modifiers: runner.input.modifiers,
 +            };
 +            if (runner.web_options.should_stop_propagation)(&input) {
-+                event.stop_propagation();
-+            }
+                 event.stop_propagation();
+             }
+-            // Note: prevent_default breaks VSCode tab focusing, hence why we don't call it here.
+-        },
+-    )
+-}
+-
+-fn install_pointerup(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
+-    runner_ref.add_event_listener(
+-        target,
+-        "pointerup",
+-        |event: web_sys::PointerEvent, runner| {
+-            let modifiers = modifiers_from_mouse_event(&event);
+-            runner.input.set_modifiers(modifiers);
+-
+-            let pos = pos_from_mouse_event(runner.canvas(), &event, runner.egui_ctx());
+-
+-            if is_interested_in_pointer_event(
+-                runner,
+-                egui::pos2(event.client_x() as f32, event.client_y() as f32),
+-            ) && let Some(button) = button_from_mouse_event(&event)
 +            if phase == egui::TouchPhase::End && (runner.web_options.should_prevent_default)(&input)
-+            {
+             {
+-                let modifiers = runner.input.modifiers;
+-                let egui_event = egui::Event::PointerButton {
+-                    pos,
+-                    button,
+-                    pressed: false,
+-                    modifiers,
+-                };
+-                let should_stop_propagation =
+-                    (runner.web_options.should_stop_propagation)(&egui_event);
+-                let should_prevent_default =
+-                    (runner.web_options.should_prevent_default)(&egui_event);
+-                runner.input.raw.events.push(egui_event);
+-
+-                // Previously on iOS, the canvas would not receive focus on
+-                // any touch event, which resulted in the on-screen keyboard
+-                // not working when focusing on a text field in an egui app.
+-                // This attempts to fix that by forcing the focus on any
+-                // click on the canvas.
 +                event.prevent_default();
 +            }
 +        }
@@ -226,59 +363,207 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +    let first_event = runner.input.raw.events.len();
 +    if runner.input.push_touch(id, phase, pos, event.pressure()) {
 +        if phase == egui::TouchPhase::Start && event.is_primary() {
-+            runner.input.primary_touch = Some(id);
++            runner.input.claim_primary(PrimaryOwner::Touch(id));
 +        }
-+        let primary = (runner.input.primary_touch == Some(id)).then_some((pos, id));
++        let primary = (runner.input.primary_owner == Some(PrimaryOwner::Touch(id))).then_some(pos);
 +        if primary.is_some() && matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
-+            runner.input.primary_touch = None;
++            runner.input.primary_owner = None;
 +        }
 +        dispatch_touch(runner, event, phase, primary, first_event);
 +    }
 +    true
 +}
 +
-+fn install_pointerdown(
++fn install_pointer_button(
 +    runner_ref: &WebRunner,
 +    target: &EventTarget,
 +    use_touch_events: bool,
++    pressed: bool,
 +) -> Result<(), JsValue> {
-     runner_ref.add_event_listener(
-         target,
-         "pointerdown",
--        |event: web_sys::PointerEvent, runner: &mut AppRunner| {
-+        move |event: web_sys::PointerEvent, runner: &mut AppRunner| {
-             let modifiers = modifiers_from_mouse_event(&event);
-             runner.input.set_modifiers(modifiers);
-+            if handle_pointer_touch(runner, &event, egui::TouchPhase::Start, use_touch_events) {
-+                return;
++    let name = if pressed { "pointerdown" } else { "pointerup" };
++    let phase = if pressed {
++        egui::TouchPhase::Start
++    } else {
++        egui::TouchPhase::End
++    };
++    runner_ref.add_event_listener(target, name, move |event: web_sys::PointerEvent, runner| {
++        runner
++            .input
++            .set_modifiers(modifiers_from_mouse_event(&event));
++        if !handle_pointer_touch(runner, &event, phase, use_touch_events)
++            && let Some(button) = button_from_mouse_event(&event)
++        {
++            physical_button(runner, &event, button, pressed);
++        }
++    })
++}
++
++fn physical_pointer_move(runner: &mut AppRunner, event: &web_sys::PointerEvent) {
++    let owner = PrimaryOwner::Pointer(event.pointer_id());
++    // Chorded changes arrive as pointermove between the first down and final up.
++    if let Some(button) = button_from_mouse_event(event) {
++        let pressed = event.buttons() & (1 << button as u8) != 0;
++        if !pressed
++            || event
++                .target()
++                .is_some_and(|target| target.eq(runner.canvas().as_ref()))
++        {
++            physical_button(runner, event, button, pressed);
++        }
++    } else if runner.input.primary_owner == Some(owner) {
++        let pos = pos_from_mouse_event(runner.canvas(), event, runner.egui_ctx());
++        runner.input.raw.events.push(egui::Event::PointerMoved(pos));
++        runner.needs_repaint.repaint();
++    }
++}
++
++fn cancel_physical_pointer(runner: &mut AppRunner, event: &web_sys::PointerEvent) {
++    let owner = PrimaryOwner::Pointer(event.pointer_id());
++    if runner.input.primary_owner == Some(owner) {
++        runner.input.primary_owner = None;
++        runner.input.raw.events.push(egui::Event::PointerGone);
++    }
++    for button in [
++        egui::PointerButton::Secondary,
++        egui::PointerButton::Middle,
++        egui::PointerButton::Extra1,
++        egui::PointerButton::Extra2,
++    ] {
++        let held = &mut runner.input.auxiliary_owners[button as usize - 1];
++        if held.is_some_and(|(id, _)| id == event.pointer_id()) {
++            *held = None;
++            runner
++                .egui_ctx()
++                .input_mut(|i| i.pointer.queue_auxiliary_release(button, true));
++            let pos = pos_from_mouse_event(runner.canvas(), event, runner.egui_ctx());
++            runner.input.raw.events.push(egui::Event::PointerButton {
++                pos,
++                button,
++                pressed: false,
++                modifiers: runner.input.modifiers,
++            });
++        }
++    }
++    runner.needs_repaint.repaint_asap();
++}
++
++fn physical_button(
++    runner: &mut AppRunner,
++    event: &web_sys::PointerEvent,
++    button: egui::PointerButton,
++    pressed: bool,
++) {
++    let capture = runner
++        .input
++        .physical_button(event.pointer_id(), button, pressed);
++    if !pressed
++        && capture.is_none()
++        && !is_interested_in_pointer_event(
++            runner,
++            egui::pos2(event.client_x() as f32, event.client_y() as f32),
++        )
++    {
++        return;
++    }
++    let input = egui::Event::PointerButton {
++        pos: pos_from_mouse_event(runner.canvas(), event, runner.egui_ctx()),
++        button,
++        pressed,
++        modifiers: runner.input.modifiers,
++    };
++    if (runner.web_options.should_stop_propagation)(&input) {
++        event.stop_propagation();
++    }
++    // Preventing pointerdown would break native browser focus behavior.
++    if !pressed && (runner.web_options.should_prevent_default)(&input) {
++        event.prevent_default();
++    }
++    if let Some(can_click) = capture {
++        if !pressed && button != egui::PointerButton::Primary {
++            runner
++                .egui_ctx()
++                .input_mut(|i| i.pointer.queue_auxiliary_release(button, !can_click));
++        }
++        runner.input.raw.events.push(input);
++        if can_click {
++            if !pressed {
+                 super::focus_without_scroll(runner.canvas()).ok();
+-
+-                // In Safari we are only allowed to do certain things
+-                // (like playing audio, start a download, etc)
+-                // on user action, such as a click.
+-                // So we need to run the app logic here and now:
+-                runner.logic();
+-
+-                // Make sure we paint the output of the above logic call asap:
+-                runner.needs_repaint.repaint_asap();
+-
+-                if should_prevent_default {
+-                    event.prevent_default();
+-                }
+-
+-                // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
+-                if should_stop_propagation {
+-                    event.stop_propagation();
+-                }
+-            }
+-        },
+-    )
 +            }
-             let mut should_stop_propagation = true;
-             if let Some(button) = button_from_mouse_event(&event) {
-                 let pos = pos_from_mouse_event(runner.canvas(), &event, runner.egui_ctx());
-@@ -568,13 +663,20 @@
-     )
++            // Browser-protected actions must run inside the trusted input callback.
++            runner.logic();
++        }
++        runner.needs_repaint.repaint_asap();
++    }
  }
  
--fn install_pointerup(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
-+fn install_pointerup(
-+    runner_ref: &WebRunner,
-+    target: &EventTarget,
-+    use_touch_events: bool,
-+) -> Result<(), JsValue> {
-     runner_ref.add_event_listener(
-         target,
-         "pointerup",
--        |event: web_sys::PointerEvent, runner| {
-+        move |event: web_sys::PointerEvent, runner| {
-             let modifiers = modifiers_from_mouse_event(&event);
-             runner.input.set_modifiers(modifiers);
-+            if handle_pointer_touch(runner, &event, egui::TouchPhase::End, use_touch_events) {
-+                return;
+ /// Returns true if the cursor is above the canvas, or if we're dragging something.
+@@ -651,17 +771,23 @@
+         let modifiers = modifiers_from_mouse_event(&event);
+         runner.input.set_modifiers(modifiers);
+ 
+-        let pos = pos_from_mouse_event(runner.canvas(), &event, runner.egui_ctx());
+-
+-        if is_interested_in_pointer_event(
+-            runner,
+-            egui::pos2(event.client_x() as f32, event.client_y() as f32),
+-        ) {
++        // Capture already establishes interest, including outside the canvas.
++        // Hover without capture still uses the document or shadow root hit test.
++        if runner.input.primary_owner.is_some()
++            || is_interested_in_pointer_event(
++                runner,
++                egui::pos2(event.client_x() as f32, event.client_y() as f32),
++            )
++        {
++            let pos = pos_from_mouse_event(runner.canvas(), &event, runner.egui_ctx());
+             let egui_event = egui::Event::PointerMoved(pos);
+             let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
+             let should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
+-            runner.input.raw.events.push(egui_event);
+-            runner.needs_repaint.repaint();
++            // During a drag only the owning PointerEvent carries a reliable identity.
++            if runner.input.primary_owner.is_none() && event.buttons() & 1 == 0 {
++                runner.input.raw.events.push(egui_event);
++                runner.needs_repaint.repaint();
 +            }
  
-             let pos = pos_from_mouse_event(runner.canvas(), &event, runner.egui_ctx());
+             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
+             if should_stop_propagation {
+@@ -680,8 +806,10 @@
+         target,
+         "mouseleave",
+         |event: web_sys::MouseEvent, runner| {
+-            runner.input.raw.events.push(egui::Event::PointerGone);
+-            runner.needs_repaint.repaint_asap();
++            if runner.input.primary_owner.is_none() && event.buttons() & 1 == 0 {
++                runner.input.raw.events.push(egui::Event::PointerGone);
++                runner.needs_repaint.repaint_asap();
++            }
  
-@@ -695,130 +797,105 @@
+             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
+             if (runner.web_options.should_stop_propagation)(&egui::Event::PointerGone) {
+@@ -695,130 +823,96 @@
      )
  }
  
@@ -304,8 +589,7 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +            name,
 +            move |event: web_sys::TouchEvent, runner| {
 +                let first_event = runner.input.raw.events.len();
-+                push_touches(runner, phase, &event);
-+                let primary = primary_touch_pos(runner, phase, &event);
++                let primary = push_touches(runner, phase, &event);
 +                if runner.input.raw.events.len() > first_event {
 +                    dispatch_touch(runner, &event, phase, primary, first_event);
 +                }
@@ -319,11 +603,11 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +    runner: &mut AppRunner,
 +    event: &web_sys::Event,
 +    phase: egui::TouchPhase,
-+    primary: Option<(egui::Pos2, egui::TouchId)>,
++    primary: Option<egui::Pos2>,
 +    first_event: usize,
 +) {
 +    use egui::{Event, PointerButton, TouchPhase};
-+    if let Some((pos, id)) = primary {
++    if let Some(pos) = primary {
 +        let events = &mut runner.input.raw.events;
 +        match phase {
 +            TouchPhase::Start => {
@@ -460,16 +744,8 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 +                events.push(Event::PointerGone);
 +            }
 +            TouchPhase::Cancel => {
-+                // PointerGone preserves pressed buttons for drags outside the window.
-+                // A cancelled contact must release capture without producing a click.
++                // Explicit capture ends here without synthesizing a clickable button-up.
 +                events.push(Event::PointerGone);
-+                runner.egui_ctx().input_mut(|input| {
-+                    input.pointer.cancel_button_on_touch(
-+                        egui::TouchDeviceId(0),
-+                        id,
-+                        PointerButton::Primary,
-+                    )
-+                });
 +            }
 +        }
 +    }
@@ -508,19 +784,36 @@ diff --git a/src/web/events.rs b/src/web/events.rs
 diff --git a/src/web/input.rs b/src/web/input.rs
 --- a/src/web/input.rs
 +++ b/src/web/input.rs
-@@ -24,51 +24,35 @@
+@@ -1,15 +1,15 @@
+-use super::{AppRunner, canvas_content_rect};
++use super::{AppRunner, canvas_content_origin};
+ 
+ pub fn pos_from_mouse_event(
+     canvas: &web_sys::HtmlCanvasElement,
+     event: &web_sys::MouseEvent,
+     ctx: &egui::Context,
+ ) -> egui::Pos2 {
+-    let rect = canvas_content_rect(canvas);
++    let origin = canvas_content_origin(canvas);
+     let zoom_factor = ctx.zoom_factor();
+     egui::Pos2 {
+-        x: (event.client_x() as f32 - rect.left()) / zoom_factor,
+-        y: (event.client_y() as f32 - rect.top()) / zoom_factor,
++        x: (event.client_x() as f32 - origin.x) / zoom_factor,
++        y: (event.client_y() as f32 - origin.y) / zoom_factor,
+     }
+ }
+ 
+@@ -24,78 +24,51 @@
      }
  }
  
 -/// A single touch is translated to a pointer movement. When a second touch is added, the pointer
 -/// should not jump to a different position. Therefore, we do not calculate the average position
 -/// of all touches, but we keep using the same touch as long as it is available.
-+/// Only the first contact on this canvas controls the egui pointer. A changed
-+/// secondary contact still produces its own touch event.
- pub fn primary_touch_pos(
-     runner: &mut AppRunner,
-+    phase: egui::TouchPhase,
-     event: &web_sys::TouchEvent,
+-pub fn primary_touch_pos(
+-    runner: &mut AppRunner,
+-    event: &web_sys::TouchEvent,
 -) -> Option<(egui::Pos2, web_sys::Touch)> {
 -    // On touchend we don't get anything in `touches`, but we still get `changed_touches`, so include those:
 -    let all_touches: Vec<_> = core::iter::chain(
@@ -560,36 +853,27 @@ diff --git a/src/web/input.rs b/src/web/input.rs
 -    }
 -
 -    None
-+) -> Option<(egui::Pos2, egui::TouchId)> {
-+    let changed = event.changed_touches();
-+    if phase == egui::TouchPhase::Start
-+        && runner.input.primary_touch.is_none()
-+        && event.target_touches().length() == changed.length()
-+    {
-+        runner.input.primary_touch = changed.item(0).map(|touch| touch.identifier().into());
-+    }
-+    let primary = runner.input.primary_touch?;
-+    let touch = (0..changed.length())
-+        .filter_map(|index| changed.item(index))
-+        .find(|touch| egui::TouchId::from(touch.identifier()) == primary)?;
-+    if matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
-+        runner.input.primary_touch = None;
-+    }
-+    Some((
-+        pos_from_touch(
-+            canvas_content_rect(runner.canvas()),
-+            &touch,
-+            runner.egui_ctx(),
-+        ),
-+        primary,
-+    ))
+-}
+-
+ fn pos_from_touch(
+-    canvas_rect: egui::Rect,
++    canvas_origin: egui::Pos2,
+     touch: &web_sys::Touch,
+     egui_ctx: &egui::Context,
+ ) -> egui::Pos2 {
+     let zoom_factor = egui_ctx.zoom_factor();
+     egui::Pos2 {
+-        x: (touch.client_x() as f32 - canvas_rect.left()) / zoom_factor,
+-        y: (touch.client_y() as f32 - canvas_rect.top()) / zoom_factor,
++        x: (touch.client_x() as f32 - canvas_origin.x) / zoom_factor,
++        y: (touch.client_y() as f32 - canvas_origin.y) / zoom_factor,
+     }
  }
  
- fn pos_from_touch(
-@@ -87,13 +71,10 @@
-     let canvas_rect = canvas_content_rect(runner.canvas());
-     for touch_idx in 0..event.changed_touches().length() {
-         if let Some(touch) = event.changed_touches().item(touch_idx) {
+-pub fn push_touches(runner: &mut AppRunner, phase: egui::TouchPhase, event: &web_sys::TouchEvent) {
+-    let canvas_rect = canvas_content_rect(runner.canvas());
+-    for touch_idx in 0..event.changed_touches().length() {
+-        if let Some(touch) = event.changed_touches().item(touch_idx) {
 -            runner.input.raw.events.push(egui::Event::Touch {
 -                device_id: egui::TouchDeviceId(0),
 -                id: egui::TouchId::from(touch.identifier()),
@@ -597,10 +881,100 @@ diff --git a/src/web/input.rs b/src/web/input.rs
 -                pos: pos_from_touch(canvas_rect, &touch, runner.egui_ctx()),
 -                force: Some(touch.force()),
 -            });
-+            let pos = pos_from_touch(canvas_rect, &touch, runner.egui_ctx());
++/// Queue each changed contact once. Only the first eligible touch moves egui's pointer.
++pub fn push_touches(
++    runner: &mut AppRunner,
++    phase: egui::TouchPhase,
++    event: &web_sys::TouchEvent,
++) -> Option<egui::Pos2> {
++    use super::PrimaryOwner;
++    let changed = event.changed_touches();
++    if phase == egui::TouchPhase::Start
++        && runner.input.primary_owner.is_none()
++        && event.target_touches().length() == changed.length()
++    {
++        if let Some(touch) = changed.item(0) {
 +            runner
 +                .input
-+                .push_touch(touch.identifier().into(), phase, pos, touch.force());
++                .claim_primary(PrimaryOwner::Touch(touch.identifier().into()));
          }
      }
++    let origin = canvas_content_origin(runner.canvas());
++    let mut primary = None;
++    for touch in (0..changed.length()).filter_map(|index| changed.item(index)) {
++        let id = touch.identifier().into();
++        let pos = pos_from_touch(origin, &touch, runner.egui_ctx());
++        if runner.input.push_touch(id, phase, pos, touch.force())
++            && runner.input.primary_owner == Some(PrimaryOwner::Touch(id))
++        {
++            primary = Some(pos);
++        }
++    }
++    if primary.is_some() && matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
++        runner.input.primary_owner = None;
++    }
++    primary
  }
+ 
+ /// The text input from a keyboard event (e.g. `X` when pressing the `X` key).
+diff --git a/src/web/mod.rs b/src/web/mod.rs
+--- a/src/web/mod.rs
++++ b/src/web/mod.rs
+@@ -46,8 +46,8 @@
+ 
+ use input::{
+     button_from_mouse_event, modifiers_from_kb_event, modifiers_from_mouse_event,
+-    modifiers_from_wheel_event, pos_from_mouse_event, primary_touch_pos, push_touches,
+-    text_from_keyboard_event, translate_key,
++    modifiers_from_wheel_event, pos_from_mouse_event, push_touches, text_from_keyboard_event,
++    translate_key,
+ };
+ 
+ // ----------------------------------------------------------------------------
+@@ -150,31 +150,24 @@
+     window.match_media(format!("(prefers-color-scheme: {theme})").as_str())
+ }
+ 
+-/// Returns the canvas in client coordinates.
+-fn canvas_content_rect(canvas: &web_sys::HtmlCanvasElement) -> egui::Rect {
+-    let bounding_rect = canvas.get_bounding_client_rect();
+-
+-    let mut rect = egui::Rect::from_min_max(
+-        egui::pos2(bounding_rect.left() as f32, bounding_rect.top() as f32),
+-        egui::pos2(bounding_rect.right() as f32, bounding_rect.bottom() as f32),
+-    );
+-
+-    // We need to subtract padding and border:
++/// The canvas content origin in client coordinates.
++fn canvas_content_origin(canvas: &web_sys::HtmlCanvasElement) -> egui::Pos2 {
++    let bounds = canvas.get_bounding_client_rect();
++    let mut origin = egui::pos2(bounds.left() as f32, bounds.top() as f32);
+     if let Some(window) = web_sys::window()
+         && let Ok(Some(style)) = window.get_computed_style(canvas)
+     {
+-        let get_property = |name: &str| -> Option<f32> {
+-            let property = style.get_property_value(name).ok()?;
+-            property.trim_end_matches("px").parse::<f32>().ok()
+-        };
+-
+-        rect.min.x += get_property("padding-left").unwrap_or_default();
+-        rect.min.y += get_property("padding-top").unwrap_or_default();
+-        rect.max.x -= get_property("padding-right").unwrap_or_default();
+-        rect.max.y -= get_property("padding-bottom").unwrap_or_default();
+-    }
+-
+-    rect
++        let padding = |name: &str| {
++            style
++                .get_property_value(name)
++                .ok()
++                .and_then(|p| p.trim_end_matches("px").parse::<f32>().ok())
++                .unwrap_or_default()
++        };
++        origin.x += padding("padding-left");
++        origin.y += padding("padding-top");
++    }
++    origin
+ }
+ 
+ fn canvas_size_in_points(canvas: &web_sys::HtmlCanvasElement, ctx: &egui::Context) -> egui::Vec2 {

@@ -53,9 +53,48 @@ selected text, and lifting a second finger let the first continue scrolling.
 A read-only link tap opened one popup during the trusted browser event.
 Switching tabs with two fingers down canceled both contacts. Moving focus to
 an input outside the canvas kept it there when the fingers lifted. With the
-egui pass limit set to one, a canceled tap left a separately held mouse button
-down and the next tap activated the link once.
+egui pass limit set to one, a canceled tap left the right mouse button down
+and the next tap activated the link once.
 See the [web host setup](GUIDE.md#touch-input-in-eframe-web-applications).
+
+On `5efc65d`, desktop WebKitGTK 2.54.2 on Wayland also scrolled 200 pixels
+on the first swipe, preserved the primary drag when the second finger lifted,
+and selected the same text on the first mouse drag after touch as with a
+mouse alone. An outside input retained focus through a late touch release.
+These checks used a private virtual seat. Safari and the iOS keyboard still
+need hands-on verification.
+
+With a held mouse button, a second device exposed a different failure.
+In Chromium, a touch on another line moved the mouse selection there.
+Canceling the touch then released the logical mouse button. With the
+prepared sources, the interrupted mouse drag selected the same range as
+the mouse-only control. In the opposite order, the touch swipe continued
+scrolling after a mouse stroke. Moving focus to an outside input while
+pressing a link canceled activation through the late mouse release.
+
+The stock native egui-winit integration also lost a mouse selection during
+a touch tap. With the [native input correction](GUIDE.md#touch-input-in-native-egui-applications),
+the mouse selected offsets 497–509 with and without the intervening tap.
+In the opposite order, a touch swipe scrolled 260 pixels with Find focused
+while a separate mouse stroke reached the window. These private Wayland
+checks used two seats so both complete device streams reached the client.
+In a single-seat control, the compositor omitted some motion and release
+events after switching devices.
+
+Under rootful Xwayland, the original winit events identified both devices'
+motion with the same master pointer ID. Touching the screen during a mouse
+selection temporarily moved the selection to the touched line. The X11
+backport preserves the cursor coordinates and gives touch-generated motion
+its XI2 source device ID. The corrected integration kept the selection
+anchored to the mouse during the touch.
+
+On Windows 11, an uninterrupted USB-tablet mouse drag selected `Select`
+at offsets 9–15. With stock egui-winit, a native touch at offset 26
+collapsed that selection while the physical mouse button remained down.
+The corrected integration kept the mouse selection. A separate winit
+harness observed the Win32 cancellation and the resulting public touch
+event. The corrected backend reported a canceled contact as `Cancelled`
+and the next ordinary tap as `Ended`.
 
 ### Native accessibility and clipboard checks, 2026-11-19
 
@@ -113,6 +152,11 @@ soft break, a link ending a non-final paragraph, insertion, removal and undo.
 The Linux host's caret description also announced entry on a native Right
 arrow. In whole-line reading that lands inside a link, Orca can speak an
 additional “Link” when the focused document's description changes.
+
+Recordings from the packaged native editor at `5efc65d` captured NVDA 2026.2
+reading a heading, its body text, and the heading again, as well as Orca 51.1
+reading the inline links. Offline transcription recovered heading levels 1
+and 3 in the Windows audio. Human listening signoff is still open.
 
 The same open Linux editor moved between two private Sway outputs at 1×, 2×,
 then 1×. Selection survived each move. Pointer placement, drag selection,

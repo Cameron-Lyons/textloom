@@ -186,6 +186,13 @@ class Driver:
         self.post("/url", {"url": url})
         self.check("fixture startup", lambda q: q["scroll"] == 0)
 
+    def route_tab(self, url, route):
+        tab = self.post("/window/new", {"type": "tab"})
+        self.post("/window", {"handle": tab["handle"]})
+        self.viewport(route == "touch")
+        self.navigate(url)
+        self.check(route + " input route", lambda q: q["advertisesTouchEvents"] == (route == "touch"))
+
     def mouse(self, kind, x, y, held=False, button="left"):
         self.cdp("Input.dispatchMouseEvent", type=kind, x=x, y=y, pointerType="mouse",
                  button="none" if kind == "mouseMoved" else button,
@@ -234,8 +241,8 @@ def gestures(d, url):
     for x in range(60, 141, 10):
         d.mouse("mouseMoved", x, 190, True)
     d.mouse("mouseReleased", 140, 190)
-    d.check("first post-touch mouse drag", lambda q: q["focused"] and
-            not q["held"] and q["selection"] == [7, 6, 7, 22])
+    baseline = d.check("first post-touch mouse drag", lambda q: q["focused"] and
+                       not q["held"] and q["selection"] == [7, 6, 7, 22])
 
     d.navigate(url + "?readonly")
     d.mouse("mouseMoved", 60, 180)
@@ -262,10 +269,7 @@ def gestures(d, url):
     secondary(d)
 
     for route in ("pointer", "touch"):
-        tab = d.post("/window/new", {"type": "tab"})
-        d.post("/window", {"handle": tab["handle"]})
-        d.viewport(route == "touch")
-        d.navigate(url + "?readonly&blur=" + route)
+        d.route_tab(url + "?readonly&blur=" + route, route)
         d.mouse("mousePressed", 600, 300, True)
         d.mouse("mouseReleased", 600, 300)
         d.script("document.querySelector('canvas').focus()")
@@ -281,6 +285,76 @@ def gestures(d, url):
         d.touch("touchEnd")
         d.check(route + " late end preserves outside focus", lambda q: q["touchUps"] == [True, True]
                 and q["active"] == "outside" and not q["contacts"] and not q["held"] and not q["links"])
+        d.mouse("mouseMoved", 42, 55)
+        d.mouse("mousePressed", 42, 55, True)
+        d.check(route + " mouse presses link", lambda q: q["active"] == "editor" and q["held"])
+        d.script("document.querySelector('#outside').focus()")
+        d.check(route + " mouse blur cancels press", lambda q: q["active"] == "outside" and not q["held"])
+        d.mouse("mouseReleased", 42, 55)
+        d.check(route + " late mouse up preserves outside focus", lambda q:
+                q["active"] == "outside" and not q["held"] and not q["links"])
+        d.mouse("mousePressed", 42, 55, True)
+        d.mouse("mouseReleased", 42, 55)
+        d.check(route + " next mouse click opens link once", lambda q: q["links"] == expected and not q["held"])
+        d.route_tab(url + "?blur=" + route, route)
+        concurrent_primary(d, route, baseline["selection"])
+
+
+def concurrent_primary(d, route, baseline):
+    d.focus_find()
+    d.script("""
+        qa.primaryEvents = [];
+        for (const type of ["pointerdown", "pointerup", "pointercancel"]) {
+            document.addEventListener(type, e => {
+                const position = type === "pointercancel" ? [] : [e.clientX, e.clientY];
+                qa.primaryEvents.push([e.pointerType, type, e.isTrusted, ...position]);
+            }, true);
+        }
+    """)
+    d.mouse("mouseMoved", 50, 190)
+    d.mouse("mousePressed", 50, 190, True)
+    anchor = d.check(route + " mouse owns primary", lambda q:
+                     q["held"] and q["focused"] and q["selection"] == baseline[:2] * 2)
+    d.touch("touchStart", (3, 42, 55))
+    contact = d.check(route + " competing touch begins", lambda q: q["contacts"] == 1)
+    d.touch("touchCancel")
+    cancelled = d.check(route + " competing touch cancels", lambda q: not q["contacts"])
+    for x in range(60, 141, 10):
+        d.mouse("mouseMoved", x, 190, True)
+    d.mouse("mouseReleased", 140, 190)
+    sequence = [["mouse", "pointerdown", True, 50, 190], ["touch", "pointerdown", True, 42, 55],
+                ["touch", "pointercancel", True], ["mouse", "pointerup", True, 140, 190]]
+    d.check(route + " mouse drag survives concurrent touch", lambda q:
+            q["primaryEvents"] == sequence and not q["held"] and q["selection"] == baseline)
+    for state in (contact, cancelled):
+        assert state["held"] and state["selection"] == anchor["selection"], state
+
+    initial = d.focus_find()
+    d.script("qa.primaryEvents.length = 0")
+    d.touch("touchStart", (7, 130, 490))
+    d.touch("touchMove", (7, 130, 440))
+    drag = d.check(route + " touch owns scroll", lambda q: q["held"] and q["contacts"] == 1
+                   and q["scroll"] == initial["scroll"] + 50)
+    d.mouse("mouseMoved", 50, 190)
+    d.mouse("mousePressed", 50, 190, True)
+    d.mouse("mouseMoved", 140, 190, True)
+    d.mouse("mouseReleased", 140, 190)
+    d.check(route + " competing mouse leaves touch in control", lambda q: q["held"] and q["find"]
+            and q["selection"] == initial["selection"] and q["scroll"] == drag["scroll"])
+    d.touch("touchMove", (7, 130, 390))
+    time.sleep(0.2)
+    d.touch("touchEnd")
+    sequence = [["touch", "pointerdown", True, 130, 490], ["mouse", "pointerdown", True, 50, 190],
+                ["mouse", "pointerup", True, 140, 190], ["touch", "pointerup", True, 130, 390]]
+    d.check(route + " touch drag survives concurrent mouse", lambda q:
+            q["primaryEvents"] == sequence and q["scroll"] == drag["scroll"] + 50
+            and q["find"] and q["selection"] == initial["selection"] and not q["contacts"] and not q["held"])
+    d.mouse("mouseMoved", 50, 190)
+    d.mouse("mousePressed", 50, 190, True)
+    d.mouse("mouseMoved", 140, 190, True)
+    d.mouse("mouseReleased", 140, 190)
+    d.check(route + " next mouse drag", lambda q: q["focused"] and not q["held"]
+            and q["selection"][0] == q["selection"][2] and q["selection"][1::2] == baseline[1::2])
 
 
 def secondary(d):

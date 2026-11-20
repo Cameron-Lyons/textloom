@@ -1586,3 +1586,27 @@ documents checked matches and navigation against a flattened Unicode reference.
 They covered both directions, wrapping, partial edge lines, overlapping
 occurrences, and lowercase expansions. A regression also checks that finding
 a nearby match leaves an earlier paragraph's word-boundary index unallocated.
+
+## Browser pointer input, 2026-11-19
+
+Headless Chromium 157 on Linux compared the web profile at `5efc65d` with
+the mixed-device correction. Both WebAssembly fixtures used the same
+packaged editor, Rust 1.100 release profile and SwiftShader renderer.
+After two warm-ups, ten paired rounds alternated the builds. Each build
+received 480 trusted mouse moves per case. The browser trace measured
+renderer-thread CPU time for each pointer move and its compatibility mouse
+event together. Selection, button states and event counts matched.
+
+| Browser configuration | Gesture | Median paired change per move (µs) | 95% bootstrap interval (µs) |
+| --- | --- | ---: | ---: |
+| Desktop | Hover | +1.8 | −4.2 to +14.4 |
+| Desktop | Drag | −20.2 | −26.6 to −15.4 |
+| Touch-capable | Hover | +6.8 | −21.4 to +14.0 |
+| Touch-capable | Drag | −6.9 | −17.8 to +1.0 |
+
+All ten optimized desktop-drag rounds used less CPU with the correction.
+All four confidence intervals for the change in event delivery interval
+included zero. The generated WebAssembly grew by 4,158 bytes to 5,665,295.
+A separate development-profile run found 7.5 µs more CPU time per move in
+touch-capable hover (95% interval +2.4 to +25.1 µs). These measurements
+cover event dispatch and input handling.
