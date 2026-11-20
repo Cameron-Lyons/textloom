@@ -3,7 +3,11 @@
 ## Unreleased
 
 - The egui editor scrolls on the first unfocused touchscreen swipe and selects
-  text on the first mouse drag after touch input.
+  text on the first mouse drag after touch input. Touch-down after a distant
+  mouse hover preserves the scroll position until the finger moves.
+  For eframe 0.37.0 web hosts,
+  the [browser touch correction](GUIDE.md#touch-input-in-eframe-web-applications)
+  prevents a single contact from also starting a mouse gesture.
 - Word deletion in a long paragraph can resolve nearby word boundaries without
   leaving a full word index in each undo snapshot.
 - Multiline find and replace stream long queries across paragraphs. Find Next

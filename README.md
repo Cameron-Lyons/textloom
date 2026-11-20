@@ -100,7 +100,9 @@ The widget handles selection, keyboard shortcuts, IME previews, and accessibilit
 link activation is reported to the host, which decides which targets to open.
 
 The [egui integration guide](GUIDE.md#egui) covers focus and input routing,
-clipboard replies, fonts, shortcuts, and cache lifetime. Run the complete native
+clipboard replies, fonts, shortcuts, and cache lifetime. Browser hosts using
+eframe 0.37.0 can enable the [touch correction](GUIDE.md#touch-input-in-eframe-web-applications).
+Run the complete native
 host from a repository checkout:
 
 ```sh

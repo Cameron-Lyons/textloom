@@ -1,4 +1,4 @@
-"""Prepare the native host's optional dependency patches from pinned Cargo archives."""
+"""Prepare optional host dependency patches from pinned Cargo archives."""
 
 import argparse
 import hashlib
@@ -13,6 +13,18 @@ from urllib.request import urlopen
 
 # Directory names match Cargo.lock. Each patch is relative to its crate root.
 PROFILES = {
+    "eframe-web": [
+        (
+            "eframe-0.37.0",
+            "9c5642501a65ca657d05f00c643a5c14ff2346cb3818032bfe23d58e1f8e5f84",
+            ("touch",),
+        ),
+        (
+            "egui-0.37.0",
+            "bec9144f49b7a28b5f395d3147e325b4fe3e77ba686eac11d1bdf0a7da3f375f",
+            ("touch-cancel",),
+        ),
+    ],
     "winit": [
         (
             "winit-0.30.13",

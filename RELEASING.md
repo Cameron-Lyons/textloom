@@ -39,6 +39,24 @@ once. On Windows 11, a native injected touch tap placed the caret and a
 focused touch drag selected text. With Find focused, an ordinary mouse drag
 selected `Select` both in a fresh session and after a touch tap.
 
+At a scroll offset of 1,242 pixels, a separate Wayland test hovered the mouse
+517 pixels above the next touch point. On `5c0ac31`, touching the screen
+immediately moved the document to offset 725. With the corrected input routing,
+touch-down kept the offset at 1,242. Moving the finger up 42 pixels then
+scrolled to 1,284. Find retained focus and the document caret stayed at zero.
+
+Headless Chromium 157 reproduced an additional first-swipe failure with stock
+eframe 0.37.0. A single contact produced a pointer press before the browser's
+touch event and started a selection. With the prepared web sources, the
+first 200-pixel swipe scrolled the editor, the first mouse drag after touch
+selected text, and lifting a second finger let the first continue scrolling.
+A read-only link tap opened one popup during the trusted browser event.
+Switching tabs with two fingers down canceled both contacts. Moving focus to
+an input outside the canvas kept it there when the fingers lifted. With the
+egui pass limit set to one, a canceled tap left a separately held mouse button
+down and the next tap activated the link once.
+See the [web host setup](GUIDE.md#touch-input-in-eframe-web-applications).
+
 ### Native accessibility and clipboard checks, 2026-11-19
 
 The native example exposed list item positions 1 of 2 and 2 of 2 through
@@ -51,6 +69,14 @@ and redo with zero reported errors. On Wayland, LibreOffice Writer offered
 formatted HTML and plain Unicode text without a Textloom fragment. The default
 and rich-enabled hosts pasted the exact two-line text and preserved it through
 undo and redo. Copying it back from rich mode confirmed the plain fallback.
+
+On Windows 11, Microsoft Edge 155.0.4283.62 pasted Textloom's HTML into a
+contenteditable document. Its DOM retained the heading, bulleted and numbered
+items, hyperlink, and bold, italic, yellow-highlighted Unicode text. In the
+reverse direction Edge offered HTML and Unicode text. Textloom pasted the
+exact plain text and blank line into a body paragraph, with one undo and one
+redo. All 14 checks passed on `5c0ac31`. This exercise covered Edge's HTML
+editor. Word and Outlook still require separate verification.
 
 Windows 11 UI Automation also returned positions 1 of 2 and 2 of 2, then 1 of 1
 after a Backspace at the first item, and both original positions after undo.
@@ -1285,7 +1311,11 @@ malformed-input regression tests when changing the codec.
    and strict Clippy for the native host and its CLI/report/clipboard regression
    tests without opening a window. The same command checks QA-tool formatting,
    tests, and Clippy, plus the headless macOS cleanup regressions;
-   Python 3 is required for those regression tests.
+   Python 3 is required for those regression tests. To include the Chromium
+   input check locally, add `--check-web`. This uses Python 3.11 or newer,
+   the `wasm32-unknown-unknown` Rust target, `wasm-bindgen` CLI 0.2.129,
+   and matching Chrome/Chromium and ChromeDriver binaries. CI runs this check
+   in its own job against the extracted crate.
    It then runs all-feature tests and compiles
    every target from the extracted Cargo package. An explicit inventory check
    requires every packaged source, test, fixture, headless example, benchmark,

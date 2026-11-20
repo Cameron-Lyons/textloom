@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden }
+  canvas { width: 100vw; height: 100vh; display: block; touch-action: none }
+</style>
+<canvas id="editor"></canvas>
+<input id="outside" aria-label="Outside editor" style="position: fixed; right: 0; top: 0" hidden>
+<script>
+  const qa = window.qa = { frames: 0, links: [], ends: [], afterSecondary: [], cancels: [], error: null };
+  const params = new URLSearchParams(location.search);
+  qa.advertisesTouchEvents = "ontouchstart" in document.querySelector("canvas");
+  qa.touchUps = [];
+  if (params.has("blur")) document.querySelector("#outside").hidden = false;
+  if (params.get("blur") === "pointer") {
+    // Exercise the pointer-only host route even when CDP also generates legacy events.
+    for (const name of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
+      document.addEventListener(name, event => event.stopImmediatePropagation(), true);
+    }
+  }
+  document.addEventListener("pointerup", event => {
+    if (event.pointerType === "touch") qa.touchUps.push(event.isTrusted);
+  }, true);
+  function observe(focused, find, al, ab, fl, fb, scroll, held, secondary, contacts) {
+    qa.frames++;
+    Object.assign(qa, { focused, find, selection: [al, ab, fl, fb], scroll, held, secondary, contacts });
+    if (qa.ends.at(-1)?.remaining === 1) qa.afterSecondary.push({ held, scroll });
+  }
+  function observeLink(url) {
+    qa.links.push({ url, trusted: window.event?.isTrusted === true });
+  }
+  document.addEventListener("touchend", event => {
+    qa.ends.push({ remaining: event.touches.length, trusted: event.isTrusted });
+  }, true);
+  document.addEventListener("touchcancel", event => qa.cancels.push(event.isTrusted), true);
+  // Keep both events in one JS task so a browser animation frame cannot flush the queued press.
+  function cancelWithinTask() {
+    const target = document.querySelector("canvas");
+    const t = new Touch({identifier: 29, target, clientX: 42, clientY: 55});
+    for (const type of ["touchstart", "touchcancel"]) {
+      const touches = type === "touchstart" ? [t] : [];
+      target.dispatchEvent(new TouchEvent(type, {
+        bubbles: true, cancelable: true, touches, targetTouches: touches, changedTouches: [t],
+      }));
+    }
+    return qa.frames;
+  }
+  window.addEventListener("error", event => { qa.error = event.message; });
+  window.addEventListener("unhandledrejection", event => { qa.error = String(event.reason); });
+</script>
+<script type="module">
+  import init, { start } from "./host.js";
+  await init();
+  await start(document.querySelector("canvas"), params.has("readonly"));
+</script>

@@ -257,6 +257,40 @@ manual signoff as unrecorded. Reports and smoke runs provide observations;
 manual native checks still need separate steps and outcomes. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md)
 for report revision labeling, font examples, and host checks.
 
+### Touch input in eframe web applications
+
+Stock eframe 0.37.0 handles both DOM pointer and touch events. In Chromium,
+one screen contact can reach egui first as a mouse button press and then as
+a touch. The first press can focus an editor and start selecting text when
+the user intended to scroll. At that point egui has no device information
+with which to distinguish the press from a real mouse click.
+
+The corrected host sends one gesture for the primary contact. Other fingers
+still supply multitouch input. Losing browser focus cancels active contacts,
+so lifting a finger afterward leaves focus on the new target. A canceled
+touch also preserves a separately held mouse button.
+
+For a web application using this version, prepare the corrected eframe and egui
+sources from the [Textloom repository](https://github.com/Cameron-Lyons/textloom/tree/main/scripts/native-qa).
+Run the helper from the application workspace.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py eframe-web vendor/web-input
+```
+
+Add both overrides to the application's root `Cargo.toml`.
+
+```toml
+[patch.crates-io]
+eframe = { path = "vendor/web-input/eframe-0.37.0" }
+egui = { path = "vendor/web-input/egui-0.37.0" }
+```
+
+Run `cargo pkgid eframe@0.37.0` and `cargo pkgid egui@0.37.0` to verify that
+both paths point into `vendor/web-input`. Call `install_input_routing` when
+creating the egui context. On a canvas that handles its own panning, set the
+CSS property `touch-action: none` so the browser leaves that gesture to the editor.
+
 ## winit
 
 Enable `features = ["winit"]`. `adapter::winit::WinitAdapter` maps keyboard events, modifiers, and native IME events to editor commands. The host provides text layout, pointer hit testing, clipboard access, and painting. Calls return a `#[must_use]` `InputOutcome`: whether the event was handled, whether presentation changed, and any clipboard request.
@@ -548,6 +582,8 @@ The dependency-free benchmark harnesses measure local insertion/undo, paragraph 
 
 - Ubuntu stable runs `scripts/check-release.sh`: formatting, tests and doctests for all eight feature combinations, release-mode search/replacement oracles, Clippy for all targets, QA-tool and headless Python regressions, complete API documentation with warnings denied, release benchmark smoke tests with `TEXTLOOM_BENCH_QUICK=1`, the headless examples, explicit package inventory verification, and tests and all-target compilation from the extracted Cargo package.
 - Rust 1.95 tests every feature combination, builds the benchmarks, and compiles and tests the standalone native host, including its CLI/report tests.
+- A Chromium job builds a WebAssembly host against the extracted package and
+  the prepared eframe source, then exercises browser touch and mouse gestures.
 - macOS and Windows run strict Clippy on all library targets and the native host, then all-feature tests, doctests, and host CLI/report tests.
 - A minimal-versions job resolves the lowest direct dependency versions that `Cargo.toml` permits and compiles all targets on Rust 1.95.
 - cargo-deny checks advisories and, as a separate required job, bans, licenses, and sources for the library, native-host, and QA-tool manifests, following `deny.toml`.

@@ -3,10 +3,12 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 allow_dirty=false
+check_web=false
 release_tag=
 while (($#)); do
     case "$1" in
         --allow-dirty) allow_dirty=true ;;
+        --check-web) check_web=true ;;
         --tag)
             if (($# < 2)); then
                 echo '--tag requires a version tag, such as v1.0.0' >&2
@@ -118,6 +120,13 @@ for package in winit@0.30.13 accesskit_atspi_common@0.21.1 accesskit_unix@0.24.1
         exit 1
     fi
 done
+if $check_web; then
+    web_sources="$native_package_check_dir/web-input"
+    python3 scripts/native-qa/prepare_native.py eframe-web "$web_sources"
+    python3 scripts/native-qa/web-touch/check.py --package "$package_root" \
+        --eframe "$web_sources/eframe-0.37.0" --egui "$web_sources/egui-0.37.0" \
+        --lockfile examples/native-editor/Cargo.lock
+fi
 if [[ $(uname -s) == Linux ]]; then
     cargo test --locked --offline --manifest-path "$native_package_check_dir/Cargo.toml" \
         --target-dir "$package_target_dir" -p accesskit_atspi_common -p accesskit_unix -p accesskit_consumer --lib

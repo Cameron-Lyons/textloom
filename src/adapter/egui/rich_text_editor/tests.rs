@@ -9012,6 +9012,123 @@ fn check_touch_scroll_and_selection(web_order: bool) {
 }
 
 #[test]
+fn touch_scroll_starts_at_the_contact_even_after_distant_mouse_hover() {
+    for web_order in [false, true] {
+        // Check both scroll directions away from either clamp. A host can
+        // supply the first movement together with the press or a frame later.
+        for (warm, hover_delta, combined, max_passes) in [
+            (false, Some(517.0), false, 2),
+            (true, Some(517.0), false, 2),
+            (true, Some(-517.0), false, 2),
+            (true, Some(-517.0), true, 2),
+            (true, Some(517.0), false, 1),
+            (true, None, true, 2),
+            (true, None, false, 2),
+            (true, Some(0.0), false, 2),
+        ] {
+            let downwards = hover_delta.is_some_and(|d| d < 0.0);
+            let start = Pos2::new(130.0, if downwards { 201.0 } else { 534.0 });
+            let travel = if downwards { 42.0 } else { -42.0 };
+            let end = start + Vec2::new(0.0, travel);
+            let context = egui::Context::default();
+            context.options_mut(|o| o.max_passes = NonZeroUsize::new(max_passes).unwrap());
+            let mut editor = Editor::from_text(&"scrollable editor\n".repeat(180));
+            let mut time = 0.0;
+            let mut render = |events, reset| {
+                time += 0.025;
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0))),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                };
+                let mut passes = Vec::new();
+                context
+                    .run_ui(raw, |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.label("Outside the editor");
+                            let mut scroll = egui::ScrollArea::vertical().animated(false);
+                            if reset {
+                                scroll = scroll.vertical_scroll_offset(1200.0);
+                            }
+                            let area = scroll.show(ui, |ui| {
+                                RichTextEditor::new(&mut editor)
+                                    .id(Id::unique("scroll"))
+                                    .show(ui);
+                            });
+                            let real_move =
+                                ui.input(|i| i.events.contains(&Event::PointerMoved(end)));
+                            passes.push((area.state.clamped_offset().y, real_move));
+                        });
+                    })
+                    .drop_without_applying_deltas();
+                passes
+            };
+            let touch = |pos, phase| Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                pos,
+                phase,
+                force: None,
+            };
+            let down = |point| {
+                let contact = touch(point, egui::TouchPhase::Start);
+                let press = primary(point, true, Modifiers::NONE);
+                if web_order {
+                    vec![press, contact]
+                } else {
+                    vec![contact, Event::PointerMoved(point), press]
+                }
+            };
+            render(vec![], true);
+            render(vec![], false);
+            if warm {
+                let outside = Pos2::new(80.0, 17.0);
+                render(down(outside), false);
+                render(
+                    vec![
+                        primary(outside, false, Modifiers::NONE),
+                        touch(outside, egui::TouchPhase::End),
+                        Event::PointerGone,
+                    ],
+                    false,
+                );
+                render(vec![], false);
+            }
+            if let Some(delta) = hover_delta {
+                let hover = Pos2::new(start.x, start.y - delta);
+                render(vec![Event::PointerMoved(hover)], false);
+            }
+            let mut press = down(start);
+            let mut movement = vec![touch(end, egui::TouchPhase::Move), Event::PointerMoved(end)];
+            if combined {
+                press.append(&mut movement);
+            }
+            let mut passes = render(press, false);
+            if warm && !combined && hover_delta.unwrap_or(0.0) == 0.0 {
+                assert_eq!(
+                    passes.len(),
+                    1,
+                    "a current or absent hover requires no preparation"
+                );
+            }
+            passes.extend(render(movement, false));
+            passes.extend(render(vec![], false));
+            let mut moved = false;
+            for (offset, saw_move) in passes {
+                moved |= saw_move;
+                assert_eq!(
+                    offset,
+                    if moved { 1200.0 - travel } else { 1200.0 },
+                    "web_order={web_order}, warm={warm}, hover_delta={hover_delta:?}, combined={combined}, max_passes={max_passes}"
+                );
+            }
+            assert!(moved);
+        }
+    }
+}
+
+#[test]
 fn first_mouse_drag_selects_after_touch_focused_a_native_field() {
     for (manual, max_passes, web_order) in [(false, 2, false), (false, 1, true), (true, 1, false)] {
         let context = egui::Context::default();

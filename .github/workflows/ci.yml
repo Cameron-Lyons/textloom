@@ -47,6 +47,42 @@ jobs:
       - name: Complete release checks
         run: ./scripts/check-release.sh
 
+  browser-input:
+    name: Browser input (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install the wasm-bindgen CLI matching the native example lockfile
+        working-directory: ${{ runner.temp }}
+        run: |
+          release=wasm-bindgen-0.2.129-x86_64-unknown-linux-musl
+          curl --fail --location --retry 3 -o bindgen.tar.gz \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/$release.tar.gz"
+          echo '82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e  bindgen.tar.gz' | sha256sum --check
+          tar -xzf bindgen.tar.gz "$release/wasm-bindgen"
+          echo "$RUNNER_TEMP/$release" >> "$GITHUB_PATH"
+      - name: Verify touch and mouse input in the packaged editor
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          export CHROME="$(command -v google-chrome)"
+          cargo package --locked --features egui
+          python3 scripts/native-qa/prepare_native.py eframe-web "$RUNNER_TEMP/web-input"
+          python3 scripts/native-qa/web-touch/check.py \
+            --package "target/package/textloom-$(./scripts/release-version.sh)" \
+            --eframe "$RUNNER_TEMP/web-input/eframe-0.37.0" --egui "$RUNNER_TEMP/web-input/egui-0.37.0" \
+            --lockfile examples/native-editor/Cargo.lock
+
   msrv:
     name: MSRV and feature combinations
     runs-on: ubuntu-latest

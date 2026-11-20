@@ -1,0 +1,140 @@
+diff --git a/src/input_state/mod.rs b/src/input_state/mod.rs
+--- a/src/input_state/mod.rs
++++ b/src/input_state/mod.rs
+@@ -9,7 +9,7 @@
+ use crate::{
+     data::input::{
+         Event, EventFilter, KeyboardShortcut, Modifiers, NUM_POINTER_BUTTONS, PointerButton,
+-        RawInput, TouchDeviceId, ViewportInfo,
++        RawInput, TouchDeviceId, TouchId, TouchPhase, ViewportInfo,
+     },
+     input_state::wheel_state::WheelState,
+ };
+@@ -1006,6 +1006,9 @@
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+ pub struct PointerState {
++    #[cfg_attr(feature = "serde", serde(skip))]
++    touch_cancellations: Vec<(TouchDeviceId, TouchId, PointerButton)>,
++
+     /// Latest known time
+     time: f64,
+ 
+@@ -1098,6 +1101,7 @@
+ impl Default for PointerState {
+     fn default() -> Self {
+         Self {
++            touch_cancellations: Vec::new(),
+             time: -f64::INFINITY,
+             latest_pos: None,
+             interact_pos: None,
+@@ -1216,6 +1220,31 @@
+ 
+                     self.down[button as usize] = pressed; // must be done after the above call to `could_any_button_be_click`
+                 }
++                Event::Touch {
++                    device_id,
++                    id,
++                    phase: TouchPhase::Cancel,
++                    ..
++                } => {
++                    if let Some(index) = self
++                        .touch_cancellations
++                        .iter()
++                        .position(|(device, touch, _)| device == device_id && touch == id)
++                    {
++                        let (_, _, button) = self.touch_cancellations.remove(index);
++                        if self.down[button as usize] {
++                            self.down[button as usize] = false;
++                            self.pointer_events.push(PointerEvent::Released {
++                                click: None,
++                                button,
++                            });
++                            if !self.any_down() {
++                                self.press_origin = None;
++                                self.press_start_time = None;
++                            }
++                        }
++                    }
++                }
+                 Event::PointerGone => {
+                     self.latest_pos = None;
+                     // When dragging a slider and the mouse leaves the viewport, we still want the drag to work,
+@@ -1523,6 +1552,18 @@
+     /// a certain amount of time and distance from when and where it was pressed.
+     pub fn secondary_clicked(&self) -> bool {
+         self.button_clicked(PointerButton::Secondary)
++    }
++
++    /// Release an emulated pointer button without a click when its touch cancellation
++    /// is processed. The integration must also submit the matching [`Event::Touch`]
++    /// with [`TouchPhase::Cancel`]. Input hooks may defer delivery to a later pass.
++    pub fn cancel_button_on_touch(
++        &mut self,
++        device_id: TouchDeviceId,
++        touch_id: TouchId,
++        button: PointerButton,
++    ) {
++        self.touch_cancellations.push((device_id, touch_id, button));
+     }
+ 
+     /// Is this button currently down?
+@@ -1705,6 +1746,7 @@
+ impl PointerState {
+     pub fn ui(&self, ui: &mut crate::Ui) {
+         let Self {
++            touch_cancellations: _,
+             time: _,
+             latest_pos,
+             interact_pos,
+@@ -1753,3 +1795,50 @@
+         ui.label(format!("pointer_events: {pointer_events:?}"));
+     }
+ }
++
++#[cfg(test)]
++mod touch_cancel_tests {
++    use super::*;
++
++    #[test]
++    fn ordered_touch_cancel_releases_only_its_button_without_clicking() {
++        let device = TouchDeviceId(0);
++        let primary = TouchId(1);
++        let secondary = TouchId(2);
++        let button = |button| Event::PointerButton {
++            pos: Pos2::ZERO,
++            button,
++            pressed: true,
++            modifiers: Modifiers::NONE,
++        };
++        let cancel = |id| Event::Touch {
++            device_id: device,
++            id,
++            phase: TouchPhase::Cancel,
++            pos: Pos2::ZERO,
++            force: None,
++        };
++        let mut pointer = PointerState::default();
++        pointer.cancel_button_on_touch(device, primary, PointerButton::Primary);
++        let input = RawInput {
++            events: vec![
++                button(PointerButton::Secondary),
++                button(PointerButton::Primary),
++                cancel(secondary),
++                Event::PointerGone,
++            ],
++            ..Default::default()
++        };
++        let pointer = pointer.begin_pass(1.0, &input, InputOptions::default());
++        assert!(pointer.primary_down() && pointer.secondary_down());
++        let input = RawInput {
++            events: vec![cancel(primary), Event::PointerGone],
++            ..Default::default()
++        };
++        let pointer = pointer.begin_pass(2.0, &input, InputOptions::default());
++        assert!(!pointer.primary_down() && pointer.secondary_down());
++        assert!(pointer.button_released(PointerButton::Primary));
++        assert!(!pointer.primary_clicked());
++        assert!(!pointer.button_released(PointerButton::Secondary));
++    }
++}
