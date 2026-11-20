@@ -1,0 +1,84 @@
+X11: Restore IME focus after replacing the active window's input context
+
+Author: ssy (shim9610)
+License: Apache-2.0 (winit)
+Upstream proposal: https://github.com/rust-windowing/winit/pull/4727
+Source revision: https://github.com/shim9610/winit/commit/6df8b561b2a9e59cfa6d739fe631f87c3b78ae5b
+Base: winit 0.30.13 with winit-0.30.13-x11-area.patch applied
+
+Adapted to the 0.30.13 event-loop target and input-context API.
+
+diff --git i/src/platform_impl/linux/x11/event_processor.rs w/src/platform_impl/linux/x11/event_processor.rs
+index fdf73e2..ac8e23b 100644
+--- i/src/platform_impl/linux/x11/event_processor.rs
++++ w/src/platform_impl/linux/x11/event_processor.rs
+@@ -84,6 +84,7 @@ impl EventProcessor {
+         let window_target = Self::window_target_mut(&mut self.target);
+ 
+         // Handle IME requests.
++        let mut ime_focus = None;
+         while let Ok(request) = self.ime_receiver.try_recv() {
+             let ime = match window_target.ime.as_mut() {
+                 Some(ime) => ime,
+@@ -95,11 +96,25 @@ impl EventProcessor {
+                     ime.send_xim_area(window_id, x, y, w, h);
+                 },
+                 ImeRequest::Allow(window_id, allowed) => {
+-                    ime.set_ime_allowed(window_id, allowed);
++                    let result = ime.set_ime_allowed(window_id, allowed);
++                    if self.active_window == Some(window_id as xproto::Window) {
++                        match result {
++                            Ok(true) => ime_focus = Some(window_id),
++                            Err(_) => ime_focus = None,
++                            Ok(false) => {},
++                        }
++                    }
+                 },
+             }
+         }
+ 
++        // Replacing the context does not generate a window focus event. Transfer
++        // focus after draining requests, so contexts replaced again in this batch
++        // do not activate the input method unnecessarily.
++        if let (Some(window_id), Some(ime)) = (ime_focus, window_target.ime.as_mut()) {
++            let _ = ime.get_mut().focus(window_id);
++        }
++
+         // Drain IME events.
+         while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
+             let window_id = mkwid(window as xproto::Window);
+diff --git i/src/platform_impl/linux/x11/ime/mod.rs w/src/platform_impl/linux/x11/ime/mod.rs
+index 50569cb..f1f5814 100644
+--- i/src/platform_impl/linux/x11/ime/mod.rs
++++ w/src/platform_impl/linux/x11/ime/mod.rs
+@@ -194,14 +194,18 @@ impl Ime {
+         }
+     }
+ 
+-    pub fn set_ime_allowed(&mut self, window: ffi::Window, allowed: bool) {
++    pub fn set_ime_allowed(
++        &mut self,
++        window: ffi::Window,
++        allowed: bool,
++    ) -> Result<bool, ImeContextCreationError> {
+         if self.is_destroyed() {
+-            return;
++            return Ok(false);
+         }
+ 
+         if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
+             if allowed == context.is_allowed() {
+-                return;
++                return Ok(false);
+             }
+         }
+ 
+@@ -209,7 +213,7 @@ impl Ime {
+         let _ = self.remove_context(window);
+ 
+         // Create new context supporting IME input.
+-        let _ = self.create_context(window, allowed);
++        self.create_context(window, allowed)
+     }
+ 
+     pub fn is_ime_allowed(&self, window: ffi::Window) -> bool {

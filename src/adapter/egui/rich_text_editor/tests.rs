@@ -8881,6 +8881,12 @@ fn nonempty_preedit_consumes_cut_paste_and_text() {
 
 #[test]
 fn touch_swipes_scroll_until_the_editor_is_focused() {
+    for web_order in [false, true] {
+        check_touch_scroll_and_selection(web_order);
+    }
+}
+
+fn check_touch_scroll_and_selection(web_order: bool) {
     let context = egui::Context::default();
     let mut editor = Editor::from_text(&"line of text\n".repeat(80));
     let id = Id::unique("touch");
@@ -8917,14 +8923,38 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
     };
     let swipe = |run: &mut dyn FnMut(&mut Editor, Vec<Event>) -> Vec2, editor: &mut Editor| {
         let mut point = Pos2::new(100.0, 300.0);
-        run(
-            editor,
-            vec![
-                touch(egui::TouchPhase::Start, point),
-                Event::PointerMoved(point),
-                primary(point, true, Modifiers::NONE),
-            ],
-        );
+        let start = touch(egui::TouchPhase::Start, point);
+        let press = primary(point, true, Modifiers::NONE);
+        let events = if web_order {
+            vec![press, start]
+        } else {
+            vec![start, Event::PointerMoved(point), press]
+        };
+        run(editor, events);
+        run(editor, Vec::new());
+        if web_order {
+            // A second finger generates another press at the held primary
+            // position followed only by the newly changed contact.
+            let second = Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::Start,
+                pos: point + Vec2::new(40.0, 0.0),
+                force: None,
+            };
+            run(editor, vec![primary(point, true, Modifiers::NONE), second]);
+            assert!(input_routing::primary_pointer_is_touch(&context));
+            run(
+                editor,
+                vec![Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(2),
+                    phase: egui::TouchPhase::End,
+                    pos: point + Vec2::new(40.0, 0.0),
+                    force: None,
+                }],
+            );
+        }
         for _ in 0..10 {
             point.y -= 20.0;
             run(
@@ -8945,15 +8975,9 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
         );
         run(editor, Vec::new())
     };
-    let known = Pos2::new(100.0, 300.0);
-    run(
-        &mut editor,
-        vec![
-            touch(egui::TouchPhase::Start, known),
-            touch(egui::TouchPhase::End, known),
-        ],
-    );
     run(&mut editor, Vec::new());
+    run(&mut editor, Vec::new());
+    assert!(!context.input(|i| i.has_touch_screen()));
     let offset = swipe(&mut run, &mut editor);
     assert!(offset.y > 0.0, "{offset:?}");
     assert_eq!(editor.selection(), Selection::caret(Position::default()));
@@ -8985,6 +9009,216 @@ fn touch_swipes_scroll_until_the_editor_is_focused() {
         !editor.selection().is_caret(),
         "a focused editor drag-selects"
     );
+}
+
+#[test]
+fn touch_scroll_starts_at_the_contact_even_after_distant_mouse_hover() {
+    for web_order in [false, true] {
+        // Check both scroll directions away from either clamp. A host can
+        // supply the first movement together with the press or a frame later.
+        for (warm, hover_delta, combined, max_passes) in [
+            (false, Some(517.0), false, 2),
+            (true, Some(517.0), false, 2),
+            (true, Some(-517.0), false, 2),
+            (true, Some(-517.0), true, 2),
+            (true, Some(517.0), false, 1),
+            (true, None, true, 2),
+            (true, None, false, 2),
+            (true, Some(0.0), false, 2),
+        ] {
+            let downwards = hover_delta.is_some_and(|d| d < 0.0);
+            let start = Pos2::new(130.0, if downwards { 201.0 } else { 534.0 });
+            let travel = if downwards { 42.0 } else { -42.0 };
+            let end = start + Vec2::new(0.0, travel);
+            let context = egui::Context::default();
+            context.options_mut(|o| o.max_passes = NonZeroUsize::new(max_passes).unwrap());
+            let mut editor = Editor::from_text(&"scrollable editor\n".repeat(180));
+            let mut time = 0.0;
+            let mut render = |events, reset| {
+                time += 0.025;
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0))),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                };
+                let mut passes = Vec::new();
+                context
+                    .run_ui(raw, |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.label("Outside the editor");
+                            let mut scroll = egui::ScrollArea::vertical().animated(false);
+                            if reset {
+                                scroll = scroll.vertical_scroll_offset(1200.0);
+                            }
+                            let area = scroll.show(ui, |ui| {
+                                RichTextEditor::new(&mut editor)
+                                    .id(Id::unique("scroll"))
+                                    .show(ui);
+                            });
+                            let real_move =
+                                ui.input(|i| i.events.contains(&Event::PointerMoved(end)));
+                            passes.push((area.state.clamped_offset().y, real_move));
+                        });
+                    })
+                    .drop_without_applying_deltas();
+                passes
+            };
+            let touch = |pos, phase| Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                pos,
+                phase,
+                force: None,
+            };
+            let down = |point| {
+                let contact = touch(point, egui::TouchPhase::Start);
+                let press = primary(point, true, Modifiers::NONE);
+                if web_order {
+                    vec![press, contact]
+                } else {
+                    vec![contact, Event::PointerMoved(point), press]
+                }
+            };
+            render(vec![], true);
+            render(vec![], false);
+            if warm {
+                let outside = Pos2::new(80.0, 17.0);
+                render(down(outside), false);
+                render(
+                    vec![
+                        primary(outside, false, Modifiers::NONE),
+                        touch(outside, egui::TouchPhase::End),
+                        Event::PointerGone,
+                    ],
+                    false,
+                );
+                render(vec![], false);
+            }
+            if let Some(delta) = hover_delta {
+                let hover = Pos2::new(start.x, start.y - delta);
+                render(vec![Event::PointerMoved(hover)], false);
+            }
+            let mut press = down(start);
+            let mut movement = vec![touch(end, egui::TouchPhase::Move), Event::PointerMoved(end)];
+            if combined {
+                press.append(&mut movement);
+            }
+            let mut passes = render(press, false);
+            if warm && !combined && hover_delta.unwrap_or(0.0) == 0.0 {
+                assert_eq!(
+                    passes.len(),
+                    1,
+                    "a current or absent hover requires no preparation"
+                );
+            }
+            passes.extend(render(movement, false));
+            passes.extend(render(vec![], false));
+            let mut moved = false;
+            for (offset, saw_move) in passes {
+                moved |= saw_move;
+                assert_eq!(
+                    offset,
+                    if moved { 1200.0 - travel } else { 1200.0 },
+                    "web_order={web_order}, warm={warm}, hover_delta={hover_delta:?}, combined={combined}, max_passes={max_passes}"
+                );
+            }
+            assert!(moved);
+        }
+    }
+}
+
+#[test]
+fn first_mouse_drag_selects_after_touch_focused_a_native_field() {
+    for (manual, max_passes, web_order) in [(false, 2, false), (false, 1, true), (true, 1, false)] {
+        let context = egui::Context::default();
+        context.options_mut(|o| o.max_passes = NonZeroUsize::new(max_passes).unwrap());
+        let mut editor = Editor::from_text(&"abcdefghijklmnopqrstuvwxyz\n".repeat(60));
+        let native = Id::unique("native");
+        let rich = Id::unique("rich");
+        let mut text = String::new();
+        let mut time = 0.0;
+        let mut frame = |editor: &mut Editor, events: Vec<Event>| {
+            time += 0.025;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut field = Rect::NOTHING;
+            let mut rich_rect = Rect::NOTHING;
+            let mut offset = 0.0;
+            let mut draw = |ui: &mut egui::Ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    field = ui
+                        .add(egui::TextEdit::singleline(&mut text).id(native))
+                        .rect;
+                    let scroll = egui::ScrollArea::vertical().animated(false).show(ui, |ui| {
+                        rich_rect = RichTextEditor::new(editor).id(rich).show(ui).response.rect;
+                    });
+                    offset = scroll.state.clamped_offset().y;
+                });
+            };
+            let output = if manual {
+                context.begin_pass(raw);
+                context.root_ui(draw);
+                context.end_pass()
+            } else {
+                context.run_ui(raw, &mut draw)
+            };
+            output.drop_without_applying_deltas();
+            (field.center(), rich_rect, offset)
+        };
+        frame(&mut editor, vec![]);
+        let (field, rect, _) = frame(&mut editor, vec![]);
+        let contact = |pos, phase| Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            pos,
+            phase,
+            force: None,
+        };
+        let mut tap = vec![
+            contact(field, egui::TouchPhase::Start),
+            Event::PointerMoved(field),
+            primary(field, true, Modifiers::NONE),
+        ];
+        if web_order {
+            tap = vec![
+                primary(field, true, Modifiers::NONE),
+                contact(field, egui::TouchPhase::Start),
+            ];
+        }
+        tap.extend([
+            primary(field, false, Modifiers::NONE),
+            Event::PointerGone,
+            contact(field, egui::TouchPhase::End),
+        ]);
+        frame(&mut editor, tap);
+        frame(&mut editor, vec![]);
+        assert!(context.memory(|m| m.has_focus(native)));
+
+        let start = rect.min + Vec2::new(15.0, 130.0);
+        let end = start + Vec2::new(92.0, -42.0);
+        // No hover or setup frame between the device switch and the press.
+        let mut press = vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::NONE),
+        ];
+        if manual {
+            // An unrelated finger at another location can arrive in the same
+            // input batch as a genuine mouse press on a hybrid device.
+            press.push(contact(field, egui::TouchPhase::Start));
+        }
+        frame(&mut editor, press);
+        frame(&mut editor, vec![Event::PointerMoved(end)]);
+        frame(&mut editor, vec![primary(end, false, Modifiers::NONE)]);
+        let (_, _, scroll) = frame(&mut editor, vec![]);
+        assert!(context.memory(|m| m.has_focus(rich)));
+        assert!(editor.selection().anchor.paragraph > editor.selection().focus.paragraph);
+        assert_eq!(scroll, 0.0);
+    }
 }
 
 #[test]
@@ -10241,6 +10475,107 @@ fn link_drags_discard_anchors_from_a_changed_document() {
         editor.selection(),
         Selection::caret(editor.document().end())
     );
+}
+
+#[test]
+fn link_taps_follow_only_the_original_occurrence_in_the_original_document() {
+    let target = Link::try_new("https://example.com").unwrap();
+    let make_editor = || {
+        let mut editor = Editor::from_text("ai cd");
+        for (start, end) in [(0, 2), (3, 5)] {
+            editor
+                .set_selection(Selection::new(
+                    Position::new(0, start),
+                    Position::new(0, end),
+                ))
+                .unwrap();
+            editor.set_link(Some(target.clone())).unwrap();
+        }
+        // The first link crosses two formatting spans.
+        editor
+            .set_selection(Selection::new(Position::new(0, 0), Position::new(0, 1)))
+            .unwrap();
+        editor.toggle_style(InlineAttribute::Bold).unwrap();
+        editor.set_selection(Selection::default()).unwrap();
+        editor
+    };
+    for touch in [false, true] {
+        for (same_occurrence, replace_document, same_frame) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let context = egui::Context::default();
+            let mut editor = make_editor();
+            let modifiers = Modifiers::NONE;
+            let (_, widget) = link_frame(&context, &mut editor, vec![], 0.0, modifiers, true);
+            let layouts = widget_cache(&context).layout.layouts;
+            let layout = layouts.get(0).unwrap();
+            let row = &layout.galley.rows[0];
+            let origin = widget.response.rect.min + Vec2::splat(PADDING);
+            let point = |x| {
+                origin
+                    + layout.rect.min.to_vec2()
+                    + row.pos.to_vec2()
+                    + Vec2::new(x, row.size.y * 0.5)
+            };
+            let press = point(row.glyphs[1].max_x() - 0.25);
+            let release = if same_occurrence {
+                point(row.glyphs[0].max_x() - 0.25)
+            } else {
+                point(row.glyphs[3].pos.x + 0.25)
+            };
+            assert_eq!(
+                navigation::link_at_point(editor.document(), &layouts, press - origin),
+                Some(target.clone())
+            );
+            let mut events = Vec::new();
+            let contact = |pos, phase| Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                pos,
+                phase,
+                force: None,
+            };
+            if touch {
+                events.push(contact(press, egui::TouchPhase::Start));
+            }
+            events.extend([Event::PointerMoved(press), primary(press, true, modifiers)]);
+            if !same_frame {
+                link_frame(
+                    &context,
+                    &mut editor,
+                    std::mem::take(&mut events),
+                    0.1,
+                    modifiers,
+                    true,
+                );
+            }
+            if replace_document {
+                editor = make_editor();
+            }
+            if touch {
+                events.push(contact(release, egui::TouchPhase::End));
+            }
+            events.extend([
+                Event::PointerMoved(release),
+                primary(release, false, modifiers),
+            ]);
+            let (_, widget) = link_frame(&context, &mut editor, events, 0.2, modifiers, true);
+            let case = format!(
+                "touch={touch} same_occurrence={same_occurrence} replace_document={replace_document} same_frame={same_frame}"
+            );
+            assert!(widget.response.clicked(), "fixture should produce a click");
+            assert_eq!(
+                widget.clicked_link.as_ref(),
+                (same_occurrence && !replace_document).then_some(&target),
+                "{case}"
+            );
+            assert_eq!(editor.selection(), Selection::default(), "{case}");
+        }
+    }
 }
 
 #[test]

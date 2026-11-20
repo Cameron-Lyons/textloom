@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::time::Duration;
 
@@ -18,10 +18,27 @@ use egui::{Context, Event, FullOutput, Id, Modifiers, Plugin, RawInput, Ui, View
 /// reach whichever widget runs first. The plugin gives each focus request a
 /// separate pass, so that input before and after it reaches the right widget,
 /// rich editors and native egui widgets such as `TextEdit` alike, regardless of
-/// draw order. Ordinary batches need no extra pass. If the context's pass limit
-/// is reached, the remaining input waits ahead of newer input and the plugin
-/// requests an immediate repaint, which the host must honor to deliver it,
-/// including when it calls `begin_pass` and `end_pass` itself.
+/// draw order. On a switch between touch and mouse, the plugin publishes
+/// updated drag senses before the primary press so egui can choose between
+/// text selection and a host scroll area. A custom host should report a primary
+/// touch press in the same raw batch as its matching contact at the same
+/// position. egui-winit sends `Touch(Start)`, `PointerMoved`, then the button.
+/// The reverse order (button followed by changed contacts) works too. Stock
+/// eframe 0.37.0 on the web can send an earlier, isolated button without
+/// device information. Web hosts can apply the [eframe touch correction].
+///
+/// [eframe touch correction]: https://github.com/Cameron-Lyons/textloom/blob/main/GUIDE.md#touch-input-in-eframe-web-applications
+///
+/// A fresh primary press without a matching contact begins a mouse gesture.
+/// A repeated button while another finger joins an active touch stays touch.
+/// When a new touch begins away from the last hover position, the plugin
+/// positions the pointer before the press so the hover distance cannot scroll
+/// the content.
+///
+/// Ordinary batches need no extra pass. If the context's pass limit is reached,
+/// remaining input waits ahead of newer input and the plugin requests an
+/// immediate repaint. Hosts using `begin_pass`/`end_pass` directly must also
+/// honor the repaint.
 ///
 /// The recorded modifiers let the widget tell a plain-text paste
 /// (Command/Ctrl+Shift+V) from a rich one even when the modifiers change later
@@ -68,10 +85,19 @@ pub fn install_input_routing(ctx: &Context) {
 #[derive(Default)]
 struct InputRouting {
     pending: HashMap<ViewportId, PendingInput>,
+    touch_pointer: HashSet<ViewportId>,
     passes: Vec<InputPass>,
     paste_requests: HashMap<ViewportId, VecDeque<PasteRequest>>,
     focused: HashMap<ViewportId, Option<Id>>,
     memory_viewport: Option<ViewportId>,
+}
+
+pub(super) fn primary_pointer_is_touch(ctx: &Context) -> bool {
+    let viewport = ctx.viewport_id();
+    ctx.plugin::<InputRouting>()
+        .lock()
+        .touch_pointer
+        .contains(&viewport)
 }
 
 pub(super) fn modifiers_at_pass_start(ctx: &Context) -> Modifiers {
@@ -159,6 +185,7 @@ struct InputPass {
 
 struct RoutedEvent {
     event: Event,
+    prepare_touch: Option<bool>,
     paste_reply: PasteReply,
 }
 
@@ -182,11 +209,140 @@ impl RoutedEvent {
 struct PendingInput {
     batches: VecDeque<InputBatch>,
     latest_focused: bool,
+    latest_pointer: PrimaryPointer,
 }
 
 struct InputBatch {
     events: VecDeque<RoutedEvent>,
     focused: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PrimaryPointer {
+    touch: bool,
+    touch_held: bool,
+    position: Option<egui::Pos2>,
+}
+
+fn primary_press(event: &Event) -> Option<egui::Pos2> {
+    match event {
+        Event::PointerButton {
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            pos,
+            ..
+        } => Some(*pos),
+        _ => None,
+    }
+}
+
+fn pointer_position(previous: Option<egui::Pos2>, event: &Event) -> Option<egui::Pos2> {
+    match event {
+        Event::PointerMoved(pos) | Event::PointerButton { pos, .. } => Some(*pos),
+        Event::PointerGone => None,
+        _ => previous,
+    }
+}
+
+fn starts_touch_at(event: &Event, pos: egui::Pos2) -> bool {
+    matches!(event, Event::Touch { phase: egui::TouchPhase::Start, pos: touch, .. } if *touch == pos)
+}
+
+fn needs_touch_origin(previous: Option<egui::Pos2>, pos: egui::Pos2, following: &[Event]) -> bool {
+    if let Some(previous) = previous {
+        return previous != pos;
+    }
+    // The host may batch the first real movement with the press. Without an
+    // origin egui reports a zero delta until the next pass.
+    following
+        .iter()
+        .take_while(|event| {
+            !matches!(event, Event::PointerButton { .. } | Event::PointerGone)
+                && !requests_focus(event)
+        })
+        .any(|event| matches!(event, Event::PointerMoved(moved) if *moved != pos))
+}
+
+/// egui hit-tests the previous pass's widgets, and its first drag delta
+/// starts at that pass's pointer position. Prepare the senses and touch
+/// origin before the press when either would be stale.
+fn prepare_input_batch(
+    events: &mut [Event],
+    pointer: &mut PrimaryPointer,
+    mut known_touch: bool,
+) -> (VecDeque<(usize, bool)>, bool) {
+    let mut changes = VecDeque::new();
+    let mut has_focus_request = false;
+    let mut pass_origin = pointer.position;
+    let mut index = 0;
+    while index < events.len() {
+        if requests_focus(&events[index]) {
+            // Each focus request runs in its own pass.
+            has_focus_request = true;
+            pass_origin = pointer.position;
+        }
+        known_touch |= matches!(events[index], Event::Touch { .. });
+        if matches!(
+            events[index],
+            Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } | Event::PointerGone
+                | Event::WindowFocused(false)
+        ) {
+            pointer.touch_held = false;
+        }
+        if let Some(pos) = primary_press(&events[index]) {
+            // egui-winit sends Touch, PointerMoved, PointerButton. The web
+            // backend sends PointerButton then the changed touch contacts.
+            let before = &events[..index];
+            let before = match before.split_last() {
+                Some((Event::PointerMoved(moved), rest)) if *moved == pos => rest,
+                _ => before,
+            };
+            let starts_before = before.last().is_some_and(|e| starts_touch_at(e, pos));
+            let mut changed_contacts = events[index + 1..]
+                .iter()
+                .take_while(|e| {
+                    matches!(
+                        e,
+                        Event::Touch {
+                            phase: egui::TouchPhase::Start,
+                            ..
+                        }
+                    )
+                })
+                .peekable();
+            // Web repeats the primary button at the held finger's position
+            // when a second finger lands. Only the new finger is in this list.
+            let repeated_touch = pointer.touch_held && changed_contacts.peek().is_some();
+            let starts_after = changed_contacts.position(|e| starts_touch_at(e, pos));
+            let next = starts_before || starts_after.is_some() || repeated_touch;
+            let fresh_touch = next && !pointer.touch_held;
+            let needs_origin =
+                fresh_touch && needs_touch_origin(pass_origin, pos, &events[index + 1..]);
+            pointer.touch_held = next;
+            if next != pointer.touch || needs_origin {
+                pointer.touch = next;
+                pass_origin = if next { Some(pos) } else { pointer.position };
+                if !known_touch && let Some(offset) = starts_after {
+                    // A default ScrollArea only registers its background after
+                    // egui has seen a touch. Deliver the web contact once in the
+                    // preparatory pass; only its paired button waits.
+                    let end = index + 1 + offset;
+                    events[index..=end].rotate_left(1);
+                    index = end;
+                    known_touch = true;
+                }
+                changes.push_back((index, next));
+            }
+        }
+        pointer.position = pointer_position(pointer.position, &events[index]);
+        index += 1;
+    }
+    let needs_separate_pass = has_focus_request || !changes.is_empty();
+    (changes, needs_separate_pass)
 }
 
 fn requests_focus(event: &Event) -> bool {
@@ -248,7 +404,26 @@ impl Plugin for InputRouting {
     fn input_hook(&mut self, ctx: &Context, input: &mut RawInput) {
         // Read egui's previous state before it processes this routed segment.
         // This also preserves held modifiers across frames and nested viewports.
-        let modifiers = ctx.input_for(input.viewport_id, |input| input.modifiers);
+        let (modifiers, known_touch, touch_held, previous_position) =
+            ctx.input_for(input.viewport_id, |input| {
+                (
+                    input.modifiers,
+                    input.has_touch_screen(),
+                    input.pointer.primary_down() && input.any_touches(),
+                    input.pointer.latest_pos(),
+                )
+            });
+        let mut latest_pointer = self.pending.get(&input.viewport_id).map_or_else(
+            || PrimaryPointer {
+                touch: self.touch_pointer.contains(&input.viewport_id),
+                touch_held,
+                position: previous_position,
+            },
+            |pending| pending.latest_pointer,
+        );
+        latest_pointer.touch_held &= latest_pointer.touch;
+        let (mut preparations, needs_separate_pass) =
+            prepare_input_batch(&mut input.events, &mut latest_pointer, known_touch);
         let mut pass = InputPass {
             viewport: input.viewport_id,
             modifiers,
@@ -264,7 +439,7 @@ impl Plugin for InputRouting {
         self.memory_viewport = Some(input.viewport_id);
         if !self.pending.contains_key(&input.viewport_id)
             && !self.paste_requests.contains_key(&input.viewport_id)
-            && !input.events.iter().any(requests_focus)
+            && !needs_separate_pass
         {
             // Ordinary batches need only the starting modifiers. Keep their
             // event buffer intact instead of allocating a routing queue and
@@ -292,7 +467,11 @@ impl Plugin for InputRouting {
         }
         let events: VecDeque<_> = mem::take(&mut input.events)
             .into_iter()
-            .map(|event| {
+            .enumerate()
+            .map(|(index, event)| {
+                let prepare_touch = preparations
+                    .pop_front_if(|(at, _)| *at == index)
+                    .map(|(_, touch)| touch);
                 let paste_reply =
                     if matches!(event, Event::Paste(_) | Event::PasteImage(_)) && eligible > 0 {
                         eligible -= 1;
@@ -312,7 +491,11 @@ impl Plugin for InputRouting {
                     } else {
                         PasteReply::Ordinary
                     };
-                RoutedEvent { event, paste_reply }
+                RoutedEvent {
+                    event,
+                    prepare_touch,
+                    paste_reply,
+                }
             })
             .collect();
         if let Some(requests) = self.paste_requests.get_mut(&input.viewport_id) {
@@ -322,9 +505,7 @@ impl Plugin for InputRouting {
             }
         }
 
-        if !self.pending.contains_key(&input.viewport_id)
-            && !events.iter().any(|event| requests_focus(&event.event))
-        {
+        if !self.pending.contains_key(&input.viewport_id) && !needs_separate_pass {
             for event in events {
                 event.deliver(&mut pass, input);
             }
@@ -338,6 +519,7 @@ impl Plugin for InputRouting {
             .or_insert_with(|| PendingInput {
                 batches: VecDeque::new(),
                 latest_focused: input.focused,
+                latest_pointer,
             });
         // A later raw batch may contain a pointer press that egui resolves before
         // widgets run. Keep it separate so it cannot steal earlier queued text.
@@ -348,6 +530,7 @@ impl Plugin for InputRouting {
                 focused: input.focused,
             });
             pending.latest_focused = input.focused;
+            pending.latest_pointer = latest_pointer;
         }
         let batch = pending.batches.front_mut().expect(
             "pending viewports keep at least one batch, and a new entry receives this pass's \
@@ -367,11 +550,39 @@ impl Plugin for InputRouting {
                     .event,
             );
         } else {
-            while batch
-                .events
-                .front()
-                .is_some_and(|event| !requests_focus(&event.event))
-            {
+            while let Some(next) = batch.events.front_mut() {
+                if requests_focus(&next.event) {
+                    break;
+                }
+                if let Some(touch) = next.prepare_touch {
+                    // Finish any earlier button gesture with its original
+                    // senses. Otherwise the preceding hover/contact can share
+                    // this preparation pass, and the press runs on the next.
+                    if !input
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, Event::PointerButton { .. }))
+                    {
+                        next.prepare_touch = None;
+                        if touch {
+                            self.touch_pointer.insert(input.viewport_id);
+                            let origin = primary_press(&next.event)
+                                .expect("only primary presses need preparation");
+                            let positioned = input
+                                .events
+                                .iter()
+                                .fold(previous_position, pointer_position);
+                            if positioned != Some(origin) {
+                                // This pass owns only the repositioning. Real
+                                // drag movement stays in the following pass.
+                                input.events.push(Event::PointerMoved(origin));
+                            }
+                        } else {
+                            self.touch_pointer.remove(&input.viewport_id);
+                        }
+                    }
+                    break;
+                }
                 let event = batch
                     .events
                     .pop_front()
@@ -410,6 +621,8 @@ impl Plugin for InputRouting {
                 .retain(|id, _| output.viewport_output.contains_key(id));
             self.paste_requests
                 .retain(|id, _| output.viewport_output.contains_key(id));
+            self.touch_pointer
+                .retain(|id| output.viewport_output.contains_key(id));
             self.focused
                 .retain(|id, _| output.viewport_output.contains_key(id));
         }
@@ -417,9 +630,7 @@ impl Plugin for InputRouting {
             output
                 .platform_output
                 .request_discard_reasons
-                .push(egui::RepaintCause::new_reason(
-                    "ordered accessibility focus",
-                ));
+                .push(egui::RepaintCause::new_reason("ordered editor input"));
         }
         if self.pending.contains_key(&viewport) || self.paste_requests.contains_key(&viewport) {
             ctx.request_repaint_of(viewport);

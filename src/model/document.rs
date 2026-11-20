@@ -52,6 +52,9 @@ pub struct Document {
     pub(super) revision: u64,
     pub(super) identity: Arc<()>,
     pub(super) numbers: OnceLock<Arc<[NumberedItem]>>,
+    // Counts from each end that no change has touched since the editor's save point.
+    pub(super) untouched_prefix: usize,
+    pub(super) untouched_suffix: usize,
     #[cfg(any(feature = "egui", feature = "accesskit"))]
     pub(super) last_change: Option<LastChange>,
 }
@@ -132,6 +135,8 @@ impl Document {
 
     fn from_shared(paragraphs: Vec<Arc<Paragraph>>) -> Self {
         Self {
+            untouched_prefix: paragraphs.len(),
+            untouched_suffix: paragraphs.len(),
             paragraphs,
             revision: 0,
             identity: Arc::new(()),
@@ -314,6 +319,17 @@ impl Document {
         Arc::clone(&self.identity)
     }
 
+    pub(crate) fn reset_changed_paragraphs(&mut self) {
+        self.untouched_prefix = self.paragraphs.len();
+        self.untouched_suffix = self.paragraphs.len();
+    }
+
+    pub(crate) fn changed_paragraphs(&self) -> Range<usize> {
+        let end = self.paragraphs.len() - self.untouched_suffix;
+        // Before the first change, the untouched prefix and suffix overlap.
+        self.untouched_prefix.min(end)..end
+    }
+
     /// Returns the document's plain text, with LF between paragraphs.
     ///
     /// Soft line breaks (U+2028) are also written as LF, and list markers are
@@ -423,10 +439,9 @@ impl Document {
     #[must_use]
     pub fn link_at(&self, position: Position) -> Option<&Link> {
         let paragraph = self.paragraph(position.paragraph)?;
-        if !paragraph.is_grapheme_boundary(position.byte) {
-            return None;
-        }
-        paragraph.link_for_byte(position.byte)
+        paragraph
+            .linked_grapheme(position.byte)
+            .map(|(_, link)| link)
     }
 
     /// Returns the range of the whole link that [`link_at`](Document::link_at)
@@ -437,10 +452,7 @@ impl Document {
     #[must_use]
     pub fn link_range_at(&self, position: Position) -> Option<Range<Position>> {
         let paragraph = self.paragraph(position.paragraph)?;
-        if !paragraph.is_grapheme_boundary(position.byte) {
-            return None;
-        }
-        let range = paragraph.link_range(position.byte)?;
+        let range = paragraph.link_range(paragraph.linked_grapheme(position.byte)?);
         Some(
             Position::new(position.paragraph, range.start)
                 ..Position::new(position.paragraph, range.end),
@@ -456,23 +468,15 @@ impl Document {
         (before == after).then_some(before)
     }
 
-    // A linked byte next to the caret, preferring the one before it, in the caret's paragraph.
-    fn caret_link_byte(&self, position: Position) -> Option<usize> {
-        let paragraph = self.paragraph(position.paragraph)?;
-        [position.byte.checked_sub(1), Some(position.byte)]
-            .into_iter()
-            .flatten()
-            .find(|byte| paragraph.link_for_byte(*byte).is_some())
-    }
-
     pub(crate) fn caret_link(&self, position: Position) -> Option<&Link> {
-        let byte = self.caret_link_byte(position)?;
-        self.paragraphs[position.paragraph].link_for_byte(byte)
+        self.paragraph(position.paragraph)?
+            .caret_link_span(position.byte)
+            .map(|(_, link)| link)
     }
 
     pub(crate) fn caret_link_range(&self, position: Position) -> Option<Range<Position>> {
-        let byte = self.caret_link_byte(position)?;
-        let range = self.paragraphs[position.paragraph].link_range(byte)?;
+        let paragraph = self.paragraph(position.paragraph)?;
+        let range = paragraph.link_range(paragraph.caret_link_span(position.byte)?);
         Some(
             Position::new(position.paragraph, range.start)
                 ..Position::new(position.paragraph, range.end),

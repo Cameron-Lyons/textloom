@@ -11,9 +11,65 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::{Indent, Replacement};
 use crate::model::{Delta, Replay};
 use crate::{
-    Color, Document, Editor, Error, Fragment, InlineStyle, Movement, Paragraph, ParagraphKind,
-    Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,
+    Color, Document, Editor, Error, Fragment, InlineStyle, Link, Movement, Paragraph,
+    ParagraphKind, Position, SearchOptions, Selection, SelectionMode, Span, StylePatch,
 };
+
+#[test]
+fn word_deletion_keeps_the_undo_paragraphs_word_index_lazy() {
+    for forward in [true, false] {
+        let unit = "one two ";
+        let text = unit.repeat(1024);
+        let mut editor = Editor::from_text(&text);
+        let caret = Position::new(0, 512 * unit.len());
+        editor.set_selection(Selection::caret(caret)).unwrap();
+        let source = Arc::clone(&editor.document().paragraphs[0]);
+        let removed = if forward {
+            editor.delete_word_forward().unwrap();
+            caret.byte..caret.byte + "one".len()
+        } else {
+            editor.delete_word_backward().unwrap();
+            caret.byte - "two ".len()..caret.byte
+        };
+        let mut expected = text;
+        expected.replace_range(removed, "");
+        assert_eq!(editor.document().paragraphs[0].text(), expected);
+        assert!(editor.undo());
+        assert_eq!(editor.selection(), Selection::caret(caret));
+        assert!(Arc::ptr_eq(&editor.document().paragraphs[0], &source));
+        assert!(
+            source
+                .indices
+                .get()
+                .is_none_or(|indices| indices.words.get().is_none())
+        );
+    }
+}
+
+#[test]
+fn looking_for_links_in_unlinked_text_leaves_grapheme_indices_lazy() {
+    let flags = "🇺🇸".repeat(100);
+    let text = format!("{flags}x");
+    let style = InlineStyle::default();
+    for suffix in [None, Some(Link::try_new("https://example.com").unwrap())] {
+        let spans = vec![
+            Span::new(0..flags.len(), style, None),
+            Span::new(flags.len()..text.len(), style, suffix.clone()),
+        ];
+        let paragraph = Paragraph::try_new(&text, spans, ParagraphKind::Body).unwrap();
+        let document = Document::from_paragraphs([paragraph]);
+        for byte in [400, 401, 404, text.len(), usize::MAX] {
+            let position = Position::new(0, byte);
+            assert_eq!(document.link_at(position), None);
+            assert_eq!(document.link_range_at(position), None);
+        }
+        assert!(document.paragraphs[0].indices.get().is_none());
+        assert_eq!(
+            document.link_at(Position::new(0, flags.len())),
+            suffix.as_ref()
+        );
+    }
+}
 
 #[test]
 fn saved_state_cache_tracks_edits_and_rollback_after_revision_saturation() {
@@ -39,6 +95,38 @@ fn saved_state_cache_tracks_edits_and_rollback_after_revision_saturation() {
     assert_eq!(editor.document().plain_text(), "xabc");
     assert!(!editor.is_modified());
     assert_eq!(editor.document().revision(), u64::MAX);
+}
+
+#[test]
+fn saved_content_comparisons_follow_shifted_paragraphs_and_history() {
+    let mut editor = Editor::from_text("a\nb\nc\nd\ne");
+    let at = Position::new;
+    editor.replace_range(at(1, 0)..at(1, 1), "B\nX").unwrap();
+    assert_eq!(editor.document().changed_paragraphs(), 1..3);
+    assert!(editor.is_modified());
+
+    // Remove d. The paragraph count is back at five, with changes at two locations.
+    editor.replace_range(at(4, 0)..at(5, 0), "").unwrap();
+    assert_eq!(editor.document().plain_text(), "a\nB\nX\nc\ne");
+    assert_eq!(editor.document().changed_paragraphs(), 1..4);
+    assert!(editor.is_modified());
+    assert!(editor.undo());
+    assert!(editor.undo());
+    assert!(!editor.is_modified());
+
+    assert!(editor.redo());
+    editor.mark_saved();
+    assert!(editor.document().changed_paragraphs().is_empty());
+    assert!(editor.redo());
+    assert!(editor.is_modified());
+    assert!(editor.undo());
+    assert!(!editor.is_modified());
+    assert_eq!(editor.document().changed_paragraphs(), 4..5);
+
+    // A new editor made from this snapshot starts its own save point.
+    let fresh = Editor::new(editor.document().clone());
+    assert!(fresh.document().changed_paragraphs().is_empty());
+    assert!(!fresh.is_modified());
 }
 
 #[test]

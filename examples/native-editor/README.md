@@ -11,6 +11,24 @@ From a repository checkout:
 cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
 ```
 
+To exercise the [native mouse and touch correction](../../GUIDE.md#touch-input-in-native-egui-applications)
+from the same checkout, prepare the sources once and run the example with
+the pinned lockfile.
+
+```sh
+python3 scripts/native-qa/prepare_native.py egui-winit target/native-input
+cargo --config 'paths=["target/native-input/egui-0.37.0","target/native-input/egui-winit-0.37.0","target/native-input/winit-0.30.13"]' \
+  run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
+```
+
+For X11 composition, candidate placement and the first Windows dead key after
+a layout switch, the host can use the
+[compatible winit patches](../../GUIDE.md#x11-and-windows-fixes-for-winit-03013).
+To hear inline links during whole-line reading with Orca, enable the two
+[Linux accessibility patches](../../GUIDE.md#inline-links-with-orca-on-linux).
+For heading announcements with NVDA, enable the
+[Windows accessibility patches](../../GUIDE.md#heading-levels-on-windows).
+
 The toolbar demonstrates uniform/mixed selection styles, inline formatting,
 fill and font colors, links, headings, block quotes, lists, indentation,
 undo/redo, and read-only/disabled modes. Find supports case and whole-word

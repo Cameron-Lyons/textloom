@@ -3,10 +3,12 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 allow_dirty=false
+check_web=false
 release_tag=
 while (($#)); do
     case "$1" in
         --allow-dirty) allow_dirty=true ;;
+        --check-web) check_web=true ;;
         --tag)
             if (($# < 2)); then
                 echo '--tag requires a version tag, such as v1.0.0' >&2
@@ -99,5 +101,37 @@ awk -v package_path="../package/textloom-$version" '
     END { if (!rewritten) exit 1 }
 ' "$native_example_manifest" > "$native_package_check_dir/Cargo.toml"
 cargo check --locked --all-targets --manifest-path "$native_package_check_dir/Cargo.toml" --target-dir "$package_target_dir"
+python3 scripts/native-qa/prepare_native.py egui-winit "$native_package_check_dir/native-input"
+python3 scripts/native-qa/prepare_native.py accesskit "$native_package_check_dir/accesskit"
+python3 scripts/native-qa/prepare_native.py accesskit-windows "$native_package_check_dir/accesskit-windows"
+cat >> "$native_package_check_dir/Cargo.toml" <<'TOML'
+
+[patch.crates-io]
+winit = { path = "native-input/winit-0.30.13" }
+egui = { path = "native-input/egui-0.37.0" }
+egui-winit = { path = "native-input/egui-winit-0.37.0" }
+accesskit_atspi_common = { path = "accesskit/accesskit_atspi_common-0.21.1" }
+accesskit_unix = { path = "accesskit/accesskit_unix-0.24.1" }
+accesskit_consumer = { path = "accesskit-windows/accesskit_consumer-0.39.2" }
+accesskit_windows = { path = "accesskit-windows/accesskit_windows-0.35.1" }
+TOML
+cargo check --offline --all-targets --manifest-path "$native_package_check_dir/Cargo.toml" --target-dir "$package_target_dir"
+for package in winit@0.30.13 egui@0.37.0 egui-winit@0.37.0 accesskit_atspi_common@0.21.1 accesskit_unix@0.24.1 accesskit_consumer@0.39.2 accesskit_windows@0.35.1; do
+    if [[ $(cargo pkgid --locked --manifest-path "$native_package_check_dir/Cargo.toml" "$package") != path+file:* ]]; then
+        echo "The native host did not resolve the prepared source for $package." >&2
+        exit 1
+    fi
+done
+if $check_web; then
+    web_sources="$native_package_check_dir/web-input"
+    python3 scripts/native-qa/prepare_native.py eframe-web "$web_sources"
+    python3 scripts/native-qa/web-touch/check.py --package "$package_root" \
+        --eframe "$web_sources/eframe-0.37.0" --egui "$web_sources/egui-0.37.0" \
+        --lockfile examples/native-editor/Cargo.lock
+fi
+if [[ $(uname -s) == Linux ]]; then
+    cargo test --locked --offline --manifest-path "$native_package_check_dir/Cargo.toml" \
+        --target-dir "$package_target_dir" -p egui -p egui-winit -p accesskit_atspi_common -p accesskit_unix -p accesskit_consumer --lib
+fi
 echo "Textloom $version automated release checks passed. No release has been published."
 echo 'Before publishing, complete native host validation and clean-commit CI as described in RELEASING.md.'

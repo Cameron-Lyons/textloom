@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- The egui editor scrolls on the first unfocused touchscreen swipe and selects
+  text on the first mouse drag after touch input. Touch-down after a distant
+  mouse hover preserves the scroll position until the finger moves.
+  Optional egui 0.37.0 input corrections preserve the active selection when
+  another device touches the screen. In web applications, releasing a drag
+  after focus moves from an editable field to another page control leaves
+  focus on that control. See the integration steps for
+  [native hosts](GUIDE.md#touch-input-in-native-egui-applications) and
+  [web applications](GUIDE.md#touch-input-in-eframe-web-applications).
+- Word deletion in a long paragraph can resolve nearby word boundaries without
+  leaving a full word index in each undo snapshot.
+- Multiline find and replace stream long queries across paragraphs. Find Next
+  and Find Previous start at the selection for queries whose occurrences cannot
+  overlap. When occurrences can overlap, both directions visit the same
+  Unicode-valid matches as `Document::find`.
+- In egui, pressing and releasing on different occurrences of the same link
+  target cancels activation. A touch tap can still activate a link that spans
+  several formatting runs.
+- The native editor preserves rich formatting when an IME commit and a paste
+  arrive in that order in the same input batch.
+- Hosts using winit 0.30.13 can apply fixes for X11 candidate placement,
+  input-context focus, composition interruption and Windows dead keys at
+  their application workspace root. See the
+  [integration instructions](GUIDE.md#x11-and-windows-fixes-for-winit-03013).
+- Both accessibility adapters now publish list containers and the indices
+  AccessKit expects. Platform readers receive the right item position, list
+  size, and heading or list level where supported. Sparse replacements, undo,
+  and redo in the direct adapter keep text positions and link targets valid
+  in untouched paragraphs between matches.
+- A link ending at a paragraph boundary exposes exactly its linked text in
+  both accessibility adapters. A soft break inside the link remains part of
+  that text. Looking up a link in unlinked text skips Unicode segmentation.
+- Windows applications can enable UI Automation heading levels and text-range
+  styles for screen readers with the
+  [AccessKit workspace patches](GUIDE.md#heading-levels-on-windows).
+- Linux applications can opt into AT-SPI Hypertext support for Orca's
+  whole-line link announcements. See the
+  [AccessKit integration instructions](GUIDE.md#inline-links-with-orca-on-linux).
+- The Linux native example describes linked and quoted text when the editing
+  caret enters it. Moving inside the same context leaves Orca free to read
+  the next character or line.
+- The native example reuses matching plain-text buffers on rich paste and skips
+  fragment decoding when the native clipboard text differs from the paste event.
+- Winit accepts the first IME commit after refocus when the previous input
+  method session ended while the widget or window was unfocused.
+- Saved-state checks skip paragraphs untouched since the last save. Forward
+  whole-word searches use constant storage for Unicode word boundaries and
+  can skip long stretches between candidate matches.
 - Escape now cancels an active egui text composition before a later click or
   commit in the same input batch.
 - Undo history counts each shared hyperlink target once per side of an edit,

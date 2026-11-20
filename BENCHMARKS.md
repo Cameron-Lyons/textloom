@@ -1450,3 +1450,163 @@ harness, wrapper probe, binaries, hashes, and raw samples are retained under
 `target/clipboard-search-20261113/`; see `editing-probe.rs`, `measure.py`,
 `results.json`, `sha256.json`, `native-html-probe.rs`, and
 `native-html-results.txt`. The regular editing harness runs the new search cases.
+
+## Saved-state checks and Unicode whole-word search, 2026-11-19
+
+Local release builds on x86-64 Linux used Rust 1.100.0 and compared this
+revision with `fa483da`. The figures below are thread CPU time per operation.
+Document construction and initial save-point setup were outside the timed loops.
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| Edit and undo in the first of 100,001 paragraphs, checking saved state after each command | 47.3–47.4 µs | 0.40–0.42 µs |
+| Same cycle in the middle paragraph | 69.7–72.0 µs | 0.40–0.44 µs |
+| Same cycle in the last paragraph | 94.2–96.2 µs | 0.39 µs |
+| Find three whole-word matches across two 490 KB gaps | 8.42 ms | 0.296 ms |
+
+The editing fixture repeats `abc\n` 100,000 times. Each timing averages 2,000
+cycles of inserting one byte, reading `is_modified()`, undoing, and reading it
+again. The ranges cover two alternating runs per build. Changes spread across the
+document can still make the first saved-state check visit all paragraphs.
+
+The case-sensitive search fixture uses `δ` between stretches of `世界 `
+repeated 70,000 times. Each build ran three times, alternating with the other
+build, with 25 searches per run. The table gives the median of the run averages.
+Scripts without a safe word-boundary restart can still require segmentation
+through the intervening text. A separate allocation count for the same search
+fell from 19 allocation or reallocation requests (largest 4 MiB) to a single
+128-byte allocation for the returned ranges. The editing benchmark includes
+both workloads.
+
+For direct AccessKit publication, replacing only the first and last paragraphs
+around 10,000 untouched paragraphs reduced the tree update from 20,005 nodes
+to five. With a replacement that inserted a line at both matches, the update
+fell from 20,009 nodes to nine. A previously published text position in the
+middle resolved to the same text after both replacements, undo, and redo.
+
+A separate release-mode probe compared two implementations of the new
+accessible list grouping. It retained one open bullet list at each of the 256
+indentation levels, then appended 100,000 items at the deepest level.
+Replacing a scan of all open levels with a stack reduced the grouping pass
+from 10.50–10.53 ms to 0.209–0.210 ms. A flat 100,000-item list took
+0.205–0.207 ms, down from 0.246 ms. Each sample averaged eight passes. A
+million-paragraph mix of indentations, restarts, headings, and ordinary text
+produced identical group ranges, positions, and sizes in both implementations.
+
+## Native rich paste, 2026-11-19
+
+A release-mode Linux probe exercised the native example's clipboard validation
+and paste capture on a roughly 4 MiB fragment spanning 4,097 paragraphs.
+For a matching event, allocation requests totaled 5,111,928 bytes per capture,
+down from 17,723,512, and CPU time fell from 4.72 ms to 3.01 ms. A paste event
+whose text differed from the native item's text allocated zero bytes during
+capture, down from 13,525,112. These measurements exclude moving the item
+through the system clipboard.
+
+## Link lookup in unlinked Unicode text, 2026-11-19
+
+A first call to `Document::link_at` or `link_range_at` in the middle of
+10,000 flag emoji previously built the paragraph's grapheme index to resolve
+the regional-indicator boundary. Both calls now return as soon as they see
+that the text has no link. This also applies when the final character of the
+paragraph has a link.
+
+On x86-64 Linux with Rust 1.100.0 in release mode, the four combinations of
+API and linked or unlinked suffix took 0.30–0.42 ms per lookup before the
+change. All four measured below 0.1 µs afterward, near the timer's resolution.
+Each of three paired runs constructed 100 fresh documents per case and timed
+only the lookup. A regression also checks that the grapheme index stays
+unallocated after these queries.
+
+For the optional AT-SPI patches, a separate in-process release probe used
+10,000 paragraphs with one link and two text runs per paragraph. Building the
+index on the first link-count request took a median 6.18 ms across five runs.
+Reading a link by index, checking its two endpoints, and querying one linked
+and one unlinked offset took a median 1.64 µs for all five calls together,
+averaged over 10,000 links in shuffled order. These timings exclude D-Bus
+transport. The backend rebuilds its index on demand after a tree update.
+
+## Word deletion and long multiline search, 2026-11-19
+
+These release-mode measurements used Rust 1.100.0 on x86-64 Linux. Starting
+halfway through one paragraph, each editing run deleted 100 words in one
+direction and retained undo history. The table shows median time per deletion
+across three paired runs. Allocation counts include requested allocations
+and reallocations during editing and exclude setup.
+
+| Paragraph | Direction | Before (µs) | After (µs) | Requested bytes per operation, before → after |
+| --- | --- | ---: | ---: | ---: |
+| 170 KB ASCII | Backward | 724 | 46 | 3.08 MB → 0.34 MB |
+| 170 KB ASCII | Forward | 740 | 37 | 3.08 MB → 0.34 MB |
+| 270 KB Greek and CJK with combining marks | Backward | 3,113 | 75 | 3.44 MB → 0.54 MB |
+| 270 KB Greek and CJK with combining marks | Forward | 3,106 | 42 | 3.44 MB → 0.54 MB |
+
+Each paragraph contained 10,000 repetitions of a short phrase with spaces.
+Resolving a nearby word boundary avoids retaining a full word index in
+each undo snapshot. A cached index or text that needs wider Unicode context
+uses the full-paragraph navigation path.
+
+For search, the query covered 22 lines and the first match ended just before
+a long paragraph containing 110,000 repetitions of accented text and emoji.
+The table shows medians of five paired runs pinned to one core, with 20
+whole-word searches per workload per run. Find-next includes resetting the
+selection. The case-insensitive query also matched the Kelvin sign to ASCII
+`k`.
+
+| Search | Case | Before (µs) | After (µs) |
+| --- | --- | ---: | ---: |
+| Find-next at the start of the document | Sensitive | 138.90 | 0.75 |
+| Find-next at the start of the document | Insensitive | 9,648.87 | 1.01 |
+| Query has more lines than the document | Insensitive | 4,896.01 | 0.22 |
+| Repetitive 16,000-paragraph miss | Sensitive | 86.41 | 91.52 |
+| Repetitive 16,000-paragraph miss | Insensitive | 98.60 | 86.02 |
+
+The repetitive control uses a query of about 4,000 short lines. It exercises
+the prefix table through repeated partial matches. Short queries (up to 16
+lines) continue to use direct paragraph comparisons.
+
+A second comparison measured Find Next and Find Previous with the caret
+between two 22-line matches after 100,000 unrelated paragraphs. The query
+used case-insensitive whole-word matching and could match a suffix of its
+first paragraph and a prefix of its last. Five paired runs used one pinned
+CPU core, alternating which build ran first. The table gives
+the median time per command, including caret reset. Each run used 100 nearby
+lookups or 40 full scans for the repetitive miss.
+
+| Search | Forward scan from document start (µs) | Directional search (µs) |
+| --- | ---: | ---: |
+| Find Next near the caret | 576.28 | 0.83 |
+| Find Previous near the caret | 566.30 | 0.72 |
+| Find Next, repetitive 16,000-paragraph miss | 91.17 | 96.98 |
+| Find Previous, repetitive 16,000-paragraph miss | 93.04 | 96.09 |
+
+The miss used about 4,000 query lines with repeated middle paragraphs and no
+complete match. For correctness, 50,000 comparisons on 2,500 generated
+documents checked matches and navigation against a flattened Unicode reference.
+They covered both directions, wrapping, partial edge lines, overlapping
+occurrences, and lowercase expansions. A regression also checks that finding
+a nearby match leaves an earlier paragraph's word-boundary index unallocated.
+
+## Browser pointer input, 2026-11-19
+
+Headless Chromium 157 on Linux compared the web profile at `5efc65d` with
+the mixed-device correction. Both WebAssembly fixtures used the same
+packaged editor, Rust 1.100 release profile and SwiftShader renderer.
+After two warm-ups, ten paired rounds alternated the builds. Each build
+received 480 trusted mouse moves per case. The browser trace measured
+renderer-thread CPU time for each pointer move and its compatibility mouse
+event together. Selection, button states and event counts matched.
+
+| Browser configuration | Gesture | Median paired change per move (µs) | 95% bootstrap interval (µs) |
+| --- | --- | ---: | ---: |
+| Desktop | Hover | +1.8 | −4.2 to +14.4 |
+| Desktop | Drag | −20.2 | −26.6 to −15.4 |
+| Touch-capable | Hover | +6.8 | −21.4 to +14.0 |
+| Touch-capable | Drag | −6.9 | −17.8 to +1.0 |
+
+All ten optimized desktop-drag rounds used less CPU with the correction.
+All four confidence intervals for the change in event delivery interval
+included zero. The generated WebAssembly grew by 4,158 bytes to 5,665,295.
+A separate development-profile run found 7.5 µs more CPU time per move in
+touch-capable hover (95% interval +2.4 to +25.1 µs). These measurements
+cover event dispatch and input handling.

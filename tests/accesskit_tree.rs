@@ -647,7 +647,7 @@ fn link_nodes(node: Node<'_>) -> Vec<LinkNode> {
 #[test]
 fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
     let docs = Link::try_new("https://example.com/docs").unwrap();
-    let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line");
+    let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line\nafter");
     editor
         .set_selection(Selection::new(Position::new(0, 5), Position::new(0, 19)))
         .unwrap();
@@ -695,10 +695,18 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
     );
 
     assert_eq!(node.document_range().text(), editor.document().plain_text());
-    let lines: Vec<_> = (0..3)
+    let lines: Vec<_> = (0..4)
         .map(|line| node.line_range_from_index(line).unwrap().text())
         .collect();
-    assert_eq!(lines, ["Read the docs\n", "now, then stop\n", "next line"]);
+    assert_eq!(
+        lines,
+        [
+            "Read the docs\n",
+            "now, then stop\n",
+            "next line\n",
+            "after"
+        ]
+    );
     let caret = node.text_selection_focus().unwrap();
     assert_eq!(caret.to_global_usv_index(), 11);
     assert_eq!(caret.to_line_index(), 0);
@@ -803,21 +811,17 @@ fn links_are_link_nodes_around_their_runs_and_keep_text_navigation() {
     assert!(!outcome.handled);
 }
 
-/// A child of the text input node: a paragraph, or a blockquote around
-/// consecutive quote paragraphs.
+/// A paragraph or group of paragraphs directly below the text input.
 #[derive(Debug, PartialEq)]
 enum Block {
-    /// The index of a paragraph outside any quote.
     Paragraph(usize),
-    /// The indices of the paragraphs inside one blockquote.
     Quote(Vec<usize>),
+    List(Vec<usize>),
 }
 
-/// Returns the blocks published under the text input node, in tree order.
 fn blocks(tree: &Tree, adapter: &AccessKitAdapter, editor: &Editor) -> Vec<Block> {
-    let paragraphs = editor.document().paragraphs().len();
     let index = |id: NodeId| {
-        (0..paragraphs)
+        (0..editor.document().paragraphs().len())
             .position(|paragraph| adapter.paragraph_node(paragraph) == Some(id))
             .expect("a published paragraph")
     };
@@ -827,52 +831,62 @@ fn blocks(tree: &Tree, adapter: &AccessKitAdapter, editor: &Editor) -> Vec<Block
         .children()
         .iter()
         .map(|&id| {
-            let node = state
-                .node_by_tree_local_id(id, TreeId::ROOT)
-                .expect("every child of the text input is in the tree");
-            if node.role() != Role::Blockquote {
-                return Block::Paragraph(index(id));
-            }
-            let children = node.data().children();
-            assert!(
-                !children.is_empty(),
-                "a blockquote should contain at least one paragraph"
-            );
-            let members = children
+            let node = state.node_by_tree_local_id(id, TreeId::ROOT).unwrap();
+            let member_role = match node.role() {
+                Role::Blockquote => Role::Paragraph,
+                Role::List => Role::ListItem,
+                _ => return Block::Paragraph(index(id)),
+            };
+            assert!(!node.data().children().is_empty());
+            let members = node
+                .data()
+                .children()
                 .iter()
                 .map(|&child| {
-                    let paragraph = state
-                        .node_by_tree_local_id(child, TreeId::ROOT)
-                        .expect("every child of a blockquote is in the tree");
-                    assert_eq!(
-                        paragraph.role(),
-                        Role::Paragraph,
-                        "blockquotes should contain only paragraphs"
-                    );
-                    assert_eq!(
-                        paragraph.parent_id(),
-                        Some(node.id()),
-                        "a quoted paragraph's parent should be its blockquote"
-                    );
+                    let paragraph = state.node_by_tree_local_id(child, TreeId::ROOT).unwrap();
+                    assert_eq!(paragraph.role(), member_role);
+                    assert_eq!(paragraph.parent_id(), Some(node.id()));
                     index(child)
                 })
                 .collect();
-            Block::Quote(members)
+            if node.role() == Role::Blockquote {
+                Block::Quote(members)
+            } else {
+                Block::List(members)
+            }
         })
         .collect()
 }
 
-/// Returns the blocks that the paragraph kinds of `editor`'s document call for.
 fn expected_blocks(editor: &Editor) -> Vec<Block> {
     let mut blocks = Vec::new();
+    let mut previous = ParagraphKind::Body;
     for (index, paragraph) in editor.document().paragraphs().iter().enumerate() {
-        if paragraph.kind() != ParagraphKind::Quote {
-            blocks.push(Block::Paragraph(index));
-        } else if let Some(Block::Quote(members)) = blocks.last_mut() {
+        let kind = paragraph.kind();
+        let continues = match (previous, kind) {
+            (ParagraphKind::Quote, ParagraphKind::Quote) => true,
+            (ParagraphKind::Bullet { indent: a }, ParagraphKind::Bullet { indent: b })
+            | (
+                ParagraphKind::Ordered { indent: a, .. },
+                ParagraphKind::Ordered {
+                    indent: b,
+                    start: None,
+                },
+            ) => a == b,
+            _ => false,
+        };
+        if continues && let Some(Block::Quote(members) | Block::List(members)) = blocks.last_mut() {
             members.push(index);
         } else {
-            blocks.push(Block::Quote(vec![index]));
+            blocks.push(match kind {
+                ParagraphKind::Quote => Block::Quote(vec![index]),
+                ParagraphKind::Ordered { .. } | ParagraphKind::Bullet { .. } => {
+                    Block::List(vec![index])
+                }
+                _ => Block::Paragraph(index),
+            });
         }
+        previous = kind;
     }
     blocks
 }
@@ -1064,7 +1078,80 @@ fn consecutive_quotes_share_a_blockquote_that_text_navigation_passes_through() {
 }
 
 #[test]
-fn consumer_tracks_blockquote_containers_through_incremental_updates() {
+fn list_item_positions_follow_edits_and_undo_in_the_published_tree() {
+    let mut editor = Editor::from_text("one\ntwo\nthree");
+    editor.select_all();
+    editor.apply_numbered_list(0).unwrap();
+    let mut adapter = AccessKitAdapter::default();
+    let mut tree = Tree::new(
+        adapter.update(&editor, "List", Focus::Focused).unwrap(),
+        true,
+    );
+    let positions = |tree: &Tree, adapter: &AccessKitAdapter| {
+        (0..3)
+            .map(|i| {
+                let id = adapter.paragraph_node(i).unwrap();
+                let node = tree
+                    .state()
+                    .node_by_tree_local_id(id, TreeId::ROOT)
+                    .unwrap();
+                assert_eq!(node.parent().unwrap().role(), Role::List);
+                assert_eq!(node.data().size_of_set(), None);
+                (
+                    node.position_in_set().unwrap() + 1,
+                    node.size_of_set_from_container(&|_| FilterResult::Include)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(positions(&tree, &adapter), [(1, 3), (2, 3), (3, 3)]);
+    let first_list = text_input(&tree, &adapter).data().children()[0];
+    let first_run = adapter.text_position(&editor, Position::new(0, 0)).unwrap();
+
+    editor
+        .set_selection(Selection::caret(Position::new(1, 0)))
+        .unwrap();
+    editor.indent_list().unwrap();
+    let mut publish = |editor: &Editor| {
+        tree.update_and_process_changes(
+            adapter.update(editor, "List", Focus::Focused).unwrap(),
+            &mut Ignore,
+        );
+        positions(&tree, &adapter)
+    };
+    let nested = [(1, 2), (1, 1), (2, 2)];
+    assert_eq!(publish(&editor), nested);
+    editor.insert_text("nested ").unwrap();
+    assert_eq!(publish(&editor), nested);
+    assert!(editor.undo());
+    assert!(editor.undo());
+    assert_eq!(publish(&editor), [(1, 3), (2, 3), (3, 3)]);
+    assert!(editor.redo());
+    assert_eq!(publish(&editor), nested);
+    assert_eq!(text_input(&tree, &adapter).data().children()[0], first_list);
+    assert_eq!(
+        adapter.text_position(&editor, Position::new(0, 0)).unwrap(),
+        first_run
+    );
+    adapter.invalidate();
+    let restarted = Tree::new(
+        adapter.update(&editor, "List", Focus::Focused).unwrap(),
+        true,
+    );
+    assert_eq!(positions(&restarted, &adapter), nested);
+    assert_eq!(
+        text_input(&restarted, &adapter).data().children()[0],
+        first_list
+    );
+    assert_eq!(
+        text_input(&restarted, &adapter).document_range().text(),
+        editor.document().plain_text()
+    );
+}
+
+#[test]
+fn consumer_tracks_blockquote_and_list_containers_through_incremental_updates() {
     let mut editor = Editor::from_text("alpha\nbeta\ngamma\ndelta\nepsilon");
     let mut adapter = AccessKitAdapter::default();
     let mut tree = Tree::new(
@@ -1087,7 +1174,7 @@ fn consumer_tracks_blockquote_containers_through_incremental_updates() {
             .unwrap();
         let caret = Position::new(index, byte);
         let _ = editor.set_selection(Selection::caret(caret));
-        let _ = match random(12) {
+        let _ = match random(14) {
             0..=2 => editor.set_paragraph_kind(ParagraphKind::Quote),
             3 => editor.set_paragraph_kind(ParagraphKind::Body),
             4 => editor.set_paragraph_kind(ParagraphKind::Bullet { indent: 0 }),
@@ -1114,6 +1201,8 @@ fn consumer_tracks_blockquote_containers_through_incremental_updates() {
                 editor.set_selection(Selection::caret(caret)).unwrap();
                 editor.insert_fragment(&fragment)
             }
+            11 => editor.apply_numbered_list(random(3) as u8),
+            12 => editor.indent_list(),
             _ => editor.delete_forward(),
         };
         if random(3) == 0 {

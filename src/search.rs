@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::ops::{ControlFlow, Range};
+use std::sync::Arc;
 
-use unicode_segmentation::{UWordBoundIndices, UnicodeSegmentation};
+use unicode_segmentation::{UWordBoundIndices, UWordBounds, UnicodeSegmentation};
 
 use crate::model::word_restart;
 use crate::types::Direction;
@@ -94,7 +95,11 @@ impl Document {
         // accepted occurrence could overlap it. Only that case needs a search.
         // Normalization can add a border ("Aa" lowers to "aa"), so check the
         // needle rather than the query.
-        if never_overlaps(&needle) {
+        let multiline = self.multiline_query(&needle, Direction::Forward);
+        if multiline.as_ref().map_or_else(
+            || never_overlaps(&needle),
+            |pattern| !pattern.can_overlap(&needle),
+        ) {
             return true;
         }
         let mut found = false;
@@ -105,13 +110,8 @@ impl Document {
             found = candidate == *range;
             ControlFlow::Break(())
         };
-        if needle.contains('\n') {
-            let _ = self.visit_multiline_matches(
-                &needle,
-                paragraph_lines(&needle).as_deref(),
-                options,
-                check,
-            );
+        if let Some(lines) = multiline {
+            let _ = self.visit_multiline_matches(lines, options, check);
         } else {
             let _ = self.visit_paragraph_matches(range.start.paragraph, &needle, options, check);
         }
@@ -184,41 +184,48 @@ impl Document {
         }
         let wrap = wrap == SearchWrap::Around;
         let needle = search_needle(query, options);
-        let lines = paragraph_lines(&needle);
-        if needle.contains('\n') && (lines.is_none() || !never_overlaps(&needle)) {
-            let mut found = None;
-            let mut wrapped = None;
-            let _ = self.visit_multiline_matches(&needle, lines.as_deref(), options, |range| {
-                match direction {
-                    Direction::Backward => {
-                        if range.end <= selection.start {
-                            found = Some(range);
-                        } else if found.is_some() || !wrap {
-                            return ControlFlow::Break(());
-                        } else {
-                            wrapped = Some(range);
-                        }
-                    }
-                    Direction::Forward => {
-                        if range.start >= selection.end {
-                            found = Some(range);
-                            return ControlFlow::Break(());
-                        }
-                        if wrap && wrapped.is_none() {
-                            wrapped = Some(range);
-                        }
-                    }
-                }
-                ControlFlow::Continue(())
-            });
-            return found.or(wrapped);
-        }
-
-        let strategy = ParagraphSearch::new(&needle, options);
         let boundary = match direction {
             Direction::Backward => selection.start,
             Direction::Forward => selection.end,
         };
+        let lines = match self.multiline_query(&needle, direction) {
+            Some(pattern) if pattern.lines.len() > self.paragraphs().len() => return None,
+            Some(mut pattern) if pattern.can_overlap(&needle) => {
+                pattern.restore_forward_order();
+                let mut found = None;
+                let mut wrapped = None;
+                let _ = self.visit_multiline_matches(pattern, options, |range| {
+                    match direction {
+                        Direction::Backward => {
+                            if range.end <= selection.start {
+                                found = Some(range);
+                            } else if found.is_some() || !wrap {
+                                return ControlFlow::Break(());
+                            } else {
+                                wrapped = Some(range);
+                            }
+                        }
+                        Direction::Forward => {
+                            if range.start >= selection.end {
+                                found = Some(range);
+                                return ControlFlow::Break(());
+                            }
+                            if wrap && wrapped.is_none() {
+                                wrapped = Some(range);
+                            }
+                        }
+                    }
+                    ControlFlow::Continue(())
+                });
+                return found.or(wrapped);
+            }
+            Some(pattern) if pattern.uses_kmp() => {
+                return pattern.find_near(self, options, boundary, wrap);
+            }
+            pattern => pattern.map(|pattern| pattern.lines),
+        };
+
+        let strategy = ParagraphSearch::new(&needle, options);
         let len = self.paragraphs().len();
         let start = boundary.paragraph;
         let search = |index: usize, bounded: bool| {
@@ -389,37 +396,49 @@ impl Document {
             Direction::Backward => index.checked_sub(breaks)?,
             Direction::Forward => index,
         };
-        let [first, middle @ .., last] = self
-            .paragraphs()
-            .get(first_index..=first_index.checked_add(breaks)?)?
-        else {
-            return None;
-        };
-        let (first_text, last_text) = (first.text(), last.text());
-        let mut middle = middle
-            .iter()
-            .map(|paragraph| paragraph.text())
-            .zip(middle_lines);
-        let (start, end) = if options.case_sensitive {
-            (first_text.ends_with(first_line)
-                && last_text.starts_with(last_line)
-                && middle.all(|(text, line)| text == *line))
-            .then(|| (first_text.len() - first_line.len(), last_line.len()))?
-        } else {
-            let start = lowered_suffix_start(first_text, first_line)?;
-            let end = lowered_prefix_end(last_text, last_line)?;
-            middle
-                .all(|(text, line)| lowered_prefix_end(text, line) == Some(text.len()))
-                .then_some((start, end))?
-        };
-        let range = Position::new(first_index, start)..Position::new(first_index + breaks, end);
-        (boundary.is_none_or(|boundary| match direction {
+        let last_index = first_index.checked_add(breaks)?;
+        let range =
+            self.multiline_edges(first_index, last_index, first_line, last_line, options)?;
+        let within_boundary = boundary.is_none_or(|boundary| match direction {
             Direction::Backward => range.end <= boundary,
             Direction::Forward => range.start >= boundary,
-        }) && self.is_grapheme_range(&range)
-            && (!options.whole_word
-                || (is_word_boundary(first, start) && is_word_boundary(last, end))))
+        });
+        (within_boundary
+            && self.paragraphs()[first_index + 1..last_index]
+                .iter()
+                .zip(middle_lines)
+                .all(|(paragraph, line)| matches_line(paragraph, line, options.case_sensitive))
+            && self.valid_search_edges(&range, options))
         .then_some(range)
+    }
+
+    fn multiline_edges(
+        &self,
+        first: usize,
+        last: usize,
+        first_line: &str,
+        last_line: &str,
+        options: SearchOptions,
+    ) -> Option<Range<Position>> {
+        let first_text = self.paragraph(first)?.text();
+        let last_text = self.paragraph(last)?.text();
+        let (start, end) = if options.case_sensitive {
+            let start = first_text.strip_suffix(first_line)?.len();
+            if !last_text.starts_with(last_line) {
+                return None;
+            }
+            (start, last_line.len())
+        } else {
+            (
+                lowered_suffix_start(first_text, first_line)?,
+                lowered_prefix_end(last_text, last_line)?,
+            )
+        };
+        Some(Position::new(first, start)..Position::new(last, end))
+    }
+
+    fn valid_search_edges(&self, range: &Range<Position>, options: SearchOptions) -> bool {
+        self.is_grapheme_range(range) && (!options.whole_word || self.has_word_edges(range))
     }
 
     fn visit_paragraph_matches(
@@ -460,25 +479,62 @@ impl Document {
         options: SearchOptions,
         mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
-        if !needle.contains('\n') {
-            for index in 0..self.paragraphs().len() {
-                self.visit_paragraph_matches(index, needle, options, &mut accept)?;
-            }
-            return ControlFlow::Continue(());
+        if let Some(lines) = self.multiline_query(needle, Direction::Forward) {
+            return self.visit_multiline_matches(lines, options, accept);
         }
-        self.visit_multiline_matches(needle, paragraph_lines(needle).as_deref(), options, accept)
+        for index in 0..self.paragraphs().len() {
+            self.visit_paragraph_matches(index, needle, options, &mut accept)?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn multiline_query<'needle>(
+        &self,
+        needle: &'needle str,
+        direction: Direction,
+    ) -> Option<MultilineQuery<'needle>> {
+        needle.contains('\n').then(|| {
+            let count = self.paragraphs().len();
+            let mut lines: Vec<_> = needle.split('\n').take(count + 1).collect();
+            // For a short query the direct suffix/whole lines/prefix checks
+            // have a bounded cost per candidate. Longer feasible queries use KMP.
+            let prefixes = if lines.len() > 16 && lines.len() <= count {
+                let last = lines.len() - 1;
+                let middle = &mut lines[1..last];
+                if direction == Direction::Backward {
+                    middle.reverse();
+                }
+                prefix_lengths(middle)
+            } else {
+                Vec::new()
+            };
+            MultilineQuery {
+                lines,
+                prefixes,
+                direction,
+            }
+        })
     }
 
     fn visit_multiline_matches(
         &self,
-        needle: &str,
-        lines: Option<&[&str]>,
+        query: MultilineQuery<'_>,
         options: SearchOptions,
         mut accept: impl FnMut(Range<Position>) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
-        let Some(lines) = lines else {
-            return self.visit_flattened_matches(needle, options, accept);
+        let Some(last_start) = self.paragraphs().len().checked_sub(query.lines.len()) else {
+            return ControlFlow::Continue(());
         };
+        if query.uses_kmp() {
+            return query.visit(
+                self,
+                options,
+                0..last_start + 1,
+                Position::default(),
+                accept,
+            );
+        }
+        let lines = &query.lines;
         // The first line must be a suffix, so each paragraph has at most one
         // candidate. Resume in the ending paragraph: a match may start there
         // if its first line comes after the previous match's last line.
@@ -495,6 +551,7 @@ impl Document {
         ControlFlow::Continue(())
     }
 
+    #[cfg(test)]
     fn visit_flattened_matches(
         &self,
         needle: &str,
@@ -572,20 +629,195 @@ impl ParagraphSearch {
 // Occurrences of a query without a nonempty border never overlap, so every
 // occurrence belongs to the forward match stream and can be found locally.
 fn never_overlaps(needle: &str) -> bool {
-    has_unique_start(needle) || literal_prefixes(needle.as_bytes()).last() == Some(&0)
+    has_unique_start(needle) || prefix_lengths(needle.as_bytes()).last() == Some(&0)
 }
 
-// A multiline query's lines match a suffix, complete paragraphs, and a prefix.
-// Bound the number of paragraphs compared at every candidate so repetitive
-// multiline queries cannot turn this fast path into a quadratic scan. Longer
-// queries use the flattened text matcher instead.
-fn paragraph_lines(needle: &str) -> Option<Vec<&str>> {
-    const MAX_LINES: usize = 16;
-    if !needle.contains('\n') {
-        return None;
+// KMP matches the whole middle lines. Only the edges of a complete match
+// can be partial paragraphs. Backward navigation traverses the reversed
+// pattern and document so it can stop at the nearest acceptable match.
+struct MultilineQuery<'needle> {
+    lines: Vec<&'needle str>,
+    prefixes: Vec<usize>,
+    direction: Direction,
+}
+
+impl MultilineQuery<'_> {
+    fn uses_kmp(&self) -> bool {
+        !self.prefixes.is_empty()
     }
-    let lines: Vec<_> = needle.split('\n').take(MAX_LINES + 1).collect();
-    (lines.len() <= MAX_LINES).then_some(lines)
+
+    fn restore_forward_order(&mut self) {
+        if self.direction == Direction::Forward || !self.uses_kmp() {
+            return;
+        }
+        let last = self.lines.len() - 1;
+        let middle = &mut self.lines[1..last];
+        middle.reverse();
+        self.prefixes = prefix_lengths(middle);
+        self.direction = Direction::Forward;
+    }
+
+    fn can_overlap(&self, needle: &str) -> bool {
+        if !self.uses_kmp() {
+            return !never_overlaps(needle);
+        }
+        let [first, middle @ .., last] = self.lines.as_slice() else {
+            unreachable!("KMP queries contain middle lines");
+        };
+        if edges_overlap(first.as_bytes(), last.as_bytes()) {
+            return true;
+        }
+        // An overlap spanning a break aligns a suffix of the complete middle
+        // lines with their prefix. Check the partial lines on either side for
+        // each such alignment, including zero shared complete lines.
+        let mut shared = self.prefixes[middle.len() - 1];
+        loop {
+            let opposite = middle.len() - 1 - shared;
+            let (left, right) = match self.direction {
+                Direction::Forward => (opposite, shared),
+                Direction::Backward => (shared, opposite),
+            };
+            if middle[left].ends_with(first) && middle[right].starts_with(last) {
+                return true;
+            }
+            if shared == 0 {
+                return false;
+            }
+            shared = self.prefixes[shared - 1];
+        }
+    }
+
+    // Candidate ranges index the starting paragraph, even when scanning backward.
+    fn find_near(
+        &self,
+        document: &Document,
+        options: SearchOptions,
+        boundary: Position,
+        wrap: bool,
+    ) -> Option<Range<Position>> {
+        let breaks = self.lines.len() - 1;
+        let count = document.paragraphs().len() - breaks;
+        let paragraph = boundary.paragraph;
+        let (near, wrapped, wrap_boundary) = match self.direction {
+            Direction::Forward => (
+                paragraph..count,
+                0..(paragraph + 1).min(count),
+                Position::default(),
+            ),
+            Direction::Backward => (
+                0..(paragraph + 1).saturating_sub(breaks),
+                paragraph.saturating_sub(breaks)..count,
+                document.end(),
+            ),
+        };
+        let find = |candidates, boundary| {
+            self.visit(document, options, candidates, boundary, ControlFlow::Break)
+                .break_value()
+        };
+        find(near, boundary).or_else(|| wrap.then(|| find(wrapped, wrap_boundary)).flatten())
+    }
+
+    fn visit<B>(
+        &self,
+        document: &Document,
+        options: SearchOptions,
+        candidates: Range<usize>,
+        mut boundary: Position,
+        mut accept: impl FnMut(Range<Position>) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if candidates.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        let [first, middle @ .., last] = self.lines.as_slice() else {
+            unreachable!("long multiline queries contain at least three lines");
+        };
+        let mut matched = 0;
+        let step = |(index, paragraph): (usize, &Arc<Paragraph>)| {
+            matched = advance_prefix(matched, &self.prefixes, |index| {
+                matches_line(paragraph, middle[index], options.case_sensitive)
+            });
+            if matched == middle.len() {
+                let start = match self.direction {
+                    Direction::Forward => index - matched,
+                    Direction::Backward => index - 1,
+                };
+                let end = start + matched + 1;
+                matched = self.prefixes[matched - 1];
+                // In the forward match stream, skip candidates already
+                // covered by the last result before inspecting partial lines.
+                if self.direction == Direction::Forward && start < boundary.paragraph {
+                    return ControlFlow::Continue(());
+                }
+                if let Some(range) = document.multiline_edges(start, end, first, last, options) {
+                    let next = match self.direction {
+                        Direction::Forward if range.start >= boundary => range.end,
+                        Direction::Backward if range.end <= boundary => range.start,
+                        _ => return ControlFlow::Continue(()),
+                    };
+                    if document.valid_search_edges(&range, options) {
+                        boundary = next;
+                        accept(range)?;
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        };
+        let mut paragraphs = document
+            .paragraphs()
+            .iter()
+            .enumerate()
+            .take(candidates.end + middle.len())
+            .skip(candidates.start + 1);
+        match self.direction {
+            Direction::Forward => paragraphs.try_for_each(step),
+            Direction::Backward => paragraphs.rev().try_for_each(step),
+        }
+    }
+}
+
+// A border without a hard break is a prefix of the first line and suffix of
+// the last. Full middle paragraphs never require a byte-level failure table.
+fn edges_overlap(first: &[u8], last: &[u8]) -> bool {
+    let limit = first.len().min(last.len());
+    let head = &first[..limit];
+    let tail = &last[last.len() - limit..];
+    if head.is_empty() || !tail.contains(&head[0]) {
+        return false;
+    }
+    if head[0] == tail[limit - 1] || head == tail {
+        return true;
+    }
+    let prefixes = prefix_lengths(head);
+    tail.iter().fold(0, |matched, byte| {
+        advance_prefix(matched, &prefixes, |index| head[index] == *byte)
+    }) > 0
+}
+
+fn advance_prefix(
+    mut matched: usize,
+    prefixes: &[usize],
+    mut matches: impl FnMut(usize) -> bool,
+) -> usize {
+    loop {
+        if matches(matched) {
+            return matched + 1;
+        }
+        if matched == 0 {
+            return 0;
+        }
+        matched = prefixes[matched - 1];
+    }
+}
+
+fn matches_line(paragraph: &Paragraph, line: &str, case_sensitive: bool) -> bool {
+    let text = paragraph.text();
+    if case_sensitive {
+        text == line
+    } else if paragraph.is_ascii() {
+        text.eq_ignore_ascii_case(line)
+    } else {
+        lowered_prefix_end(text, line) == Some(text.len())
+    }
 }
 
 fn lowercase_char(character: char) -> impl DoubleEndedIterator<Item = char> {
@@ -699,37 +931,27 @@ fn ascii_word_boundary(text: &[u8], byte: usize) -> Option<bool> {
 }
 
 struct WordBoundaries<'text> {
-    text: &'text str,
-    paragraph: Option<&'text Paragraph>,
+    paragraph: &'text Paragraph,
     start: usize,
     boundaries: Vec<usize>,
     remaining: Option<UWordBoundIndices<'text>>,
 }
 
 impl<'text> WordBoundaries<'text> {
-    fn new(text: &'text str, start: usize) -> Self {
+    // Nearby navigation can revisit a long unspaced prefix on every press.
+    // Cache expensive scans in the paragraph's compact word-boundary index.
+    fn for_paragraph(paragraph: &'text Paragraph, start: usize) -> Self {
         Self {
-            text,
-            paragraph: None,
+            paragraph,
             start,
             boundaries: Vec::new(),
             remaining: None,
         }
     }
 
-    // Nearby navigation can revisit a long unspaced prefix on every press.
-    // Reuse the paragraph's compact, forward-segmented index after expensive
-    // scans. Full-paragraph searches retain their one-pass streaming behavior.
-    fn for_paragraph(paragraph: &'text Paragraph, start: usize) -> Self {
-        Self {
-            paragraph: Some(paragraph),
-            ..Self::new(paragraph.text(), start)
-        }
-    }
-
     fn index_after_scan(&mut self, byte: usize, scanned: usize) -> Option<bool> {
-        if scanned > 4_096 && scanned >= self.text.len() / 2 {
-            let boundary = self.paragraph?.indexed_word_boundary(byte);
+        if scanned > 4_096 && scanned >= self.paragraph.text().len() / 2 {
+            let boundary = self.paragraph.indexed_word_boundary(byte);
             self.boundaries = Vec::new();
             self.remaining = None;
             Some(boundary)
@@ -745,24 +967,22 @@ impl<'text> WordBoundaries<'text> {
              precedes {}",
             self.start
         );
-        if let Some(boundary) = ascii_word_boundary(self.text.as_bytes(), byte) {
+        let text = self.paragraph.text();
+        if let Some(boundary) = ascii_word_boundary(text.as_bytes(), byte) {
             return boundary;
         }
-        if let Some(boundary) = self
-            .paragraph
-            .and_then(|paragraph| paragraph.cached_word_boundary(byte))
-        {
+        if let Some(boundary) = self.paragraph.cached_word_boundary(byte) {
             return boundary;
         }
         // ASCII edges can be decided locally. Defer even finding a safe
         // restart until Unicode context is needed: searching backwards for a
         // space would otherwise scan an unrelated, possibly huge prefix.
         if self.remaining.is_none() {
-            self.start = word_restart(self.text, self.start);
+            self.start = word_restart(text, self.start);
             if let Some(boundary) = self.index_after_scan(byte, byte - self.start) {
                 return boundary;
             }
-            self.remaining = Some(self.text[self.start..].split_word_bound_indices());
+            self.remaining = Some(text[self.start..].split_word_bound_indices());
         }
         while self
             .boundaries
@@ -873,6 +1093,39 @@ fn lowercase(text: &str) -> String {
     }
 }
 
+// Candidate starts advance monotonically, as do candidate ends, even when a
+// rejected literal overlaps the next one. Keep a separate segmenter for each
+// edge so neither needs to retain a table of previously visited boundaries.
+fn forward_word_boundary<'text>(
+    text: &'text str,
+    words: &mut UWordBounds<'text>,
+    other: &UWordBounds<'text>,
+    byte: usize,
+) -> bool {
+    if let Some(boundary) = ascii_word_boundary(text.as_bytes(), byte) {
+        return boundary;
+    }
+    let tail_len = text.len() - byte;
+    // Once this edge catches up to the other cursor, resume its segmentation.
+    if (tail_len..words.as_str().len()).contains(&other.as_str().len()) {
+        *words = other.clone();
+    }
+    let unscanned = words.as_str();
+    let gap = unscanned.len().saturating_sub(tail_len);
+    if gap > 4_096 {
+        // Search only the unvisited gap for a safe Unicode restart. Without a
+        // suitable space the current segmenter retains the full word context.
+        let restart = word_restart(unscanned, gap);
+        if restart != 0 {
+            *words = unscanned[restart..].split_word_bounds();
+        }
+    }
+    while words.as_str().len() > tail_len {
+        words.next();
+    }
+    words.as_str().len() == tail_len
+}
+
 fn visit_text_matches(
     source: &str,
     ascii: bool,
@@ -893,15 +1146,18 @@ fn visit_text_matches(
     if needle.len() > searched.len() {
         return ControlFlow::Continue(());
     }
-    let mut words = WordBoundaries::new(source, 0);
+    let mut starts = source.split_word_bounds();
+    let mut ends = starts.clone();
     let mut offsets = LowercaseOffsets::new(source, !options.case_sensitive && !ascii);
     visit_literals(&searched, needle, |bytes| {
         let range = offsets
             .original(bytes.start)
             .zip(offsets.original(bytes.end))
             .and_then(|(start, end)| {
-                (!options.whole_word || (words.contains(end) && words.contains(start)))
-                    .then_some(start..end)
+                (!options.whole_word
+                    || (forward_word_boundary(source, &mut starts, &ends, start)
+                        && forward_word_boundary(source, &mut ends, &starts, end)))
+                .then_some(start..end)
             });
         if let Some(range) = range {
             accept(range)
@@ -956,7 +1212,7 @@ fn visit_literals_with_retry(
                 offset = next;
                 continue 'search;
             }
-            let prefixes = literal_prefixes(needle.as_bytes());
+            let prefixes = prefix_lengths(needle.as_bytes());
             if prefixes[needle.len() - 1] == 0 {
                 // Without a shared prefix and suffix, occurrences cannot overlap.
                 may_overlap = Some(false);
@@ -968,18 +1224,14 @@ fn visit_literals_with_retry(
     }
 }
 
-fn literal_prefixes(needle: &[u8]) -> Vec<usize> {
-    // Build a KMP failure table only after a rejected match might hide overlaps.
-    // Restarting a fresh str matcher for each rejection can be quadratic.
+fn prefix_lengths<T: PartialEq>(needle: &[T]) -> Vec<usize> {
+    // KMP failure table: each entry is the longest proper prefix ending here.
     let mut prefixes = vec![0; needle.len()];
     let mut matched = 0;
     for index in 1..needle.len() {
-        while matched > 0 && needle[index] != needle[matched] {
-            matched = prefixes[matched - 1];
-        }
-        if needle[index] == needle[matched] {
-            matched += 1;
-        }
+        matched = advance_prefix(matched, &prefixes, |previous| {
+            needle[index] == needle[previous]
+        });
         prefixes[index] = matched;
     }
     prefixes
@@ -995,12 +1247,7 @@ fn visit_overlapping_literals(
     let needle = needle.as_bytes();
     let mut matched = 0;
     for (index, &byte) in source.as_bytes()[offset..].iter().enumerate() {
-        while matched > 0 && byte != needle[matched] {
-            matched = prefixes[matched - 1];
-        }
-        if byte == needle[matched] {
-            matched += 1;
-        }
+        matched = advance_prefix(matched, prefixes, |previous| byte == needle[previous]);
         if matched == needle.len() {
             let end = offset + index + 1;
             // Accepted matches consume their bytes; rejected matches may overlap.
@@ -1107,17 +1354,20 @@ mod tests {
     fn ascii_word_checks_defer_prefix_scanning_until_unicode_context_is_needed() {
         let prefix = "!?".repeat(4_096);
         let text = format!("{prefix}a:β γ");
+        let document = Document::from_text(&text);
+        let paragraph = &document.paragraphs()[0];
         let start = prefix.len() - 2;
-        let mut words = WordBoundaries::new(&text, start);
+        let mut words = WordBoundaries::for_paragraph(paragraph, start);
         assert!(words.contains(start + 1));
         assert!(words.contains(text.len()));
         assert!(words.remaining.is_none());
+        assert!(paragraph.cached_word_boundary(start).is_none());
         assert_eq!(words.start, start);
 
         // The colon and Greek letter belong to the same word as the preceding
         // ASCII letter. Restarting at the queried edge would invent a boundary.
         assert!(!words.contains(prefix.len() + 2));
-        assert!(words.remaining.is_some());
+        assert!(paragraph.cached_word_boundary(start).is_some());
         assert_eq!(words.start, 0);
         let boundaries: Vec<_> = text
             .split_word_bound_indices()
@@ -1210,7 +1460,9 @@ mod tests {
         options: SearchOptions,
     ) -> Option<usize> {
         let needle = search_needle(query, options);
-        paragraph_lines(&needle)?;
+        if !needle.contains('\n') {
+            return None;
+        }
         let mut matches = Vec::new();
         let _ = document.visit_flattened_matches(&needle, options, |range| {
             matches.push(range);
@@ -1292,6 +1544,89 @@ mod tests {
                 let count = assert_matches_flattened_stream(&document, query, options);
                 if !whole_word {
                     assert_eq!(count, Some(2), "{text:?}, {query:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_query_line_borders_agree_with_literal_borders_in_both_directions() {
+        let document = Document::from_text(&"\n".repeat(50));
+        let parts = ["", "a", "ab", "ba", "abc", "β", "aβ", "βa", "İ"];
+        for first in parts {
+            for last in parts {
+                for unit in ["\na", "a\na", "a\nab\na", "aβ\nβa\n", "ab\nβ\nba"] {
+                    for middle in [
+                        unit.repeat(17),
+                        format!("{unit}\n{}\n{unit}", "q\n".repeat(16)),
+                    ] {
+                        let query = format!("{first}\n{middle}\n{last}");
+                        let bordered = (1..query.len())
+                            .any(|start| query.as_bytes().starts_with(&query.as_bytes()[start..]));
+                        for direction in [Direction::Backward, Direction::Forward] {
+                            let pattern = document.multiline_query(&query, direction).unwrap();
+                            assert_eq!(
+                                pattern.can_overlap(&query),
+                                bordered,
+                                "{query:?} {direction:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_directional_search_leaves_word_boundaries_before_the_caret_lazy() {
+        let middle = "K\n".repeat(17);
+        let first = "你好".repeat(5_000);
+        let text = format!("{first}\n{middle}END\n好\n{middle}END·好\n{middle}END");
+        let doc = Document::from_text(&text);
+        let query = format!("好\n{}end", "k\n".repeat(17));
+        let options = SearchOptions {
+            case_sensitive: false,
+            whole_word: true,
+        };
+        // Both nearby matches share a paragraph and respect its byte boundary.
+        let caret = Position::new(37, "END·".len());
+        for (direction, start) in [(Direction::Backward, 19), (Direction::Forward, 37)] {
+            let found = doc
+                .find_relative(&query, options, caret..caret, SearchWrap::Stop, direction)
+                .unwrap();
+            assert_eq!(found.start.paragraph, start);
+            assert!(doc.paragraphs()[0].cached_word_boundary(0).is_none());
+        }
+    }
+
+    #[test]
+    fn long_multiline_queries_match_the_flattened_unicode_oracle() {
+        let middle = "İ\nΣ\n\nK\n".repeat(4);
+        let lowered = "i\u{307}\nσ\n\nk\n".repeat(4);
+        let query = format!("a\n{lowered}a");
+        let text = format!("ba\n{middle}aa\n{lowered}a\u{301}\n{middle}a");
+        let empty_lines = "\n".repeat(17);
+        let unbordered = format!("é\n{lowered}β");
+        let shared_end = format!(" é\n{middle}βé\n{lowered}β·é\n{middle}β");
+        for (source, query) in [
+            (text.as_str(), query.as_str()),
+            (shared_end.as_str(), unbordered.as_str()),
+            (text.as_str(), empty_lines.as_str()),
+            (&"\n".repeat(39), empty_lines.as_str()),
+            ("one paragraph", query.as_str()),
+        ] {
+            let document = Document::from_text(source);
+            for case_sensitive in [true, false] {
+                for whole_word in [true, false] {
+                    assert_matches_flattened_stream(
+                        &document,
+                        query,
+                        SearchOptions {
+                            case_sensitive,
+                            whole_word,
+                        },
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -1544,6 +1879,7 @@ mod tests {
                 .chain([text.len()])
                 .collect();
             let char_boundaries = (0..=text.len()).filter(|byte| text.is_char_boundary(*byte));
+            let document = Document::from_text(&text);
             for byte in char_boundaries {
                 let restart = word_restart(&text, byte);
                 assert!(restart <= byte, "byte {byte} in {text:?}");
@@ -1558,7 +1894,7 @@ mod tests {
                     "restart {restart} for byte {byte} in {text:?}"
                 );
                 assert_eq!(
-                    WordBoundaries::new(&text, byte).contains(byte),
+                    WordBoundaries::for_paragraph(&document.paragraphs()[0], byte).contains(byte),
                     boundaries.binary_search(&byte).is_ok(),
                     "byte {byte} in {text:?}"
                 );

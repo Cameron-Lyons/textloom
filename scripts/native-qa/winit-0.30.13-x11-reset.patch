@@ -1,0 +1,179 @@
+X11: Reset Fcitx's enabled XIC in place for adjacent IME interrupt requests
+
+Local compatibility patch for winit 0.30.13. License: Apache-2.0 (winit)
+Base: winit 0.30.13 with winit-0.30.13-x11-area.patch and winit-0.30.13-x11-focus.patch applied
+Xlib reset semantics: https://github.com/mirror/libX11/blob/master/man/XmbResetIC.man
+Server-side fix for context destruction during synchronous key delivery: https://github.com/fcitx/xcb-imdkit/pull/18
+
+egui-winit and Textloom interrupt composition by disabling and immediately
+re-enabling IME. Resetting the same live Fcitx context allows outstanding
+replies to complete. Only an already queued, adjacent enable for the same
+enabled window can take this path. A standalone disable still runs immediately.
+Use the selected @im=fcitx provider, since other providers can turn an
+unconfirmed preedit into a commit when reset. Alternate names use winit's
+original behavior.
+
+diff --git a/src/platform_impl/linux/x11/event_processor.rs b/src/platform_impl/linux/x11/event_processor.rs
+index ac8e23b..39b0fa7 100644
+--- a/src/platform_impl/linux/x11/event_processor.rs
++++ b/src/platform_impl/linux/x11/event_processor.rs
+@@ -85,7 +85,8 @@ impl EventProcessor {
+ 
+         // Handle IME requests.
+         let mut ime_focus = None;
+-        while let Ok(request) = self.ime_receiver.try_recv() {
++        let mut requests = self.ime_receiver.try_iter().peekable();
++        while let Some(request) = requests.next() {
+             let ime = match window_target.ime.as_mut() {
+                 Some(ime) => ime,
+                 None => continue,
+@@ -96,6 +97,17 @@ impl EventProcessor {
+                     ime.send_xim_area(window_id, x, y, w, h);
+                 },
+                 ImeRequest::Allow(window_id, allowed) => {
++                    // Hosts interrupt preedit with an adjacent disable/enable pair.
++                    // Reset the live XIC so pending XIM replies still reach it.
++                    // Never wait for an enable or skip another window's request.
++                    if !allowed
++                        && matches!(requests.peek(), Some(ImeRequest::Allow(id, true)) if *id == window_id)
++                        && ime.reset_fcitx_if_allowed(window_id)
++                    {
++                        requests.next();
++                        continue;
++                    }
++
+                     let result = ime.set_ime_allowed(window_id, allowed);
+                     if self.active_window == Some(window_id as xproto::Window) {
+                         match result {
+diff --git a/src/platform_impl/linux/x11/ime/input_method.rs b/src/platform_impl/linux/x11/ime/input_method.rs
+index e1f2fbd..d187559 100644
+--- a/src/platform_impl/linux/x11/ime/input_method.rs
++++ b/src/platform_impl/linux/x11/ime/input_method.rs
+@@ -9,7 +9,18 @@ use x11rb::protocol::xproto;
+ 
+ static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+ 
+-unsafe fn open_im(xconn: &Arc<XConnection>, locale_modifiers: &CStr) -> Option<ffi::XIM> {
++fn uses_fcitx(modifiers: &[u8]) -> bool {
++    modifiers
++        .split(|byte| *byte == b'@')
++        .skip(1)
++        .find_map(|modifier| modifier.strip_prefix(b"im="))
++        == Some(&b"fcitx"[..])
++}
++
++unsafe fn open_im(
++    xconn: &Arc<XConnection>,
++    locale_modifiers: &CStr,
++) -> Option<(ffi::XIM, bool)> {
+     let _lock = GLOBAL_LOCK.lock();
+ 
+     // XSetLocaleModifiers returns...
+@@ -17,7 +28,12 @@ unsafe fn open_im(xconn: &Arc<XConnection>, locale_modifiers: &CStr) -> Option<f
+     // * The new locale modifiers if we succeeded in setting them.
+     // * NULL if the locale modifiers string is malformed or if the current locale is not supported
+     //   by Xlib.
+-    unsafe { (xconn.xlib.XSetLocaleModifiers)(locale_modifiers.as_ptr()) };
++    let modifiers = unsafe { (xconn.xlib.XSetLocaleModifiers)(locale_modifiers.as_ptr()) };
++    // Xlib can append environment modifiers to those requested here. The first
++    // im= modifier selects the provider. Use the string accepted by Xlib while
++    // this thread still holds the locale-modifier lock.
++    let is_fcitx =
++        !modifiers.is_null() && uses_fcitx(unsafe { CStr::from_ptr(modifiers) }.to_bytes());
+ 
+     let im = unsafe {
+         (xconn.xlib.XOpenIM)(xconn.display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut())
+@@ -26,7 +42,7 @@ unsafe fn open_im(xconn: &Arc<XConnection>, locale_modifiers: &CStr) -> Option<f
+     if im.is_null() {
+         None
+     } else {
+-        Some(im)
++        Some((im, is_fcitx))
+     }
+ }
+ 
+@@ -36,10 +52,11 @@ pub struct InputMethod {
+     pub preedit_style: Style,
+     pub none_style: Style,
+     _name: String,
++    pub(super) is_fcitx: bool,
+ }
+ 
+ impl InputMethod {
+-    fn new(xconn: &Arc<XConnection>, im: ffi::XIM, name: String) -> Option<Self> {
++    fn new(xconn: &Arc<XConnection>, im: ffi::XIM, name: String, is_fcitx: bool) -> Option<Self> {
+         let mut styles: *mut XIMStyles = std::ptr::null_mut();
+ 
+         // Query the styles supported by the XIM.
+@@ -83,7 +100,7 @@ impl InputMethod {
+         let preedit_style = preedit_style.unwrap_or_else(|| none_style.unwrap());
+         let none_style = none_style.unwrap_or(preedit_style);
+ 
+-        Some(InputMethod { im, _name: name, preedit_style, none_style })
++        Some(InputMethod { im, _name: name, preedit_style, none_style, is_fcitx })
+     }
+ }
+ 
+@@ -251,7 +268,7 @@ impl PotentialInputMethod {
+     pub fn open_im(&mut self, xconn: &Arc<XConnection>) -> Option<InputMethod> {
+         let im = unsafe { open_im(xconn, &self.name.c_string) };
+         self.successful = Some(im.is_some());
+-        im.and_then(|im| InputMethod::new(xconn, im, self.name.string.clone()))
++        im.and_then(|(im, is_fcitx)| InputMethod::new(xconn, im, self.name.string.clone(), is_fcitx))
+     }
+ }
+ 
+@@ -343,3 +360,19 @@ impl PotentialInputMethods {
+         Failure
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::uses_fcitx;
++
++    #[test]
++    fn fcitx_requires_the_first_exact_im_modifier() {
++        assert!(uses_fcitx(b"@im=fcitx"));
++        assert!(uses_fcitx(b"@im=fcitx@im=ibus"));
++        assert!(!uses_fcitx(b"@im=ibus@im=fcitx"));
++        assert!(!uses_fcitx(b"@im=fcitx5"));
++        assert!(!uses_fcitx(b"@im=local"));
++        assert!(!uses_fcitx(b"im=fcitx"));
++        assert!(!uses_fcitx(b""));
++    }
++}
+diff --git a/src/platform_impl/linux/x11/ime/mod.rs b/src/platform_impl/linux/x11/ime/mod.rs
+index f1f5814..b3e6cb8 100644
+--- a/src/platform_impl/linux/x11/ime/mod.rs
++++ b/src/platform_impl/linux/x11/ime/mod.rs
+@@ -194,6 +194,29 @@ impl Ime {
+         }
+     }
+ 
++    pub fn reset_fcitx_if_allowed(&mut self, window: ffi::Window) -> bool {
++        let Some(Some(context)) = self.inner.contexts.get(&window) else {
++            return false;
++        };
++        // Other providers can send a commit on reset even if the user hasn't
++        // confirmed the preedit. Keep their original interruption behavior.
++        let is_fcitx = self.inner.im.as_ref().is_some_and(|im| im.is_fcitx);
++        if !is_fcitx || self.is_destroyed() || !context.is_allowed() {
++            return false;
++        }
++
++        // Xlib returns the pending preedit on reset. It wasn't confirmed by the
++        // user, and real commits still arrive through the normal key-event path.
++        let preedit = unsafe { (self.xconn.xlib.Xutf8ResetIC)(context.ic) };
++        drop(util::memory::XSmartPointer::new(&self.xconn, preedit));
++
++        // Preserve the public events that the original allow requests generated.
++        for event in [ImeEvent::Disabled, ImeEvent::Enabled] {
++            self.inner.event_sender.send((window, event)).expect("Failed to send IME update");
++        }
++        true
++    }
++
+     pub fn set_ime_allowed(
+         &mut self,
+         window: ffi::Window,

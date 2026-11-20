@@ -1,0 +1,404 @@
+diff --git a/src/context.rs b/src/context.rs
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -1805,22 +1805,31 @@
+ 
+             let clicked = Some(id) == viewport.interact_widgets.clicked;
+             let mut any_press = false;
++            let mut clear_capture = false;
+ 
+             for pointer_event in &input.pointer.pointer_events {
+                 match pointer_event {
+-                    PointerEvent::Moved(_) => {}
++                    PointerEvent::Moved(_) | PointerEvent::AuxiliaryReleased(_) => {}
+                     PointerEvent::Pressed { .. } => {
+                         any_press = true;
++                        if input.pointer.explicit_capture {
++                            // A new press can replace a lost capture in this same pass.
++                            clear_capture = false;
++                        }
+                     }
+                     PointerEvent::Released { click, .. } => {
+                         if enabled && sense.senses_click() && clicked && click.is_some() {
+                             res.flags.set(Flags::CLICKED, true);
+                         }
+ 
+-                        res.flags.set(Flags::IS_POINTER_BUTTON_DOWN_ON, false);
+-                        res.flags.set(Flags::DRAGGED, false);
++                        clear_capture = true;
+                     }
+                 }
++            }
++
++            if clear_capture {
++                res.flags.set(Flags::IS_POINTER_BUTTON_DOWN_ON, false);
++                res.flags.set(Flags::DRAGGED, false);
+             }
+ 
+             // is_pointer_button_down_on is false when released, but we want interact_pointer_pos
+@@ -5405,4 +5414,47 @@
+             output.drop_without_applying_deltas();
+         }
+     }
++    #[test]
++    fn capture_keeps_a_new_press_after_an_earlier_release_in_the_same_pass() {
++        use crate::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Sense, vec2};
++        let ctx = Context::default();
++        ctx.input_mut(|i| i.pointer.set_explicit_capture(true));
++        ctx.options_mut(|o| o.max_passes = 1.try_into().unwrap());
++        let frame = |events| {
++            let mut state = (Pos2::ZERO, false, false);
++            ctx.run_ui(
++                RawInput {
++                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0))),
++                    events,
++                    ..Default::default()
++                },
++                |ui| {
++                    let (rect, response) =
++                        ui.allocate_exact_size(vec2(160.0, 80.0), Sense::click_and_drag());
++                    state = (
++                        rect.center(),
++                        response.is_pointer_button_down_on(),
++                        response.clicked(),
++                    );
++                },
++            )
++            .drop_without_applying_deltas();
++            state
++        };
++        let pos = frame(vec![]).0;
++        let button = |pressed| Event::PointerButton {
++            pos,
++            button: PointerButton::Primary,
++            pressed,
++            modifiers: Modifiers::NONE,
++        };
++        assert!(frame(vec![Event::PointerMoved(pos), button(true)]).1);
++        let (_, down, clicked) = frame(vec![Event::PointerGone, button(true)]);
++        assert!(down && !clicked);
++        let (_, down, clicked) = frame(vec![button(false), button(true)]);
++        assert!(
++            down && clicked,
++            "the previous click and subsequent press both survive"
++        );
++    }
+ }
+diff --git a/src/input_state/mod.rs b/src/input_state/mod.rs
+--- a/src/input_state/mod.rs
++++ b/src/input_state/mod.rs
+@@ -973,6 +973,8 @@
+         position: Pos2,
+         button: PointerButton,
+     },
++    /// A separately held button ended while the primary still owns the widget.
++    AuxiliaryReleased(PointerButton),
+     Released {
+         click: Option<Click>,
+         button: PointerButton,
+@@ -985,7 +987,7 @@
+     }
+ 
+     pub fn is_release(&self) -> bool {
+-        matches!(self, Self::Released { .. })
++        matches!(self, Self::Released { .. } | Self::AuxiliaryReleased(_))
+     }
+ 
+     pub fn is_click(&self) -> bool {
+@@ -1006,6 +1008,11 @@
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+ pub struct PointerState {
++    #[cfg_attr(feature = "serde", serde(skip))]
++    pub(crate) explicit_capture: bool,
++    #[cfg_attr(feature = "serde", serde(skip))]
++    auxiliary_releases: std::collections::VecDeque<(PointerButton, bool)>,
++
+     /// Latest known time
+     time: f64,
+ 
+@@ -1098,6 +1105,8 @@
+ impl Default for PointerState {
+     fn default() -> Self {
+         Self {
++            explicit_capture: false,
++            auxiliary_releases: Default::default(),
+             time: -f64::INFINITY,
+             latest_pos: None,
+             interact_pos: None,
+@@ -1166,6 +1175,22 @@
+                     let pressed = *pressed;
+                     let modifiers = *modifiers;
+ 
++                    if self.explicit_capture && button != PointerButton::Primary {
++                        let cancelled = !pressed && self.take_auxiliary_release(button);
++                        if self.primary_down() || cancelled {
++                            if pressed {
++                                self.down[button as usize] = true;
++                                self.pointer_events.push(PointerEvent::Pressed {
++                                    position: pos,
++                                    button,
++                                });
++                            } else {
++                                self.cancel_button(button);
++                            }
++                            continue;
++                        }
++                    }
++
+                     self.latest_pos = Some(pos);
+                     self.interact_pos = Some(pos);
+ 
+@@ -1216,10 +1241,23 @@
+ 
+                     self.down[button as usize] = pressed; // must be done after the above call to `could_any_button_be_click`
+                 }
++                Event::WindowFocused(false) if self.explicit_capture => {
++                    for button in [
++                        PointerButton::Primary,
++                        PointerButton::Secondary,
++                        PointerButton::Middle,
++                        PointerButton::Extra1,
++                        PointerButton::Extra2,
++                    ] {
++                        self.cancel_button(button);
++                    }
++                }
+                 Event::PointerGone => {
++                    if self.explicit_capture {
++                        self.cancel_button(PointerButton::Primary);
++                    }
+                     self.latest_pos = None;
+-                    // When dragging a slider and the mouse leaves the viewport, we still want the drag to work,
+-                    // so we don't treat this as a `PointerEvent::Released`.
++                    // Without explicit capture a pointer can leave a viewport during a drag.
+                     // NOTE: we do NOT clear `self.interact_pos` here. It will be cleared next frame.
+ 
+                     // Delay the clearing until after the final velocity calculation, so we can
+@@ -1436,7 +1474,7 @@
+     pub fn button_released(&self, button: PointerButton) -> bool {
+         self.pointer_events
+             .iter()
+-            .any(|event| matches!(event, &PointerEvent::Released{button: b, ..} if button == b))
++            .any(|event| matches!(event, &PointerEvent::Released{button: b, ..} | &PointerEvent::AuxiliaryReleased(b) if button == b))
+     }
+ 
+     /// Was the primary button pressed this frame?
+@@ -1523,6 +1561,51 @@
+     /// a certain amount of time and distance from when and where it was pressed.
+     pub fn secondary_clicked(&self) -> bool {
+         self.button_clicked(PointerButton::Secondary)
++    }
++
++    /// Use integration-managed capture. During a primary gesture the integration
++    /// must retain the pointer across surface boundaries and submit [`Event::PointerGone`]
++    /// only when capture ends. A disappearance then cancels primary without a click.
++    /// A genuine [`Event::WindowFocused(false)`] cancels all buttons.
++    pub fn set_explicit_capture(&mut self, enabled: bool) {
++        self.explicit_capture = enabled;
++        if !enabled {
++            self.auxiliary_releases.clear();
++        }
++    }
++
++    /// Record the disposition of an auxiliary button release before submitting its
++    /// [`Event::PointerButton`]. Record every release for that button in input order,
++    /// including ordinary releases. The matching raw input can be deferred to a later pass.
++    pub fn queue_auxiliary_release(&mut self, button: PointerButton, cancelled: bool) {
++        debug_assert_ne!(button, PointerButton::Primary);
++        self.auxiliary_releases.push_back((button, cancelled));
++    }
++
++    fn take_auxiliary_release(&mut self, button: PointerButton) -> bool {
++        self.auxiliary_releases
++            .iter()
++            .position(|(b, _)| *b == button)
++            .and_then(|index| self.auxiliary_releases.remove(index))
++            .is_some_and(|(_, cancelled)| cancelled)
++    }
++
++    fn cancel_button(&mut self, button: PointerButton) {
++        if std::mem::take(&mut self.down[button as usize]) {
++            let event = if self.primary_down() {
++                PointerEvent::AuxiliaryReleased(button)
++            } else {
++                PointerEvent::Released {
++                    click: None,
++                    button,
++                }
++            };
++            self.pointer_events.push(event);
++            if !self.any_down() {
++                self.press_origin = None;
++                self.press_start_time = None;
++            }
++        }
+     }
+ 
+     /// Is this button currently down?
+@@ -1705,6 +1788,8 @@
+ impl PointerState {
+     pub fn ui(&self, ui: &mut crate::Ui) {
+         let Self {
++            explicit_capture: _,
++            auxiliary_releases: _,
+             time: _,
+             latest_pos,
+             interact_pos,
+@@ -1753,3 +1838,145 @@
+         ui.label(format!("pointer_events: {pointer_events:?}"));
+     }
+ }
++
++#[cfg(test)]
++mod capture_tests {
++    use super::*;
++    use crate::{TouchId, TouchPhase, pos2};
++
++    fn button(button: PointerButton, pressed: bool, x: f32) -> Event {
++        Event::PointerButton {
++            pos: pos2(x, 0.0),
++            button,
++            pressed,
++            modifiers: Modifiers::NONE,
++        }
++    }
++
++    fn pass(pointer: PointerState, events: Vec<Event>) -> PointerState {
++        pointer.begin_pass(
++            1.0,
++            &RawInput {
++                events,
++                ..Default::default()
++            },
++            InputOptions::default(),
++        )
++    }
++
++    #[test]
++    fn earlier_disappearance_cannot_consume_a_later_physical_cancellation() {
++        use PointerButton::Primary;
++        let mut pointer = PointerState::default();
++        pointer.set_explicit_capture(true);
++        let touch = |phase| Event::Touch {
++            device_id: TouchDeviceId(0),
++            id: TouchId(17),
++            phase,
++            pos: pos2(10.0, 0.0),
++            force: None,
++        };
++        // Input hooks may defer the entire sequence until a single egui pass.
++        let pointer = pass(
++            pointer,
++            vec![
++                touch(TouchPhase::Start),
++                button(Primary, true, 10.0),
++                touch(TouchPhase::Cancel),
++                Event::PointerGone,
++                Event::PointerGone,
++                button(Primary, true, 90.0),
++                Event::PointerGone,
++            ],
++        );
++        assert!(!pointer.any_down() && !pointer.any_click());
++        assert_eq!(
++            pointer
++                .pointer_events
++                .iter()
++                .filter(|event| event.is_release())
++                .count(),
++            2
++        );
++    }
++
++    #[test]
++    fn auxiliary_release_preserves_primary_geometry_and_widget_capture() {
++        use PointerButton::{Primary, Secondary};
++        let mut pointer = PointerState::default();
++        pointer.set_explicit_capture(true);
++        pointer.queue_auxiliary_release(Secondary, true);
++        let pointer = pass(
++            pointer,
++            vec![
++                button(Primary, true, 10.0),
++                button(Secondary, true, 90.0),
++                button(Secondary, false, 90.0),
++            ],
++        );
++        assert!(pointer.primary_down() && pointer.button_released(Secondary));
++        assert!(!pointer.secondary_down() && !pointer.any_click());
++        assert_eq!(pointer.press_origin(), Some(pos2(10.0, 0.0)));
++        assert_eq!(pointer.interact_pos(), Some(pos2(10.0, 0.0)));
++        assert!(matches!(
++            pointer.pointer_events.last(),
++            Some(PointerEvent::AuxiliaryReleased(Secondary))
++        ));
++    }
++
++    #[test]
++    fn auxiliary_releases_follow_their_own_button_in_input_order() {
++        use PointerButton::{Middle, Secondary};
++        let mut pointer = PointerState::default();
++        pointer.set_explicit_capture(true);
++        pointer.queue_auxiliary_release(Secondary, false);
++        pointer.queue_auxiliary_release(Middle, true);
++        pointer.queue_auxiliary_release(Secondary, true);
++        let pointer = pass(
++            pointer,
++            vec![
++                button(Secondary, true, 10.0),
++                button(Secondary, false, 10.0),
++                button(Middle, true, 10.0),
++                button(Middle, false, 10.0),
++                button(Secondary, true, 10.0),
++                button(Secondary, false, 10.0),
++            ],
++        );
++        let releases: Vec<_> = pointer
++            .pointer_events
++            .iter()
++            .filter_map(|e| {
++                if let PointerEvent::Released { button, click } = e {
++                    Some((*button, click.is_some()))
++                } else {
++                    None
++                }
++            })
++            .collect();
++        assert_eq!(
++            releases,
++            [(Secondary, true), (Middle, false), (Secondary, false)]
++        );
++    }
++
++    #[test]
++    fn focus_loss_cancels_every_button_only_in_explicit_capture_mode() {
++        use PointerButton::{Primary, Secondary};
++        for enabled in [false, true] {
++            let mut pointer = PointerState::default();
++            pointer.set_explicit_capture(enabled);
++            let pointer = pass(
++                pointer,
++                vec![
++                    button(Secondary, true, 10.0),
++                    button(Primary, true, 10.0),
++                    Event::WindowFocused(false),
++                ],
++            );
++            assert_eq!(pointer.primary_down(), !enabled);
++            assert_eq!(pointer.secondary_down(), !enabled);
++            assert!(!pointer.any_click());
++        }
++    }
++}
+diff --git a/src/interaction.rs b/src/interaction.rs
+--- a/src/interaction.rs
++++ b/src/interaction.rs
+@@ -159,6 +159,7 @@
+         match pointer_event {
+             PointerEvent::Moved(_) => {}
+ 
++            PointerEvent::AuxiliaryReleased(_) => {}
+             PointerEvent::Pressed { .. } => {
+                 // Maybe new click?
+                 if interaction.potential_click_id.is_none() {

@@ -1,0 +1,38 @@
+Windows: Prepare the keyboard layout on WM_INPUTLANGCHANGE
+
+Author: Komov
+License: Apache-2.0 (winit)
+Upstream: https://github.com/rust-windowing/winit/pull/4582
+Commit: eb3fc10c3898caa74e78f98c1d87682474984a4f (merged into master as fb78ecbb0364e56facacdddea290d8cd71d7e22e)
+Base: winit 0.30.13 from crates.io (SHA-256 a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d)
+
+Apply from the root of a clean winit 0.30.13 source tree with git apply.
+
+diff --git a/src/platform_impl/windows/event_loop.rs b/src/platform_impl/windows/event_loop.rs
+--- a/src/platform_impl/windows/event_loop.rs
++++ b/src/platform_impl/windows/event_loop.rs
+@@ -53,8 +53,8 @@
+     WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT,
+     WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
+     WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN,
+-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
++    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUTLANGCHANGE, WM_INPUT_DEVICE_CHANGE,
++    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+     WM_MENUCHAR, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE,
+     WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP,
+     WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
+@@ -1617,6 +1617,13 @@
+             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
+         },
+ 
++        WM_INPUTLANGCHANGE => {
++            // Building a layout calls ToUnicodeEx. Do it before the first key can
++            // leave a pending dead key, then let Windows notify child windows.
++            LAYOUT_CACHE.lock().unwrap().get_current_layout();
++            result = ProcResult::DefWindowProc(wparam);
++        },
++
+         // this is necessary for us to maintain minimize/restore state
+         WM_SYSCOMMAND => {
+             if wparam == SC_RESTORE as usize {

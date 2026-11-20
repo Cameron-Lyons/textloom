@@ -121,7 +121,7 @@ ui.add(textloom::adapter::egui::RichTextEditor::new(&mut editor));
 
 The widget draws rich paragraphs, selections, list markers, headings, block quotes, and preedit text. Fills paint behind the glyphs and replace inline code's background, with selections and highlights visible over them. Links use egui's hyperlink color unless explicitly colored and are always underlined. Quote paragraphs are indented with a bar in the gutter that continues across consecutive quotes. Soft line breaks start new rows for the caret, hit testing, Home/End, Up/Down, IME preview, and selection painting. It routes pointer and keyboard input through the same core and publishes a caret-local IME area (the caret plus same-row preedit) through egui's platform output, so candidate windows follow the caret. It checks layout character counts and retries inconsistent font shaping to keep rendered text and cursor positions aligned. Each independently stored editor should use a stable widget ID. For a scrolling editor, place the widget inside an egui `ScrollArea`. Cached layouts stay in egui's temporary memory until `RichTextEditor::forget_state(ctx, id)` releases them, for example when an editor closes.
 
-A primary-button press places the caret, dragging extends the selection from the press point, Shift+click extends it, and double/triple click select a word or paragraph on release; a press and release within one frame, such as a touchpad tap, also counts as a click. Ctrl/Command+click on a link in an editable widget, or a click in a read-only one, activates it on release over the same link without moving the caret; a drag from a link still selects. Document changes discard pending link presses. Hovering a link shows its target in a tooltip, and a pointing hand while a click would activate it. On touch screens, swipes scroll the enclosing area until the editor has focus. Clicks retain the chosen visual row at wrap boundaries, and selection highlighting extends a hard paragraph break only after the final wrapped row. Focused caret and preedit changes scroll into view even when the widget starts outside the viewport. Clicking, dragging, or moving focus away during IME composition commits the visible preedit, as native text views do, after first applying IME events queued earlier in the same frame; one immediate identical commit that an input method repeats after the click or focus change is ignored, including after focus returns. IME input that arrives after Tab or an AccessKit focus request has moved focus to another widget is left to that widget, whatever the draw order. Egui moves focus for Shift+Tab only in the next pass, so IME input in later input batches reaches the newly focused widget, while an IME commit in the Shift+Tab batch is inserted by the editor like text and a preedit there is ignored. Escape, read-only mode, and disabling the widget cancel a composition. Cancellation also suppresses one immediate identical commit, even after ignored or invalid input; valid nonempty preedit starts a fresh composition. Typing or navigation after an empty preedit also cancels the old candidate. Keyboard and accessibility actions follow their input batch order; accessibility actions based on content changed by an earlier event are rejected as stale.
+A primary-button press places the caret, dragging extends the selection from the press point, Shift+click extends it, and double/triple click select a word or paragraph on release; a press and release within one frame, such as a touchpad tap, also counts as a click. Ctrl/Command+click on a link in an editable widget, or a click in a read-only one, activates it on release over the same link without moving the caret; a drag from a link still selects. Document changes discard pending link presses. Hovering a link shows its target in a tooltip, and a pointing hand while a click would activate it. The first touchscreen swipe over an unfocused editor scrolls its enclosing area. A tap focuses the editor so later touch drags can select text. A mouse drag selects from its press point even after the touchscreen has been used. Clicks retain the chosen visual row at wrap boundaries, and selection highlighting extends a hard paragraph break only after the final wrapped row. Focused caret and preedit changes scroll into view even when the widget starts outside the viewport. Clicking, dragging, or moving focus away during IME composition commits the visible preedit, as native text views do, after first applying IME events queued earlier in the same frame; one immediate identical commit that an input method repeats after the click or focus change is ignored, including after focus returns. IME input that arrives after Tab or an AccessKit focus request has moved focus to another widget is left to that widget, whatever the draw order. Egui moves focus for Shift+Tab only in the next pass, so IME input in later input batches reaches the newly focused widget, while an IME commit in the Shift+Tab batch is inserted by the editor like text and a preedit there is ignored. Escape, read-only mode, and disabling the widget cancel a composition. Cancellation also suppresses one immediate identical commit, even after ignored or invalid input; valid nonempty preedit starts a fresh composition. Typing or navigation after an empty preedit also cancels the old candidate. Keyboard and accessibility actions follow their input batch order; accessibility actions based on content changed by an earlier event are rejected as stale.
 
 When pointer events arrive together, selection uses the press position and its
 modifiers, and a drag ends at its release position even if the pointer subsequently
@@ -185,10 +185,11 @@ preserves input order around AccessKit focus requests for rich editors and
 native `TextEdit` fields, regardless of widget draw order. It also captures
 starting modifiers so Command/Ctrl+Shift+V stays plain text when modifiers change
 later in the same batch, including across routed passes. Each focus request
-gets a separate UI pass before subsequent input is delivered. Ordinary input
-needs no extra pass; if egui's pass limit is reached, remaining input waits for
-the next repaint, ahead of newer input. The widget also installs routing on
-first use, taking effect on the next pass; late installation cannot recover that
+gets a separate UI pass before subsequent input is delivered. The first touch
+press and switches between touch and mouse also use an extra pass so the
+correct widget handles the drag. If egui reaches its pass limit, remaining
+input waits for the next repaint, ahead of newer input. The widget also installs
+routing on first use, taking effect on the next pass; late installation cannot recover that
 initial pass's starting modifiers. Hosts must honor the returned repaint
 requests to deliver pending input, including when using manual `begin_pass` /
 `end_pass` calls. Window lifecycle and dropped-file handling remain host-owned.
@@ -256,6 +257,73 @@ manual signoff as unrecorded. Reports and smoke runs provide observations;
 manual native checks still need separate steps and outcomes. See the [native example guide](https://github.com/Cameron-Lyons/textloom/blob/main/examples/native-editor/README.md)
 for report revision labeling, font examples, and host checks.
 
+### Touch input in native egui applications
+
+In egui-winit 0.37.0, a touch tap during a mouse drag can move the selection
+anchor and end the drag while the mouse button is still down. Native egui
+hosts, including eframe applications, can use the corrected input integration
+to keep the gesture with the device that started it.
+
+From the application's workspace, prepare the sources and add the
+overrides to its root `Cargo.toml`.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py egui-winit vendor/native-input
+```
+
+```toml
+[patch.crates-io]
+egui = { path = "vendor/native-input/egui-0.37.0" }
+egui-winit = { path = "vendor/native-input/egui-winit-0.37.0" }
+winit = { path = "vendor/native-input/winit-0.30.13" }
+```
+
+Use the workspace's existing patch table if it has one. This profile
+includes the [X11 and Windows winit fixes](#x11-and-windows-fixes-for-winit-03013).
+Run `cargo check` to update the application lockfile. For an application
+that also targets the web, use one egui override and add eframe from the
+web profile below. Both profiles prepare the same egui source.
+
+### Touch input in eframe web applications
+
+Stock eframe 0.37.0 handles both DOM pointer and touch events. In Chromium,
+one screen contact can reach egui first as a mouse button press and then as
+a touch. The first press can focus an editor and start selecting text when
+the user intended to scroll. At that point egui has no device information
+with which to distinguish the press from a real mouse click.
+
+The corrected host sends one gesture for the primary contact. Other fingers
+still supply multitouch input. If a mouse, pen, or finger starts dragging,
+it keeps control of that drag until release or cancellation. For example,
+touching the screen during a mouse selection leaves the selection anchored
+where the mouse was pressed. Moving focus outside the editor cancels the
+gesture, so a late release leaves focus on the new target. On desktop
+WebKitGTK, mixing a held mouse button with touchscreen input on one Wayland
+seat can produce mouse motion at the touch location and omit the mouse
+release. The browser reports that motion with the same device ID and
+button state as genuine mouse movement.
+
+For a web application using this version, prepare the corrected eframe and egui
+sources from the [Textloom repository](https://github.com/Cameron-Lyons/textloom/tree/main/scripts/native-qa).
+Run the helper from the application workspace.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py eframe-web vendor/web-input
+```
+
+Add both overrides to the application's root `Cargo.toml`.
+
+```toml
+[patch.crates-io]
+eframe = { path = "vendor/web-input/eframe-0.37.0" }
+egui = { path = "vendor/web-input/egui-0.37.0" }
+```
+
+Run `cargo pkgid eframe@0.37.0` and `cargo pkgid egui@0.37.0` to verify that
+both paths point into `vendor/web-input`. Call `install_input_routing` when
+creating the egui context. On a canvas that handles its own panning, set the
+CSS property `touch-action: none` so the browser leaves that gesture to the editor.
+
 ## winit
 
 Enable `features = ["winit"]`. `adapter::winit::WinitAdapter` maps keyboard events, modifiers, and native IME events to editor commands. The host provides text layout, pointer hit testing, clipboard access, and painting. Calls return a `#[must_use]` `InputOutcome`: whether the event was handled, whether presentation changed, and any clipboard request.
@@ -273,15 +341,123 @@ Opt into `WinitAdapter::new().rich_clipboard(true)` for `CopyRich`/`CutRich` fra
 
 Call `set_read_only(true, &mut editor)` for a selectable viewer: navigation and copy remain available, cut copies, and keyboard edits, paste, and IME are suppressed. Enabling read-only mode cancels active preedit; call `sync_ime` to update the native window.
 
+### X11 and Windows fixes for winit 0.30.13
+
+Direct winit and egui-winit hosts using 0.30.13 can opt into these fixes.
+
+- On X11, touch contacts and their compatibility cursor motions carry the
+  XI2 physical source device ID. Ordinary mouse motion keeps its existing
+  ID. A host can distinguish motion from the touchscreen while a mouse drag
+  is active.
+- On Windows, a touch carrying `POINTER_FLAG_CANCELED` produces
+  `TouchPhase::Cancelled`, including when the same message carries
+  `POINTER_FLAG_UP`. A normal lift still produces `TouchPhase::Ended`.
+- On X11, the backend passes the whole caret rectangle to XIM so Fcitx can
+  place its candidate window above or below the line. On-the-spot input needs
+  libX11 1.8.11 or newer and an input method that honors the rectangle.
+- When a focused X11 window enables text input, its replacement input context
+  receives focus. This lets a user start composing after making a read-only
+  editor editable without switching windows.
+- With the X11 input method opened as `@im=fcitx`, a disable and re-enable
+  queued together for the same window interrupt composition by resetting the
+  existing input context. This
+  keeps pending keyboard replies associated with a live context when moving
+  between editable fields. A separate disable still takes effect immediately.
+- On Windows, the backend prepares a newly selected keyboard layout before
+  translating the first key, preserving a dead key typed immediately after
+  switching layouts.
+
+From the application workspace, run the helper from a Textloom checkout with
+Python 3 and Git. It verifies the published crate checksum, applies the
+patches, and places the result in a new directory.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_winit.py vendor/winit-0.30.13
+```
+
+Add this override to the application's workspace-root `Cargo.toml`, then
+build once to update its lockfile. `cargo tree -i winit@0.30.13` shows the
+local path and the hosts using it. The native example has its own workspace
+root at `examples/native-editor`.
+
+```toml
+[patch.crates-io]
+winit = { path = "vendor/winit-0.30.13" }
+```
+
+A host using these fixes should pass the original caret rectangle, including
+its height, through the regular adapter APIs. The repository keeps the
+[patch sources and preparation helper](https://github.com/Cameron-Lyons/textloom/tree/main/scripts/native-qa)
+together.
+
 ## Accessibility
 
 `accessibility::AccessibilitySnapshot` exposes borrowed paragraph semantics and directional selection without an extra dependency, and `apply_action` applies validated `AccessibleAction`s through the editor. The optional `accesskit` feature provides `AccessKitAdapter`, a text input tree with styled runs, grapheme boundaries, selection, and validated accessibility actions. Each paragraph's runs form one logical line, or one line per soft line break, which is published as LF at the end of its line; AccessKit has no separate soft-break concept, so consumers may also treat it as a paragraph end. Runs hold at most 255 characters, carry word starts that match word movement, publish fills as background color, and split where formatting or links change. Runs with a hyperlink are children of a `Link` node with the target as its URL and the linked text as its label; consecutive quote paragraphs are children of one `Blockquote` node. Text navigation passes through both levels. Connect its tree updates and action requests to your host's platform AccessKit adapter.
 
 Updates are incremental. Call `AccessKitAdapter::invalidate()` whenever the platform adapter requests an initial tree (`ActivationHandler::request_initial_tree`, or accesskit_winit's `WindowEvent::InitialTreeRequested` before the next update) and after discarding an update; its documentation includes a recipe. Hosts that add bounds or character geometry must reapply them to every node in each update, including the root and editor nodes, and can call `invalidate()` to republish every node after layout changes. `locate_text_run()` and `locate_link()` map a run or link node back to its paragraph and byte range for `ScrollIntoView` requests. A `Click` on a link node, also in read-only mode, returns the link in `AccessibilityOutcome::activated_link` without changing the editor. A tree grafted with `with_tree_id()` uses a generic container root.
 
-The host owns focus and layout geometry. Both adapters use AccessKit 0.25, matching egui's integration and avoiding a duplicate dependency version. Use a matching platform adapter for the direct tree. Text movement is logical; a renderer must provide visual movement across wrapped lines or bidirectional text. AccessKit limits a character to 255 UTF-8 bytes, so the direct adapter and the egui widget publish a longer grapheme as several characters whose interior positions resolve to the grapheme start. The egui widget publishes the same link, block quote, and soft-break structure and reports link clicks in `clicked_link`. Egui list items also publish their position and set size: headings close every set, shallower items close deeper sets, body text, quotes, and the other list kind at the same level interrupt a set without closing it, and an explicit start begins a new set. Displayed list numbers are not published because AccessKit 0.25 has no item-number property.
+The host owns focus and layout geometry. Both adapters use AccessKit 0.25, matching egui's integration and avoiding a duplicate dependency version. Use a matching platform adapter for the direct tree. Text movement is logical; a renderer must provide visual movement across wrapped lines or bidirectional text. AccessKit limits a character to 255 UTF-8 bytes, so the direct adapter and the egui widget publish a longer grapheme as several characters whose interior positions resolve to the grapheme start. The egui widget publishes the same link, block quote, and soft-break structure and reports link clicks in `clicked_link`. Both adapters publish each item's zero-based position and the full logical set size on its parent list. A nested list or an intervening paragraph splits the parent into consecutive groups in reading order. Items in a resumed group retain their position in the logical set. A heading closes every set, and a shallower item closes deeper sets. Body text, quotes, and the other list kind at the same level leave a set open. An explicit start begins a new set. Displayed list numbers are not published because AccessKit 0.25 has no item-number property.
+
+The Linux native example adds a short description to the focused document
+when the caret is on a linked grapheme or in a quoted paragraph. Orca can
+announce entry into either context while keeping the user's place in the
+editor. Moving within the same context preserves ordinary reading, and an
+extended selection uses the reader's selection feedback. Integrators can
+localize this feedback in their own host.
 
 The direct `AccessKitAdapter` supports selection replacement and full-value replacement as one undo step; full-value replacement, here and in the egui widget, uses the style and paragraph kind at the document start. `AccessibilityOutcome::composition_canceled` reports discarded preedit so the host can reset the platform input method. The adapter's `set_read_only(true, &mut editor)` advertises read-only capabilities and suppresses replacement actions while retaining focus and selection. Publish `update()` after changing the mode, and keep it aligned with your input adapter.
+
+### Inline links with Orca on Linux
+
+Stock `accesskit_unix` 0.24.1 exposes clickable link objects. Orca also
+queries the document's AT-SPI Hypertext interface to announce links while
+reading a whole line. Applications using the versions below can enable that
+interface and Unicode character offsets with two workspace-level patches.
+Run the helper from a Textloom checkout, with your application workspace as
+the current directory.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py accesskit vendor/accesskit
+```
+
+Add these entries to the application's workspace-root `Cargo.toml` and build
+once to update its lockfile. If the workspace already has a `[patch.crates-io]`
+table, add both entries to it.
+
+```toml
+[patch.crates-io]
+accesskit_atspi_common = { path = "vendor/accesskit/accesskit_atspi_common-0.21.1" }
+accesskit_unix = { path = "vendor/accesskit/accesskit_unix-0.24.1" }
+```
+
+The document stays focused during reading and editing. Orca's separate
+**Present Link** command operates on the focused object, so it still reports
+“Not on a link” when keyboard focus is in the document. When whole-line
+navigation lands inside a link, Orca can also speak the native example's
+caret description after reading the line.
+
+### Heading levels on Windows
+
+The stock Windows backend exposes each heading's level through the generic
+UI Automation `Level` property. Readers can also query `HeadingLevel` on
+the element or ask for the `StyleId` of a text range inside the editor.
+Applications using `accesskit_windows` 0.35.1 and `accesskit_consumer` 0.39.2
+can enable both with workspace patches. From your application workspace, run
+the helper from a Textloom checkout.
+
+```sh
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py accesskit-windows vendor/accesskit-windows
+```
+
+Add the following entries to your workspace-root `Cargo.toml` and build once
+to update the lockfile. If the workspace already has a `[patch.crates-io]`
+table, add both entries there.
+
+```toml
+[patch.crates-io]
+accesskit_consumer = { path = "vendor/accesskit-windows/accesskit_consumer-0.39.2" }
+accesskit_windows = { path = "vendor/accesskit-windows/accesskit_windows-0.35.1" }
+```
 
 ## Performance and validation
 
@@ -299,8 +475,9 @@ it does not scan earlier paragraphs for list context.
 Inserting empty text or a single empty fragment paragraph at a valid caret
 returns without rebuilding paragraph text or formatting runs.
 `is_modified()` caches its content comparison until the next document change,
-so repeated reads between edits take constant time. The first comparison after
-an edit or history replay may still visit the complete document.
+so repeated reads between edits take constant time. The first comparison checks
+the paragraph count and skips the prefix and suffix untouched since the save
+point. Edits near opposite ends can still require a full comparison.
 Editor clones share the immutable saved-state paragraph list and keep independent
 dirty-state caches. Cloning still copies the live document's paragraph references
 and undo history.
@@ -314,15 +491,23 @@ Unicode indexes. Rebuilding changed runs still copies the paragraph's run array.
 Reading the selected link at a caret also uses binary lookup. Explicit link-range
 queries and link edits still visit the linked formatting runs.
 
-Grapheme, scalar, and word indexes are built independently when needed and shared across formatting/history snapshots. Position validation, style lookup, boundary snapping, and adjacent grapheme movement reuse an existing grapheme index or inspect bounded local Unicode context. If that context is insufficient, they build the full index once and reuse it. Ordinary arrow movement and grapheme deletion avoid indexing an entire newly edited paragraph. Conversions at paragraph start return zero without building either index. Grapheme counting and other index conversions still build the full index, while scalar counting does not; indexed navigation uses binary searches instead of rescanning long paragraphs. ASCII grapheme/scalar offsets need no indexes, and ASCII word indexes are allocated only when used. `history_bytes()` estimates retained text, formatting, and link targets, charging the larger side of each change once so that text and runs shared by both sides are not counted twice, and each shared link target once per side. It also charges the paragraph pointers on both sides of a change and the record of each separately kept run of a sparse change; shared navigation caches and allocator overhead are excluded.
+Grapheme, scalar, and word indexes are built independently when needed and shared across formatting/history snapshots. Position validation, style lookup, boundary snapping, and adjacent grapheme movement reuse an existing grapheme index or inspect bounded local Unicode context. If that context is insufficient, they build the full index once and reuse it. Ordinary arrow movement and grapheme deletion avoid indexing an entire newly edited paragraph. Word deletion reuses a cached word index or looks for word boundaries near the caret. It builds the full index when the local text provides insufficient Unicode context. Conversions at paragraph start return zero without building either index. Grapheme counting and other index conversions still build the full index, while scalar counting does not; indexed navigation uses binary searches instead of rescanning long paragraphs. ASCII grapheme/scalar offsets need no indexes, and ASCII word indexes are allocated only when used. `history_bytes()` estimates retained text, formatting, and link targets, charging the larger side of each change once so that text and runs shared by both sides are not counted twice, and each shared link target once per side. It also charges the paragraph pointers on both sides of a change and the record of each separately kept run of a sparse change; shared navigation caches and allocator overhead are excluded.
 
 A text edit costs time proportional to the affected paragraph bytes and runs. Inserting/removing paragraphs also shifts later paragraph references in the document's vector. List edits change only the paragraphs they touch: displayed numbers are computed from paragraph kinds and cached, and the first lookup after a change that affects numbering or the paragraph count recomputes them in one pass. Switching between body and quote, or between heading levels, preserves the numbering cache, including undo/redo. This is intended for application text fields and documents with reasonable paragraph sizes; it is not a rope for enormous single-line buffers.
 
-Queries without paragraph breaks search paragraphs independently: case-sensitive searches borrow text, and lowercase matching and whole-word indexes use temporary text/index memory bounded by the current paragraph. Word indexes and lowercase coordinate maps are prepared only when a literal candidate needs validation. Word indexes grow only as far as candidates need and remain local to each search. Candidate edges whose neighboring characters are ASCII apply the UAX #29 rules directly without a word index, and ASCII paragraphs lowercase without a coordinate map.
+Queries without paragraph breaks search paragraphs independently. Case-sensitive
+searches borrow the text. A forward scan checks whole-word matches with two
+Unicode word iterators, one for each edge. They use constant boundary storage
+and can skip large gaps between candidates when a space provides a safe place
+to restart segmentation. Edges with sufficient ASCII context use the UAX #29
+rules directly. Lowercase matching builds a coordinate map only when a match
+needs validation in a non-ASCII paragraph.
 
 Find-next/previous start at the selection boundary paragraph, visit paragraphs in the requested direction, and wrap through a bounded second interval. When a query cannot overlap itself, navigation searches from the selection: case-sensitive queries without whole-word matching scan directly, and other queries search windows that double in size away from the selection (lowercased for case-insensitive queries). Whole-word checks that need a word index segment words from the nearest earlier space that the next character does not join (any character other than a UAX #29 Extend, Format, ZWJ, or WSegSpace character), or from the paragraph start when no such space precedes the window, as in text written without spaces. Queries that can overlap themselves retain the complete forward match stream and lowercase context. All matches respect the original paragraph's grapheme boundaries. A nearby match can be found without searching unrelated earlier text; missing queries may still visit the whole document.
 
-Cross-paragraph searches of up to 16 lines compare paragraph text directly. The query's first line must end a paragraph, its middle lines must fill the following paragraphs, and its last line must start the final paragraph of the match. When a query can overlap itself, the search considers candidates in document order and resumes at the end of each accepted match. Longer queries temporarily flatten the document to avoid repeatedly comparing the same paragraphs.
+For a cross-paragraph match, the query's first line must match a paragraph suffix, each middle line must match a whole paragraph, and the last line must match a paragraph prefix. Queries of up to 16 lines compare those paragraphs directly. Longer queries use a prefix table for the complete middle lines.
+
+When the normalized query cannot overlap itself, Find Next scans forward from the selection end and Find Previous scans backward from its start. Wrapping searches the remaining interval if needed. When occurrences can overlap, both commands follow the same sequence as `Document::find`, accepting matches in document order and resuming at the end of each accepted match. Adjacent matches can share a paragraph when their byte ranges meet or have a gap. Temporary search storage scales with the query.
 
 Literal searchers are reused across matches within each searched text. After a rejected candidate, case-sensitive paragraph-local searches without whole-word matching can skip to the next grapheme start. Potentially overlapping candidates get at most two retries for short queries before using a linear byte matcher with temporary memory proportional to the query length; patterns that cannot overlap retain the standard string iterator. This avoids repeatedly rescanning long, repetitive queries.
 
@@ -400,11 +585,13 @@ still registers the complete tree required by egui, cloning cached run
 properties and applying current coordinate transforms. Direct AccessKit
 selection/label changes reuse paragraph nodes; precise single-paragraph edits
 update that paragraph and its run locations without scanning unchanged paragraph
-identities, and structural edits rebuild only the replaced paragraphs. An edit
+identities. Sparse replacements reuse the runs and links of shared paragraphs
+between matches, including when an earlier match adds or removes paragraphs. An edit
 that replaces paragraphs one for one and keeps their kinds also keeps their
-node IDs and skips restaging quote containers and the editor's child list. After
-several edits between updates, unchanged paragraphs at both ends are matched by
-identity and only the middle is rebuilt. The editor node still lists every
+node IDs and skips restaging quote containers, list sets, and the editor's child
+list. Changes to a list set republish item nodes whose position or set size
+changed. After several edits between updates, the adapter matches unchanged
+paragraphs by identity. The editor node still lists every
 paragraph, so cloning and comparing it on each content update scales with
 paragraph count. Direct runs of ASCII
 paragraphs skip Unicode segmentation; other paragraphs pay word segmentation for
@@ -435,6 +622,8 @@ The dependency-free benchmark harnesses measure local insertion/undo, paragraph 
 
 - Ubuntu stable runs `scripts/check-release.sh`: formatting, tests and doctests for all eight feature combinations, release-mode search/replacement oracles, Clippy for all targets, QA-tool and headless Python regressions, complete API documentation with warnings denied, release benchmark smoke tests with `TEXTLOOM_BENCH_QUICK=1`, the headless examples, explicit package inventory verification, and tests and all-target compilation from the extracted Cargo package.
 - Rust 1.95 tests every feature combination, builds the benchmarks, and compiles and tests the standalone native host, including its CLI/report tests.
+- A Chromium job builds a WebAssembly host against the extracted package and
+  the prepared eframe source, then exercises browser touch and mouse gestures.
 - macOS and Windows run strict Clippy on all library targets and the native host, then all-feature tests, doctests, and host CLI/report tests.
 - A minimal-versions job resolves the lowest direct dependency versions that `Cargo.toml` permits and compiles all targets on Rust 1.95.
 - cargo-deny checks advisories and, as a separate required job, bans, licenses, and sources for the library, native-host, and QA-tool manifests, following `deny.toml`.
