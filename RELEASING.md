@@ -72,6 +72,16 @@ the mouse-only control. In the opposite order, the touch swipe continued
 scrolling after a mouse stroke. Moving focus to an outside input while
 pressing a link canceled activation through the late mouse release.
 
+On `5dccabc`, Firefox 160, Chromium 157 and WebKitGTK 2.54.2 exposed
+another focus case. With eframe's hidden text input focused, releasing a
+mouse or touch drag could take focus back from another input on the page.
+An intervening pointer movement or repaint could mask the failure. The
+prepared web integration now observes focus changes on both the canvas and
+the hidden input. All three engines kept focus on the outside input through
+the late release. Firefox and WebKitGTK also preserved an internal focus
+transfer between the canvas and text input. The Chromium regression tests
+transfer focus during capture of a trusted release, before eframe handles it.
+
 The stock native egui-winit integration also lost a mouse selection during
 a touch tap. With the [native input correction](GUIDE.md#touch-input-in-native-egui-applications),
 the mouse selected offsets 497–509 with and without the intervening tap.

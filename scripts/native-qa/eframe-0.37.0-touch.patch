@@ -18,6 +18,27 @@ diff --git a/src/web/app_runner.rs b/src/web/app_runner.rs
              return false;
          }
  
+@@ -243,7 +244,10 @@
+     }
+ 
+     pub fn update_focus(&mut self) {
+-        let has_focus = self.has_focus();
++        self.set_focus(self.has_focus());
++    }
++
++    pub(super) fn set_focus(&mut self, has_focus: bool) {
+         if self.input.raw.focused != has_focus {
+             log::trace!("{} Focus changed to {has_focus}", self.canvas().id());
+             self.input.set_focus(has_focus);
+@@ -260,7 +264,7 @@
+     ///
+     /// The result can be painted later with a call to [`Self::run_and_paint`] or [`Self::paint`].
+     pub fn logic(&mut self) {
+-        // We sometimes miss blur/focus events due to the text agent, so let's just poll each frame:
++        // Focus can change while another event handler has borrowed the runner.
+         self.update_focus();
+ 
+         let canvas_size = super::canvas_size_in_points(self.canvas(), self.egui_ctx());
 diff --git a/src/web/backend.rs b/src/web/backend.rs
 --- a/src/web/backend.rs
 +++ b/src/web/backend.rs
@@ -180,10 +201,11 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  };
  
  use js_sys::Reflect;
-@@ -67,6 +67,12 @@
+@@ -66,7 +66,12 @@
+     let canvas = runner_ref.try_lock().unwrap().canvas().clone();
  
      install_blur_focus(runner_ref, &document)?;
-     install_blur_focus(runner_ref, &canvas)?;
+-    install_blur_focus(runner_ref, &canvas)?;
 +    // Window deactivation can leave the same element focused in the document.
 +    for name in ["focus", "blur"] {
 +        runner_ref.add_event_listener(&window, name, |_: web_sys::FocusEvent, runner| {
@@ -193,7 +215,7 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  
      prevent_default_and_stop_propagation(
          runner_ref,
-@@ -90,16 +96,36 @@
+@@ -90,16 +95,36 @@
      // Use `document` here to notice if the user releases a drag outside of the canvas:
      // See https://github.com/emilk/egui/issues/3157
      install_mousemove(runner_ref, &document)?;
@@ -238,7 +260,16 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  
      install_wheel(runner_ref, &canvas)?;
      install_gesture(runner_ref, &canvas)?;
-@@ -531,98 +557,192 @@
+@@ -110,8 +135,6 @@
+ }
+ 
+ fn install_blur_focus(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
+-    // NOTE: because of the text agent we sometime miss 'blur' events,
+-    // so we also poll the focus state each frame in `AppRunner::logic`.
+     for event_name in ["blur", "focus", "visibilitychange"] {
+         let closure =
+             move |_event: web_sys::MouseEvent, runner: &mut AppRunner, web_runner: &WebRunner| {
+@@ -531,98 +554,192 @@
      Ok(())
  }
  
@@ -518,7 +549,7 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  }
  
  /// Returns true if the cursor is above the canvas, or if we're dragging something.
-@@ -651,17 +771,23 @@
+@@ -651,17 +768,23 @@
          let modifiers = modifiers_from_mouse_event(&event);
          runner.input.set_modifiers(modifiers);
  
@@ -550,7 +581,7 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  
              // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
              if should_stop_propagation {
-@@ -680,8 +806,10 @@
+@@ -680,8 +803,10 @@
          target,
          "mouseleave",
          |event: web_sys::MouseEvent, runner| {
@@ -563,7 +594,7 @@ diff --git a/src/web/events.rs b/src/web/events.rs
  
              // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
              if (runner.web_options.should_stop_propagation)(&egui::Event::PointerGone) {
-@@ -695,130 +823,96 @@
+@@ -695,130 +820,96 @@
      )
  }
  
@@ -978,3 +1009,34 @@ diff --git a/src/web/mod.rs b/src/web/mod.rs
  }
  
  fn canvas_size_in_points(canvas: &web_sys::HtmlCanvasElement, ctx: &egui::Context) -> egui::Vec2 {
+diff --git a/src/web/text_agent.rs b/src/web/text_agent.rs
+--- a/src/web/text_agent.rs
++++ b/src/web/text_agent.rs
+@@ -69,7 +69,26 @@
+         // See https://github.com/emilk/egui/issues/8295
+         super::focus_without_scroll(&input).ok();
+ 
+-        // attach event listeners
++        // Both elements belong to the app. A direct blur listener sees the
++        // destination before a late pointer release can refocus the canvas.
++        // Moving focus between the two must preserve the active gesture.
++        let canvas_target: &web_sys::EventTarget = canvas;
++        let input_target: &web_sys::EventTarget = &input;
++        for (target, other) in [(canvas_target, input_target), (input_target, canvas_target)] {
++            runner_ref.add_event_listener(target, "focus", |_: web_sys::FocusEvent, runner| {
++                runner.update_focus();
++            })?;
++            let other = other.clone();
++            runner_ref.add_event_listener(
++                target,
++                "blur",
++                move |event: web_sys::FocusEvent, runner| {
++                    if event.related_target().as_ref() != Some(&other) {
++                        runner.set_focus(false);
++                    }
++                },
++            )?;
++        }
+ 
+         runner_ref.add_event_listener(
+             &input,

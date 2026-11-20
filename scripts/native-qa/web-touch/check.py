@@ -298,6 +298,42 @@ def gestures(d, url):
         d.check(route + " next mouse click opens link once", lambda q: q["links"] == expected and not q["held"])
         d.route_tab(url + "?blur=" + route, route)
         concurrent_primary(d, route, baseline["selection"])
+        text_agent_blur(d, route)
+
+
+def text_agent_blur(d, route):
+    for owner in ("touch", "mouse"):
+        initial = d.focus_find()
+        if owner == "touch":
+            d.touch("touchStart", (7, 130, 520))
+            d.touch("touchMove", (7, 130, 470))
+            d.check(route + " touch scroll with Find focused", lambda q: q["find"] and q["held"]
+                    and q["contacts"] == 1 and q["scroll"] == initial["scroll"] + 50)
+        else:
+            d.mouse("mouseMoved", 50, 190)
+            d.mouse("mousePressed", 50, 190, True)
+            d.check(route + " mouse holds editable document", lambda q: q["held"] and q["focused"])
+
+        # Transfer focus before eframe handles the trusted release, with no intervening
+        # motion or animation frame that could let its fallback focus poll hide a missed blur.
+        d.script("""
+            const agent = document.querySelector("input:not(#outside)");
+            const outside = document.getElementById("outside");
+            if (!agent || document.activeElement !== agent) throw Error("text agent is not focused");
+            qa.agentRelease = null;
+            window.addEventListener("pointerup", event => {
+                const fromAgent = document.activeElement === agent;
+                outside.focus();
+                qa.agentRelease = [event.pointerType, event.isTrusted, fromAgent, document.activeElement === outside];
+            }, { capture: true, once: true });
+        """)
+        if owner == "touch":
+            d.touch("touchEnd")
+        else:
+            d.mouse("mouseReleased", 50, 190)
+        d.check(f"{route} {owner} release after text-agent blur", lambda q:
+                q["agentRelease"] == [owner, True, True, True] and q["active"] == "outside"
+                and not q["held"] and not q["contacts"] and not q["links"])
 
 
 def concurrent_primary(d, route, baseline):

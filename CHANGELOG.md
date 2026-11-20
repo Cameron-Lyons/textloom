@@ -6,7 +6,9 @@
   text on the first mouse drag after touch input. Touch-down after a distant
   mouse hover preserves the scroll position until the finger moves.
   Optional egui 0.37.0 input corrections preserve the active selection when
-  another device touches the screen. See the integration steps for
+  another device touches the screen. In web applications, releasing a drag
+  after focus moves from an editable field to another page control leaves
+  focus on that control. See the integration steps for
   [native hosts](GUIDE.md#touch-input-in-native-egui-applications) and
   [web applications](GUIDE.md#touch-input-in-eframe-web-applications).
 - Word deletion in a long paragraph can resolve nearby word boundaries without
