@@ -281,11 +281,26 @@ jobs:
       - name: Install virtual display and software renderer
         timeout-minutes: 5
         run: |
-          # Avoid repeated Ubuntu archive DNS failures while retaining its signing key.
-          sudo sed -i 's|^URIs:.*|URIs: https://mirrors.edge.kernel.org/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources
-          apt_options=(-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
-          sudo apt-get "${apt_options[@]}" update --error-on=any
-          sudo apt-get "${apt_options[@]}" install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
+          packages=(libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb)
+          if states=$(dpkg-query -W -f='${db:Status-Status}\n' "${packages[@]}" 2>/dev/null) &&
+              [[ $(sort -u <<< "$states") == installed ]]; then
+            echo 'Renderer packages already installed.'
+            exit 0
+          fi
+
+          install_packages() {
+            local apt=(sudo apt-get -o Dir::Etc::sourcelist="$1" -o Dir::Etc::sourceparts=-
+                       -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+            "${apt[@]}" update --error-on=any &&
+              "${apt[@]}" install --no-install-recommends --yes "${packages[@]}"
+          }
+          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+          if ! install_packages "$ubuntu_sources"; then
+            echo 'Retrying with an independent Ubuntu mirror.'
+            fallback_sources="$RUNNER_TEMP/textloom-renderer.sources"
+            sed 's|^URIs:.*|URIs: https://mirrors.edge.kernel.org/ubuntu/|' "$ubuntu_sources" > "$fallback_sources"
+            install_packages "$fallback_sources"
+          fi
       - name: Build native renderer and report validator
         run: |
           cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target
