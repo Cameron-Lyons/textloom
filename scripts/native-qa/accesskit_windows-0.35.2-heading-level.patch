@@ -1,28 +1,26 @@
 Expose heading levels on UIA elements and TextPattern ranges
 
-Textloom compatibility patch for accesskit_windows-0.35.1.
-Base: crates.io accesskit_windows-0.35.1 (SHA-256 ce63f35d6bdcf59f26b76b3379063f738e6412cef46999cc772d46aa3de35adb)
+Textloom compatibility patch for accesskit_windows-0.35.2.
+Base: crates.io accesskit_windows-0.35.2 (SHA-256 498668b90da9995302a0055aaecad4756932333da2ddef6baee1c00844c430fc)
 Upstream project: https://github.com/AccessKit/accesskit
 UIA properties: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-automation-element-propids
 UIA text styles: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-style-identifiers
 Textloom changes are MIT licensed. Apply this patch at the crate root.
 
 diff --git a/Cargo.toml b/Cargo.toml
-index 00f1a7b..f393f96 100644
+index af3df80..b739e6f 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -45,7 +45,8 @@ path = "src/lib.rs"
- version = "0.25.1"
+@@ -46,6 +46,7 @@ version = "0.25.2"
  
  [dependencies.accesskit_consumer]
--version = "0.39.1"
-+version = "0.39.2"
+ version = "0.39.2"
 +path = "../accesskit_consumer-0.39.2"
  
  [dependencies.hashbrown]
  version = "0.17"
 diff --git a/src/node.rs b/src/node.rs
-index f414f77..d37a025 100644
+index f4a97e3..6e6fe4e 100644
 --- a/src/node.rs
 +++ b/src/node.rs
 @@ -49,6 +49,14 @@ fn runtime_id_from_node_id(id: FullNodeId) -> [i32; RUNTIME_ID_SIZE] {
@@ -421,28 +419,15 @@ index 6b18382..e6dc1ae 100644
 +    }
 +}
 diff --git a/Cargo.lock b/Cargo.lock
+index 8d24c9b..4ec3e07 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -20,18 +20,16 @@
- 
- [[package]]
- name = "accesskit"
--version = "0.25.1"
--source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "ad442f58ee04714aaa0ba0a2768c1ea1935b29507bb22ddece8cbbc76db02932"
-+version = "0.25.2"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "4e883d1d28c5fd5568c79ed2d2bd48d9f2fd3945c8974ed0f53690ceddb051be"
- dependencies = [
-  "uuid",
- ]
- 
+@@ -30,8 +30,6 @@ dependencies = [
  [[package]]
  name = "accesskit_consumer"
--version = "0.39.1"
+ version = "0.39.2"
 -source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "8a45e2bb300bea6d5f33a82c3e051c3ddc6f41c209750f68a0acbe991a284344"
-+version = "0.39.2"
+-checksum = "f3da8f27636015191b2264ee1df681503170a632cafd832fdc1edfdd4e3a2fd3"
  dependencies = [
   "accesskit",
   "hashbrown",

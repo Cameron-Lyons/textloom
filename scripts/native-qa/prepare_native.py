@@ -60,8 +60,8 @@ PROFILES = {
             ("format",),
         ),
         (
-            "accesskit_windows-0.35.1",
-            "ce63f35d6bdcf59f26b76b3379063f738e6412cef46999cc772d46aa3de35adb",
+            "accesskit_windows-0.35.2",
+            "498668b90da9995302a0055aaecad4756932333da2ddef6baee1c00844c430fc",
             ("heading-level",),
         ),
     ],

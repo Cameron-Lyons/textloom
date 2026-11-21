@@ -196,7 +196,7 @@ jobs:
         run: |
           probe=$(mktemp -d target/windows-heading.XXXXXX)
           python scripts/native-qa/prepare_native.py accesskit-windows "$probe/provider"
-          manifest="$probe/provider/accesskit_windows-0.35.1/Cargo.toml"
+          manifest="$probe/provider/accesskit_windows-0.35.2/Cargo.toml"
           cargo test --locked --manifest-path "$manifest" --target-dir target --lib heading
       - name: Tests and doctests
         run: cargo test --locked --all-features

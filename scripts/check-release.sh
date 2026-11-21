@@ -113,10 +113,10 @@ egui-winit = { path = "native-input/egui-winit-0.37.0" }
 accesskit_atspi_common = { path = "accesskit/accesskit_atspi_common-0.21.1" }
 accesskit_unix = { path = "accesskit/accesskit_unix-0.24.1" }
 accesskit_consumer = { path = "accesskit-windows/accesskit_consumer-0.39.2" }
-accesskit_windows = { path = "accesskit-windows/accesskit_windows-0.35.1" }
+accesskit_windows = { path = "accesskit-windows/accesskit_windows-0.35.2" }
 TOML
 cargo check --offline --all-targets --manifest-path "$native_package_check_dir/Cargo.toml" --target-dir "$package_target_dir"
-for package in winit@0.30.13 egui@0.37.0 egui-winit@0.37.0 accesskit_atspi_common@0.21.1 accesskit_unix@0.24.1 accesskit_consumer@0.39.2 accesskit_windows@0.35.1; do
+for package in winit@0.30.13 egui@0.37.0 egui-winit@0.37.0 accesskit_atspi_common@0.21.1 accesskit_unix@0.24.1 accesskit_consumer@0.39.2 accesskit_windows@0.35.2; do
     if [[ $(cargo pkgid --locked --manifest-path "$native_package_check_dir/Cargo.toml" "$package") != path+file:* ]]; then
         echo "The native host did not resolve the prepared source for $package." >&2
         exit 1

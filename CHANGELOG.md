@@ -35,7 +35,8 @@
   both accessibility adapters. A soft break inside the link remains part of
   that text. Looking up a link in unlinked text skips Unicode segmentation.
 - Windows applications can enable UI Automation heading levels and text-range
-  styles for screen readers with the
+  styles for screen readers with the patched `accesskit_windows` 0.35.2
+  provider, which retains the upstream password-field privacy fix. See the
   [AccessKit workspace patches](GUIDE.md#heading-levels-on-windows).
 - Linux applications can opt into AT-SPI Hypertext support for Orca's
   whole-line link announcements. See the

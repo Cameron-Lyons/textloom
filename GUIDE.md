@@ -441,22 +441,28 @@ caret description after reading the line.
 The stock Windows backend exposes each heading's level through the generic
 UI Automation `Level` property. Readers can also query `HeadingLevel` on
 the element or ask for the `StyleId` of a text range inside the editor.
-Applications using `accesskit_windows` 0.35.1 and `accesskit_consumer` 0.39.2
+Applications using `accesskit_windows` 0.35.2 and `accesskit_consumer` 0.39.2
 can enable both with workspace patches. From your application workspace, run
 the helper from a Textloom checkout.
 
 ```sh
-python3 /path/to/textloom/scripts/native-qa/prepare_native.py accesskit-windows vendor/accesskit-windows
+python3 /path/to/textloom/scripts/native-qa/prepare_native.py accesskit-windows vendor/accesskit-windows-0.35.2
 ```
 
-Add the following entries to your workspace-root `Cargo.toml` and build once
-to update the lockfile. If the workspace already has a `[patch.crates-io]`
-table, add both entries there.
+Set both paths in the `[patch.crates-io]` table in your workspace-root
+`Cargo.toml`.
 
 ```toml
 [patch.crates-io]
-accesskit_consumer = { path = "vendor/accesskit-windows/accesskit_consumer-0.39.2" }
-accesskit_windows = { path = "vendor/accesskit-windows/accesskit_windows-0.35.1" }
+accesskit_consumer = { path = "vendor/accesskit-windows-0.35.2/accesskit_consumer-0.39.2" }
+accesskit_windows = { path = "vendor/accesskit-windows-0.35.2/accesskit_windows-0.35.2" }
+```
+
+If your lockfile selects `accesskit_windows` 0.35.1, update it from the
+workspace root so Cargo uses the patched provider.
+
+```sh
+cargo update -p accesskit_windows --precise 0.35.2
 ```
 
 ## Performance and validation
