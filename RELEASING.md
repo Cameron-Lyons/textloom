@@ -15,6 +15,11 @@ configurations and the relevant upstream fixes. The macOS hands-on confirmation
 below applies to the tested build and named scenarios. Physical-input and
 audible screen-reader signoff remain open for the final revision.
 
+In the `4d8c340` offline editor check, a tester reported that typing in Safari
+on an iPhone went into the **Outside** field after the held gesture ended.
+The exact iPhone model, iOS version and whether the on-screen keyboard stayed
+usable after release remain unconfirmed.
+
 ### Editing, search and pointer checks, 2026-11-19
 
 Word deletion matched whole-paragraph navigation in 42,442 generated checks
@@ -61,8 +66,7 @@ On `5efc65d`, desktop WebKitGTK 2.54.2 on Wayland also scrolled 200 pixels
 on the first swipe, preserved the primary drag when the second finger lifted,
 and selected the same text on the first mouse drag after touch as with a
 mouse alone. An outside input retained focus through a late touch release.
-These checks used a private virtual seat. Safari and the iOS keyboard still
-need hands-on verification.
+These WebKitGTK checks used a private virtual seat.
 
 With a held mouse button, a second device exposed a different failure.
 In Chromium, a touch on another line moved the mouse selection there.
