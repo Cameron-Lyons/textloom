@@ -190,6 +190,14 @@ jobs:
         run: cargo clippy --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target -- -D warnings
       - name: Native host CLI and report tests
         run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Exercise private macOS pasteboards across fresh test processes
+        if: runner.os == 'macOS'
+        run: |
+          for attempt in 1 2 3 4 5; do
+            echo "Private pasteboard run $attempt"
+            cargo test --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target \
+              --bin textloom-native-example clipboard::macos::tests:: -- --test-threads=3
+          done
       - name: Windows UI Automation heading properties and text ranges
         if: runner.os == 'Windows'
         shell: bash
