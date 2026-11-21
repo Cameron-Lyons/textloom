@@ -13,12 +13,18 @@ known failures in the supported configurations. The
 [native dependency limitations](#native-dependency-limitations) identify those
 configurations and the relevant upstream fixes. The macOS hands-on confirmation
 below applies to the tested build and named scenarios. Physical-input and
-audible screen-reader signoff remain open for the final revision.
+live screen-reader checks remain open for the final revision.
 
 In the `4d8c340` offline editor check, a tester reported that typing in Safari
 on an iPhone went into the **Outside** field after the held gesture ended.
 The exact iPhone model, iOS version and whether the on-screen keyboard stayed
 usable after release remain unconfirmed.
+
+A listener confirmed that all three screen-reader recordings from native
+build `88114c7` were clear. Orca 51.1 read the inline link names on Linux.
+On Windows 11, NVDA 2026.2 read heading levels 1 and 3 and the intervening
+body text in one clip. In the other, the listener could distinguish “Select”
+from “Select t” as the selection grew.
 
 ### Editing, search and pointer checks, 2026-11-19
 
@@ -170,7 +176,7 @@ additional “Link” when the focused document's description changes.
 Recordings from the packaged native editor at `5efc65d` captured NVDA 2026.2
 reading a heading, its body text, and the heading again, as well as Orca 51.1
 reading the inline links. Offline transcription recovered heading levels 1
-and 3 in the Windows audio. Human listening signoff is still open.
+and 3 in the Windows audio.
 
 The same open Linux editor moved between two private Sway outputs at 1×, 2×,
 then 1×. Selection survived each move. Pointer placement, drag selection,
@@ -1422,7 +1428,7 @@ malformed-input regression tests when changing the codec.
    host behavior claimed by this release is a release blocker. Use the native
    signoff protocol in `examples/native-editor/NATIVE_QA.md` and record unavailable
    checks explicitly. Windows VM and hosted automation are available; physical
-   device checks and audible reader signoff remain open. A release candidate
+   device checks and live screen-reader signoff remain open. A release candidate
    may be published with them open if its
    GitHub release lists them; 1.0.0 may not.
 
