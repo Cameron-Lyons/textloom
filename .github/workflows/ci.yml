@@ -281,7 +281,10 @@ jobs:
       - name: Install virtual display and software renderer
         timeout-minutes: 5
         run: |
-          packages=(libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb)
+          packages=(
+            libegl1 libgl1-mesa-dri libglx-mesa0
+            libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
+          )
           if states=$(dpkg-query -W -f='${db:Status-Status}\n' "${packages[@]}" 2>/dev/null) &&
               [[ $(sort -u <<< "$states") == installed ]]; then
             echo 'Renderer packages already installed.'
