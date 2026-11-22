@@ -91,7 +91,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native host and report validator
         run: |
-          python scripts/native-qa/build_input_host.py
+          python scripts/native-qa/build_input_host.py --reader nvda
           cargo build --locked --manifest-path scripts/qa-tools/Cargo.toml --target-dir target --bin check-native-report
       - name: Install signed Mesa software renderer
         id: mesa

@@ -6,20 +6,67 @@ interaction probes provide supporting evidence. Record the observed outcome of
 each applicable check separately; the host's JSON report always leaves manual
 signoff unrecorded.
 
-Start from a clean checkout of the candidate under review. On Linux or macOS:
+Start in the repository root of a clean candidate checkout. Set
+`TEXTLOOM_QA_REVISION` before building so the host embeds the commit in its
+report. Choose the dependency configuration you want to test.
+
+## Stock registry build
+
+These commands use the versions in the example's lockfile with no source
+overrides. Record any observed [stock dependency limitations](../../RELEASING.md#native-dependency-limitations).
+
+On Linux or macOS, run
 
 ```sh
 TEXTLOOM_QA_REVISION="$(git rev-parse HEAD)" \
   cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target -- \
-  --rich-clipboard --qa-report native-qa-editable.json
+  --rich-clipboard --qa-report native-qa-stock-editable.json
 ```
 
-On Windows PowerShell:
+In Windows PowerShell, run
 
 ```powershell
 $env:TEXTLOOM_QA_REVISION = git rev-parse HEAD
-cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target -- --rich-clipboard --qa-report native-qa-editable.json
+cargo run --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target -- --rich-clipboard --qa-report native-qa-stock-editable.json
 ```
+
+## Prepared input and screen-reader builds
+
+The helper verifies which prepared libraries Cargo compiled and prints the
+executable path. Launch that executable directly and finish testing it before
+rebuilding another configuration at the same path. The commands below show
+the default path. Use the printed path if it differs.
+
+On Linux with Orca, build the input and AT-SPI patches together. Read a
+whole line containing an inline link and record which link names Orca announces.
+
+```sh
+export TEXTLOOM_QA_REVISION="$(git rev-parse HEAD)"
+python3 scripts/native-qa/build_input_host.py --reader orca &&
+  ./target/debug/textloom-native-example --rich-clipboard --qa-report native-qa-orca-editable.json
+```
+
+On Windows with NVDA, build the input and UI Automation patches together.
+Read a level 1 heading, a body paragraph and a level 3 heading, and record
+which levels and text NVDA announces.
+
+```powershell
+$env:TEXTLOOM_QA_REVISION = git rev-parse HEAD
+python scripts/native-qa/build_input_host.py --reader nvda
+if ($LASTEXITCODE -eq 0) {
+    & '.\target\debug\textloom-native-example.exe' --rich-clipboard --qa-report native-qa-nvda-editable.json
+}
+```
+
+On macOS, build the input patches and use the system VoiceOver reader.
+
+```sh
+export TEXTLOOM_QA_REVISION="$(git rev-parse HEAD)"
+python3 scripts/native-qa/build_input_host.py &&
+  ./target/debug/textloom-native-example --rich-clipboard --qa-report native-qa-voiceover-editable.json
+```
+
+## Running the checks
 
 Choose an unused report path; the host refuses to start if the file exists or
 cannot be created. Supply `--font PATH` when the default fonts do not
@@ -116,13 +163,14 @@ cover the winit adapter's focus and `sync_ime` integration.
 
 ## Signoff record
 
-For each platform, attach a record with these fields:
+For each platform and dependency configuration tested, attach a record with these fields:
 
 ```text
 Candidate full commit:
 Clean checkout confirmed:
 OS/version and display backend:
 Native host egui/eframe/winit versions:
+Dependency configuration (stock registry, or prepared command and libraries the helper verified):
 Display scale(s) and supplied font(s):
 Physical keyboard/layout and dead-key/AltGr sequences:
 Japanese/Chinese IME names and versions:
