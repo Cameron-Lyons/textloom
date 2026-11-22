@@ -1,0 +1,33 @@
+Windows: Preserve a cancelled native touch contact
+
+Base: winit 0.30.13 from crates.io (SHA-256 a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d)
+License: Apache-2.0 (winit)
+
+Win32 can deliver POINTER_FLAG_CANCELED together with POINTER_FLAG_UP.
+Report TouchPhase::Cancelled so an interrupted contact cannot complete a tap.
+Apply from the crate root with git apply.
+
+diff --git a/src/platform_impl/windows/event_loop.rs b/src/platform_impl/windows/event_loop.rs
+--- a/src/platform_impl/windows/event_loop.rs
++++ b/src/platform_impl/windows/event_loop.rs
+@@ -35,7 +35,7 @@
+     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+ };
+ use windows_sys::Win32::UI::Input::Pointer::{
+-    POINTER_FLAG_DOWN, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
++    POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
+ };
+ use windows_sys::Win32::UI::Input::Touch::{
+     CloseTouchInputHandle, GetTouchInputInfo, TOUCHEVENTF_DOWN, TOUCHEVENTF_MOVE, TOUCHEVENTF_UP,
+@@ -2106,7 +2106,10 @@
+                     userdata.send_event(Event::WindowEvent {
+                         window_id: RootWindowId(WindowId(window)),
+                         event: WindowEvent::Touch(Touch {
+-                            phase: if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_DOWN) {
++                            phase: if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_CANCELED)
++                            {
++                                TouchPhase::Cancelled
++                            } else if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_DOWN) {
+                                 TouchPhase::Started
+                             } else if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_UP) {
+                                 TouchPhase::Ended

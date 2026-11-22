@@ -288,6 +288,7 @@ pub(super) fn numbering(checks: &Checks) -> Result<Value> {
         replace_document(session, "one\ntwo\nthree")?;
         session.keys(&["ctrl+a", "ctrl+shift+7"])?;
         let initial = copy(session)?;
+        let initial_kinds = session.kinds()?;
         session.select("three", Some(Caret::End))?;
         let initial_status = session.status()?;
         session.click_element("Restart at 1", None, "Button")?;
@@ -304,6 +305,7 @@ pub(super) fn numbering(checks: &Checks) -> Result<Value> {
         let indented_status = session.status()?;
         session.keys(&["ctrl+a"])?;
         let nested = copy(session)?;
+        let nested_kinds = session.kinds()?;
         session.select("two", Some(Caret::End))?;
         session.click_element("Outdent", None, "Button")?;
         session.keys(&["ctrl+a"])?;
@@ -313,6 +315,7 @@ pub(super) fn numbering(checks: &Checks) -> Result<Value> {
         session.screenshot("numbered-list")?;
         let contains = |status: &Value, label: &str| listed(status.clone()).iter().any(|value| value == label);
         let expectations = json!({
+            "UIA exposes three ordered paragraphs before and after indenting the second": initial_kinds == ["list item"; 3] && nested_kinds == initial_kinds,
             "three numbered items start at 1": html(&initial).contains("<ol start=\"1\">") && html(&initial).matches("<li").count() == 3 && contains(&initial_status, "Item 3."),
             "Restart at 1 changes the third marker": html(&restarted).contains("<li value=\"1\">three") && contains(&restart_status, "Item 1."),
             "Continue numbering restores the third marker": contains(&continue_status, "Item 3.") && same_rich(&continued, &initial),
@@ -320,7 +323,7 @@ pub(super) fn numbering(checks: &Checks) -> Result<Value> {
             "Outdent restores the original fragment": same_rich(&outdented, &initial),
             "copying only the third item preserves its computed start": html(&partial).contains("<ol start=\"3\"><li>three</li></ol>"),
         });
-        finish(session, expectations, json!({"initial": initial, "restarted": restarted, "nested": nested, "partial": partial, "initial_status": initial_status, "restart_status": restart_status, "continue_status": continue_status, "indented_status": indented_status}))
+        finish(session, expectations, json!({"initial": initial, "restarted": restarted, "nested": nested, "partial": partial, "initial_status": initial_status, "restart_status": restart_status, "continue_status": continue_status, "indented_status": indented_status, "initial_kinds": initial_kinds, "nested_kinds": nested_kinds}))
     })
 }
 

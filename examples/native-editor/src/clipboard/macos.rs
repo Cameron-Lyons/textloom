@@ -182,6 +182,8 @@ fn read_from(board: &NSPasteboard) -> Result<Option<NativeItem>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, PoisonError};
+
     use textloom::{Color, Editor, Fragment, StylePatch};
 
     use super::*;
@@ -190,22 +192,27 @@ mod tests {
     // user's general clipboard, including when running concurrently in CI.
     struct TestPasteboard(Retained<NSPasteboard>);
 
-    impl TestPasteboard {
-        fn new() -> Self {
-            Self(NSPasteboard::pasteboardWithUniqueName())
-        }
-    }
-
     impl Drop for TestPasteboard {
         fn drop(&mut self) {
             self.0.clearContents();
         }
     }
 
+    fn with_test_pasteboard(run: impl FnOnce(&NSPasteboard)) {
+        // The boards have distinct names, but their setup and teardown use the
+        // same AppKit service. Drain one fixture's autorelease pool before the
+        // next fixture starts.
+        static ACCESS: Mutex<()> = Mutex::new(());
+        let _access = ACCESS.lock().unwrap_or_else(PoisonError::into_inner);
+        autoreleasepool(|_| {
+            let board = TestPasteboard(NSPasteboard::pasteboardWithUniqueName());
+            run(&board.0);
+        });
+    }
+
     #[test]
     fn native_formats_preserve_unicode_styles_and_replaced_publications() {
-        autoreleasepool(|_| {
-            let board = TestPasteboard::new();
+        with_test_pasteboard(|board| {
             let mut editor = Editor::from_text("café 日本語 e\u{301} 👩🏽\u{200d}💻\nsecond");
             editor.select_all();
             editor
@@ -218,20 +225,26 @@ mod tests {
             let fragment = Fragment::from_document(editor.document());
             for _ in 0..2 {
                 let item = NativeItem::from_fragment(&fragment).unwrap();
-                let generation = board.0.changeCount();
-                publish_to(&board.0, &item).unwrap();
+                let generation = board.changeCount();
+                publish_to(board, &item).unwrap();
                 assert_ne!(
-                    board.0.changeCount(),
+                    board.changeCount(),
                     generation,
                     "identical text still represents a fresh publication"
                 );
-                let captured = read_from(&board.0).unwrap().unwrap();
+                let captured = read_from(board).unwrap().unwrap();
                 assert_eq!(captured, item);
                 assert_eq!(captured.fragment().unwrap(), fragment);
 
                 // Inspect each native representation independently of read_from.
-                let items = board.0.pasteboardItems().unwrap();
-                assert_eq!(items.count(), 1);
+                let items = board.pasteboardItems().unwrap();
+                assert_eq!(
+                    items.count(),
+                    1,
+                    "board {:?}, generation {} after publication from {generation}",
+                    board.name(),
+                    board.changeCount()
+                );
                 let native_item = items.firstObject().unwrap();
                 for (data_type, expected) in [
                     (PLAIN_TYPE, item.plain.as_bytes()),
@@ -250,10 +263,9 @@ mod tests {
 
     #[test]
     fn empty_external_and_multiple_items_use_plain_fallback() {
-        autoreleasepool(|_| {
-            let board = TestPasteboard::new();
-            board.0.clearContents();
-            assert!(read_from(&board.0).unwrap().is_none());
+        with_test_pasteboard(|board| {
+            board.clearContents();
+            assert!(read_from(board).unwrap().is_none());
 
             let external = NSPasteboardItem::new();
             assert!(external.setData_forType(
@@ -262,10 +274,10 @@ mod tests {
             ));
             let writer: &ProtocolObject<dyn NSPasteboardWriting> =
                 ProtocolObject::from_ref(&*external);
-            assert!(board.0.writeObjects(&NSArray::from_slice(&[writer])));
-            assert!(read_from(&board.0).unwrap().is_none());
+            assert!(board.writeObjects(&NSArray::from_slice(&[writer])));
+            assert!(read_from(board).unwrap().is_none());
 
-            board.0.clearContents();
+            board.clearContents();
             // AppKit binds an item to its first publication; never publish the
             // same NSPasteboardItem again, even after clearing that pasteboard.
             let first = NSPasteboardItem::new();
@@ -291,20 +303,21 @@ mod tests {
             ));
             let second_writer: &ProtocolObject<dyn NSPasteboardWriting> =
                 ProtocolObject::from_ref(&*second);
-            assert!(
-                board
-                    .0
-                    .writeObjects(&NSArray::from_slice(&[first_writer, second_writer]))
-            );
-            assert!(read_from(&board.0).unwrap().is_none());
+            assert!(board.writeObjects(&NSArray::from_slice(&[first_writer, second_writer])));
+            assert!(read_from(board).unwrap().is_none());
         });
     }
 
     #[test]
     fn incomplete_or_invalid_native_items_are_rejected() {
-        autoreleasepool(|_| {
-            let board = TestPasteboard::new();
-            for plain in [None, Some(b"\xff".as_slice())] {
+        with_test_pasteboard(|board| {
+            for (plain, expected_error) in [
+                (None, "Native clipboard item is missing plain text"),
+                (
+                    Some(b"\xff".as_slice()),
+                    "Native clipboard plain text is not UTF-8",
+                ),
+            ] {
                 let item = NSPasteboardItem::new();
                 assert!(
                     item.setData_forType(
@@ -324,9 +337,16 @@ mod tests {
                 }
                 let writer: &ProtocolObject<dyn NSPasteboardWriting> =
                     ProtocolObject::from_ref(&*item);
-                board.0.clearContents();
-                assert!(board.0.writeObjects(&NSArray::from_slice(&[writer])));
-                assert!(read_from(&board.0).is_err(), "plain {plain:?}");
+                board.clearContents();
+                assert!(board.writeObjects(&NSArray::from_slice(&[writer])));
+                let generation = board.changeCount();
+                assert_eq!(
+                    read_from(board),
+                    Err(expected_error.to_owned()),
+                    "board {:?}, generation {generation} before read, {} after",
+                    board.name(),
+                    board.changeCount()
+                );
             }
         });
     }

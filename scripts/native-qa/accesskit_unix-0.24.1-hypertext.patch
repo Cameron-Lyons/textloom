@@ -1,0 +1,249 @@
+Expose the AT-SPI Hypertext interface with distinct hyperlink proxy paths
+
+Textloom compatibility patch for accesskit_unix-0.24.1.
+Base: crates.io accesskit_unix-0.24.1 (SHA-256 30d5192871228c54f1b0fb4a85cef000e11a3804f25d2165f14afa0daa67f3f6)
+Upstream project: https://github.com/AccessKit/accesskit
+Protocol: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/iface.Hypertext.html
+Textloom changes are MIT licensed. Apply this patch at the crate root.
+
+diff --git a/src/atspi/bus.rs b/src/atspi/bus.rs
+index 2181ee6..bb00525 100644
+--- a/src/atspi/bus.rs
++++ b/src/atspi/bus.rs
+@@ -4,7 +4,7 @@
+ // the LICENSE-MIT file), at your option.
+ 
+ use crate::{
+-    atspi::{ObjectId, cache_path, interfaces::*},
++    atspi::{ObjectId, cache_path, hyperlink_path, interfaces::*},
+     context::get_or_init_app_context,
+     executor::{Executor, Task},
+ };
+@@ -156,6 +156,18 @@ impl Bus {
+                 HyperlinkInterface::new(bus_name.clone(), node.clone()),
+             )
+             .await?;
++            self.register_interface(
++                &hyperlink_path(node.adapter_id(), node.id()),
++                HyperlinkInterface::new(bus_name.clone(), node.clone()),
++            )
++            .await?;
++        }
++        if new_interfaces.contains(Interface::Hypertext) {
++            self.register_interface(
++                &path,
++                HypertextInterface::new(bus_name.clone(), node.clone()),
++            )
++            .await?;
+         }
+         if new_interfaces.contains(Interface::Image) {
+             self.register_interface(&path, ImageInterface::new(node.clone()))
+@@ -224,6 +236,12 @@ impl Bus {
+         if old_interfaces.contains(Interface::Hyperlink) {
+             self.unregister_interface::<HyperlinkInterface>(&path)
+                 .await?;
++            self.unregister_interface::<HyperlinkInterface>(&hyperlink_path(adapter_id, node_id))
++                .await?;
++        }
++        if old_interfaces.contains(Interface::Hypertext) {
++            self.unregister_interface::<HypertextInterface>(&path)
++                .await?;
+         }
+         if old_interfaces.contains(Interface::Image) {
+             self.unregister_interface::<ImageInterface>(&path).await?;
+diff --git a/src/atspi/interfaces/cache.rs b/src/atspi/interfaces/cache.rs
+index a85c6c9..d214685 100644
+--- a/src/atspi/interfaces/cache.rs
++++ b/src/atspi/interfaces/cache.rs
+@@ -210,6 +210,51 @@ mod tests {
+         assert!(app.ifaces.contains(Interface::Application));
+     }
+ 
++    #[test]
++    fn hypertext_returns_distinct_proxy_and_anchor_paths_and_named_nulls() {
++        use crate::atspi::{
++            OwnedObjectAddress, hyperlink_path,
++            interfaces::{HyperlinkInterface, HypertextInterface},
++        };
++        use zbus::zvariant::ObjectPath;
++
++        let mut link = with_children(Role::Link, &[NodeId(2)]);
++        link.set_url("https://example.com");
++        let mut text = Node::new(Role::TextRun);
++        text.set_value("x");
++        text.set_character_lengths(vec![1]);
++        let mut tree = window_with_button();
++        tree.nodes = vec![
++            (
++                NodeId(0),
++                with_children(Role::MultilineTextInput, &[NodeId(1)]),
++            ),
++            (NodeId(1), link),
++            (NodeId(2), text),
++        ];
++        let (adapter, _) = root_for(tree);
++        let doc = adapter.platform_node(adapter.root_id());
++        let anchor = adapter.platform_node(doc.child_at_index(0).unwrap().unwrap());
++        let bus_name = OwnedUniqueName::try_from(BUS_NAME).unwrap();
++        let text = HypertextInterface::new(bus_name.clone(), doc);
++        let link = HyperlinkInterface::new(bus_name.clone(), anchor.clone());
++        let proxy = text.get_link(0).unwrap().0;
++        let accessible = link.get_object(0).unwrap().0;
++        assert_eq!(accessible, ObjectId::from(&anchor).to_address(&bus_name));
++        assert_eq!(
++            proxy,
++            OwnedObjectAddress::new(&bus_name, hyperlink_path(anchor.adapter_id(), anchor.id()))
++        );
++        assert_ne!(proxy, accessible);
++        let null = OwnedObjectAddress::new(
++            &bus_name,
++            ObjectPath::try_from("/org/a11y/atspi/null").unwrap().into(),
++        );
++        for invalid_index in [-1, 1] {
++            assert_eq!(text.get_link(invalid_index).unwrap().0, null);
++        }
++    }
++
+     #[test]
+     fn top_window_parent_is_application_root() {
+         let (_adapter, iface) = cache(window_with_button());
+diff --git a/src/atspi/interfaces/hyperlink.rs b/src/atspi/interfaces/hyperlink.rs
+index fbb12f7..75f7947 100644
+--- a/src/atspi/interfaces/hyperlink.rs
++++ b/src/atspi/interfaces/hyperlink.rs
+@@ -40,7 +40,7 @@ impl HyperlinkInterface {
+         self.node.hyperlink_end_index().map_err(self.map_error())
+     }
+ 
+-    fn get_object(&self, index: i32) -> fdo::Result<(OwnedObjectAddress,)> {
++    pub(super) fn get_object(&self, index: i32) -> fdo::Result<(OwnedObjectAddress,)> {
+         let object = self
+             .node
+             .hyperlink_object(index)
+diff --git a/src/atspi/interfaces/hypertext.rs b/src/atspi/interfaces/hypertext.rs
+new file mode 100644
+index 0000000..43e0df6
+--- /dev/null
++++ b/src/atspi/interfaces/hypertext.rs
+@@ -0,0 +1,55 @@
++// Copyright 2026 The AccessKit Authors. All rights reserved.
++// Licensed under the Apache License, Version 2.0 (found in
++// the LICENSE-APACHE file) or the MIT license (found in
++// the LICENSE-MIT file), at your option.
++// Hypertext implementation copyright 2026 The Textloom Authors (MIT).
++
++use accesskit_atspi_common::PlatformNode;
++use zbus::{fdo, interface, names::OwnedUniqueName};
++
++use crate::atspi::{OwnedObjectAddress, hyperlink_path};
++
++pub(crate) struct HypertextInterface {
++    bus_name: OwnedUniqueName,
++    node: PlatformNode,
++}
++
++impl HypertextInterface {
++    pub fn new(bus_name: OwnedUniqueName, node: PlatformNode) -> Self {
++        Self { bus_name, node }
++    }
++
++    fn map_error(&self) -> impl '_ + FnOnce(accesskit_atspi_common::Error) -> fdo::Error {
++        |error| crate::util::map_error_from_node(&self.node, error)
++    }
++}
++
++#[interface(name = "org.a11y.atspi.Hypertext")]
++impl HypertextInterface {
++    #[zbus(property, name = "version")]
++    fn version(&self) -> u32 {
++        1
++    }
++
++    #[zbus(name = "GetNLinks")]
++    fn get_n_links(&self) -> fdo::Result<i32> {
++        self.node.n_links().map_err(self.map_error())
++    }
++
++    pub(super) fn get_link(&self, index: i32) -> fdo::Result<(OwnedObjectAddress,)> {
++        let link = self.node.link_at_index(index).map_err(self.map_error())?;
++        // libatspi resolves the bus name before recognizing the null path.
++        Ok((match link {
++            Some(id) => {
++                OwnedObjectAddress::new(&self.bus_name, hyperlink_path(self.node.adapter_id(), id))
++            }
++            None => OwnedObjectAddress::null_in(&self.bus_name),
++        },))
++    }
++
++    fn get_link_index(&self, offset: i32) -> fdo::Result<i32> {
++        self.node
++            .link_index_at_offset(offset)
++            .map_err(self.map_error())
++    }
++}
+diff --git a/src/atspi/interfaces/mod.rs b/src/atspi/interfaces/mod.rs
+index 239413b..944055b 100644
+--- a/src/atspi/interfaces/mod.rs
++++ b/src/atspi/interfaces/mod.rs
+@@ -11,6 +11,7 @@ mod component;
+ mod document;
+ mod editable_text;
+ mod hyperlink;
++mod hypertext;
+ mod image;
+ mod selection;
+ mod text;
+@@ -41,6 +42,7 @@ pub(crate) use component::*;
+ pub(crate) use document::*;
+ pub(crate) use editable_text::*;
+ pub(crate) use hyperlink::*;
++pub(crate) use hypertext::*;
+ pub(crate) use image::*;
+ pub(crate) use selection::*;
+ pub(crate) use text::*;
+diff --git a/src/atspi/mod.rs b/src/atspi/mod.rs
+index 799e9f3..26d4946 100644
+--- a/src/atspi/mod.rs
++++ b/src/atspi/mod.rs
+@@ -10,4 +10,4 @@ mod object_id;
+ 
+ pub(crate) use bus::*;
+ pub(crate) use object_address::OwnedObjectAddress;
+-pub(crate) use object_id::{ObjectId, cache_path};
++pub(crate) use object_id::{ObjectId, cache_path, hyperlink_path};
+diff --git a/src/atspi/object_address.rs b/src/atspi/object_address.rs
+index 8acd0ec..49bdf88 100644
+--- a/src/atspi/object_address.rs
++++ b/src/atspi/object_address.rs
+@@ -27,6 +27,10 @@ impl OwnedObjectAddress {
+         }
+     }
+ 
++    pub(crate) fn null_in(bus_name: &UniqueName) -> Self {
++        Self::new(bus_name, ObjectPath::from_str_unchecked(NULL_PATH).into())
++    }
++
+     pub(crate) fn null() -> Self {
+         Self {
+             bus_name: String::new(),
+diff --git a/src/atspi/object_id.rs b/src/atspi/object_id.rs
+index e65ceda..e9af687 100644
+--- a/src/atspi/object_id.rs
++++ b/src/atspi/object_id.rs
+@@ -15,6 +15,16 @@ const ACCESSIBLE_PATH_PREFIX: &str = "/org/a11y/atspi/accessible/";
+ const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+ const CACHE_PATH: &str = "/org/a11y/atspi/cache";
+ 
++// libatspi interns Accessible and Hyperlink objects in one path-keyed table.
++// The Hyperlink proxy and the Accessible returned by GetObject must be distinct.
++pub(crate) fn hyperlink_path(adapter: usize, node: FullNodeId) -> OwnedObjectPath {
++    ObjectPath::from_string_unchecked(format!(
++        "/org/a11y/atspi/hyperlink/{adapter}/{}",
++        u128::from(node)
++    ))
++    .into()
++}
++
+ pub(crate) fn cache_path() -> OwnedObjectPath {
+     ObjectPath::from_str_unchecked(CACHE_PATH).into()
+ }

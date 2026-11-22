@@ -1,0 +1,814 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -100,8 +100,13 @@
+     /// it onto per-event `modifiers` fields and emit [`egui::Event::ModifiersChanged`].
+     modifiers: egui::Modifiers,
+ 
+-    pointer_pos_in_points: Option<egui::Pos2>,
+-    any_pointer_button_down: bool,
++    /// The window cursor used by a fresh mouse press. Its last move may have
++    /// been produced by X11 pointer emulation. A held primary keeps its own
++    /// position independently until that device moves or releases it.
++    cursor: Option<Pos2>,
++    primary: Option<(PrimarySource, Pos2)>,
++    auxiliary: [Option<MousePress>; egui::NUM_POINTER_BUTTONS - 1],
++    contacts: Vec<(egui::TouchDeviceId, egui::TouchId, Pos2)>,
+     current_cursor_icon: Option<egui::CursorIcon>,
+ 
+     /// Cached `CustomCursor` for the last RGBA bitmap pushed through
+@@ -116,14 +121,8 @@
+ 
+     /// If `true`, mouse inputs will be treated as touches.
+     /// Useful for debugging touch support in egui.
+-    ///
+-    /// Creates duplicate touches, if real touch inputs are coming.
+     simulate_touch_screen: bool,
+-
+-    /// Is Some(…) when a touch is being translated to a pointer.
+-    ///
+-    /// Only one touch will be interpreted as pointer at any time.
+-    pointer_touch_id: Option<u64>,
++    simulated_contact: Option<(winit::event::DeviceId, egui::PointerButton, Pos2)>,
+ 
+     #[cfg(feature = "accesskit")]
+     pub accesskit: Option<accesskit_winit::Adapter>,
+@@ -145,6 +144,19 @@
+     /// for details.
+     #[cfg(target_os = "windows")]
+     pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum PrimarySource {
++    Mouse(winit::event::DeviceId),
++    Touch(egui::TouchDeviceId, egui::TouchId),
++}
++
++#[derive(Clone, Copy)]
++struct MousePress {
++    device: winit::event::DeviceId,
++    pos: Pos2,
++    can_click: bool,
+ }
+ 
+ impl State {
+@@ -172,6 +184,10 @@
+             clipboard::Clipboard::new(display_target.display_handle().ok().map(|h| h.as_raw()))
+         };
+ 
++        egui_ctx.input_mut_for(viewport_id, |input| {
++            input.pointer.set_explicit_capture(true)
++        });
++
+         let mut slf = Self {
+             viewport_id,
+             start_time: web_time::Instant::now()
+@@ -180,15 +196,17 @@
+             egui_ctx,
+             egui_input,
+             modifiers: egui::Modifiers::default(),
+-            pointer_pos_in_points: None,
+-            any_pointer_button_down: false,
++            cursor: None,
++            primary: None,
++            auxiliary: Default::default(),
++            contacts: Vec::new(),
+             current_cursor_icon: None,
+             current_custom_cursor: None,
+ 
+             clipboard,
+ 
+             simulate_touch_screen: false,
+-            pointer_touch_id: None,
++            simulated_contact: None,
+ 
+             #[cfg(feature = "accesskit")]
+             accesskit: None,
+@@ -391,8 +409,12 @@
+                     consumed: false,
+                 }
+             }
+-            WindowEvent::MouseInput { state, button, .. } => {
+-                self.on_mouse_button_input(*state, *button);
++            WindowEvent::MouseInput {
++                device_id,
++                state,
++                button,
++            } => {
++                self.on_mouse_button_input(*device_id, *state, *button);
+                 EventResponse {
+                     repaint: true,
+                     consumed: self.egui_ctx.egui_wants_pointer_input(),
+@@ -405,16 +427,20 @@
+                     consumed: self.egui_ctx.egui_wants_pointer_input(),
+                 }
+             }
+-            WindowEvent::CursorMoved { position, .. } => {
+-                self.on_cursor_moved(window, *position);
++            WindowEvent::CursorMoved {
++                device_id,
++                position,
++            } => {
++                let scale = pixels_per_point(&self.egui_ctx, window);
++                let pos = egui::pos2(position.x as f32 / scale, position.y as f32 / scale);
++                self.on_cursor_moved(*device_id, pos);
+                 EventResponse {
+                     repaint: true,
+                     consumed: self.egui_ctx.egui_is_using_pointer(),
+                 }
+             }
+             WindowEvent::CursorLeft { .. } => {
+-                self.pointer_pos_in_points = None;
+-                self.egui_input.events.push(egui::Event::PointerGone);
++                self.on_cursor_left();
+                 EventResponse {
+                     repaint: true,
+                     consumed: false,
+@@ -494,6 +520,7 @@
+                 if !focused {
+                     // Avoid sticky modifiers when focus is lost (egui clears its own copy too).
+                     self.modifiers = egui::Modifiers::default();
++                    self.cancel_pointers();
+                 }
+                 self.egui_input
+                     .events
+@@ -836,7 +863,7 @@
+     ///
+     /// Returns `true` if the event was sent to egui.
+     pub fn on_mouse_motion(&mut self, delta: (f64, f64)) -> bool {
+-        if !self.is_pointer_in_window() && !self.any_pointer_button_down {
++        if !self.is_pointer_in_window() && !self.is_any_pointer_button_down() {
+             return false;
+         }
+ 
+@@ -849,12 +876,12 @@
+ 
+     /// Returns `true` when the pointer is currently inside the window.
+     pub fn is_pointer_in_window(&self) -> bool {
+-        self.pointer_pos_in_points.is_some()
++        self.cursor.is_some() || matches!(self.primary, Some((PrimarySource::Touch(..), _)))
+     }
+ 
+     /// Returns `true` if any pointer button is currently held down.
+     pub fn is_any_pointer_button_down(&self) -> bool {
+-        self.any_pointer_button_down
++        self.primary.is_some() || self.auxiliary.iter().any(Option::is_some)
+     }
+ 
+     /// Call this when there is a new [`accesskit::ActionRequest`].
+@@ -867,154 +894,287 @@
+             .push(egui::Event::AccessKitActionRequest(request));
+     }
+ 
++    fn claim_primary(&mut self, source: PrimarySource, pos: Pos2) -> bool {
++        if self.primary.is_some() {
++            return false;
++        }
++        self.primary = Some((source, pos));
++        for press in self.auxiliary.iter_mut().flatten() {
++            press.can_click = false;
++        }
++        true
++    }
++
++    fn push_button(&mut self, pos: Pos2, button: egui::PointerButton, pressed: bool) {
++        self.egui_input.events.push(egui::Event::PointerButton {
++            pos,
++            button,
++            pressed,
++            modifiers: self.modifiers,
++        });
++    }
++
++    fn simulated_touch(&mut self, phase: egui::TouchPhase, pos: Pos2) {
++        self.egui_input.events.push(egui::Event::Touch {
++            device_id: egui::TouchDeviceId(0),
++            id: egui::TouchId(0),
++            phase,
++            pos,
++            force: None,
++        });
++    }
++
+     fn on_mouse_button_input(
+         &mut self,
+-        state: winit::event::ElementState,
++        device: winit::event::DeviceId,
++        state: ElementState,
+         button: winit::event::MouseButton,
+     ) {
+-        if let Some(pos) = self.pointer_pos_in_points
+-            && let Some(button) = translate_mouse_button(button)
++        let Some(button) = translate_mouse_button(button) else {
++            return;
++        };
++        let pressed = state == ElementState::Pressed;
++        let pos = if pressed {
++            let Some(pos) = self.cursor else { return };
++            // An OS grab can lose its release when the seat switches devices.
++            // A new press of the very same button starts a fresh grab.
++            if button == egui::PointerButton::Primary {
++                let source = PrimarySource::Mouse(device);
++                if self.primary.is_some_and(|(owner, _)| owner == source) {
++                    self.primary = None;
++                    self.egui_input.events.push(egui::Event::PointerGone);
++                }
++                if !self.claim_primary(source, pos) {
++                    return;
++                }
++            } else {
++                let index = button as usize - 1;
++                if let Some(previous) = self.auxiliary[index] {
++                    if previous.device != device {
++                        return;
++                    }
++                    self.release_auxiliary(button, previous.pos, true);
++                }
++                self.auxiliary[index] = Some(MousePress {
++                    device,
++                    pos,
++                    can_click: self.primary.is_none(),
++                });
++            }
++            pos
++        } else if button == egui::PointerButton::Primary {
++            let Some((owner, pos)) = self.primary else {
++                return;
++            };
++            if owner != PrimarySource::Mouse(device) {
++                return;
++            }
++            self.primary = None;
++            pos
++        } else {
++            let slot = &mut self.auxiliary[button as usize - 1];
++            let Some(press) = *slot else { return };
++            if press.device != device {
++                return;
++            }
++            *slot = None;
++            self.release_auxiliary(button, press.pos, !press.can_click);
++            press.pos
++        };
++        if pressed || button == egui::PointerButton::Primary {
++            self.push_button(pos, button, pressed);
++        }
++
++        // Middle-click pastes the PRIMARY selection on X11 and Wayland.
++        if pressed
++            && self.primary.is_none()
++            && button == egui::PointerButton::Middle
++            && let Some(text) = self.clipboard.get_primary_text()
++            && !text.is_empty()
+         {
+-            let pressed = state == winit::event::ElementState::Pressed;
+-
+-            self.egui_input.events.push(egui::Event::PointerButton {
+-                pos,
+-                button,
+-                pressed,
+-                modifiers: self.modifiers,
+-            });
+-
+-            // Middle-click pastes the PRIMARY selection on X11 and Wayland:
+-            if pressed
+-                && button == egui::PointerButton::Middle
+-                && let Some(text) = self.clipboard.get_primary_text()
+-                && !text.is_empty()
++            self.egui_input
++                .events
++                .push(egui::Event::MiddleClickPaste { pos, text });
++        }
++
++        if self.simulate_touch_screen {
++            if let Some((owner, held, last)) = self.simulated_contact
++                && (owner, held) == (device, button)
+             {
+-                self.egui_input
+-                    .events
+-                    .push(egui::Event::MiddleClickPaste { pos, text });
+-            }
+-
+-            if self.simulate_touch_screen {
++                self.simulated_contact = None;
+                 if pressed {
+-                    self.any_pointer_button_down = true;
+-
+-                    self.egui_input.events.push(egui::Event::Touch {
+-                        device_id: egui::TouchDeviceId(0),
+-                        id: egui::TouchId(0),
+-                        phase: egui::TouchPhase::Start,
+-                        pos,
+-                        force: None,
+-                    });
++                    self.simulated_touch(egui::TouchPhase::Cancel, last);
+                 } else {
+-                    self.any_pointer_button_down = false;
+-
+-                    self.egui_input.events.push(egui::Event::PointerGone);
+-
+-                    self.egui_input.events.push(egui::Event::Touch {
+-                        device_id: egui::TouchDeviceId(0),
+-                        id: egui::TouchId(0),
+-                        phase: egui::TouchPhase::End,
+-                        pos,
+-                        force: None,
+-                    });
+-                }
+-            }
+-        }
+-    }
+-
+-    fn on_cursor_moved(
++                    self.simulated_touch(egui::TouchPhase::End, pos);
++                }
++            }
++            if pressed && self.simulated_contact.is_none() {
++                self.simulated_contact = Some((device, button, pos));
++                self.simulated_touch(egui::TouchPhase::Start, pos);
++            }
++        }
++        if !pressed
++            && self.primary.is_none()
++            && (self.cursor.is_none() || self.simulate_touch_screen)
++        {
++            self.egui_input.events.push(egui::Event::PointerGone);
++        }
++    }
++
++    fn release_auxiliary(&mut self, button: egui::PointerButton, pos: Pos2, cancelled: bool) {
++        self.egui_ctx.input_mut_for(self.viewport_id, |input| {
++            input.pointer.queue_auxiliary_release(button, cancelled);
++        });
++        self.push_button(pos, button, false);
++    }
++
++    fn on_cursor_moved(&mut self, device: winit::event::DeviceId, pos: Pos2) {
++        self.cursor = Some(pos);
++        for press in self
++            .auxiliary
++            .iter_mut()
++            .flatten()
++            .filter(|press| press.device == device)
++        {
++            press.pos = pos;
++        }
++        if let Some((source, last_pos)) = &mut self.primary {
++            if *source != PrimarySource::Mouse(device) {
++                return;
++            }
++            *last_pos = pos;
++        }
++        if self.simulate_touch_screen {
++            let Some((owner, _, last_pos)) = &mut self.simulated_contact else {
++                return;
++            };
++            if *owner != device {
++                return;
++            }
++            *last_pos = pos;
++        }
++        self.egui_input.events.push(egui::Event::PointerMoved(pos));
++        if self.simulate_touch_screen {
++            self.simulated_touch(egui::TouchPhase::Move, pos);
++        }
++    }
++
++    fn on_cursor_left(&mut self) {
++        // A grab can continue outside the window. Wayland also sends leave
++        // when a touch switches the seat cursor during a physical mouse drag.
++        self.cursor = None;
++        if self.primary.is_none() {
++            self.egui_input.events.push(egui::Event::PointerGone);
++        }
++    }
++
++    fn on_touch(&mut self, window: &Window, touch: &winit::event::Touch) {
++        let scale = pixels_per_point(&self.egui_ctx, window);
++        let pos = egui::pos2(
++            touch.location.x as f32 / scale,
++            touch.location.y as f32 / scale,
++        );
++        let force = match touch.force {
++            Some(winit::event::Force::Normalized(force)) => Some(force as f32),
++            Some(winit::event::Force::Calibrated {
++                force,
++                max_possible_force,
++                ..
++            }) => Some((force / max_possible_force) as f32),
++            None => None,
++        };
++        self.touch_at(
++            egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
++            egui::TouchId(touch.id),
++            to_egui_touch_phase(touch.phase),
++            pos,
++            force,
++        );
++    }
++
++    fn touch_at(
+         &mut self,
+-        window: &Window,
+-        pos_in_pixels: winit::dpi::PhysicalPosition<f64>,
++        device_id: egui::TouchDeviceId,
++        id: egui::TouchId,
++        phase: egui::TouchPhase,
++        pos: Pos2,
++        force: Option<f32>,
+     ) {
+-        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+-
+-        let pos_in_points = egui::pos2(
+-            pos_in_pixels.x as f32 / pixels_per_point,
+-            pos_in_pixels.y as f32 / pixels_per_point,
+-        );
+-        self.pointer_pos_in_points = Some(pos_in_points);
+-
+-        if self.simulate_touch_screen {
+-            if self.any_pointer_button_down {
+-                self.egui_input
+-                    .events
+-                    .push(egui::Event::PointerMoved(pos_in_points));
+-
++        use egui::TouchPhase::{Cancel, End, Move, Start};
++        let known = self
++            .contacts
++            .iter()
++            .position(|&(dev, finger, _)| dev == device_id && finger == id);
++        let source = PrimarySource::Touch(device_id, id);
++        match (phase, known) {
++            (Start, Some(i)) => {
++                // Native contact IDs may be reused after a lost terminal event.
++                let previous = std::mem::replace(&mut self.contacts[i].2, pos);
+                 self.egui_input.events.push(egui::Event::Touch {
+-                    device_id: egui::TouchDeviceId(0),
+-                    id: egui::TouchId(0),
+-                    phase: egui::TouchPhase::Move,
+-                    pos: pos_in_points,
++                    device_id,
++                    id,
++                    pos: previous,
++                    phase: Cancel,
+                     force: None,
+                 });
+-            }
+-        } else {
+-            self.egui_input
+-                .events
+-                .push(egui::Event::PointerMoved(pos_in_points));
+-        }
+-    }
+-
+-    fn on_touch(&mut self, window: &Window, touch: &winit::event::Touch) {
+-        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+-
+-        // Emit touch event
++                if self.primary.is_some_and(|(owner, _)| owner == source) {
++                    self.primary = None;
++                    self.egui_input.events.push(egui::Event::PointerGone);
++                }
++            }
++            (Start, None) => self.contacts.push((device_id, id, pos)),
++            (Move, Some(i)) => self.contacts[i].2 = pos,
++            (End | Cancel, Some(i)) => {
++                self.contacts.swap_remove(i);
++            }
++            _ => return, // A late event after focus loss.
++        }
+         self.egui_input.events.push(egui::Event::Touch {
+-            device_id: egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
+-            id: egui::TouchId::from(touch.id),
+-            phase: to_egui_touch_phase(touch.phase),
+-            pos: egui::pos2(
+-                touch.location.x as f32 / pixels_per_point,
+-                touch.location.y as f32 / pixels_per_point,
+-            ),
+-            force: match touch.force {
+-                Some(winit::event::Force::Normalized(force)) => Some(force as f32),
+-                Some(winit::event::Force::Calibrated {
+-                    force,
+-                    max_possible_force,
+-                    ..
+-                }) => Some((force / max_possible_force) as f32),
+-                None => None,
+-            },
++            device_id,
++            id,
++            phase,
++            pos,
++            force,
+         });
+-        // If we're not yet translating a touch or we're translating this very
+-        // touch …
+-        if self.pointer_touch_id.is_none() || self.pointer_touch_id.unwrap_or_default() == touch.id
++        let button = egui::PointerButton::Primary;
++        if phase == Start {
++            if self.claim_primary(source, pos) {
++                self.egui_input.events.push(egui::Event::PointerMoved(pos));
++                self.push_button(pos, button, true);
++            }
++        } else if let Some((owner, last_pos)) = &mut self.primary
++            && *owner == source
+         {
+-            // … emit PointerButton resp. PointerMoved events to emulate mouse
+-            match touch.phase {
+-                winit::event::TouchPhase::Started => {
+-                    self.pointer_touch_id = Some(touch.id);
+-                    // First move the pointer to the right location
+-                    self.on_cursor_moved(window, touch.location);
+-                    self.on_mouse_button_input(
+-                        winit::event::ElementState::Pressed,
+-                        winit::event::MouseButton::Left,
+-                    );
+-                }
+-                winit::event::TouchPhase::Moved => {
+-                    self.on_cursor_moved(window, touch.location);
+-                }
+-                winit::event::TouchPhase::Ended => {
+-                    self.pointer_touch_id = None;
+-                    self.on_mouse_button_input(
+-                        winit::event::ElementState::Released,
+-                        winit::event::MouseButton::Left,
+-                    );
+-                    // The pointer should vanish completely to not get any
+-                    // hover effects
+-                    self.pointer_pos_in_points = None;
+-                    self.egui_input.events.push(egui::Event::PointerGone);
+-                }
+-                winit::event::TouchPhase::Cancelled => {
+-                    self.pointer_touch_id = None;
+-                    self.pointer_pos_in_points = None;
+-                    self.egui_input.events.push(egui::Event::PointerGone);
+-                }
+-            }
+-        }
++            if phase == Move {
++                *last_pos = pos;
++                self.egui_input.events.push(egui::Event::PointerMoved(pos));
++            } else {
++                self.primary = None;
++                if phase == End {
++                    self.push_button(pos, button, false);
++                }
++                self.egui_input.events.push(egui::Event::PointerGone);
++            }
++        }
++    }
++
++    fn cancel_pointers(&mut self) {
++        for (device_id, id, pos) in self.contacts.drain(..) {
++            self.egui_input.events.push(egui::Event::Touch {
++                device_id,
++                id,
++                pos,
++                phase: egui::TouchPhase::Cancel,
++                force: None,
++            });
++        }
++        if let Some((_, _, pos)) = self.simulated_contact.take() {
++            self.simulated_touch(egui::TouchPhase::Cancel, pos);
++        }
++        if self.primary.take().is_some() {
++            self.egui_input.events.push(egui::Event::PointerGone);
++        }
++        self.auxiliary.fill(None);
+     }
+ 
+     fn on_mouse_wheel(
+@@ -1332,7 +1492,7 @@
+         cursor_icon: egui::CursorIcon,
+         cursor_image: Option<&egui::CustomCursorImage>,
+     ) {
+-        let is_pointer_in_window = self.pointer_pos_in_points.is_some();
++        let is_pointer_in_window = self.is_pointer_in_window();
+         if !is_pointer_in_window {
+             // Drop both caches so the cursor gets re-applied (and the
+             // bitmap re-checked for staleness) once the pointer comes
+@@ -2676,3 +2836,225 @@
+         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+     }
+ }
++
++#[cfg(test)]
++mod pointer_capture_tests {
++    use super::*;
++    use egui::{Event, PointerButton, TouchPhase, pos2};
++    use winit::event::{
++        DeviceId,
++        ElementState::{Pressed, Released},
++        MouseButton,
++    };
++
++    struct Headless;
++    impl HasDisplayHandle for Headless {
++        fn display_handle(
++            &self,
++        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
++            Err(raw_window_handle::HandleError::Unavailable)
++        }
++    }
++
++    fn state() -> State {
++        State::new(
++            egui::Context::default(),
++            ViewportId::ROOT,
++            &Headless,
++            None,
++            None,
++            None,
++        )
++    }
++
++    fn touch(s: &mut State, id: u64, phase: TouchPhase, x: f32) {
++        s.touch_at(
++            egui::TouchDeviceId(1),
++            egui::TouchId(id),
++            phase,
++            pos2(x, 40.0),
++            None,
++        );
++    }
++
++    fn frame(state: &mut State) {
++        let raw = state.egui_input.take();
++        state.egui_ctx.run_ui(raw, |_| {}).textures_delta.clear();
++    }
++
++    #[test]
++    fn mouse_capture_survives_touch_and_cursor_departure_without_more_motion() {
++        let mut s = state();
++        let mouse = DeviceId::dummy();
++        let pos = pos2(12.0, 16.0);
++        s.on_cursor_moved(mouse, pos);
++        s.on_mouse_button_input(mouse, Pressed, MouseButton::Left);
++        frame(&mut s);
++        s.on_cursor_left();
++        touch(&mut s, 7, TouchPhase::Start, 80.0);
++        touch(&mut s, 7, TouchPhase::End, 80.0);
++        s.on_mouse_button_input(mouse, Released, MouseButton::Left);
++        assert!(matches!(s.egui_input.events.as_slice(), [
++            Event::Touch { phase: TouchPhase::Start, .. },
++            Event::Touch { phase: TouchPhase::End, .. },
++            Event::PointerButton { pos: release, pressed: false, .. }, Event::PointerGone
++        ] if *release == pos));
++        frame(&mut s);
++        assert!(!s.egui_ctx.input(|i| i.pointer.any_down()));
++    }
++
++    #[test]
++    fn touch_capture_ignores_unrelated_motion_and_secondary_contacts() {
++        let mut s = state();
++        let mouse = DeviceId::dummy();
++        touch(&mut s, 1, TouchPhase::Start, 10.0);
++        frame(&mut s);
++        s.on_cursor_moved(mouse, pos2(60.0, 0.0));
++        s.on_mouse_button_input(mouse, Pressed, MouseButton::Left);
++        s.on_mouse_button_input(mouse, Released, MouseButton::Left);
++        touch(&mut s, 2, TouchPhase::Start, 80.0);
++        touch(&mut s, 2, TouchPhase::End, 80.0);
++        assert!(
++            s.egui_input
++                .events
++                .iter()
++                .all(|event| matches!(event, Event::Touch { .. }))
++        );
++        touch(&mut s, 1, TouchPhase::Move, 12.0);
++        frame(&mut s);
++        assert!(s.egui_ctx.input(
++            |i| i.pointer.primary_down() && i.pointer.latest_pos() == Some(pos2(12.0, 40.0))
++        ));
++        touch(&mut s, 1, TouchPhase::End, 14.0);
++        frame(&mut s);
++        assert!(!s.egui_ctx.input(|i| i.pointer.any_down()));
++    }
++
++    #[test]
++    fn reused_contact_or_repeated_physical_down_recovers_a_missing_release() {
++        let mut s = state();
++        let mouse = DeviceId::dummy();
++        let origin = pos2(14.0, 23.0);
++        s.on_cursor_moved(mouse, origin);
++        s.on_mouse_button_input(mouse, Pressed, MouseButton::Left);
++        frame(&mut s);
++        s.on_cursor_left();
++        s.on_cursor_moved(mouse, origin);
++        s.on_mouse_button_input(mouse, Pressed, MouseButton::Left);
++        assert!(matches!(
++            s.egui_input.events.as_slice(),
++            [
++                Event::PointerMoved(_),
++                Event::PointerGone,
++                Event::PointerButton { pressed: true, .. }
++            ]
++        ));
++        s.on_mouse_button_input(mouse, Released, MouseButton::Left);
++        frame(&mut s);
++        assert!(!s.egui_ctx.input(|i| i.pointer.any_down()));
++
++        touch(&mut s, 3, TouchPhase::Start, 40.0);
++        frame(&mut s);
++        touch(&mut s, 3, TouchPhase::Start, 70.0);
++        assert!(matches!(
++            s.egui_input.events.as_slice(),
++            [
++                Event::Touch {
++                    phase: TouchPhase::Cancel,
++                    ..
++                },
++                Event::PointerGone,
++                Event::Touch {
++                    phase: TouchPhase::Start,
++                    ..
++                },
++                Event::PointerMoved(_),
++                Event::PointerButton { pressed: true, .. }
++            ]
++        ));
++        touch(&mut s, 3, TouchPhase::End, 70.0);
++        frame(&mut s);
++        assert!(!s.egui_ctx.input(|i| i.pointer.any_down()));
++    }
++
++    #[test]
++    fn physical_auxiliary_and_cancelled_touch_remain_independent() {
++        let mut s = state();
++        let mouse = DeviceId::dummy();
++        touch(&mut s, 1, TouchPhase::Start, 10.0);
++        s.on_cursor_moved(mouse, pos2(80.0, 20.0));
++        s.on_mouse_button_input(mouse, Pressed, MouseButton::Right);
++        touch(&mut s, 1, TouchPhase::Cancel, 10.0);
++        frame(&mut s);
++        assert!(
++            s.egui_ctx
++                .input(|i| !i.pointer.primary_down() && i.pointer.secondary_down())
++        );
++        s.on_mouse_button_input(mouse, Released, MouseButton::Right);
++        frame(&mut s);
++        assert!(s.egui_ctx.input(
++            |i| !i.pointer.any_down() && !i.pointer.button_clicked(PointerButton::Secondary)
++        ));
++    }
++
++    #[test]
++    fn focus_loss_ends_all_contacts_and_ignores_late_ups() {
++        let mut s = state();
++        let mouse = DeviceId::dummy();
++        touch(&mut s, 1, TouchPhase::Start, 10.0);
++        touch(&mut s, 2, TouchPhase::Start, 20.0);
++        s.on_cursor_moved(mouse, pos2(90.0, 20.0));
++        s.on_mouse_button_input(mouse, Pressed, MouseButton::Right);
++        s.cancel_pointers();
++        s.egui_input.events.push(Event::WindowFocused(false));
++        let n = s.egui_input.events.len();
++        touch(&mut s, 1, TouchPhase::End, 10.0);
++        touch(&mut s, 2, TouchPhase::Move, 25.0);
++        s.on_mouse_button_input(mouse, Released, MouseButton::Right);
++        assert_eq!(n, s.egui_input.events.len());
++        assert_eq!(
++            s.egui_input
++                .events
++                .iter()
++                .filter(|e| matches!(
++                    e,
++                    Event::Touch {
++                        phase: TouchPhase::Cancel,
++                        ..
++                    }
++                ))
++                .count(),
++            2
++        );
++        frame(&mut s);
++        assert!(!s.egui_ctx.input(|i| i.pointer.any_down()));
++    }
++
++    #[test]
++    fn simulated_mouse_touch_keeps_its_start_move_and_end() {
++        for button in [MouseButton::Left, MouseButton::Right] {
++            let mut s = state();
++            let mouse = DeviceId::dummy();
++            s.simulate_touch_screen = true;
++            s.on_cursor_moved(mouse, pos2(10.0, 20.0));
++            assert!(s.egui_input.events.is_empty());
++            s.on_mouse_button_input(mouse, Pressed, button);
++            s.on_cursor_moved(mouse, pos2(30.0, 20.0));
++            s.on_mouse_button_input(mouse, Released, button);
++            let phases: Vec<_> = s
++                .egui_input
++                .events
++                .iter()
++                .filter_map(|event| match event {
++                    Event::Touch { phase, .. } => Some(*phase),
++                    _ => None,
++                })
++                .collect();
++            assert_eq!(
++                phases,
++                [TouchPhase::Start, TouchPhase::Move, TouchPhase::End]
++            );
++            assert!(!s.is_any_pointer_button_down());
++        }
++    }
++}

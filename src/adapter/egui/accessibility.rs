@@ -392,7 +392,11 @@ fn build_paragraph_snapshot(
             shortened += grapheme.len() - 1;
         }
     }
-    if runs.last().is_none_or(|run| run.soft_break) {
+    // A paragraph separator belongs to the paragraph, outside any inline link.
+    if runs
+        .last()
+        .is_none_or(|run| run.soft_break || (line_break && run.link.is_some()))
+    {
         runs.push(RunBuilder {
             id: id.with(("grapheme_run", runs.len())),
             range: text.len()..text.len(),
@@ -512,71 +516,6 @@ impl Run {
             character_index,
         })
     }
-}
-
-// A list item's place in its AccessKit set, both counted from one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ListPosition {
-    position_in_set: usize,
-    size_of_set: usize,
-}
-
-fn list_positions(kinds: impl Iterator<Item = ParagraphKind>) -> Vec<Option<ListPosition>> {
-    // A set that later items at its level and kind may still join.
-    struct OpenSet {
-        ordered: bool,
-        indent: u8,
-        set: usize,
-    }
-    let mut open: Vec<OpenSet> = Vec::new();
-    let mut sizes: Vec<usize> = Vec::new();
-    // Each list item's set and its position in it.
-    let mut members: Vec<Option<(usize, usize)>> = Vec::new();
-    for kind in kinds {
-        let (ordered, indent, restart) = match kind {
-            ParagraphKind::Bullet { indent } => (false, indent, false),
-            ParagraphKind::Ordered { indent, start } => (true, indent, start.is_some()),
-            ParagraphKind::Heading { .. } => {
-                open.clear();
-                members.push(None);
-                continue;
-            }
-            _ => {
-                members.push(None);
-                continue;
-            }
-        };
-        open.retain(|candidate| candidate.indent <= indent);
-        let existing = open
-            .iter()
-            .position(|candidate| candidate.indent == indent && candidate.ordered == ordered);
-        let set = match existing {
-            Some(index) if !restart => open[index].set,
-            _ => {
-                if let Some(index) = existing {
-                    open.remove(index);
-                }
-                sizes.push(0);
-                open.push(OpenSet {
-                    ordered,
-                    indent,
-                    set: sizes.len() - 1,
-                });
-                sizes.len() - 1
-            }
-        };
-        sizes[set] += 1;
-        members.push(Some((set, sizes[set])));
-    }
-    members
-        .into_iter()
-        .map(|member| {
-            member.map(|(set, position)| ListPosition {
-                position_in_set: position,
-                size_of_set: sizes[set],
-            })
-        })
-        .collect()
 }
 
 impl Snapshot {
@@ -763,60 +702,86 @@ impl Snapshot {
             .ctx()
             .layer_transform_to_global(ui.layer_id())
             .unwrap_or_default();
-        let list_items = list_positions(
+        let publish_container = |id: Id, range, role, size: Option<usize>| {
+            let bounds = layouts
+                .views_range(range)
+                .map(|member| {
+                    if let Some(marker) = member.marker {
+                        member
+                            .rect
+                            .union(marker.rect.translate(member.marker_position.to_vec2()))
+                    } else {
+                        member
+                            .quote_bar
+                            .map_or(member.rect, |bar| bar.union(member.rect))
+                    }
+                })
+                .fold(Rect::NOTHING, Rect::union)
+                .translate(origin.to_vec2());
+            Ui::new(
+                ui.ctx().clone(),
+                id,
+                egui::UiBuilder::new()
+                    .accessibility_parent(widget_id)
+                    .layer_id(ui.layer_id())
+                    .max_rect(bounds),
+            );
+            ui.ctx().accesskit_node_builder(id, |node| {
+                node.set_role(role);
+                node.set_bounds(accesskit_rect(to_global * bounds));
+                if let Some(size) = size {
+                    node.set_size_of_set(size);
+                }
+            });
+        };
+        let mut lists = node_semantics::list_groups(
             self.paragraphs
                 .iter()
                 .map(|paragraph| paragraph.source.kind()),
-        );
-        let is_quote =
-            |paragraph: &Arc<ParagraphSnapshot>| paragraph.source.kind() == ParagraphKind::Quote;
-        let mut quote = None;
+        )
+        .peekable();
+        let mut parent = widget_id;
+        let mut group_end = 0;
+        let mut next_position = None;
         let paragraphs = self
             .paragraphs
             .iter()
             .zip(layouts.views_range(0..layouts.len()))
-            .zip(list_items)
             .enumerate();
-        for (index, ((paragraph, layout), list_item)) in paragraphs {
+        for (index, (paragraph, layout)) in paragraphs {
             let kind = paragraph.source.kind();
-            if kind != ParagraphKind::Quote {
-                quote = None;
-            } else if quote.is_none() {
-                let id = widget_id.with(("blockquote", paragraph.serial));
-                let end = index
-                    + self.paragraphs[index..]
-                        .iter()
-                        .take_while(|paragraph| is_quote(paragraph))
-                        .count();
-                let bounds = layouts
-                    .views_range(index..end)
-                    .map(|member| {
-                        member
-                            .quote_bar
-                            .map_or(member.rect, |bar| bar.union(member.rect))
-                    })
-                    .fold(Rect::NOTHING, Rect::union)
-                    .translate(origin.to_vec2());
-                Ui::new(
-                    ui.ctx().clone(),
-                    id,
-                    egui::UiBuilder::new()
-                        .accessibility_parent(widget_id)
-                        .layer_id(ui.layer_id())
-                        .max_rect(bounds),
-                );
-                ui.ctx().accesskit_node_builder(id, |node| {
-                    node.set_role(accesskit::Role::Blockquote);
-                    node.set_bounds(accesskit_rect(to_global * bounds));
-                });
-                quote = Some(id);
+            if index == group_end {
+                if let Some(list) = lists.next_if(|list| list.paragraphs.start == index) {
+                    parent = widget_id.with(("list", paragraph.serial));
+                    group_end = list.paragraphs.end;
+                    next_position = Some(list.first_position);
+                    publish_container(
+                        parent,
+                        list.paragraphs,
+                        accesskit::Role::List,
+                        Some(list.size),
+                    );
+                } else if kind == ParagraphKind::Quote {
+                    parent = widget_id.with(("blockquote", paragraph.serial));
+                    group_end = index
+                        + self.paragraphs[index..]
+                            .iter()
+                            .take_while(|member| member.source.kind() == ParagraphKind::Quote)
+                            .count();
+                    next_position = None;
+                    publish_container(parent, index..group_end, accesskit::Role::Blockquote, None);
+                } else {
+                    parent = widget_id;
+                    group_end = index + 1;
+                    next_position = None;
+                }
             }
             let paragraph_rect = layout.rect.translate(origin.to_vec2());
             let paragraph_ui = Ui::new(
                 ui.ctx().clone(),
                 paragraph.id,
                 egui::UiBuilder::new()
-                    .accessibility_parent(quote.unwrap_or(widget_id))
+                    .accessibility_parent(parent)
                     .layer_id(ui.layer_id())
                     .max_rect(paragraph_rect),
             );
@@ -824,9 +789,9 @@ impl Snapshot {
                 node_semantics::set_paragraph_semantics(node, kind);
                 node.set_is_line_breaking_object();
                 node.set_bounds(accesskit_rect(to_global * paragraph_rect));
-                if let Some(list_item) = list_item {
-                    node.set_position_in_set(list_item.position_in_set);
-                    node.set_size_of_set(list_item.size_of_set);
+                if let Some(position) = &mut next_position {
+                    node.set_position_in_set(*position);
+                    *position += 1;
                 }
             });
             let from_galley = to_global
@@ -2066,6 +2031,18 @@ mod tests {
         layouts: &ParagraphLayouts,
         focus_prefer_next_row: bool,
     ) -> HashMap<accesskit::NodeId, accesskit::Node> {
+        published_update(editor, snapshot, layouts, focus_prefer_next_row)
+            .nodes
+            .into_iter()
+            .collect()
+    }
+
+    fn published_update(
+        editor: &Editor,
+        snapshot: &Snapshot,
+        layouts: &ParagraphLayouts,
+        focus_prefer_next_row: bool,
+    ) -> accesskit::TreeUpdate {
         let context = egui::Context::default();
         context.enable_accesskit();
         let widget_id = Id::unique("editor");
@@ -2088,7 +2065,7 @@ mod tests {
         });
         let update = output.platform_output.accesskit_update.take().unwrap();
         output.drop_without_applying_deltas();
-        update.nodes.into_iter().collect()
+        update
     }
 
     fn select(editor: &mut Editor, start: (usize, usize), end: (usize, usize)) {
@@ -3160,6 +3137,43 @@ mod tests {
         assert_eq!(snapshot.decode(focus), Some(editor.selection().focus));
     }
 
+    // AT-SPI (like UIA) adds one to the item index and reads size from
+    // the nearest ancestor container. Verify the tree the platform consumes.
+    fn platform_list_positions(editor: &Editor) -> Vec<(Option<usize>, Option<usize>)> {
+        let (layouts, snapshot) = snapshot_for(editor, 500.0);
+        let tree = accesskit_consumer::Tree::new(
+            published_update(editor, &snapshot, &layouts, true),
+            true,
+        );
+        let state = tree.state();
+        let node = |id| {
+            state
+                .node_by_tree_local_id(id, accesskit::TreeId::ROOT)
+                .unwrap()
+        };
+        assert_eq!(
+            node(snapshot.widget_id.accesskit_id())
+                .document_range()
+                .text(),
+            editor.document().plain_text()
+        );
+        snapshot
+            .paragraphs
+            .iter()
+            .map(|paragraph| {
+                let item = node(paragraph.id.accesskit_id());
+                assert!(item.size_of_set().is_none());
+                if item.role() == accesskit::Role::ListItem {
+                    assert_eq!(item.parent().unwrap().role(), accesskit::Role::List);
+                }
+                (
+                    item.position_in_set().map(|index| index + 1),
+                    item.size_of_set_from_container(&accesskit_consumer::common_filter),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn list_items_publish_their_position_and_set_size() {
         let mut editor = Editor::from_text("a\nb\nc\nbody\nd\ne\nf\ng");
@@ -3184,18 +3198,8 @@ mod tests {
             select(&mut editor, (range.0, 0), (range.1, 1));
             editor.set_paragraph_kind(kind).unwrap();
         }
-        let (layouts, snapshot) = snapshot_for(&editor, 500.0);
-        let nodes = published_nodes(&editor, &snapshot, &layouts, true);
-        let sets: Vec<_> = snapshot
-            .paragraphs
-            .iter()
-            .map(|paragraph| {
-                let node = &nodes[&paragraph.id.accesskit_id()];
-                (node.position_in_set(), node.size_of_set())
-            })
-            .collect();
         assert_eq!(
-            sets,
+            platform_list_positions(&editor),
             [
                 (Some(1), Some(5)),
                 (Some(2), Some(5)),
@@ -3215,96 +3219,13 @@ mod tests {
             indent,
             start: None,
         };
-        let bullet = |indent| ParagraphKind::Bullet { indent };
-        // Each item's position in its set and the set's size.
-        let positions = |kinds: &[ParagraphKind]| -> Vec<Option<(usize, usize)>> {
-            let items = list_positions(kinds.iter().copied()).into_iter();
-            items
-                .map(|item| item.map(|item| (item.position_in_set, item.size_of_set)))
-                .collect()
-        };
-        assert_eq!(
-            positions(&[ordered(0), ordered(1), ordered(0)]),
-            [Some((1, 2)), Some((1, 1)), Some((2, 2))]
-        );
-        assert_eq!(
-            positions(&[
-                ordered(0),
-                ordered(2),
-                ordered(1),
-                ordered(1),
-                ordered(0),
-                ordered(1)
-            ]),
-            [
-                Some((1, 2)),
-                Some((1, 1)),
-                Some((1, 2)),
-                Some((2, 2)),
-                Some((2, 2)),
-                Some((1, 1)),
-            ]
-        );
-        assert_eq!(
-            positions(&[bullet(0), ordered(1), bullet(0), ordered(0), bullet(0)]),
-            [
-                Some((1, 3)),
-                Some((1, 1)),
-                Some((2, 3)),
-                Some((1, 1)),
-                Some((3, 3)),
-            ]
-        );
-        let restart = ParagraphKind::Ordered {
-            indent: 0,
-            start: Some(5),
-        };
-        assert_eq!(
-            positions(&[
-                ordered(0),
-                ParagraphKind::Body,
-                ordered(0),
-                restart,
-                ordered(0)
-            ]),
-            [Some((1, 2)), None, Some((2, 2)), Some((1, 2)), Some((2, 2))]
-        );
-        assert_eq!(
-            positions(&[
-                bullet(0),
-                bullet(1),
-                ParagraphKind::Heading { level: 2 },
-                bullet(1),
-                ParagraphKind::Body,
-                bullet(0),
-            ]),
-            [
-                Some((1, 1)),
-                Some((1, 1)),
-                None,
-                Some((1, 1)),
-                None,
-                Some((1, 1)),
-            ]
-        );
-
         let mut editor = Editor::from_text("a\nb\nc");
         select(&mut editor, (0, 0), (2, 1));
         editor.set_paragraph_kind(ordered(0)).unwrap();
         select(&mut editor, (1, 0), (1, 1));
         editor.indent_list().unwrap();
-        let (layouts, snapshot) = snapshot_for(&editor, 500.0);
-        let nodes = published_nodes(&editor, &snapshot, &layouts, true);
-        let sets: Vec<_> = snapshot
-            .paragraphs
-            .iter()
-            .map(|paragraph| {
-                let node = &nodes[&paragraph.id.accesskit_id()];
-                (node.position_in_set(), node.size_of_set())
-            })
-            .collect();
         assert_eq!(
-            sets,
+            platform_list_positions(&editor),
             [(Some(1), Some(2)), (Some(1), Some(1)), (Some(2), Some(2))]
         );
     }
@@ -3424,7 +3345,7 @@ mod tests {
     #[test]
     fn links_publish_link_nodes_around_their_runs_for_platform_adapters() {
         let docs = Link::try_new("https://example.com/docs").unwrap();
-        let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line");
+        let mut editor = Editor::from_text("Read the docs\u{2028}now, then stop\nnext line\nafter");
         select(&mut editor, (0, 5), (0, 19));
         editor.set_link(Some(docs.clone())).unwrap();
         select(&mut editor, (0, 9), (0, 13));
@@ -3518,10 +3439,30 @@ mod tests {
             .node_by_tree_local_id(id.accesskit_id(), accesskit::TreeId::ROOT)
             .unwrap();
         assert_eq!(node.document_range().text(), editor.document().plain_text());
-        let lines: Vec<_> = (0..3)
+        let lines: Vec<_> = (0..4)
             .map(|line| node.line_range_from_index(line).unwrap().text())
             .collect();
-        assert_eq!(lines, ["Read the docs\n", "now, then stop\n", "next line"]);
+        assert_eq!(
+            lines,
+            [
+                "Read the docs\n",
+                "now, then stop\n",
+                "next line\n",
+                "after"
+            ]
+        );
+        let second_link = node
+            .children()
+            .nth(1)
+            .unwrap()
+            .children()
+            .find(|child| child.role() == accesskit::Role::Link)
+            .unwrap();
+        let linked_text: String = second_link
+            .children()
+            .map(|run| run.value().unwrap())
+            .collect();
+        assert_eq!(linked_text, "line");
         let caret = node.text_selection_focus().unwrap();
         assert_eq!(caret.to_global_usv_index(), 11);
         assert_eq!(caret.backward_to_word_start().to_global_usv_index(), 9);

@@ -1,0 +1,433 @@
+Expose heading levels on UIA elements and TextPattern ranges
+
+Textloom compatibility patch for accesskit_windows-0.35.2.
+Base: crates.io accesskit_windows-0.35.2 (SHA-256 498668b90da9995302a0055aaecad4756932333da2ddef6baee1c00844c430fc)
+Upstream project: https://github.com/AccessKit/accesskit
+UIA properties: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-automation-element-propids
+UIA text styles: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-style-identifiers
+Textloom changes are MIT licensed. Apply this patch at the crate root.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index af3df80..b739e6f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46,6 +46,7 @@ version = "0.25.2"
+ 
+ [dependencies.accesskit_consumer]
+ version = "0.39.2"
++path = "../accesskit_consumer-0.39.2"
+ 
+ [dependencies.hashbrown]
+ version = "0.17"
+diff --git a/src/node.rs b/src/node.rs
+index f4a97e3..6e6fe4e 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -49,6 +49,14 @@ fn runtime_id_from_node_id(id: FullNodeId) -> [i32; RUNTIME_ID_SIZE] {
+     ]
+ }
+ 
++// AccessKit stores zero-based levels. UIA defines nine heading identifiers.
++pub(crate) fn heading_index(node: &NodeRef<'_>) -> Option<usize> {
++    if node.role() != Role::Heading {
++        return None;
++    }
++    node.level().filter(|index| *index < 9)
++}
++
+ pub(crate) struct NodeWrapper<'a> {
+     pub(crate) node: &'a NodeRef<'a>,
+     pub(crate) string_buffer: &'a mut Vec<u16>,
+@@ -699,6 +707,10 @@ impl NodeWrapper<'_> {
+             .and_then(|level| level.try_into().ok())
+     }
+ 
++    fn heading_level(&self) -> Option<i32> {
++        heading_index(self.node).map(|index| HeadingLevel1.0 + index as i32)
++    }
++
+     fn is_selection_pattern_supported(&self) -> bool {
+         self.node.is_container_with_selectable_children()
+     }
+@@ -1323,6 +1335,7 @@ properties! {
+     (UIA_IsRequiredForFormPropertyId, is_required),
+     (UIA_IsPasswordPropertyId, is_password),
+     (UIA_LevelPropertyId, level),
++    (UIA_HeadingLevelPropertyId, heading_level),
+     (UIA_PositionInSetPropertyId, position_in_set),
+     (UIA_SizeOfSetPropertyId, size_of_set),
+     (UIA_AriaPropertiesPropertyId, aria_properties),
+@@ -1537,3 +1550,58 @@ fn platform_node_impl_send_sync() {
+     fn assert_send_sync<T: Send + Sync>() {}
+     assert_send_sync::<PlatformNode>();
+ }
++
++#[cfg(test)]
++mod heading_tests {
++    use super::*;
++    use accesskit::{Node, TreeInfo, TreeUpdate};
++
++    #[test]
++    fn heading_level_property_uses_uia_ids_only_for_valid_headings() {
++        fn property(role: Role, level: Option<usize>) -> Option<i32> {
++            let id = NodeId(42);
++            let mut node = Node::new(role);
++            if let Some(level) = level {
++                node.set_level(level);
++            }
++            let tree = Tree::new(
++                TreeUpdate {
++                    nodes: vec![(id, node)],
++                    tree: Some(TreeInfo::new(id)),
++                    tree_id: TreeId::ROOT,
++                    focus: id,
++                },
++                true,
++            );
++            let node = tree.state().root();
++            NodeWrapper {
++                node: &node,
++                string_buffer: &mut Vec::new(),
++            }
++            .heading_level()
++        }
++
++        for (index, expected) in [
++            HeadingLevel1,
++            HeadingLevel2,
++            HeadingLevel3,
++            HeadingLevel4,
++            HeadingLevel5,
++            HeadingLevel6,
++            HeadingLevel7,
++            HeadingLevel8,
++            HeadingLevel9,
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            assert_eq!(property(Role::Heading, Some(index)), Some(expected.0));
++        }
++        for level in [None, Some(9), Some(usize::MAX)] {
++            assert_eq!(property(Role::Heading, level), None);
++        }
++        for role in [Role::Paragraph, Role::ListItem] {
++            assert_eq!(property(role, Some(0)), None);
++        }
++    }
++}
+diff --git a/src/text.rs b/src/text.rs
+index 6b18382..e6dc1ae 100644
+--- a/src/text.rs
++++ b/src/text.rs
+@@ -5,9 +5,9 @@
+ 
+ #![allow(non_upper_case_globals)]
+ 
+-use accesskit::{Action, ActionData, ActionRequest, ScrollHint, VerticalOffset};
++use accesskit::{Action, ActionData, ActionRequest, ListStyle, Role, ScrollHint, VerticalOffset};
+ use accesskit_consumer::{
+-    NodeRef, TextPosition as Position, TextRange as Range, Tree, TreeState,
++    NodeRef, TextPosition as Position, TextRange as Range, TextRangePropertyValue, Tree, TreeState,
+     WeakTextRange as WeakRange,
+ };
+ use std::sync::{Arc, RwLock, Weak};
+@@ -78,6 +78,110 @@ fn set_endpoint_position<'a>(
+     Ok(())
+ }
+ 
++// Text clients query the document range, whose runs may sit under a link
++// or other inline container inside a heading. Stop at this text provider.
++fn run_style_id(run: &NodeRef, owner: &NodeRef) -> i32 {
++    let mut node = *run;
++    loop {
++        match node.role() {
++            Role::Heading => {
++                return crate::node::heading_index(&node)
++                    .map_or(StyleId_Custom.0, |level| StyleId_Heading1.0 + level as i32);
++            }
++            Role::Blockquote => return StyleId_Quote.0,
++            Role::ListItem => {
++                return match node.data().list_style() {
++                    Some(ListStyle::Numeric) => StyleId_NumberedList.0,
++                    Some(
++                        ListStyle::Circle | ListStyle::Disc | ListStyle::Square | ListStyle::Image,
++                    ) => StyleId_BulletedList.0,
++                    _ => StyleId_Custom.0,
++                };
++            }
++            _ => {}
++        }
++        if node.id() == owner.id() {
++            break;
++        }
++        let Some(parent) = node.parent() else { break };
++        node = parent;
++    }
++    StyleId_Normal.0
++}
++
++fn range_style_id(range: &Range) -> TextRangePropertyValue<i32> {
++    let mut first = None;
++    let mixed = range.traverse_runs(false, |run| {
++        let style = run_style_id(run.start().inner_node(), range.node());
++        (*first.get_or_insert(style) != style).then_some(())
++    });
++    if mixed.is_some() {
++        TextRangePropertyValue::Mixed
++    } else {
++        TextRangePropertyValue::Single(first.unwrap_or(StyleId_Normal.0))
++    }
++}
++
++fn find_style<'a>(range: &Range<'a>, wanted: i32, backward: bool) -> Option<Range<'a>> {
++    let mut first = None;
++    let mut last = None;
++    range.traverse_runs(backward, |run| {
++        if run_style_id(run.start().inner_node(), range.node()) == wanted {
++            first.get_or_insert(run);
++            last = Some(run);
++            None
++        } else {
++            first.is_some().then_some(())
++        }
++    });
++    let mut found = first?;
++    if backward {
++        found.set_start(last?.start());
++    } else {
++        found.set_end(last?.end());
++    }
++    Some(found)
++}
++
++fn is_format_start(pos: Position) -> bool {
++    if pos.is_format_start() {
++        return true;
++    }
++    let previous = pos.biased_to_end();
++    let node = pos.inner_node();
++    let before = previous.inner_node();
++    if before.id() == node.id() {
++        return false;
++    }
++    let range = pos.to_degenerate_range();
++    run_style_id(node, range.node()) != run_style_id(before, range.node())
++}
++
++// A Format unit ends at the first change of any supported format attribute,
++// including the semantic style inherited from a heading or other block.
++fn format_boundary(pos: Position, backward: bool) -> Position {
++    let mut range = pos.to_degenerate_range();
++    let limit = if backward {
++        let start = pos.document_start();
++        range.set_start(start);
++        start
++    } else {
++        let end = pos.document_end();
++        range.set_end(end);
++        end
++    };
++    let mut skip_current = !backward;
++    range
++        .traverse_runs(backward, |run| {
++            if std::mem::take(&mut skip_current) {
++                return None;
++            }
++            let start = run.start();
++            is_format_start(start).then_some(start)
++        })
++        .unwrap_or(limit)
++}
++
+ fn back_to_unit_start(start: Position, unit: TextUnit) -> Result<Position> {
+     match unit {
+         TextUnit_Character => {
+@@ -87,10 +191,10 @@ fn back_to_unit_start(start: Position, unit: TextUnit) -> Result<Position> {
+             Ok(start)
+         }
+         TextUnit_Format => {
+-            if start.is_format_start() {
+-                Ok(start)
++            if is_format_start(start.biased_to_start()) {
++                Ok(start.biased_to_start())
+             } else {
+-                Ok(start.backward_to_format_start())
++                Ok(format_boundary(start, true))
+             }
+         }
+         TextUnit_Word => {
+@@ -135,7 +239,7 @@ fn back_to_unit_start(start: Position, unit: TextUnit) -> Result<Position> {
+ fn move_forward_to_start(pos: Position, unit: TextUnit) -> Result<Position> {
+     match unit {
+         TextUnit_Character => Ok(pos.forward_to_character_start()),
+-        TextUnit_Format => Ok(pos.forward_to_format_start()),
++        TextUnit_Format => Ok(format_boundary(pos, false)),
+         TextUnit_Word => Ok(pos.forward_to_word_start()),
+         TextUnit_Line => Ok(pos.forward_to_line_start()),
+         TextUnit_Paragraph => Ok(pos.forward_to_paragraph_start()),
+@@ -148,7 +252,7 @@ fn move_forward_to_start(pos: Position, unit: TextUnit) -> Result<Position> {
+ fn move_forward_to_end(pos: Position, unit: TextUnit) -> Result<Position> {
+     match unit {
+         TextUnit_Character => Ok(pos.forward_to_character_end()),
+-        TextUnit_Format => Ok(pos.forward_to_format_end()),
++        TextUnit_Format => Ok(format_boundary(pos, false).biased_to_end()),
+         TextUnit_Word => Ok(pos.forward_to_word_end()),
+         TextUnit_Line => Ok(pos.forward_to_line_end()),
+         TextUnit_Paragraph => Ok(pos.forward_to_paragraph_end()),
+@@ -161,7 +265,7 @@ fn move_forward_to_end(pos: Position, unit: TextUnit) -> Result<Position> {
+ fn move_backward(pos: Position, unit: TextUnit) -> Result<Position> {
+     match unit {
+         TextUnit_Character => Ok(pos.backward_to_character_start()),
+-        TextUnit_Format => Ok(pos.backward_to_format_start()),
++        TextUnit_Format => Ok(format_boundary(pos, true)),
+         TextUnit_Word => Ok(pos.backward_to_word_start()),
+         TextUnit_Line => Ok(pos.backward_to_line_start()),
+         TextUnit_Paragraph => Ok(pos.backward_to_paragraph_start()),
+@@ -395,13 +499,21 @@ impl ITextRangeProvider_Impl for PlatformRange_Impl {
+ 
+     fn FindAttribute(
+         &self,
+-        _id: UIA_TEXTATTRIBUTE_ID,
+-        _value: &VARIANT,
+-        _backward: BOOL,
++        id: UIA_TEXTATTRIBUTE_ID,
++        value: &VARIANT,
++        backward: BOOL,
+     ) -> Result<ITextRangeProvider> {
+-        // TODO: implement when we support variable formatting (part of rich text)
+-        // Justification: JUCE doesn't implement this.
+-        Err(Error::empty())
++        if id != UIA_StyleIdAttributeId {
++            return Err(Error::empty());
++        }
++        if value.vt() != VT_I4 {
++            return Err(invalid_arg());
++        }
++        let style = i32::try_from(value)?;
++        self.read(|range| {
++            let found = find_style(&range, style, backward.as_bool()).ok_or_else(Error::empty)?;
++            Ok(PlatformRange::new(&self.context, found).into())
++        })
+     }
+ 
+     fn FindText(
+@@ -418,6 +530,7 @@ impl ITextRangeProvider_Impl for PlatformRange_Impl {
+ 
+     fn GetAttributeValue(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
+         self.read(|range| match id {
++            UIA_StyleIdAttributeId => Ok(Variant::from(range_style_id(&range)).into()),
+             UIA_IsReadOnlyAttributeId => {
+                 // TBD: do we ever want to support mixed read-only/editable text?
+                 let value = range.node().is_read_only();
+@@ -650,3 +763,97 @@ fn platform_range_impl_send_sync() {
+     fn assert_send_sync<T: Send + Sync>() {}
+     assert_send_sync::<PlatformRange>();
+ }
++
++#[cfg(test)]
++mod style_tests {
++    use super::*;
++    use accesskit::{Node, NodeId, TreeId, TreeInfo, TreeUpdate};
++
++    #[test]
++    fn heading_ranges_cover_linked_runs_and_respect_search_bounds() {
++        fn parent(role: Role, children: &[u64]) -> Node {
++            let mut node = Node::new(role);
++            node.set_children(children.iter().copied().map(NodeId).collect::<Vec<_>>());
++            node
++        }
++        fn run(s: &str, lengths: &[u8]) -> Node {
++            let mut node = Node::new(Role::TextRun);
++            node.set_value(s);
++            node.set_character_lengths(lengths.to_vec());
++            node
++        }
++        let mut bold = run("🦀", &[4]);
++        bold.set_font_weight(700.0);
++        let mut heading = parent(Role::Heading, &[2, 3, 5]);
++        heading.set_level(0);
++        let mut second_heading = parent(Role::Heading, &[8]);
++        second_heading.set_level(0);
++        let mut empty_heading = parent(Role::Heading, &[10]);
++        empty_heading.set_level(5);
++        let root = NodeId(0);
++        let tree = Tree::new(
++            TreeUpdate {
++                nodes: vec![
++                    (root, parent(Role::MultilineTextInput, &[1, 6, 7, 9])),
++                    (NodeId(1), heading),
++                    (NodeId(2), bold),
++                    (NodeId(3), parent(Role::Link, &[4])),
++                    (NodeId(4), run("e\u{301}", &[3])),
++                    (NodeId(5), run("\n", &[1])),
++                    (NodeId(6), run("body\n", &[1; 5])),
++                    (NodeId(7), second_heading),
++                    (NodeId(8), run("x\n", &[1, 1])),
++                    (NodeId(9), empty_heading),
++                    (NodeId(10), run("", &[])),
++                ],
++                tree: Some(TreeInfo::new(root)),
++                tree_id: TreeId::ROOT,
++                focus: root,
++            },
++            true,
++        );
++        let doc = tree.state().root();
++        let range = doc.document_range();
++        let style = StyleId_Heading1.0;
++        assert_eq!(range_style_id(&range), TextRangePropertyValue::Mixed);
++        let first = find_style(&range, style, false).unwrap();
++        assert_eq!(first.text(), "🦀e\u{301}\n");
++        assert_eq!(
++            range_style_id(&first),
++            TextRangePropertyValue::Single(style)
++        );
++        assert_eq!(find_style(&range, style, true).unwrap().text(), "x\n");
++        assert_eq!(
++            find_style(&range, StyleId_Normal.0, false).unwrap().text(),
++            "body\n"
++        );
++        assert!(find_style(&range, StyleId_Heading2.0, true).is_none());
++        let mut clipped = range;
++        clipped.set_start(doc.text_position_from_global_usv_index(1).unwrap());
++        clipped.set_end(doc.text_position_from_global_usv_index(3).unwrap());
++        assert_eq!(
++            find_style(&clipped, style, true).unwrap().text(),
++            "e\u{301}"
++        );
++        // The inline font changes after the crab. The heading and the body
++        // then have identical visual attributes across their block boundary.
++        let pos = |offset| doc.text_position_from_global_usv_index(offset).unwrap();
++        for (start, end) in [(0, 1), (1, 4), (4, 9), (9, 11)] {
++            assert!(is_format_start(pos(start)));
++            assert_eq!(
++                format_boundary(pos(start), false).to_global_usv_index(),
++                end
++            );
++            assert_eq!(format_boundary(pos(end), true).to_global_usv_index(), start);
++        }
++        assert!(!is_format_start(pos(3)));
++        assert_eq!(format_boundary(pos(3), false).to_global_usv_index(), 4);
++        assert_eq!(format_boundary(pos(3), true).to_global_usv_index(), 1);
++        let empty = doc.document_end().to_degenerate_range();
++        assert_eq!(
++            range_style_id(&empty),
++            TextRangePropertyValue::Single(StyleId_Heading6.0)
++        );
++        assert!(find_style(&empty, StyleId_Heading6.0, false) == Some(empty));
++    }
++}
+diff --git a/Cargo.lock b/Cargo.lock
+index 8d24c9b..4ec3e07 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -30,8 +30,6 @@ dependencies = [
+ [[package]]
+ name = "accesskit_consumer"
+ version = "0.39.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f3da8f27636015191b2264ee1df681503170a632cafd832fdc1edfdd4e3a2fd3"
+ dependencies = [
+  "accesskit",
+  "hashbrown",

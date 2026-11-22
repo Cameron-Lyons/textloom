@@ -127,7 +127,6 @@ impl Debug for Editor {
 
 #[derive(Clone)]
 struct SavePoint {
-    revision: u64,
     // Saved content is immutable; editor clones can share the paragraph list too.
     paragraphs: Arc<[Arc<Paragraph>]>,
     // Edits and history/transaction restores invalidate this content comparison.
@@ -135,19 +134,21 @@ struct SavePoint {
 }
 
 impl SavePoint {
-    fn new(document: &Document) -> Self {
+    fn new(document: &mut Document) -> Self {
+        document.reset_changed_paragraphs();
         Self {
-            revision: document.revision(),
             paragraphs: Arc::from(document.paragraphs()),
-            cached_match: OnceLock::new(),
+            cached_match: OnceLock::from(true),
         }
     }
 
     fn matches(&self, document: &Document) -> bool {
-        (self.revision == document.revision() && self.revision != u64::MAX)
-            || *self
-                .cached_match
-                .get_or_init(|| self.paragraphs.as_ref() == document.paragraphs())
+        *self.cached_match.get_or_init(|| {
+            let current = document.paragraphs();
+            let changed = document.changed_paragraphs();
+            current.len() == self.paragraphs.len()
+                && current[changed.clone()] == self.paragraphs[changed]
+        })
     }
 }
 
@@ -173,10 +174,10 @@ impl Editor {
     /// The typing style is that of the document's first grapheme, or the
     /// default style if the first paragraph is empty.
     #[must_use]
-    pub fn new(document: Document) -> Self {
+    pub fn new(mut document: Document) -> Self {
         Self {
             typing_style: document.style_at(Position::default()),
-            saved: SavePoint::new(&document),
+            saved: SavePoint::new(&mut document),
             document,
             selection: Selection::default(),
             history: History::default(),
@@ -494,7 +495,7 @@ impl Editor {
     /// document.
     pub fn mark_saved(&mut self) {
         self.normalize_history();
-        self.saved = SavePoint::new(&self.document);
+        self.saved = SavePoint::new(&mut self.document);
     }
 
     /// Returns whether the content differs from the content at the last
@@ -941,10 +942,13 @@ impl Editor {
             return self.replace_selection("", Group::None);
         }
         let focus = self.selection.focus;
-        let target = match direction {
-            Direction::Forward => self.next_word(focus),
-            Direction::Backward => self.previous_word(focus),
-        };
+        let target = self.document.paragraphs()[focus.paragraph]
+            .local_word_deletion(focus.byte, direction)
+            .map(|byte| Position::new(focus.paragraph, byte))
+            .unwrap_or_else(|| match direction {
+                Direction::Forward => self.next_word(focus),
+                Direction::Backward => self.previous_word(focus),
+            });
         self.delete_to(target, Group::None)
     }
 

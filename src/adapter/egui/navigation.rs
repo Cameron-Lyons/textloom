@@ -91,6 +91,14 @@ pub(super) fn link_at_point(
     layouts: &ParagraphLayouts,
     point: Vec2,
 ) -> Option<Link> {
+    linked_grapheme_at_point(document, layouts, point).map(|(_, link)| link.clone())
+}
+
+pub(super) fn linked_grapheme_at_point<'doc>(
+    document: &'doc Document,
+    layouts: &ParagraphLayouts,
+    point: Vec2,
+) -> Option<(Position, &'doc Link)> {
     let paragraph = layouts.paragraph_at_y(point.y);
     if !document.paragraph(paragraph)?.has_links() {
         // Hover runs every frame, including over long paragraphs with no links.
@@ -98,7 +106,7 @@ pub(super) fn link_at_point(
         return None;
     }
     let position = grapheme_at_point(document, layouts, point)?;
-    document.link_at(position).cloned()
+    Some((position, document.link_at(position)?))
 }
 
 pub(super) fn pointer_navigation(

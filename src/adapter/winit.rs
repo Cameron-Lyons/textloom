@@ -740,7 +740,8 @@ impl WinitAdapter {
     /// [`Ime::Disabled`] arrives.
     ///
     /// Events are returned unhandled while the editor lacks focus. In read-only
-    /// mode, they are consumed and cancel any composition.
+    /// mode, they are consumed and cancel any composition. In either state,
+    /// `Ime::Disabled` still signals the end of the platform's IME session.
     ///
     /// # Errors
     ///
@@ -748,15 +749,16 @@ impl WinitAdapter {
     /// reversed or not on character boundaries of its text, and the editor's error if
     /// it rejects the composition.
     pub fn handle_ime(&mut self, event: &Ime, editor: &mut Editor) -> Result<InputOutcome, Error> {
+        if matches!(event, Ime::Disabled) {
+            // The old session cannot send another commit, even when Disabled
+            // arrives between losing focus and the next redraw.
+            self.ime.preedit = false;
+            self.ime.stale = true;
+        }
         if !self.is_focused() {
             return Ok(InputOutcome::default());
         }
         if self.read_only {
-            if matches!(event, Ime::Disabled) {
-                // No preedit or commit follows Disabled, so the canceled session is over.
-                self.ime.preedit = false;
-                self.ime.stale = true;
-            }
             let changed = editor.cancel_composition() || self.ime_enabled;
             self.ime_enabled = false;
             return Ok(InputOutcome {
@@ -788,8 +790,6 @@ impl WinitAdapter {
             }
             Ime::Disabled => {
                 self.ime_enabled = false;
-                self.ime.stale = true;
-                self.ime.preedit = false;
                 editor.cancel_composition();
             }
             Ime::Preedit(text, selection) => {
@@ -3573,6 +3573,47 @@ mod tests {
                 area: Some(area(1.0)),
             }
         );
+    }
+
+    #[test]
+    fn ime_disabled_while_unfocused_allows_new_input_on_refocus_before_redraw() {
+        for window_blur in [false, true] {
+            let mut editor = Editor::from_text("old");
+            editor.select_all();
+            let mut adapter = focused(&mut editor);
+            adapter.plan_ime(&editor, false, area(1.0));
+            adapter
+                .handle_ime(&Ime::Preedit("unfinished".into(), None), &mut editor)
+                .unwrap();
+            let focus = |adapter: &mut WinitAdapter, editor: &mut Editor, focused: bool| {
+                if window_blur {
+                    adapter
+                        .handle_window_event(&WindowEvent::Focused(focused), editor)
+                        .unwrap()
+                } else {
+                    adapter.set_focused(focused, editor)
+                }
+            };
+            focus(&mut adapter, &mut editor, false);
+            assert!(editor.composition().is_none());
+            for event in [Ime::Commit("stale".into()), Ime::Disabled] {
+                let outcome = adapter.handle_ime(&event, &mut editor).unwrap();
+                assert!(!outcome.handled && !outcome.changed);
+            }
+            focus(&mut adapter, &mut editor, true);
+            adapter.handle_ime(&Ime::Enabled, &mut editor).unwrap();
+            let commit = adapter
+                .handle_ime(&Ime::Commit("新".into()), &mut editor)
+                .unwrap();
+            assert!(
+                commit.handled && commit.changed,
+                "window blur: {window_blur}"
+            );
+            assert_eq!(editor.document().plain_text(), "新");
+            assert!(editor.undo());
+            assert_eq!(editor.selected_text(), "old");
+            assert!(!adapter.plan_ime(&editor, false, area(1.0)).interrupt);
+        }
     }
 
     #[test]

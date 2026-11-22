@@ -47,6 +47,42 @@ jobs:
       - name: Complete release checks
         run: ./scripts/check-release.sh
 
+  browser-input:
+    name: Browser input (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install the wasm-bindgen CLI matching the native example lockfile
+        working-directory: ${{ runner.temp }}
+        run: |
+          release=wasm-bindgen-0.2.129-x86_64-unknown-linux-musl
+          curl --fail --location --retry 3 -o bindgen.tar.gz \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/$release.tar.gz"
+          echo '82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e  bindgen.tar.gz' | sha256sum --check
+          tar -xzf bindgen.tar.gz "$release/wasm-bindgen"
+          echo "$RUNNER_TEMP/$release" >> "$GITHUB_PATH"
+      - name: Verify touch and mouse input in the packaged editor
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          export CHROME="$(command -v google-chrome)"
+          cargo package --locked --features egui
+          python3 scripts/native-qa/prepare_native.py eframe-web "$RUNNER_TEMP/web-input"
+          python3 scripts/native-qa/web-touch/check.py \
+            --package "target/package/textloom-$(./scripts/release-version.sh)" \
+            --eframe "$RUNNER_TEMP/web-input/eframe-0.37.0" --egui "$RUNNER_TEMP/web-input/egui-0.37.0" \
+            --lockfile examples/native-editor/Cargo.lock
+
   msrv:
     name: MSRV and feature combinations
     runs-on: ubuntu-latest
@@ -154,6 +190,22 @@ jobs:
         run: cargo clippy --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target -- -D warnings
       - name: Native host CLI and report tests
         run: cargo test --locked --all-targets --manifest-path examples/native-editor/Cargo.toml --target-dir target
+      - name: Exercise private macOS pasteboards across fresh test processes
+        if: runner.os == 'macOS'
+        run: |
+          for attempt in 1 2 3 4 5; do
+            echo "Private pasteboard run $attempt"
+            cargo test --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target \
+              --bin textloom-native-example clipboard::macos::tests:: -- --test-threads=3
+          done
+      - name: Windows UI Automation heading properties and text ranges
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          probe=$(mktemp -d target/windows-heading.XXXXXX)
+          python scripts/native-qa/prepare_native.py accesskit-windows "$probe/provider"
+          manifest="$probe/provider/accesskit_windows-0.35.2/Cargo.toml"
+          cargo test --locked --manifest-path "$manifest" --target-dir target --lib heading
       - name: Tests and doctests
         run: cargo test --locked --all-features
       - name: Build native renderer and report validator
@@ -237,11 +289,29 @@ jobs:
       - name: Install virtual display and software renderer
         timeout-minutes: 5
         run: |
-          # Avoid repeated Ubuntu archive DNS failures while retaining its signing key.
-          sudo sed -i 's|^URIs:.*|URIs: https://mirrors.edge.kernel.org/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources
-          apt_options=(-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
-          sudo apt-get "${apt_options[@]}" update --error-on=any
-          sudo apt-get "${apt_options[@]}" install --no-install-recommends --yes libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
+          packages=(
+            libegl1 libgl1-mesa-dri libglx-mesa0
+            libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 xauth xvfb
+          )
+          if states=$(dpkg-query -W -f='${db:Status-Status}\n' "${packages[@]}" 2>/dev/null) &&
+              [[ $(sort -u <<< "$states") == installed ]]; then
+            echo 'Renderer packages already installed.'
+            exit 0
+          fi
+
+          install_packages() {
+            local apt=(sudo apt-get -o Dir::Etc::sourcelist="$1" -o Dir::Etc::sourceparts=-
+                       -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+            "${apt[@]}" update --error-on=any &&
+              "${apt[@]}" install --no-install-recommends --yes "${packages[@]}"
+          }
+          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+          if ! install_packages "$ubuntu_sources"; then
+            echo 'Retrying with an independent Ubuntu mirror.'
+            fallback_sources="$RUNNER_TEMP/textloom-renderer.sources"
+            sed 's|^URIs:.*|URIs: https://mirrors.edge.kernel.org/ubuntu/|' "$ubuntu_sources" > "$fallback_sources"
+            install_packages "$fallback_sources"
+          fi
       - name: Build native renderer and report validator
         run: |
           cargo build --locked --manifest-path examples/native-editor/Cargo.toml --target-dir target

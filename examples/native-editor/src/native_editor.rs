@@ -1268,17 +1268,9 @@ impl NativeEditor {
             }
         }
         if let Some(clipboard) = &mut self.clipboard {
-            let document_owns_input = self.enabled
-                && !self.read_only
-                && ui.input(|input| input.focused)
-                && document_was_focused
-                && self
-                    .editor
-                    .composition()
-                    .is_none_or(|composition| composition.text.is_empty());
-            // Snapshot capture happens before routing. Advance every delivered
-            // Paste slot so native-field input cannot shift the document's queue.
-            ui.input(|input| clipboard.stage_paste(&input.events, document_owns_input));
+            // The widget decides whether to paste when it reaches the event.
+            // An earlier event in this pass may have changed focus or ended IME.
+            ui.input(|input| clipboard.stage_paste(&input.events));
         }
         if self.clipboard_self_test {
             self.clipboard_self_test = false;
@@ -1381,6 +1373,25 @@ impl NativeEditor {
                     })
                     .inner;
                 let response = output.response.labelled_by(document_label.id);
+                // Orca presents description changes on the focused entry while
+                // the caret moves through the document's semantic children.
+                #[cfg(target_os = "linux")]
+                if self.enabled && response.has_focus() {
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        let selection = self.editor.selection();
+                        if selection.is_caret() {
+                            let linked = self.editor.document().link_at(selection.focus).is_some();
+                            let quoted = self.editor.selection_paragraph_kind()
+                                == Some(ParagraphKind::Quote);
+                            match (linked, quoted) {
+                                (true, true) => node.set_description("Link in block quote"),
+                                (true, false) => node.set_description("Link"),
+                                (false, true) => node.set_description("Block quote"),
+                                (false, false) => {}
+                            }
+                        }
+                    });
+                }
                 self.document_id = Some(response.id);
                 if let Some(qa) = &mut self.qa {
                     qa.widget_errors(output.errors.len(), output.accessibility_errors.len());
@@ -3748,6 +3759,59 @@ mod tests {
         assert_eq!(harness.app.qa.as_ref().unwrap().host_command_errors(), 1);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn document_description_tracks_link_boundaries_and_consecutive_quotes() {
+        let mut host = Harness::new("caret-description");
+        let point = Position::new;
+        let range =
+            |paragraph, start, end| Selection::new(point(paragraph, start), point(paragraph, end));
+        host.app.editor = Editor::from_text("abcd\nquote one\nquote two\nbody");
+        let editor = &mut host.app.editor;
+        editor.set_selection(range(0, 1, 3)).unwrap();
+        let link = Link::try_new("https://example.com").unwrap();
+        editor.set_link(Some(link.clone())).unwrap();
+        editor
+            .set_selection(Selection::new(point(1, 0), point(2, 4)))
+            .unwrap();
+        editor.set_paragraph_kind(ParagraphKind::Quote).unwrap();
+        editor.set_selection(range(1, 0, 2)).unwrap();
+        editor.set_link(Some(link)).unwrap();
+
+        for (selection, expected) in [
+            (range(0, 0, 0), None),
+            (range(0, 1, 1), Some("Link")),
+            (range(0, 2, 2), Some("Link")),
+            (range(0, 3, 3), None),
+            (range(0, 1, 3), None),
+            (range(1, 0, 0), Some("Link in block quote")),
+            (range(1, 2, 2), Some("Block quote")),
+            (range(2, 0, 0), Some("Block quote")),
+            (range(2, 2, 4), None),
+            (range(2, 4, 4), Some("Block quote")),
+            (range(3, 0, 0), None),
+        ] {
+            host.app.editor.set_selection(selection).unwrap();
+            host.step(Vec::new());
+            let entry = &host.nodes[&host.app.document_id.unwrap().accesskit_id()];
+            assert_eq!(entry.description(), expected, "{selection:?}");
+            assert!(host.editor_focused());
+        }
+
+        let document = host.app.document_id.unwrap();
+        host.app.editor.set_selection(range(0, 1, 1)).unwrap();
+        let find = host.app.text_field_ids[1].unwrap();
+        host.step(vec![accessibility_focus(find)]);
+        assert_eq!(host.nodes[&document.accesskit_id()].description(), None);
+        host.step(vec![accessibility_focus(document)]);
+        assert_eq!(
+            host.nodes[&document.accesskit_id()].description(),
+            Some("Link")
+        );
+        host.click("Enabled", Role::CheckBox);
+        assert_eq!(host.nodes[&document.accesskit_id()].description(), None);
+    }
+
     #[test]
     fn remove_link_handles_mixed_links_and_plain_text_without_changing_formatting() {
         for backward in [false, true] {
@@ -4019,6 +4083,45 @@ mod tests {
         harness.click("Apply link", Role::Button);
         assert_eq!(harness.app.editor.document().to_bytes(), before);
         assert_eq!(harness.app.editor.undo_len(), 0);
+    }
+
+    #[test]
+    fn paste_after_an_ime_commit_in_the_same_pass_preserves_rich_text() {
+        for paste_first in [false, true] {
+            let mut harness = Harness::new("ime-rich-paste");
+            harness.app.editor = Editor::from_text("");
+            harness.preedit("に");
+            let mut source = Editor::from_text("paste");
+            source.select_all();
+            source.toggle_style(InlineAttribute::Bold).unwrap();
+            harness.app.clipboard = Some(NativeClipboard::with_pending_paste(
+                source.selected_fragment(),
+            ));
+            let commit = egui::Event::Ime(egui::ImeEvent::Commit("日".into()));
+            let paste = egui::Event::Paste("paste".into());
+            // Deliver a raw batch with a rich clipboard item already captured.
+            harness.deliver(egui::RawInput {
+                events: if paste_first {
+                    vec![paste, commit]
+                } else {
+                    vec![commit, paste]
+                },
+                focused: true,
+                ..Default::default()
+            });
+            let doc = harness.app.editor.document();
+            if paste_first {
+                assert_eq!(doc.plain_text(), "日");
+            } else {
+                assert_eq!(doc.plain_text(), "日paste");
+                assert!(doc.paragraphs()[0].spans().last().unwrap().style.bold);
+                let pasted = doc.to_bytes();
+                assert!(harness.app.editor.undo());
+                assert_eq!(harness.app.editor.document().plain_text(), "日");
+                assert!(harness.app.editor.redo());
+                assert_eq!(harness.app.editor.document().to_bytes(), pasted);
+            }
+        }
     }
 
     #[test]

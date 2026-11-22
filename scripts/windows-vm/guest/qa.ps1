@@ -212,8 +212,19 @@ function Get-ElementRect([string]$Name, [string]$Type = '') {
 
 # Paragraph kinds as AccessKit exposes them: heading, group (body text), and list item.
 function Get-ParagraphKinds([string]$Name = 'Document') {
-    $children = (Get-HostElement $Name 'Edit').FindAll($Scope::Children, [System.Windows.Automation.Condition]::TrueCondition)
-    return @($children | ForEach-Object { [ordered]@{ kind = $_.Current.LocalizedControlType; rect = Get-Rect $_.Current.BoundingRectangle } })
+    $all = [System.Windows.Automation.Condition]::TrueCondition
+    $children = (Get-HostElement $Name 'Edit').FindAll($Scope::Children, $all)
+    foreach ($child in $children) {
+        # UIA lists own the paragraph items; consecutive quotes stay grouped.
+        $members = if ($child.Current.ControlType -eq [System.Windows.Automation.ControlType]::List) {
+            $child.FindAll($Scope::Children, $all)
+        } else {
+            $child
+        }
+        foreach ($member in $members) {
+            [ordered]@{ kind = $member.Current.LocalizedControlType; rect = Get-Rect $member.Current.BoundingRectangle }
+        }
+    }
 }
 
 function Get-ParagraphStyle {

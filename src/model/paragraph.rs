@@ -393,6 +393,60 @@ impl Paragraph {
         self.boundary_at_or_after(byte)
     }
 
+    // Deleting a word immediately replaces the paragraph. Building its word
+    // index just for that lookup would leave it attached to the undo snapshot.
+    pub(crate) fn local_word_deletion(&self, byte: usize, direction: Direction) -> Option<usize> {
+        const WINDOW: usize = 128;
+        let text = self.text();
+        if text.len() <= WINDOW * 2
+            || self
+                .indices
+                .get()
+                .is_some_and(|indices| indices.words.get().is_some())
+        {
+            return None;
+        }
+        // Restart at a known Unicode word boundary on either side of the
+        // caret. If the window contains insufficient context, let the caller
+        // use the normal paragraph-wide word stops.
+        let left = text.ceil_char_boundary(byte.saturating_sub(WINDOW));
+        let start = if left == 0 {
+            0
+        } else {
+            // Leave room for the preceding word even at the start of the next one.
+            let cut = super::word_restart(&text[left..], (byte - left) / 2);
+            if cut == 0 {
+                return None;
+            }
+            left + cut
+        };
+        let right = byte.saturating_add(WINDOW).min(text.len());
+        let end = if right == text.len() {
+            right
+        } else {
+            let cut = super::word_restart(&text[byte..], right - byte);
+            if cut == 0 {
+                return None;
+            }
+            byte + cut
+        };
+        let words = word_stops(&text[start..end]);
+        // Neighboring symbol segments can form a single editor word. Only
+        // the interior of this window establishes both ends of such a run.
+        match direction {
+            Direction::Backward => {
+                let word = words.iter().rfind(|word| start + word.start < byte)?;
+                (word.start != 0 || start == 0)
+                    .then(|| self.boundary_at_or_before(start + word.start))
+            }
+            Direction::Forward => {
+                let word = words.iter().find(|word| start + word.end > byte)?;
+                (start + word.end != end || end == text.len())
+                    .then(|| self.boundary_at_or_after(start + word.end))
+            }
+        }
+    }
+
     fn text_indices(&self) -> &TextIndices {
         self.indices
             .get_or_init(|| Arc::new(TextIndices::default()))
@@ -715,14 +769,32 @@ impl Paragraph {
             .map_or_else(InlineStyle::default, |span| span.style)
     }
 
-    pub(super) fn link_for_byte(&self, byte: usize) -> Option<&Link> {
+    fn linked_span(&self, byte: usize) -> Option<(usize, &Link)> {
+        if !self.linked {
+            return None;
+        }
         let index = self.spans.partition_point(|span| span.range.end <= byte);
-        self.spans.get(index)?.link.as_ref()
+        Some((index, self.spans.get(index)?.link.as_ref()?))
     }
 
-    pub(super) fn link_range(&self, byte: usize) -> Option<Range<usize>> {
-        let index = self.spans.partition_point(|span| span.range.end <= byte);
-        let link = self.spans.get(index)?.link.as_ref()?;
+    pub(super) fn link_for_byte(&self, byte: usize) -> Option<&Link> {
+        self.linked_span(byte).map(|(_, link)| link)
+    }
+
+    pub(super) fn linked_grapheme(&self, byte: usize) -> Option<(usize, &Link)> {
+        // Unlinked text never needs a grapheme index, even if checking this
+        // boundary would require regional-indicator context from far away.
+        let span = self.linked_span(byte)?;
+        self.is_grapheme_boundary(byte).then_some(span)
+    }
+
+    pub(super) fn caret_link_span(&self, byte: usize) -> Option<(usize, &Link)> {
+        byte.checked_sub(1)
+            .and_then(|before| self.linked_span(before))
+            .or_else(|| self.linked_span(byte))
+    }
+
+    pub(super) fn link_range(&self, (index, link): (usize, &Link)) -> Range<usize> {
         let start = self.spans[..index]
             .iter()
             .rev()
@@ -734,7 +806,7 @@ impl Paragraph {
             .take_while(|span| span.link.as_ref() == Some(link))
             .last()
             .map_or(self.spans[index].range.end, |span| span.range.end);
-        Some(start..end)
+        start..end
     }
 }
 
@@ -951,6 +1023,38 @@ fn push_symbol_runs(stops: &mut Vec<Range<usize>>, bytes: &[u8], gap: Range<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_word_deletions_agree_with_full_paragraph_navigation() {
+        for text in [
+            "can't 3.14 \t•-!?  alpha 世界 𝄞 🦀👩‍💻 \u{ad} É\u{301}! ".repeat(12),
+            "א׳ א״א \u{200d}🦀 🇦🇧🇨🇩🇪\u{3000} \u{301}  。、\tべ ".repeat(12),
+            format!(
+                "{} {} end {}",
+                "👩\u{200d}".repeat(90),
+                "🇨".repeat(250),
+                "!".repeat(300)
+            ),
+        ] {
+            let local = Paragraph::plain(&text);
+            let indexed = Paragraph::plain(&text);
+            for byte in text
+                .grapheme_indices(true)
+                .map(|(i, _)| i)
+                .chain([text.len()])
+            {
+                for direction in [Direction::Backward, Direction::Forward] {
+                    if let Some(stop) = local.local_word_deletion(byte, direction) {
+                        let expected = match direction {
+                            Direction::Backward => indexed.previous_word(byte),
+                            Direction::Forward => indexed.next_word(byte),
+                        };
+                        assert_eq!(stop, expected, "{direction:?} at {byte} in {text:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn span_repairs_match_full_grapheme_segmentation() {

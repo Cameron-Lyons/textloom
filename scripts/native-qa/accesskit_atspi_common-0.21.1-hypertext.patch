@@ -1,0 +1,474 @@
+Index hyperlink ranges in the Unicode scalar coordinates of AT-SPI Text
+
+Textloom compatibility patch for accesskit_atspi_common-0.21.1.
+Base: crates.io accesskit_atspi_common-0.21.1 (SHA-256 24f5baf62e34a4a6c30e3d697e4782f821a7337049c44c3b40576a27dfbb580d)
+Upstream project: https://github.com/AccessKit/accesskit
+Protocol: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/iface.Hypertext.html
+Textloom changes are MIT licensed. Apply this patch at the crate root.
+
+diff --git a/src/adapter.rs b/src/adapter.rs
+index 58255cf..5f7cad1 100644
+--- a/src/adapter.rs
++++ b/src/adapter.rs
+@@ -533,6 +533,7 @@ impl Adapter {
+     pub fn update(&mut self, update: TreeUpdate) {
+         let mut handler = AdapterChangeHandler::new(self);
+         let mut tree = self.context.tree.write().unwrap();
++        self.context.hypertext.invalidate();
+         tree.update_and_process_changes(update, &mut handler);
+         drop(tree);
+         handler.emit_selection_changed();
+@@ -541,6 +542,7 @@ impl Adapter {
+     pub fn update_window_focus_state(&mut self, is_focused: bool) {
+         let mut handler = AdapterChangeHandler::new(self);
+         let mut tree = self.context.tree.write().unwrap();
++        self.context.hypertext.invalidate();
+         tree.update_host_focus_state_and_process_changes(is_focused, &mut handler);
+     }
+ 
+@@ -696,6 +698,163 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn hypertext_uses_text_scalar_offsets_across_runs_and_updates() {
++        fn run(text: &str, lengths: &[u8]) -> Node {
++            let mut node = Node::new(Role::TextRun);
++            node.set_value(text);
++            node.set_character_lengths(lengths.to_vec());
++            node
++        }
++        let mut first = with_children(Role::Link, &[NodeId(4), NodeId(5)]);
++        first.set_url("https://example.com/first");
++        let mut second = with_children(Role::Link, &[NodeId(7)]);
++        second.set_url("https://example.com/second");
++        let mut initial = initial_tree();
++        initial.nodes = vec![
++            (
++                NodeId(0),
++                with_children(Role::MultilineTextInput, &[NodeId(1)]),
++            ),
++            (
++                NodeId(1),
++                with_children(
++                    Role::Paragraph,
++                    &[NodeId(2), NodeId(3), NodeId(6), NodeId(8)],
++                ),
++            ),
++            (NodeId(2), run("🦀 ", &[4, 1])),
++            (NodeId(3), first),
++            (NodeId(4), run("e\u{301}", &[3])),
++            (NodeId(5), run("\n", &[1])),
++            (NodeId(6), second),
++            (NodeId(7), run("文", &[3])),
++            (NodeId(8), run("z", &[1])),
++        ];
++        let (mut adapter, _) = build(initial);
++        let doc = adapter.platform_node(adapter.root_id());
++        assert!(
++            doc.interfaces()
++                .unwrap()
++                .contains(atspi_common::Interface::Hypertext)
++        );
++        assert_eq!(doc.n_links().unwrap(), 2);
++        assert_eq!(doc.link_at_index(-1).unwrap(), None);
++        assert_eq!(doc.link_at_index(2).unwrap(), None);
++        let a = adapter.platform_node(doc.link_at_index(0).unwrap().unwrap());
++        let b = adapter.platform_node(doc.link_at_index(1).unwrap().unwrap());
++        assert_eq!(
++            (
++                a.hyperlink_start_index().unwrap(),
++                a.hyperlink_end_index().unwrap()
++            ),
++            (2, 5)
++        );
++        assert_eq!(
++            (
++                b.hyperlink_start_index().unwrap(),
++                b.hyperlink_end_index().unwrap()
++            ),
++            (5, 6)
++        );
++        assert_eq!(doc.text(2, 5).unwrap(), "e\u{301}\n");
++        let indices: Vec<_> = (-1..=7)
++            .map(|offset| doc.link_index_at_offset(offset).unwrap())
++            .collect();
++        assert_eq!(indices, [-1, -1, -1, 0, 0, 0, 1, -1, -1]);
++
++        adapter.update(update(vec![(NodeId(2), run("abc", &[1, 1, 1]))]));
++        assert_eq!(a.hyperlink_start_index().unwrap(), 3);
++        assert_eq!(b.hyperlink_end_index().unwrap(), 7);
++        adapter.update(update(vec![(
++            NodeId(1),
++            with_children(Role::Paragraph, &[NodeId(6), NodeId(8)]),
++        )]));
++        assert_eq!(doc.n_links().unwrap(), 1);
++        assert_eq!(doc.link_index_at_offset(0).unwrap(), 0);
++        assert_eq!(b.hyperlink_start_index().unwrap(), 0);
++        assert!(a.hyperlink_start_index().is_err());
++    }
++
++    #[test]
++    fn hypertext_owns_visible_nonoverlapping_ranges_in_its_own_text() {
++        fn run() -> Node {
++            let mut node = Node::new(Role::TextRun);
++            node.set_value("x");
++            node.set_character_lengths(vec![1]);
++            node
++        }
++        fn link(children: &[NodeId]) -> Node {
++            let mut node = with_children(Role::Link, children);
++            node.set_url("https://example.com");
++            node
++        }
++        let mut hidden = with_children(Role::Group, &[NodeId(2)]);
++        hidden.set_hidden();
++        let mut initial = initial_tree();
++        initial.nodes = vec![
++            (
++                NodeId(0),
++                with_children(
++                    Role::Document,
++                    &[NodeId(1), NodeId(5), NodeId(8), NodeId(13)],
++                ),
++            ),
++            (NodeId(1), hidden),
++            (
++                NodeId(2),
++                with_children(Role::GenericContainer, &[NodeId(3)]),
++            ),
++            (NodeId(3), link(&[NodeId(4)])),
++            (NodeId(4), run()),
++            (
++                NodeId(5),
++                with_children(Role::MultilineTextInput, &[NodeId(6)]),
++            ),
++            (NodeId(6), link(&[NodeId(7)])),
++            (NodeId(7), run()),
++            (NodeId(8), link(&[NodeId(9), NodeId(10)])),
++            (NodeId(9), run()),
++            (NodeId(10), link(&[NodeId(11)])),
++            (NodeId(11), run()),
++            (
++                NodeId(13),
++                with_children(Role::PasswordInput, &[NodeId(14)]),
++            ),
++            (NodeId(14), link(&[NodeId(15)])),
++            (NodeId(15), run()),
++        ];
++        let (adapter, _) = build(initial);
++        let doc = adapter.platform_node(adapter.root_id());
++        let child = |node: &crate::PlatformNode, index| {
++            adapter.platform_node(node.child_at_index(index).unwrap().unwrap())
++        };
++        let editor = child(&doc, 0);
++        let outer = child(&doc, 1);
++        let inner = child(&outer, 0);
++        let password = child(&doc, 2);
++        assert_eq!(doc.n_links().unwrap(), 1);
++        assert_eq!(doc.link_at_index(0).unwrap(), Some(outer.id()));
++        assert_eq!(
++            (
++                outer.hyperlink_start_index().unwrap(),
++                outer.hyperlink_end_index().unwrap()
++            ),
++            (2, 4)
++        );
++        assert_eq!(doc.link_index_at_offset(0).unwrap(), -1);
++        assert_eq!(doc.link_index_at_offset(1).unwrap(), -1);
++        assert_eq!(doc.link_index_at_offset(3).unwrap(), 0);
++        assert_eq!(inner.hyperlink_start_index().unwrap(), -1);
++        let own = child(&editor, 0);
++        assert_eq!(editor.link_at_index(0).unwrap(), Some(own.id()));
++        assert_eq!(own.hyperlink_start_index().unwrap(), 0);
++        assert_eq!(own.hyperlink_end_index().unwrap(), 1);
++        assert!(!password.supports_hypertext().unwrap());
++        assert!(password.n_links().is_err());
++        assert_eq!(child(&password, 0).hyperlink_start_index().unwrap(), -1);
++    }
++
+     #[test]
+     fn no_cache_events_on_construction() {
+         let (_adapter, ops) = build(initial_tree());
+diff --git a/src/context.rs b/src/context.rs
+index 5c8d8bb..07b5b61 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -35,6 +35,7 @@ impl<H: ActionHandler + Send> ActionHandlerNoMut for ActionHandlerWrapper<H> {
+ pub(crate) struct Context {
+     pub(crate) app_context: Arc<RwLock<AppContext>>,
+     pub(crate) tree: RwLock<Tree>,
++    pub(crate) hypertext: crate::hypertext::Cache,
+     pub(crate) action_handler: Arc<dyn ActionHandlerNoMut + Send + Sync>,
+     pub(crate) root_window_bounds: RwLock<WindowBounds>,
+ }
+@@ -60,6 +61,7 @@ impl Context {
+         Arc::new(Self {
+             app_context: Arc::clone(app_context),
+             tree: RwLock::new(tree),
++            hypertext: Default::default(),
+             action_handler,
+             root_window_bounds: RwLock::new(root_window_bounds),
+         })
+diff --git a/src/hypertext.rs b/src/hypertext.rs
+new file mode 100644
+index 0000000..fa46983
+--- /dev/null
++++ b/src/hypertext.rs
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Textloom Authors.
++// SPDX-License-Identifier: MIT
++
++use accesskit::Role;
++use accesskit_consumer::{FilterResult, FullNodeId, NodeRef};
++use std::{collections::HashMap, ops::Range, sync::Mutex};
++
++use crate::filters::filter;
++
++/// Orca enumerates a text object's links and asks each for both endpoints.
++/// Keep one lazily built index so those requests do not repeatedly walk the text.
++#[derive(Default)]
++pub(crate) struct Cache(Mutex<Option<(FullNodeId, Links)>>);
++
++impl Cache {
++    // Both reading the index and invalidating it take place under the tree lock.
++    pub(crate) fn invalidate(&self) {
++        self.0.lock().unwrap().take();
++    }
++
++    pub(crate) fn with<T>(&self, owner: &NodeRef, f: impl FnOnce(&Links) -> T) -> T {
++        let mut index = self.0.lock().unwrap();
++        if let Some((id, links)) = index.as_ref() {
++            if *id == owner.id() {
++                return f(links);
++            }
++        }
++        f(&index.insert((owner.id(), Links::new(owner))).1)
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct Links {
++    ordered: Vec<(FullNodeId, Range<usize>)>,
++    by_id: HashMap<FullNodeId, usize>,
++}
++
++impl Links {
++    fn new(owner: &NodeRef) -> Self {
++        let mut result = Self::default();
++        let mut offset = 0;
++        // Mirror the consumer's TextRun traversal so every offset uses the
++        // same Unicode scalar coordinates as the AT-SPI Text interface.
++        let runs = owner.filtered_children(|node| {
++            if node.id() == owner.id() || node.role() == Role::TextRun {
++                FilterResult::Include
++            } else {
++                FilterResult::ExcludeNode
++            }
++        });
++        for run in runs {
++            let start = offset;
++            offset += run.data().value().unwrap_or_default().chars().count();
++            if start == offset {
++                continue;
++            }
++            let mut link = None;
++            let mut parent = run.parent();
++            while let Some(node) = parent {
++                if node.id() == owner.id() {
++                    break;
++                }
++                // A nested text provider owns its own links. An outer link
++                // can itself contain a label or other text provider.
++                if node.supports_text_ranges() {
++                    link = None;
++                } else if node.supports_url() && filter(&node) == FilterResult::Include {
++                    // An outer hyperlink owns its entire interval; nested links
++                    // cannot have overlapping indices in the same text object.
++                    link = Some(node.id());
++                } else if link.is_some() && filter(&node) == FilterResult::ExcludeSubtree {
++                    // Transparent containers can hide an excluded ancestor from
++                    // a link's own filter result. Only return registered objects.
++                    link = None;
++                }
++                parent = node.parent();
++            }
++            if let Some(id) = link {
++                if let Some((last_id, range)) = result.ordered.last_mut() {
++                    if *last_id == id {
++                        range.end = offset;
++                        continue;
++                    }
++                }
++                result.by_id.insert(id, result.ordered.len());
++                result.ordered.push((id, start..offset));
++            }
++        }
++        result
++    }
++
++    pub(crate) fn count(&self) -> usize {
++        self.ordered.len()
++    }
++
++    pub(crate) fn id_at(&self, index: usize) -> Option<FullNodeId> {
++        self.ordered.get(index).map(|(id, _)| *id)
++    }
++
++    pub(crate) fn index_at(&self, offset: usize) -> Option<usize> {
++        let index = self
++            .ordered
++            .partition_point(|(_, range)| range.end <= offset);
++        self.ordered
++            .get(index)
++            .filter(|(_, range)| range.contains(&offset))
++            .map(|_| index)
++    }
++
++    pub(crate) fn range(&self, id: FullNodeId) -> Option<Range<usize>> {
++        self.by_id
++            .get(&id)
++            .map(|&index| self.ordered[index].1.clone())
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 066ab9f..5d59b52 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@ mod context;
+ mod error;
+ mod events;
+ mod filters;
++mod hypertext;
+ mod node;
+ mod rect;
+ #[cfg(feature = "simplified-api")]
+diff --git a/src/node.rs b/src/node.rs
+index cfcc46a..b0af3f9 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -506,6 +506,9 @@ impl NodeWrapper<'_> {
+         }
+         if self.supports_text() {
+             interfaces.insert(Interface::Text);
++            if !self.0.is_password_input() {
++                interfaces.insert(Interface::Hypertext);
++            }
+         }
+         if self.supports_value() {
+             interfaces.insert(Interface::Value);
+@@ -1243,17 +1246,67 @@ impl PlatformNode {
+         self.resolve(|node| if node.url().is_some() { Ok(1) } else { Ok(0) })
+     }
+ 
++    fn with_hypertext<T>(
++        &self,
++        f: impl FnOnce(&crate::hypertext::Links) -> Result<T>,
++    ) -> Result<T> {
++        self.resolve_for_text_with_context(|node, _, context| {
++            if node.is_password_input() {
++                return Err(Error::UnsupportedInterface);
++            }
++            context.hypertext.with(&node, f)
++        })
++    }
++
++    pub fn supports_hypertext(&self) -> Result<bool> {
++        self.resolve(|node| Ok(node.supports_text_ranges() && !node.is_password_input()))
++    }
++
++    pub fn n_links(&self) -> Result<i32> {
++        self.with_hypertext(|links| links.count().try_into().map_err(|_| Error::TooManyChildren))
++    }
++
++    pub fn link_at_index(&self, index: i32) -> Result<Option<FullNodeId>> {
++        self.with_hypertext(|links| Ok(usize::try_from(index).ok().and_then(|i| links.id_at(i))))
++    }
++
++    pub fn link_index_at_offset(&self, offset: i32) -> Result<i32> {
++        self.with_hypertext(|links| {
++            match usize::try_from(offset).ok().and_then(|i| links.index_at(i)) {
++                Some(index) => index.try_into().map_err(|_| Error::TooManyChildren),
++                None => Ok(-1),
++            }
++        })
++    }
++
++    fn hyperlink_range(&self) -> Result<Option<std::ops::Range<usize>>> {
++        self.resolve_with_context(|node, _, context| {
++            let mut parent = node.parent();
++            while let Some(owner) = parent {
++                if owner.supports_text_ranges() {
++                    return Ok(if owner.is_password_input() {
++                        None
++                    } else {
++                        context
++                            .hypertext
++                            .with(&owner, |links| links.range(node.id()))
++                    });
++                }
++                parent = owner.parent();
++            }
++            Ok(None)
++        })
++    }
++
+     pub fn hyperlink_start_index(&self) -> Result<i32> {
+-        self.resolve(|_| {
+-            // TODO: Support rich text
+-            Ok(-1)
++        self.hyperlink_range()?.map_or(Ok(-1), |range| {
++            range.start.try_into().map_err(|_| Error::TooManyCharacters)
+         })
+     }
+ 
+     pub fn hyperlink_end_index(&self) -> Result<i32> {
+-        self.resolve(|_| {
+-            // TODO: Support rich text
+-            Ok(-1)
++        self.hyperlink_range()?.map_or(Ok(-1), |range| {
++            range.end.try_into().map_err(|_| Error::TooManyCharacters)
+         })
+     }
+ 
+diff --git a/src/simplified.rs b/src/simplified.rs
+index c1fec21..66f71ac 100644
+--- a/src/simplified.rs
++++ b/src/simplified.rs
+@@ -273,6 +273,36 @@ impl Accessible {
+         }
+     }
+ 
++    pub fn supports_hypertext(&self) -> Result<bool> {
++        match self {
++            Self::Node(node) => node.supports_hypertext(),
++            Self::Root(_) => Ok(false),
++        }
++    }
++
++    pub fn n_links(&self) -> Result<i32> {
++        match self {
++            Self::Node(node) => node.n_links(),
++            Self::Root(_) => Err(Error::UnsupportedInterface),
++        }
++    }
++
++    pub fn link_at_index(&self, index: i32) -> Result<Option<Self>> {
++        match self {
++            Self::Node(node) => node
++                .link_at_index(index)
++                .map(|id| id.map(|id| Self::Node(node.relative(id)))),
++            Self::Root(_) => Err(Error::UnsupportedInterface),
++        }
++    }
++
++    pub fn link_index_at_offset(&self, offset: i32) -> Result<i32> {
++        match self {
++            Self::Node(node) => node.link_index_at_offset(offset),
++            Self::Root(_) => Err(Error::UnsupportedInterface),
++        }
++    }
++
+     pub fn supports_hyperlink(&self) -> Result<bool> {
+         match self {
+             Self::Node(node) => node.supports_hyperlink(),
