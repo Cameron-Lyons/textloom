@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The native example now uses `url` 2.5.9, which fixes a stack overflow when
+  computing a URL's origin. [RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2026-0592.html)
 - The egui editor scrolls on the first unfocused touchscreen swipe and selects
   text on the first mouse drag after touch input. Touch-down after a distant
   mouse hover preserves the scroll position until the finger moves.
